@@ -1,0 +1,413 @@
+"""Report snapshot and publication status."""
+
+from __future__ import annotations
+
+import os
+from typing import TYPE_CHECKING
+
+from pubanon import (
+    _config,
+    _run,
+)
+from pubanon._cli import _context, _inspect
+from pubanon._errors import PubanonError
+from pubanon._gate import RuleClass
+from pubanon._remote import _host
+from pubanon._snapshots import _audit, _candidate, _records
+from pubanon._terminal import (
+    escape,
+    next_step,
+    style,
+)
+from pubanon._terminal import (
+    field as terminal_field,
+)
+
+if TYPE_CHECKING:
+    import argparse
+
+
+def _publication_status(
+    ctx: _context.ProjectContext,
+    main: str | None,
+    tags: dict[str, str],
+    verified: _host.Destination | None,
+    *,
+    verbose: bool = False,
+) -> str:
+    """Show the last snapshot with destination facts recorded at publication."""
+    if main is None:
+        return terminal_field('Last published snapshot', 'none')
+    record = _records.load_publication(ctx.paths, ctx.project.name, main)
+    version = next((tag for tag, commit in tags.items() if commit == main), None)
+    lines = [
+        style('Last published snapshot', 'heading'),
+        terminal_field(
+            'Version', escape((record.tag_intent if record else None) or version or 'untagged')
+        ),
+    ]
+    if record is not None:
+        destination = record.destination
+        lines.extend(
+            [
+                terminal_field(
+                    'Destination', f'{escape(destination.owner)}/{escape(destination.repo)}'
+                ),
+                terminal_field('Visibility at publication', destination.visibility.upper()),
+                terminal_field(
+                    'Published',
+                    record.confirmed_at.astimezone().isoformat(sep=' ', timespec='seconds'),
+                ),
+            ]
+        )
+        same_destination = (destination.adapter, destination.owner, destination.repo) == (
+            ctx.project.host,
+            ctx.project.owner,
+            ctx.project.repo,
+        )
+        if same_destination:
+            if destination.visibility != ctx.project.visibility:
+                lines.append(
+                    terminal_field('Configured visibility', ctx.project.visibility.upper())
+                )
+            if verified is not None:
+                lines.append(terminal_field('Current visibility', verified.visibility.upper()))
+        else:
+            lines.append(
+                terminal_field(
+                    'Configured destination',
+                    f'{escape(ctx.project.owner)}/{escape(ctx.project.repo)} '
+                    f'({ctx.project.visibility.upper()})',
+                )
+            )
+    else:
+        lines.append(terminal_field('Source', 'not recorded'))
+    if verbose:
+        lines.append(terminal_field('Snapshot commit', main))
+    return '\n'.join(lines)
+
+
+def _replacement_summary(record: _candidate.CandidateRecord) -> str:
+    """Explain which published history the replacement changes."""
+    if record.replace_scope == 'all':
+        return 'Replace all published history and tags with one new initial publication.'
+    if record.replaces == record.prestate_main:
+        return 'Replace the latest publication; preserve earlier history.'
+    return (
+        'Replace the selected publication and rebuild later publications; '
+        'preserve earlier history.'
+    )
+
+
+def _show_status_audit(
+    ctx: _context.ProjectContext,
+    main: str | None,
+    tags: dict[str, str],
+    *,
+    verified_against_host: bool,
+) -> list[str]:
+    """Return current-policy findings over the local published history."""
+    if main is None:
+        return ['No recorded snapshot history to check.']
+    commits = _audit.published_commits(ctx.paths, ctx.project.name, new=main)
+    if not commits:
+        return ['No recorded snapshot history to check.']
+    rules = _config.assemble_rules(
+        ctx.global_config,
+        ctx.project,
+        _config.derived_private_terms(ctx.paths, ctx.project, os.environ),
+    )
+    result = _audit.audit_history(
+        ctx.paths, ctx.project.name, commits, tags, rules, ctx.global_config, tip=main
+    )
+    label = 'audit: local copy of published history'
+    if verified_against_host:
+        label += '; verified against the host'
+    lines = [label]
+
+    details = _audit.history_details(
+        result,
+        ctx.global_config,
+        ctx.project,
+        _config.derived_private_terms(ctx.paths, ctx.project, os.environ),
+    )
+    has_exposure = any(
+        finding.rule_class is RuleClass.IDENTITY_CRITICAL for finding in result.findings
+    )
+    for label, detail in details.items():
+        lines.append(f'{label.rsplit(" ", 1)[0]}: {escape(detail)}')
+    lines.extend(f'identity problem: {escape(problem)}' for problem in result.identity_problems)
+    if result.identity_problems:
+        lines.append('Content auditing could not be completed reliably.')
+    elif not has_exposure:
+        lines.append('No configured sensitive terms were found in the checked history.')
+    elif _audit.exposure_digest(result.findings) == ctx.project.acknowledged_exposure:
+        lines.append('exposure acknowledged')
+    else:
+        lines.append('exposure unacknowledged: publish will require interactive acknowledgment')
+    if has_exposure:
+        lines.append(
+            'If this history has been public, deleting or rewriting it does not erase '
+            'copies, forks, or caches'
+        )
+    return lines
+
+
+def _snapshot_provenance(
+    ctx: _context.ProjectContext, record: _candidate.CandidateRecord
+) -> list[str]:
+    """Render full identifiers and source coordinates for verbose snapshot status."""
+    lines = [
+        terminal_field('Snapshot commit', record.commit),
+        terminal_field('Source commit', record.pinned.commit),
+        terminal_field('Source repository', escape(str(ctx.project.source_path))),
+        terminal_field(
+            'Local store',
+            escape(str(_candidate.candidate_store_path(ctx.paths, ctx.project.name))),
+        ),
+        terminal_field(
+            'Source selector', escape(record.pinned.selector_name or record.pinned.commit)
+        ),
+    ]
+    if record.tip is not None and record.tip != record.commit:
+        lines.append(terminal_field('Final snapshot ID', record.tip))
+    return lines
+
+
+def rewrite_status(
+    paths: _config.Paths, name: str, record: _candidate.CandidateRecord, *, verbose: bool = False
+) -> list[str]:
+    """Summarize replacement preparation and actionable incomplete progress."""
+    progress = _records.load_rewrite(paths, name)
+    label = ', '.join(tag for tag, oid in record.prestate_tags.items() if oid == record.replaces)
+    selected = label or (record.replaces or record.commit)[:12]
+    scope = (
+        'all published snapshots'
+        if record.replace_scope == 'all'
+        else f'published snapshot for {escape(selected)}'
+    )
+    details = [terminal_field('Replaces', scope), _replacement_summary(record)]
+    count = len(progress.replayed) if progress is not None else len(record.replayed)
+    if count:
+        details.append(terminal_field('Later snapshots rebuilt', str(count)))
+    if record.tip is not None and progress is None:
+        if verbose:
+            details.append(terminal_field('Resulting tip', record.tip))
+        return details
+    details.append(terminal_field('Preparation', 'incomplete', kind='warning'))
+    if record.tip is not None:
+        details.append('Replacement preparation completed; local cleanup is pending.')
+    elif progress is None:
+        details.append('Replacement initialization incomplete; saved snapshot is available.')
+    elif progress.phase == 'replaying':
+        details.append('Preparation interrupted while rebuilding later snapshots.')
+    elif progress.phase == 'exporting':
+        details.append('Conflict export incomplete; continuation restores the export.')
+    else:
+        directory = _records.rewrite_directory(paths, name)
+        decisions = (
+            len(
+                {path for conflict in progress.pause.conflicts for path in conflict.decision_paths}
+            )
+            if progress.pause
+            else 0
+        )
+        details.append(terminal_field('Path decisions awaiting resolution', str(decisions)))
+        details.append(terminal_field('Resolution directory', escape(str(directory))))
+        details.append(
+            terminal_field('Resolution manifest', escape(str(directory / 'resolutions.toml')))
+        )
+    if progress is not None and progress.pause is not None:
+        old = progress.pause.old
+        tags = sorted(tag for tag, oid in record.prestate_tags.items() if oid == old)
+        release = escape(', '.join(tags)) if tags else old[:12]
+        details.append(terminal_field('Rebuilding snapshot', release))
+        details.extend(
+            f'  {escape(conflict.conflict_type)}: {escape(conflict.message)}'
+            for conflict in progress.pause.conflicts
+        )
+    if verbose and record.tip is not None:
+        details.append(terminal_field('Resulting tip', record.tip))
+    return details
+
+
+def _status_candidate(
+    ctx: _context.ProjectContext,
+    record: _candidate.CandidateRecord | None,
+    *,
+    verbose: bool = False,
+) -> tuple[list[str], list[str], bool, bool]:
+    """Report snapshot recovery before considering publication or remote status."""
+    paths, name = ctx.paths, ctx.project.name
+    details: list[str] = []
+    causes: list[str] = []
+    source_changed = False
+    source_available = False
+    if record is None:
+        details.append(terminal_field('Prepared snapshot', 'none'))
+    elif record.state == _candidate.STATE_UNKNOWN_OUTCOME and _candidate.confirmed_publication(
+        paths, name, record
+    ):
+        details.append(style('Snapshot published; local recording needs completion.', 'warning'))
+    else:
+        incomplete = record.replaces is not None and (
+            record.tip is None or _records.load_rewrite(paths, name) is not None
+        )
+        title = (
+            'Snapshot with unknown publish outcome'
+            if record.state == _candidate.STATE_UNKNOWN_OUTCOME
+            else 'Snapshot preparation incomplete'
+            if incomplete
+            else 'Prepared snapshot'
+        )
+        details.extend(
+            [
+                style(title, 'heading'),
+                terminal_field('Version', escape(record.tag_intent or 'untagged')),
+                terminal_field(
+                    'Operation', 'replacement' if record.replaces is not None else 'new'
+                ),
+            ]
+        )
+        if record.state == _candidate.STATE_UNKNOWN_OUTCOME:
+            details.append(terminal_field('Publish outcome', 'unknown', kind='warning'))
+        if record.replaces is not None and record.state != _candidate.STATE_UNKNOWN_OUTCOME:
+            details.extend(rewrite_status(paths, name, record, verbose=verbose))
+        if verbose:
+            details.extend(_snapshot_provenance(ctx, record))
+        if _config.fingerprint(ctx.global_config, ctx.project) != record.fingerprint:
+            causes.append('Pubanon settings have changed since this snapshot was prepared.')
+        if record.pinned.selector_kind == 'ref' and record.pinned.selector_name is not None:
+            current = _run.run_git(
+                ['rev-parse', '--verify', record.pinned.selector_name],
+                cwd=ctx.project.source_path,
+                check=False,
+            )
+            expected_selector = f'{record.pinned.selector_oid}\n'.encode()
+            if current.returncode != 0 or current.stdout != expected_selector:
+                source_changed = True
+        exists = _run.run_git(
+            ['cat-file', '-e', f'{record.pinned.commit}^{{commit}}'],
+            cwd=ctx.project.source_path,
+            check=False,
+        )
+        source_available = exists.returncode == 0
+        if not source_available:
+            causes.append(
+                'The source commit used to prepare this snapshot is no longer available.'
+            )
+        details.append(
+            terminal_field(
+                'Source revision changed since preparation',
+                'yes' if source_changed else 'no',
+                kind='warning' if source_changed else 'plain',
+            )
+        )
+        details.extend(causes)
+    return details, causes, source_changed, source_available
+
+
+def command_status(args: argparse.Namespace) -> None:
+    """Report local snapshot, invalidation, and optional remote state."""
+    paths = _config.derive_paths(os.environ)
+    name = _context.project_name(paths, args.project)
+    with _config.project_lock(paths, name):
+        ctx = _context.load_context(paths, name)
+        record = _candidate.load_candidate(paths, name)
+        details, causes, source_changed, source_available = _status_candidate(
+            ctx, record, verbose=args.verbose
+        )
+        if args.remote:
+            _context.require_advisory_store(paths, name)
+        main, tags = _context.local_refs(ctx)
+        publication_index = len(details)
+        verified_against_host = False
+        destination = None
+        unresolved = getattr(record, 'state', None) == _candidate.STATE_UNKNOWN_OUTCOME
+        comparison: str | None = None
+        if args.remote:
+            destination = _host.verify_destination(ctx.paths, ctx.global_config, ctx.project)
+            remote = _host.ls_remote(destination, paths, name)
+            _context.refuse_unexpected_branches(remote)
+            comparison = 'match' if (remote.main, remote.tags) == (main, tags) else 'mismatch'
+            details.append(
+                'GitHub matches the recorded published snapshot.'
+                if comparison == 'match'
+                else 'GitHub differs from the recorded published snapshot.'
+            )
+            differing_tags = [
+                tag
+                for tag in sorted(tags.keys() | remote.tags.keys())
+                if tags.get(tag) != remote.tags.get(tag)
+            ]
+            if differing_tags:
+                details.append(f'{style("Tags that differ:")} {escape(", ".join(differing_tags))}')
+            if args.audit and comparison == 'mismatch' and not unresolved:
+                raise PubanonError(
+                    'host refs do not match local published state',
+                    expected=escape(_host.remote_refs_text(_host.RemoteRefs(main, tags, ()))),
+                    actual=escape(_host.remote_refs_text(remote)),
+                    recovery='pubanon repo verify; use --repair-store only if the host is '
+                    'authoritative, or see "Accepting an outside fix" in the operator '
+                    'guide if the host changed outside Pubanon',
+                )
+            verified_against_host = comparison == 'match'
+        details.insert(
+            publication_index,
+            '\n'
+            + _publication_status(
+                ctx,
+                main,
+                tags,
+                destination if verified_against_host else None,
+                verbose=args.verbose,
+            ),
+        )
+        if args.audit and not unresolved:
+            details.extend(
+                _show_status_audit(
+                    ctx,
+                    main,
+                    tags,
+                    verified_against_host=verified_against_host,
+                )
+            )
+        action_index = (
+            unresolved,
+            comparison == 'mismatch',
+            record is None,
+            bool(causes),
+            source_changed,
+            True,
+        ).index(True)
+        next_actions = (
+            'pubanon publish --resolve',
+            'pubanon repo verify',
+            'pubanon prepare',
+            _candidate.reprepare_advice(record, project=name)
+            if source_available and record is not None
+            else 'pubanon discard && pubanon prepare',
+            'pubanon inspect',
+            'pubanon inspect',
+        )
+        action = next_actions[action_index]
+        if (
+            record is not None
+            and record.replaces is not None
+            and not unresolved
+            and comparison != 'mismatch'
+            and not causes
+        ):
+            if record.tip is None or _records.load_rewrite(paths, name) is not None:
+                action = _context.project_command(
+                    name, 'prepare', f'--project={name}', '--continue'
+                )
+            else:
+                action = 'pubanon inspect'
+        directories = _inspect.inspection_status(paths, name)
+        if directories:
+            details.extend(['', *directories])
+        print(terminal_field('Project', escape(name)))
+        print()
+        print('\n'.join(details) + '\n')
+        next_step(action)

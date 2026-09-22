@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    # Publications push a branch and tags together; test the branch once.
+    branches:
+      - "**"
+
+permissions:
+  contents: read
+
+env:
+  CI_IMPORT: pubanon
+  CI_INSTALL_TARGET: .
+  UV_PYTHON_DOWNLOADS: never
+  UV_SYSTEM_PYTHON: "1"
+  UV_VERSION: 0.12.1
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - name: Install dependencies
+        run: uv pip install --system --python python --no-python-downloads --group dev -e "$CI_INSTALL_TARGET"
+      - name: Check formatting
+        run: ruff format --check .
+      - name: Check lint
+        run: ruff check .
+      - name: Check Markdown
+        run: |
+          mdformat --check . \
+            --exclude '.superpowers/**' \
+            --exclude 'docs/internal/**' \
+            --exclude 'docs/superpowers/**'
+      - name: Check project metadata formatting
+        run: pyproject-fmt --check pyproject.toml
+      - name: Check types
+        run: pyright
+      - name: Build distributions
+        run: uv build --python python --no-python-downloads
+      - name: Check worktree
+        run: git diff --check
+      - name: Audit distributions
+        run: |
+          python - <<'PY'
+          import tarfile
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          dist = Path('dist')
+          wheels = list(dist.glob('*.whl'))
+          sdists = list(dist.glob('*.tar.gz'))
+          assert len(wheels) == 1, wheels
+          assert len(sdists) == 1, sdists
+
+          allowed_roots = {
+              '.gitignore',
+              'src',
+              'README.md',
+              'LICENSE',
+              'pyproject.toml',
+              'PKG-INFO',
+          }
+
+          with zipfile.ZipFile(wheels[0]) as archive:
+              names = archive.namelist()
+              dist_info = {PurePosixPath(n).parts[0] for n in names if '.dist-info/' in n}
+              allowed_wheel_roots = {'pubanon', *dist_info}
+              archives = [(archive.filename, names, False)]
+          with tarfile.open(sdists[0], 'r:gz') as archive:
+              archives.append((archive.name, archive.getnames(), True))
+
+          for archive_name, names, strip_sdist_root in archives:
+              for raw_name in names:
+                  path = PurePosixPath(raw_name)
+                  assert not path.is_absolute(), (archive_name, raw_name)
+                  assert '..' not in path.parts, (archive_name, raw_name)
+                  parts = path.parts[1:] if strip_sdist_root else path.parts
+                  if not parts:
+                      continue
+                  roots = allowed_wheel_roots if not strip_sdist_root else allowed_roots
+                  assert parts[0] in roots, (archive_name, raw_name)
+          PY
+      - name: Install wheel
+        run: uv pip install --system --python python --no-deps --force-reinstall dist/*.whl
+      - name: Smoke-test import
+        run: python -c "import importlib, os; importlib.import_module(os.environ['CI_IMPORT'])"
+      - name: Smoke-test CLI
+        run: pubanon --help
+      - name: Save distributions for release
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-distributions
+          path: dist/
+          if-no-files-found: error
+          overwrite: true
+
+  tests:
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            python-version: "3.13"
+          - os: ubuntu-24.04
+            python-version: "3.14"
+          - os: ubuntu-24.04
+            python-version: "3.15"
+          - os: macos-15
+            python-version: "3.13"
+          - os: windows-2022
+            python-version: "3.13"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: ${{ matrix.python-version == '3.15' }}
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - name: Install dependencies
+        run: uv pip install --system --python python --no-python-downloads --group dev -e "$CI_INSTALL_TARGET"
+      - name: Run tests
+        run: python -m pytest -q --durations=15
