@@ -10,22 +10,34 @@ from pubanon import (
     _run,
 )
 from pubanon._cli import _context
-from pubanon._errors import PubanonError
+from pubanon._errors import OperationCanceled, PubanonError
 from pubanon._snapshots import _candidate, _history, _records, _source
 from pubanon._terminal import (
     confirm,
+    display_path,
+    display_time,
     escape,
+    fields,
     heading,
     next_step,
     output,
     style,
 )
-from pubanon._terminal import (
-    field as terminal_field,
-)
 
 if TYPE_CHECKING:
     import argparse
+    from collections.abc import Sequence
+
+
+def _clean_summary(*, snapshots: bool, copies: bool) -> str:
+    """Name only the local objects in one cleanup preview."""
+    if snapshots and copies:
+        return (
+            'The listed snapshots, review copies, and source recovery information will be removed.'
+        )
+    if snapshots:
+        return 'The listed snapshots and their source recovery information will be removed.'
+    return 'The listed review copies will be removed.'
 
 
 def _delete_publication(ctx: _context.ProjectContext, args: argparse.Namespace) -> None:
@@ -33,14 +45,14 @@ def _delete_publication(ctx: _context.ProjectContext, args: argparse.Namespace) 
     entry = _history.select_publication(
         ctx.paths, ctx.project.name, args.selector, include_deleted=True
     )
-    for line in _history.delete_guidance(ctx.paths, ctx.project, entry):
-        label, separator, value = line.partition(':')
-        print(f'{style(label + separator)}{value}' if separator else line)
+    lines = _history.delete_guidance(ctx.paths, ctx.project, entry)
+    fields([(label, value) for label, _, value in (line.partition(': ') for line in lines[:2])])
+    for line in lines[2:]:
+        print(line)
     cleanup = _history.source_cleanup_guidance(ctx.project, entry)
     label = ', '.join(entry.tags) or entry.commit[:12]
     if not args.yes and not confirm(f'Delete local snapshot {label}?'):
-        output('Nothing was deleted.')
-        return
+        raise OperationCanceled('Canceled. Nothing was deleted.')
     _history.delete_publication(ctx.paths, ctx.project, entry)
     output('Deleted the local snapshot and recovery information.', kind='success')
     for line in cleanup:
@@ -55,13 +67,7 @@ def _history_source_status(
         return 'not recorded'
     if entry.record.source_bookmark is None:
         return 'unavailable'
-    source_commit = (
-        entry.record.pinned.commit
-        if entry.record.pinned is not None
-        else entry.record.derivation.original_source
-        if entry.record.derivation is not None
-        else None
-    )
+    source_commit = _records.publication_source(entry.record)
     if source_commit is None:
         return 'unavailable'
     return _source.source_recovery(
@@ -71,13 +77,27 @@ def _history_source_status(
     ).status
 
 
+def _matching_source_details(match: _source.SourceMatches | None) -> list[tuple[str, str]]:
+    """Describe the latest exact content match and the number found."""
+    if match is None:
+        return [
+            ('Latest match', 'unavailable'),
+            ('Number of matches', 'unavailable'),
+        ]
+    return [
+        (f'Latest match on {escape(match.branch)}', match.latest or 'none'),
+        ('Number of matches', str(match.count)),
+    ]
+
+
 def _history_entry(
     ctx: _context.ProjectContext,
     entry: _history.PublicationEntry,
     candidate: _candidate.CandidateRecord | None,
     *,
     verbose: bool,
-) -> tuple[tuple[str, str, str, str], list[str]]:
+    match: _source.SourceMatches | None = None,
+) -> tuple[tuple[str, str, str, str], list[str | tuple[str, str]]]:
     """Describe one published row and its optional provenance."""
     pending = (
         candidate is not None
@@ -86,28 +106,26 @@ def _history_entry(
     )
     snapshot = entry.commit if verbose else entry.commit[:12]
     state = 'published' if pending else 'superseded' if entry.replaced else 'published'
-    published = (
-        entry.record.confirmed_at.astimezone().isoformat(sep=' ', timespec='seconds')
-        if entry.record is not None
-        else '-'
-    )
-    details: list[str] = []
+    published = display_time(entry.record.confirmed_at) if entry.record is not None else '-'
+    details: list[str | tuple[str, str]] = []
     if pending:
-        details.append(terminal_field('Local recording', 'incomplete', kind='warning'))
+        details.append(('Local recording', style('incomplete', 'warning')))
     if verbose:
-        details.extend(['', terminal_field('Snapshot', snapshot)])
-        details.append(terminal_field('Source', _history_source_status(ctx.project, entry)))
+        details.extend(['', ('Snapshot', snapshot)])
+        details.append(('Source', _history_source_status(ctx.project, entry)))
         if entry.record is not None and entry.record.pinned is not None:
-            details.append(terminal_field('Source commit', entry.record.pinned.commit))
+            details.append(('Original source', entry.record.pinned.commit))
+            details.extend(_matching_source_details(match))
         elif entry.record is not None and entry.record.derivation is not None:
             derivation = entry.record.derivation
             details.extend(
                 [
-                    terminal_field('Original snapshot', derivation.original),
-                    terminal_field('Correction snapshot', derivation.correction),
-                    terminal_field('Source input', derivation.original_source or 'unavailable'),
+                    ('Original snapshot', derivation.original),
+                    ('Correction snapshot', derivation.correction),
+                    ('Source input', derivation.original_source or 'unavailable'),
                 ]
             )
+            details.extend(_matching_source_details(match))
     return (snapshot, escape(', '.join(entry.tags) or 'untagged'), state, published), details
 
 
@@ -117,7 +135,7 @@ def _pending_history(
     entries: tuple[_history.PublicationEntry, ...],
     *,
     verbose: bool,
-) -> tuple[list[tuple[str, str, str, str]], list[str], str]:
+) -> tuple[list[tuple[str, str, str, str]], list[str | tuple[str, str]], str]:
     """List each retained snapshot under its own identity and return its recovery action."""
     progress = _records.load_rewrite(ctx.paths, ctx.project.name)
     incomplete = record.replaces is not None and (record.tip is None or progress is not None)
@@ -147,7 +165,7 @@ def _pending_history(
     )
     published = {entry.commit for entry in entries}
     rows: list[tuple[str, str, str, str]] = []
-    details: list[str] = []
+    details: list[str | tuple[str, str]] = []
     for commit, intended, source, source_label in snapshots:
         if commit in published:
             continue
@@ -157,17 +175,17 @@ def _pending_history(
         snapshot = commit if verbose else commit[:12]
         rows.append((snapshot, escape(version), state, '-'))
         if confirmed:
-            details.append(terminal_field('Local recording', 'incomplete', kind='warning'))
+            details.append(('Local recording', style('incomplete', 'warning')))
         if verbose:
             details.extend(
                 [
                     '',
-                    terminal_field('Snapshot', snapshot),
-                    terminal_field('Operation', 'replacement' if record.replaces else 'new'),
+                    ('Snapshot', snapshot),
+                    ('Operation', 'replacement' if record.replaces else 'new'),
                 ]
             )
             if source is not None:
-                details.append(terminal_field(source_label, source))
+                details.append((source_label, source))
     if unknown:
         if not confirmed:
             details.append('Pubanon could not confirm whether publication completed.')
@@ -176,6 +194,28 @@ def _pending_history(
         details.append('Preparation stopped before the replacement was ready.')
         return rows, details, 'pubanon prepare --continue'
     return rows, details, 'pubanon inspect' if rows else ''
+
+
+def _refresh_source_matches(
+    ctx: _context.ProjectContext,
+    entries: tuple[_history.PublicationEntry, ...],
+    *,
+    verbose: bool,
+) -> dict[str, _source.SourceMatches]:
+    """Read source history once for display and refresh opted-in source tags."""
+    if not verbose and not ctx.project.source_tags:
+        return {}
+    try:
+        matches = _history.source_matches(ctx.project, entries)
+        for warning in _history.refresh_source_tags(ctx.project, entries, matches=matches):
+            output(escape(warning), kind='warning')
+    except OperationCanceled:
+        raise
+    except (OSError, PubanonError) as exc:
+        output(f'Source matching unavailable: {escape(str(exc))}', kind='warning')
+        return {}
+    else:
+        return matches
 
 
 def _selected_prepared(
@@ -201,7 +241,9 @@ def _selected_prepared(
     return None
 
 
-def _show_history_table(rows: list[tuple[str, str, str, str]], details: list[str]) -> None:
+def _show_history_table(
+    rows: list[tuple[str, str, str, str]], details: list[str | tuple[str, str]]
+) -> None:
     """Align snapshot rows and append their recording and provenance details."""
     headers = ('ID', 'Version', 'State', 'Published')
     widths = [max(len(row[index]) for row in [headers, *rows]) for index in range(3)]
@@ -223,38 +265,67 @@ def _show_history_table(rows: list[tuple[str, str, str, str]], details: list[str
             f'{snapshot.ljust(widths[0])}  {version.ljust(widths[1])}  '
             f'{style(state.ljust(widths[2]), state_kind)}  {published}'
         )
-    recording_note = terminal_field('Local recording', 'incomplete', kind='warning')
+    recording_note = ('Local recording', style('incomplete', 'warning'))
     if recording_note in details:
-        print(recording_note)
+        fields([recording_note])
+    detail_rows: list[tuple[str, str]] = []
     for detail in details:
-        if detail != recording_note:
+        if detail == recording_note:
+            continue
+        if isinstance(detail, tuple):
+            detail_rows.append(detail)
+        else:
+            fields(detail_rows)
+            detail_rows.clear()
             print(detail)
+    fields(detail_rows)
+
+
+def _show_source_lines(lines: Sequence[str], rows: list[tuple[str, str]]) -> None:
+    """Align source recovery fields while preserving complete runnable commands."""
+    for line in lines:
+        if line.startswith('git '):
+            label = 'Remove source worktree' if ' worktree remove ' in line else 'View source'
+            rows.append((label, style(line, 'choice')))
+        else:
+            label, separator, value = line.partition(':')
+            if separator:
+                rows.append((label, value.lstrip()))
+            else:
+                fields(rows)
+                rows = []
+                print(line)
+    fields(rows)
 
 
 def _show_publication(
-    ctx: _context.ProjectContext, entry: _history.PublicationEntry, *, verbose: bool = False
+    ctx: _context.ProjectContext,
+    entry: _history.PublicationEntry,
+    *,
+    verbose: bool = False,
+    match: _source.SourceMatches | None = None,
 ) -> None:
     """Show recorded provenance, bounded Git changes, and source recovery advice."""
     heading('Superseded snapshot' if entry.replaced else 'Published snapshot')
-    print(terminal_field('Snapshot commit', entry.commit if verbose else entry.commit[:12]))
-    version = ', '.join(entry.tags) or 'untagged'
-    print(f'{style("Version:")} {escape(version)}')
+    rows = [
+        ('Snapshot commit', entry.commit if verbose else entry.commit[:12]),
+        ('Version', escape(', '.join(entry.tags) or 'untagged')),
+    ]
     record = entry.record
     if record is not None:
         destination = record.destination
-        print(
-            terminal_field(
-                'Destination', f'{escape(destination.owner)}/{escape(destination.repo)}'
-            )
+        rows.extend(
+            [
+                ('Destination', f'{escape(destination.owner)}/{escape(destination.repo)}'),
+                ('Visibility at publication', destination.visibility),
+                ('Published', display_time(record.confirmed_at)),
+            ]
         )
-        print(terminal_field('Visibility at publication', destination.visibility.upper()))
-        confirmed_at = record.confirmed_at.astimezone().isoformat(sep=' ', timespec='seconds')
-        print(terminal_field('Published', confirmed_at))
         if verbose and record.pinned is not None:
-            print(terminal_field('Source commit', record.pinned.commit))
+            rows.append(('Original source', record.pinned.commit))
     elif entry.commit_time is not None:
-        commit_time = entry.commit_time.astimezone().isoformat(sep=' ', timespec='seconds')
-        print(f'{style("Commit time:")} {commit_time}')
+        rows.append(('Commit time', display_time(entry.commit_time)))
+    fields(rows)
     store = _candidate.candidate_store_path(ctx.paths, ctx.project.name)
     summary = (
         _run.run_git(
@@ -277,9 +348,9 @@ def _show_publication(
     available = summary is not None and summary.returncode == 0
     if available and summary is not None:
         heading('Changes', separate=True)
-        changes = summary.stdout.decode(errors='surrogateescape').strip() or 'No file changes'
+        changes = summary.stdout.decode(errors='surrogateescape').rstrip() or ' No file changes'
         for line in changes.split('\n'):
-            print(escape(line))
+            print('  ' + escape(line.removeprefix(' ')))
     else:
         output(
             'Change summary and published inspection unavailable: local Git objects are missing',
@@ -295,59 +366,70 @@ def _show_publication(
         else [f'Source: {_history_source_status(ctx.project, entry)}']
     )
     if verbose:
-        print(terminal_field('Local store', escape(str(store))))
-    if record and record.source_bookmark and source_lines[0].startswith('Source unavailable:'):
-        print(
-            f'{style("Recorded source repository:")} '
-            f'{escape(str(record.source_bookmark.source_path))}'
+        fields(
+            [
+                (f'Latest match on {escape(match.branch)}', match.latest or 'none')
+                if match is not None
+                else ('Latest match', 'unavailable'),
+                ('Number of matches', str(match.count) if match is not None else 'unavailable'),
+                ('Local store', display_path(store)),
+            ]
         )
-    for line in source_lines:
-        if line.startswith('git '):
-            label = 'Remove source worktree:' if ' worktree remove ' in line else 'View source:'
-            print(f'{style(label)} {style(line, "choice")}')
-        else:
-            label, separator, value = line.partition(':')
-            print(f'{style(label + separator)}{value}' if separator else line)
+        print()
+    source_rows: list[tuple[str, str]] = []
+    if record and record.source_bookmark and source_lines[0].startswith('Source unavailable:'):
+        source_rows.append(
+            ('Recorded source repository', display_path(record.source_bookmark.source_path))
+        )
+    _show_source_lines(source_lines, source_rows)
     print()
     next_step(
         f'pubanon inspect --published {entry.commit if verbose else entry.commit[:12]}'
         if available
-        else 'pubanon repo verify --repair-store'
+        else 'pubanon repo restore --to local'
     )
 
 
 def command_clean(args: argparse.Namespace) -> None:
-    """Preview and delete superseded local snapshots under the project lock."""
+    """Preview and remove superseded snapshots and review copies."""
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
         ctx = _context.load_context(paths, name)
         entries = tuple(entry for entry in _history.publications(paths, name) if entry.replaced)
-        if not entries:
-            output('No superseded snapshots to clean.')
+        copies = _candidate.inspection_paths(paths, name)
+        if not entries and not copies:
+            output('Nothing to remove.')
             return
         for entry in entries:
             _history.delete_guidance(paths, ctx.project, entry)
-        heading('Superseded snapshots to remove')
-        rows = [_history_entry(ctx, entry, None, verbose=args.verbose)[0] for entry in entries]
-        _show_history_table(rows, [])
-        print(
-            'The listed snapshots, review directories, and source recovery information '
-            'will be removed.'
-        )
+        if entries:
+            heading('Superseded snapshots to remove')
+            rows = [_history_entry(ctx, entry, None, verbose=args.verbose)[0] for entry in entries]
+            _show_history_table(rows, [])
+        if copies:
+            heading('Review copies to remove', separate=bool(entries))
+            for copy in copies:
+                print(f'  {display_path(copy)}')
+        print(_clean_summary(snapshots=bool(entries), copies=bool(copies)))
         print('Current published snapshots and prepared work are kept.')
-        question = (
-            'Delete this superseded local snapshot?'
-            if len(entries) == 1
-            else f'Delete these {len(entries)} superseded local snapshots?'
-        )
+        if entries:
+            question = (
+                'Delete this superseded local snapshot?'
+                if len(entries) == 1
+                else f'Delete these {len(entries)} superseded local snapshots?'
+            )
+        else:
+            question = (
+                'Remove this review copy?' if len(copies) == 1 else 'Remove these review copies?'
+            )
         if not args.yes and not confirm(question):
-            output('Nothing was deleted.')
-            return
+            raise OperationCanceled('Canceled. Nothing was deleted.')
         for entry in entries:
             _history.delete_publication(paths, ctx.project, entry)
             output(f'Deleted local snapshot {entry.commit[:12]}.', kind='success')
-        output('Superseded snapshot cleanup complete.', kind='success')
+        _candidate.clean_inspect(paths, name)
+        output('Cleanup complete.', kind='success')
 
 
 def command_delete(args: argparse.Namespace) -> None:
@@ -355,33 +437,17 @@ def command_delete(args: argparse.Namespace) -> None:
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
-        ctx = _context.load_context(paths, name)
-        candidate = _selected_prepared(paths, name, args.selector)
-        if candidate is not None:
-            if candidate.state == _candidate.STATE_UNKNOWN_OUTCOME:
-                raise PubanonError(
-                    'Pubanon could not confirm whether the last publication completed',
-                    recovery='pubanon publish --resolve',
-                )
-            tip = candidate.tip or candidate.commit
-            print(terminal_field('Prepared snapshot', tip))
-            print('The saved candidate and its review directories will be removed.')
-            if not args.yes and not confirm(f'Delete local snapshot {tip[:12]}?'):
-                output('Nothing was deleted.')
-                return
-            reviewed = dict.fromkeys(
-                (candidate.commit, *(entry.new for entry in candidate.replayed), tip)
+        if args.selector == 'prepared':
+            raise PubanonError(
+                'Prepared snapshots are discarded with pubanon discard',
+                recovery='pubanon discard',
             )
-            for commit in reviewed:
-                _candidate.clean_inspect(paths, name, commit=commit)
-            _candidate.discard(paths, name, force=False)
-            output('Deleted the prepared snapshot and its review directories.', kind='success')
-            return
+        ctx = _context.load_context(paths, name)
         _delete_publication(ctx, args)
 
 
 def command_discard(args: argparse.Namespace) -> None:
-    """Discard one retained snapshot and report preserved snapshot directories."""
+    """Discard one retained snapshot and its review copies."""
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
@@ -392,10 +458,10 @@ def command_discard(args: argparse.Namespace) -> None:
     else:
         output('No prepared snapshot was found.', kind='warning')
     if copies:
-        heading('Preserved snapshot directories', separate=True)
+        heading('Remaining review copies', separate=True)
         for copy in copies:
-            print(f'  {escape(str(copy))}')
-        next_step(_context.project_command(name, 'inspect', f'--project={name}', '--clean'))
+            print(f'  {display_path(copy)}')
+        next_step(_context.project_command(name, 'clean', f'--project={name}'))
 
 
 def command_list(args: argparse.Namespace) -> None:
@@ -411,6 +477,7 @@ def command_list(args: argparse.Namespace) -> None:
             print()
             next_step('pubanon prepare')
             return
+        matches = _refresh_source_matches(ctx, entries, verbose=args.verbose)
         print(style('Snapshots', 'heading'))
         rows, details, action = (
             _pending_history(ctx, candidate, entries, verbose=args.verbose)
@@ -418,17 +485,19 @@ def command_list(args: argparse.Namespace) -> None:
             else ([], [], '')
         )
         for entry in entries:
-            row, provenance = _history_entry(ctx, entry, candidate, verbose=args.verbose)
+            row, provenance = _history_entry(
+                ctx, entry, candidate, verbose=args.verbose, match=matches.get(entry.commit)
+            )
             rows.append(row)
             details.extend(provenance)
-        _show_history_table(rows, details)
         if args.verbose:
-            print(terminal_field('Source repository', escape(str(ctx.project.source_path))))
-            print(
-                terminal_field(
-                    'Local store', escape(str(_candidate.candidate_store_path(paths, name)))
-                )
+            details.extend(
+                [
+                    ('Source repository', display_path(ctx.project.source_path)),
+                    ('Local store', display_path(_candidate.candidate_store_path(paths, name))),
+                ]
             )
+        _show_history_table(rows, details)
         if not action:
             main, _tags = _context.local_refs(ctx)
             selector = (
@@ -458,6 +527,9 @@ def command_show(args: argparse.Namespace) -> None:
             print()
             next_step('pubanon inspect')
             return
-        _show_publication(
-            ctx, _history.select_publication(paths, name, args.selector), verbose=args.verbose
-        )
+        entries = _history.publications(paths, name)
+        entry = _history.select_publication(paths, name, args.selector, entries=entries)
+        if not ctx.project.source_tags:
+            entries = (entry,)
+        matches = _refresh_source_matches(ctx, entries, verbose=args.verbose)
+        _show_publication(ctx, entry, verbose=args.verbose, match=matches.get(entry.commit))

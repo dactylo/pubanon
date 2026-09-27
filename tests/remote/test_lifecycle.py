@@ -1,4 +1,5 @@
 import json
+import re
 import subprocess
 from collections.abc import Callable
 from contextlib import redirect_stdout
@@ -18,11 +19,11 @@ from pubanon._config import (
     ProjectConfig,
     Settings,
 )
-from pubanon._errors import ObservationTimeoutError, PubanonError
+from pubanon._errors import ObservationTimeoutError, OperationCanceled, PubanonError
 from pubanon._remote import _host, _lifecycle, _package, _watch
 from pubanon._remote._host import CheckVerdict
 from pubanon._snapshots import _audit, _candidate, _records, _source
-from pubanon._terminal import escape
+from pubanon._terminal import escape, verbose_context
 from tests._git import git_env
 from tests._permissions import assert_private_mode
 
@@ -50,6 +51,16 @@ _CREATE_ARGS = [
     'has_wiki=false',
     '-F',
     'has_projects=true',
+    '-F',
+    'has_discussions=false',
+]
+_PATCH_SETTINGS_ARGS = [
+    'api',
+    '-X',
+    'PATCH',
+    'repos/anonymous-account/public-repo',
+    '-F',
+    'has_pull_requests=false',
 ]
 _REPOSITORY_ARGS = [
     'api',
@@ -100,12 +111,15 @@ def _configs(tmp_path: Path) -> tuple[Paths, GlobalConfig, ProjectConfig]:
         hygiene_terms=(),
         self_publication=True,
         required_checks=(),
+        publication_route='direct',
         settings=Settings(
             description='Public repository',
             default_branch='main',
             issues=True,
             wiki=False,
             projects=True,
+            pull_requests=False,
+            discussions=False,
         ),
     )
     return paths, global_config, project
@@ -178,6 +192,8 @@ def _published_fixture(
         issues=True,
         wiki=False,
         projects=True,
+        pull_requests=False,
+        discussions=False,
     )
     project = replace(project, allow=('**',), settings=settings)
 
@@ -244,6 +260,8 @@ def _settings_response(settings: Settings) -> dict[str, object]:
                 'issues': settings.issues,
                 'wiki': settings.wiki,
                 'projects': settings.projects,
+                'pull_requests': settings.pull_requests,
+                'discussions': settings.discussions,
             }
         ),
     }
@@ -264,6 +282,18 @@ def _success_responses(*, create_args: list[str] | None = None) -> list[dict[str
             'once': True,
         },
         {'args': create_args or _CREATE_ARGS},
+        {'args': _PATCH_SETTINGS_ARGS},
+        _settings_response(
+            Settings(
+                'Public repository',
+                'main',
+                issues=True,
+                wiki=False,
+                projects=True,
+                pull_requests=False,
+                discussions=False,
+            )
+        ),
         {'args': _REPOSITORY_ARGS, 'stdout': json.dumps(repository) + '\n'},
     ]
 
@@ -303,13 +333,17 @@ def test_disclosure_local_inventory_path_remains_usable_without_display_prompt(
 
     monkeypatch.setattr('builtins.input', _decline)
 
-    with pytest.raises(PubanonError, match='public disclosure was not acknowledged'):
+    with pytest.raises(OperationCanceled, match=r'Canceled\. Nothing was changed.'):
         _lifecycle._verify_disclosure(paths, project, already_public=False)
 
     assert prompts == [
         'These runs, logs, and artifacts become public with the repository. Continue? [y/n] '
     ]
     disclosure_path = paths.data_dir / 'projects' / project.name / 'disclosure.json'
+    assert disclosure_path.exists()
+    assert 'Saved inventory:' not in capsys.readouterr().out
+    with verbose_context(enabled=True), pytest.raises(OperationCanceled):
+        _lifecycle._verify_disclosure(paths, project, already_public=False)
     assert f'Saved inventory: {escape(str(disclosure_path))}' in capsys.readouterr().out
 
 
@@ -327,7 +361,7 @@ def test_repo_create_declined_confirmation_creates_nothing(
 
     monkeypatch.setattr('builtins.input', _decline)
 
-    with pytest.raises(PubanonError, match='creation declined'):
+    with pytest.raises(OperationCanceled, match=r'Canceled\. Nothing was created.'):
         _lifecycle.repo_create(paths, global_config, project, visibility='private', yes=False)
 
     assert _gh_calls(tmp_path) == [_ACCOUNT_ARGS, _ABSENCE_ARGS]
@@ -427,9 +461,9 @@ def test_repo_create_failed_post_reports_unknown_outcome_and_present_retry(
 @pytest.mark.parametrize(
     ('field', 'error'),
     [
-        ('owner', 'repository owner failed content gates'),
-        ('repo', 'repository repo failed content gates'),
-        ('settings.description', 'repository description failed content gates'),
+        ('owner', 'repository owner did not pass content checks'),
+        ('repo', 'repository name did not pass content checks'),
+        ('settings.description', 'repository description did not pass content checks'),
     ],
 )
 def test_repo_create_gates_every_host_visible_string_before_host_contact(
@@ -446,6 +480,8 @@ def test_repo_create_gates_every_host_visible_string_before_host_contact(
         issues=True,
         wiki=False,
         projects=True,
+        pull_requests=False,
+        discussions=False,
     )
     if field == 'owner':
         project = replace(project, owner=f'{term}-owner')
@@ -530,9 +566,7 @@ def test_repo_create_refuses_visibility_mismatch_before_host_contact(tmp_path: P
     error = exc_info.value
     assert error.expected == 'private'
     assert error.actual == 'public'
-    assert error.recovery == (
-        'align the --private/--public flag with visibility in the project configuration'
-    )
+    assert error.recovery == ('align the requested visibility with the project configuration')
     assert _gh_calls(tmp_path) == []
 
 
@@ -568,12 +602,92 @@ def test_repo_create_reports_gate_term_and_coordinate_field(
         hygiene_terms=(term,),
     )
 
-    with pytest.raises(PubanonError, match='repository repo failed content gates') as exc_info:
+    with pytest.raises(
+        PubanonError, match='repository name did not pass content checks'
+    ) as exc_info:
         _lifecycle.repo_create(paths, global_config, project, visibility='private', yes=True)
 
     assert exc_info.value.fact == f'repo: public-repo-{term}'
     assert term in (exc_info.value.fact or '')
     assert _gh_calls(tmp_path) == []
+
+
+def test_repo_create_routes_account_requirement_with_configuration_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, global_config, project = _configs(tmp_path)
+    requirements: list[tuple[str, str]] = []
+
+    def _require_account(expected: str, *, authority: str) -> str:
+        requirements.append((expected, authority))
+        return expected
+
+    def _repository_visible(_owner: str, _repo: str) -> bool:
+        return True
+
+    monkeypatch.setattr(_lifecycle, 'require_authenticated_account', _require_account)
+    monkeypatch.setattr(_lifecycle, 'repository_visible', _repository_visible)
+
+    with pytest.raises(PubanonError, match='configured repository already exists'):
+        _lifecycle.repo_create(paths, global_config, project, visibility='private', yes=True)
+
+    assert requirements == [('anonymous-account', 'configuration')]
+
+
+@pytest.mark.parametrize('failure', ['update', 'readback', 'mismatch'])
+def test_repo_create_settings_failure_reports_created_repository(
+    failure: str,
+    fake_gh: Path,
+    tmp_path: Path,
+) -> None:
+    paths, global_config, project = _configs(tmp_path)
+    responses = _success_responses()
+    for response in responses:
+        if response['args'] == (_PATCH_SETTINGS_ARGS if failure == 'update' else _SETTINGS_ARGS):
+            if failure == 'mismatch':
+                response['stdout'] = json.dumps(
+                    {
+                        'description': 'Host override',
+                        'default_branch': 'master',
+                        'issues': False,
+                        'wiki': True,
+                        'projects': False,
+                        'pull_requests': True,
+                        'discussions': True,
+                    }
+                )
+            else:
+                response.update(returncode=1, stderr='settings transport failed\n')
+    _responses(fake_gh, responses)
+
+    with pytest.raises(PubanonError) as error:
+        _lifecycle.repo_create(paths, global_config, project, visibility='private', yes=True)
+
+    assert 'repository was created' in str(error.value)
+    assert 'GitHub settings' in (error.value.recovery or '')
+    assert 'pubanon repo verify' in (error.value.recovery or '')
+    assert error.value.actual is None
+    if failure == 'mismatch':
+        assert 'settings do not match' in str(error.value)
+        for difference in (
+            'description: declared Public repository, observed Host override',
+            'issues: declared true, observed false',
+            'wiki: declared false, observed true',
+            'projects: declared true, observed false',
+            'pull_requests: declared false, observed true',
+            'discussions: declared false, observed true',
+        ):
+            assert difference in (error.value.fact or '')
+        assert 'default_branch' not in (error.value.fact or '')
+    else:
+        assert 'could not be verified' in str(error.value)
+        assert 'settings transport failed' in (error.value.fact or '')
+        assert 'observed' not in (error.value.fact or '')
+    calls = _gh_calls(tmp_path)
+    assert calls.count(_CREATE_ARGS) == 1
+    assert calls.count(_PATCH_SETTINGS_ARGS) == 1
+    assert calls.count(_SETTINGS_ARGS) == (0 if failure == 'update' else 1)
 
 
 @pytest.mark.parametrize('ref', ['refs/tags/v1.0.0', 'refs/heads/private-backup'])
@@ -603,7 +717,7 @@ def test_repo_create_reports_partial_creation_when_remote_is_not_empty(
         check=True,
         env=git_env(),
     )
-    monkeypatch.setattr(_lifecycle, 'URL_TEMPLATE', remote.as_uri())
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', remote.as_uri())
     _responses(fake_gh, _success_responses())
 
     with pytest.raises(PubanonError) as exc_info:
@@ -612,29 +726,6 @@ def test_repo_create_reports_partial_creation_when_remote_is_not_empty(
     assert 'partial' in str(exc_info.value)
     assert exc_info.value.recovery == 'pubanon repo verify'
     assert _CREATE_ARGS in _gh_calls(tmp_path)
-
-
-def test_repo_create_routes_account_requirement_with_configuration_authority(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    paths, global_config, project = _configs(tmp_path)
-    requirements: list[tuple[str, str]] = []
-
-    def _require_account(expected: str, *, authority: str) -> str:
-        requirements.append((expected, authority))
-        return expected
-
-    def _repository_visible(_owner: str, _repo: str) -> bool:
-        return True
-
-    monkeypatch.setattr(_lifecycle, 'require_authenticated_account', _require_account)
-    monkeypatch.setattr(_lifecycle, 'repository_visible', _repository_visible)
-
-    with pytest.raises(PubanonError, match='configured repository already exists'):
-        _lifecycle.repo_create(paths, global_config, project, visibility='private', yes=True)
-
-    assert requirements == [('anonymous-account', 'configuration')]
 
 
 @pytest.mark.parametrize(
@@ -660,6 +751,8 @@ def test_repo_create_user_owner_posts_settings_then_verifies_empty_repository(
         issues=True,
         wiki=False,
         projects=True,
+        pull_requests=False,
+        discussions=False,
     )
     project = replace(project, settings=settings)
     candidate_before = None
@@ -677,11 +770,19 @@ def test_repo_create_user_owner_posts_settings_then_verifies_empty_repository(
                 None,
             ),
         )
-        _candidate.save_candidate(paths, project.name, replace(record, state=candidate_state))
+        _candidate.save_candidate(
+            paths,
+            project.name,
+            replace(
+                record,
+                state=candidate_state,
+                fingerprint=_candidate.fingerprint(global_config, project),
+            ),
+        )
         candidate_before = _records.candidate_path(paths, project.name).read_bytes()
     remote = tmp_path / 'host.git'
     subprocess.run(['git', 'init', '--bare', '-q', remote], check=True, env=git_env())
-    monkeypatch.setattr(_lifecycle, 'URL_TEMPLATE', remote.as_uri())
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', remote.as_uri())
     create_args = _CREATE_ARGS
     _responses(fake_gh, _success_responses(create_args=create_args))
 
@@ -693,15 +794,21 @@ def test_repo_create_user_owner_posts_settings_then_verifies_empty_repository(
         _ACCOUNT_ARGS,
         _ABSENCE_ARGS,
         create_args,
+        _PATCH_SETTINGS_ARGS,
+        _SETTINGS_ARGS,
         _ACCOUNT_ARGS,
         _REPOSITORY_ARGS,
     ]
     output = captured.getvalue()
-    assert 'Create private GitHub repository anonymous-account/public-repo.' in output
-    assert 'Description: Public repository' in output
-    assert 'The default branch is main.' in output
-    assert 'Created and verified an empty private host repository.' in output
-    assert 'The source repository and local publication state were not changed.' in output
+    assert 'Create repository anonymous-account/public-repo' in output
+    assert 'Visibility:' in output
+    assert 'private' in output
+    assert 'Description:' in output
+    assert 'Public repository' in output
+    assert 'Default branch:' in output
+    assert 'Features:' in output
+    assert 'pull requests, and discussions off' in output
+    assert 'Created private repository anonymous-account/public-repo.' in output
     assert output.rstrip().endswith(f'Next: {next_action}')
     if candidate_before is not None:
         assert _records.candidate_path(paths, project.name).read_bytes() == candidate_before
@@ -717,7 +824,7 @@ def test_repo_create_yes_does_not_prompt(
     paths, global_config, project = _configs(tmp_path)
     remote = tmp_path / 'host.git'
     subprocess.run(['git', 'init', '--bare', '-q', remote], check=True, env=git_env())
-    monkeypatch.setattr(_lifecycle, 'URL_TEMPLATE', remote.as_uri())
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', remote.as_uri())
 
     def _unexpected_prompt(_prompt: str) -> str:
         pytest.fail('repo create --yes requested confirmation')
@@ -744,39 +851,38 @@ def test_reveal_convergence_tail_runs_the_same_ordered_steps(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     paths, global_config, project = _configs(tmp_path)
+    steps: list[str] = []
 
     def _verify(
         _paths: Paths,
         _g: GlobalConfig,
         _p: ProjectConfig,
     ) -> str:
-        print('trace: verify public remote')
+        steps.append('verify public remote')
         return 'release-commit'
 
     def _save(_paths: Paths, public_project: ProjectConfig) -> None:
         assert public_project == replace(project, visibility='public')
-        print('trace: save public project')
+        steps.append('save public project')
 
     monkeypatch.setattr(_lifecycle, '_verify_after_flip', _verify)
     monkeypatch.setattr(_lifecycle, 'save_project', _save)
 
     _CONVERGE_PUBLIC(paths, global_config, project, host_changed=host_changed)
 
-    lines = capsys.readouterr().out.splitlines()
+    output = re.sub(r': +', ': ', capsys.readouterr().out)
     changed = (
-        'Host visibility changed to public, and local configuration now records it.'
+        'Made anonymous-account/public-repo public.'
         if host_changed
-        else 'The host was already public; local configuration now records public visibility.'
+        else 'Recorded public visibility for anonymous-account/public-repo; it was already public.'
     )
-    assert lines == [
-        'trace: verify public remote',
-        'trace: save public project',
-        'Repository is public and verified.',
-        changed,
-        'prior Actions history and logs are now public',
-        '',
-        'Details: verified commit release-commit',
-    ]
+    assert steps == ['verify public remote', 'save public project']
+    assert changed in output
+    assert 'warning: its earlier Actions history and logs are now public too.' in output
+    assert 'verified commit release-commit' not in output
+    with verbose_context(enabled=True):
+        _CONVERGE_PUBLIC(paths, global_config, project, host_changed=host_changed)
+    assert 'Verified commit: release-commit' in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
@@ -830,8 +936,7 @@ def test_reveal_declined_final_confirmation_does_not_flip_or_record(
     )
     assert project.settings is not None
     _config.save_project(paths, project)
-    monkeypatch.setattr(_lifecycle, 'URL_TEMPLATE', destination.url)
-    monkeypatch.setattr(_host, 'URL_TEMPLATE', destination.url)
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', destination.url)
     _responses(
         fake_gh,
         [
@@ -849,13 +954,14 @@ def test_reveal_declined_final_confirmation_does_not_flip_or_record(
 
     monkeypatch.setattr('builtins.input', _answer)
 
-    with pytest.raises(PubanonError, match='reveal declined'):
+    with pytest.raises(OperationCanceled, match=r'Canceled\. Nothing was changed.'):
         _lifecycle.reveal(paths, global_config, project)
 
     assert _SET_VISIBILITY_ARGS not in _gh_calls(tmp_path)
     assert _config.load_project(paths, project.name).visibility == 'private'
 
 
+@pytest.mark.slow
 def test_reveal_fresh_flips_once_then_verifies_and_records_public_intent(
     fake_gh: Path,
     tmp_path: Path,
@@ -869,8 +975,7 @@ def test_reveal_fresh_flips_once_then_verifies_and_records_public_intent(
     )
     assert project.settings is not None
     _config.save_project(paths, project)
-    monkeypatch.setattr(_lifecycle, 'URL_TEMPLATE', destination.url)
-    monkeypatch.setattr(_host, 'URL_TEMPLATE', destination.url)
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', destination.url)
     pre_settings = _settings_response(project.settings)
     pre_settings['once'] = True
     _responses(
@@ -921,9 +1026,14 @@ def test_reveal_fresh_flips_once_then_verifies_and_records_public_intent(
     assert 'become public with the repository' in prompts[0]
     assert prompts[1] == 'Make it public? [y/n] '
     assert convergence_calls == [True]
-    output = capsys.readouterr().out
-    assert 'prior Actions history and logs are now public' in output
-    assert f'Details: verified commit {commit}' in output
+    output = re.sub(r': +', ': ', capsys.readouterr().out)
+    assert 'warning: its earlier Actions history and logs are now public too.' in output
+    assert output.startswith('Make anonymous-account/public-repo public\n')
+    assert 'Published history:' in output
+    assert 'Not checked by Pubanon:' in output
+    assert 'Made anonymous-account/public-repo public.' in output
+    assert 'Repository is public and verified.' not in output
+    assert f'verified commit {commit}' not in output
     assert 'Next:' not in output
 
 
@@ -937,7 +1047,10 @@ def test_reveal_gates_current_coordinates_before_host_contact(
     global_config = replace(global_config, sensitive_terms=(term,))
     project = replace(project, **{field: f'public-{term}'})
 
-    with pytest.raises(PubanonError, match=f'repository {field} failed content gates') as exc_info:
+    label = 'name' if field == 'repo' else field
+    with pytest.raises(
+        PubanonError, match=f'repository {label} did not pass content checks'
+    ) as exc_info:
         _lifecycle.reveal(paths, global_config, project)
 
     assert term in exc_info.value.render()
@@ -960,7 +1073,7 @@ def test_reveal_manual_flip_sanitization_failure_keeps_private_intent(
     project = replace(project, hygiene_terms=(term,))
     assert project.settings is not None
     _config.save_project(paths, project)
-    monkeypatch.setattr(_lifecycle, 'URL_TEMPLATE', destination.url)
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', destination.url)
     _responses(
         fake_gh,
         [
@@ -976,8 +1089,8 @@ def test_reveal_manual_flip_sanitization_failure_keeps_private_intent(
     assert 'sanitization and identity' in exc_info.value.render()
     assert _config.load_project(paths, project.name).visibility == 'private'
     assert _SET_VISIBILITY_ARGS not in _gh_calls(tmp_path)
-    output = capsys.readouterr().out
-    assert 'content is already exposed' in output
+    output = re.sub(r': +', ': ', capsys.readouterr().out)
+    assert 'content is already public' in output
 
 
 def test_reveal_package_timeout_refuses_without_visibility_mutation(
@@ -1004,8 +1117,7 @@ def test_reveal_package_timeout_refuses_without_visibility_mutation(
         'refs/tags/v1.2.3',
         commit,
     )
-    monkeypatch.setattr(_lifecycle, 'URL_TEMPLATE', destination.url)
-    monkeypatch.setattr(_host, 'URL_TEMPLATE', destination.url)
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', destination.url)
     _responses(
         fake_gh,
         [
@@ -1023,7 +1135,6 @@ def test_reveal_package_timeout_refuses_without_visibility_mutation(
     def _timeout(*_args: object) -> _package.PackageRelease | None:
         observations.append('release')
         raise ObservationTimeoutError(
-            detail='private timeout detail',
             stdout=b'private timeout stdout',
             stderr=b'private timeout stderr',
         )
@@ -1048,11 +1159,12 @@ def test_reveal_package_timeout_refuses_without_visibility_mutation(
     assert observations == ['checks', 'release']
     assert _SET_VISIBILITY_ARGS not in _gh_calls(tmp_path)
     assert _config.load_project(paths, project.name).visibility == 'private'
-    output = capsys.readouterr().out
+    output = re.sub(r': +', ': ', capsys.readouterr().out)
     assert 'Repository is public and verified.' not in output
     assert 'local configuration now records public visibility' not in output
 
 
+@pytest.mark.slow
 def test_reveal_patch_failure_reports_unknown_outcome_then_resumes_without_patch(
     fake_gh: Path,
     tmp_path: Path,
@@ -1065,8 +1177,7 @@ def test_reveal_patch_failure_reports_unknown_outcome_then_resumes_without_patch
     )
     assert project.settings is not None
     _config.save_project(paths, project)
-    monkeypatch.setattr(_lifecycle, 'URL_TEMPLATE', destination.url)
-    monkeypatch.setattr(_host, 'URL_TEMPLATE', destination.url)
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', destination.url)
     first_settings = _settings_response(project.settings)
     first_settings['once'] = True
     resume_settings = _settings_response(project.settings)
@@ -1113,6 +1224,7 @@ def test_reveal_patch_failure_reports_unknown_outcome_then_resumes_without_patch
     assert _config.load_project(paths, project.name).visibility == 'public'
 
 
+@pytest.mark.slow
 def test_reveal_post_flip_branch_drift_is_reported_and_keeps_private_intent(
     fake_gh: Path,
     tmp_path: Path,
@@ -1126,8 +1238,7 @@ def test_reveal_post_flip_branch_drift_is_reported_and_keeps_private_intent(
     )
     assert project.settings is not None
     _config.save_project(paths, project)
-    monkeypatch.setattr(_lifecycle, 'URL_TEMPLATE', destination.url)
-    monkeypatch.setattr(_host, 'URL_TEMPLATE', destination.url)
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', destination.url)
     pre_settings = _settings_response(project.settings)
     pre_settings['once'] = True
     _responses(
@@ -1164,6 +1275,7 @@ def test_reveal_post_flip_branch_drift_is_reported_and_keeps_private_intent(
     assert _gh_calls(tmp_path).count(_SET_VISIBILITY_ARGS) == 1
 
 
+@pytest.mark.slow
 def test_reveal_post_flip_settings_drift_resumes_without_second_patch(
     fake_gh: Path,
     tmp_path: Path,
@@ -1176,8 +1288,7 @@ def test_reveal_post_flip_settings_drift_resumes_without_second_patch(
     )
     assert project.settings is not None
     _config.save_project(paths, project)
-    monkeypatch.setattr(_lifecycle, 'URL_TEMPLATE', destination.url)
-    monkeypatch.setattr(_host, 'URL_TEMPLATE', destination.url)
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', destination.url)
     pre_settings = _settings_response(project.settings)
     pre_settings['once'] = True
     _responses(
@@ -1227,6 +1338,7 @@ def test_reveal_post_flip_settings_drift_resumes_without_second_patch(
     assert _config.load_project(paths, project.name).visibility == 'public'
 
 
+@pytest.mark.slow
 def test_reveal_prints_trusted_disclosure_path_and_safely_renders_inventory(
     fake_gh: Path,
     tmp_path: Path,
@@ -1243,8 +1355,7 @@ def test_reveal_prints_trusted_disclosure_path_and_safely_renders_inventory(
     )
     assert project.settings is not None
     _config.save_project(paths, project)
-    monkeypatch.setattr(_lifecycle, 'URL_TEMPLATE', destination.url)
-    monkeypatch.setattr(_host, 'URL_TEMPLATE', destination.url)
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', destination.url)
     pre_settings = _settings_response(project.settings)
     pre_settings['once'] = True
     _responses(
@@ -1268,10 +1379,16 @@ def test_reveal_prints_trusted_disclosure_path_and_safely_renders_inventory(
 
     _lifecycle.reveal(paths, global_config, project)
 
-    disclosure_path = paths.data_dir / 'projects' / project.name / 'disclosure.json'
-    output_lines = capsys.readouterr().out.splitlines()
-    assert f'Saved inventory: {escape(str(disclosure_path))}' in output_lines
+    output_lines = re.sub(r': +', ': ', capsys.readouterr().out).splitlines()
+    assert not any('Saved inventory:' in line for line in output_lines)
     assert f'  {term}\\x1bjob: 1' in output_lines
+    assert '  Activity: https://github.com/anonymous-account/public-repo/activity' in output_lines
+    assert '  Review: https://github.com/anonymous-account/public-repo/actions' in output_lines
+    assert any(
+        'warning: Pubanon has not scanned Actions logs, artifact contents, or other retained '
+        'GitHub objects.' in line
+        for line in output_lines
+    )
 
 
 def test_reveal_public_config_private_host_refuses_repo_verify_recovery(
@@ -1297,10 +1414,10 @@ def test_reveal_public_config_private_host_refuses_repo_verify_recovery(
         _lifecycle.reveal(paths, global_config, project)
 
     assert str(exc_info.value) == (
-        'declared visibility is public but the host repository is private'
+        'declared visibility is public but the final repository is private'
     )
     assert exc_info.value.recovery is not None
-    assert 'make the host public' in exc_info.value.recovery
+    assert 'make the repository public' in exc_info.value.recovery
     assert 'visibility = "private"' in exc_info.value.recovery
     assert (
         escape(str(paths.config_dir / 'projects' / f'{project.name}.toml'))
@@ -1324,7 +1441,7 @@ def test_reveal_public_config_public_host_is_idempotent(
     project = replace(project, visibility='public')
     assert project.settings is not None
     _config.save_project(paths, project)
-    monkeypatch.setattr(_lifecycle, 'URL_TEMPLATE', destination.url)
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', destination.url)
     _responses(
         fake_gh,
         [
@@ -1338,14 +1455,17 @@ def test_reveal_public_config_public_host_is_idempotent(
     _lifecycle.reveal(paths, global_config, project)
 
     assert _SET_VISIBILITY_ARGS not in _gh_calls(tmp_path)
-    output = capsys.readouterr().out
-    assert 'Repository is already public.' in output
-    assert 'Verified now: public visibility, published refs, and repository settings.' in output
+    output = re.sub(r': +', ': ', capsys.readouterr().out)
+    assert 'Repository anonymous-account/public-repo is already public.' in output
+    assert (
+        'Verified now: public visibility, published branches and tags, and repository settings.'
+        in output
+    )
     assert 'No local or host state was changed.' not in output
     assert 'Repository is already public and verified.' not in output
     assert 'Prior Actions history and logs are already public.' not in output
-    assert 'Next: pubanon status --audit --remote' in output
-    assert output.index('Next:') > output.index('Details:')
+    assert 'Next: pubanon audit --remote' in output
+    assert output.index('Next:') > output.index('Verified now:')
 
 
 @pytest.mark.parametrize('exposure', ['Anonymous Publisher', 'anonymous@example.invalid'])
@@ -1360,8 +1480,7 @@ def test_reveal_refuses_newly_sensitive_anonymous_identity_before_visibility_mut
     project = replace(project, extra_terms=(exposure,))
     assert project.settings is not None
     _config.save_project(paths, project)
-    monkeypatch.setattr(_lifecycle, 'URL_TEMPLATE', destination.url)
-    monkeypatch.setattr(_host, 'URL_TEMPLATE', destination.url)
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', destination.url)
     _responses(
         fake_gh,
         [
@@ -1384,8 +1503,8 @@ def test_reveal_refuses_newly_sensitive_anonymous_identity_before_visibility_mut
         assert f'{commit[:12]}:header:{field}' in rendered
     assert 'project extra_terms entry 1' in rendered
     assert f'commit {commit}' in rendered
-    assert 'header author value bytes' in rendered
-    assert 'header committer value bytes' in rendered
+    assert 'header author value; text ' in rendered
+    assert 'header committer value; text ' in rendered
     assert exposure in (error.value.fact or '')
     assert exposure in rendered
     calls = _gh_calls(tmp_path)
@@ -1406,8 +1525,7 @@ def test_reveal_refuses_structural_history_before_disclosure_or_mutation(
     )
     assert project.settings is not None
     _config.save_project(paths, project)
-    monkeypatch.setattr(_lifecycle, 'URL_TEMPLATE', destination.url)
-    monkeypatch.setattr(_host, 'URL_TEMPLATE', destination.url)
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', destination.url)
     _responses(
         fake_gh,
         [
@@ -1470,6 +1588,7 @@ def test_reveal_resume_refuses_canonical_coordinate_drift_before_verification(
     assert _config.load_project(paths, project.name).visibility == 'private'
 
 
+@pytest.mark.slow
 def test_reveal_resumes_already_public_host_with_complete_read_only_verification(
     fake_gh: Path,
     tmp_path: Path,
@@ -1484,7 +1603,7 @@ def test_reveal_resumes_already_public_host_with_complete_read_only_verification
     project = replace(project, required_checks=('build',))
     assert project.settings is not None
     _config.save_project(paths, project)
-    monkeypatch.setattr(_lifecycle, 'URL_TEMPLATE', destination.url)
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', destination.url)
     check_args = [
         'api',
         (
@@ -1538,16 +1657,15 @@ def test_reveal_resumes_already_public_host_with_complete_read_only_verification
     assert any('/actions/artifacts?' in ' '.join(call) for call in calls)
     assert _config.load_project(paths, project.name).visibility == 'public'
     assert prompts == ['These runs, logs, and artifacts are already public. Continue? [y/n] ']
-    output = capsys.readouterr().out
-    assert 'host repository is already public; verifying before recording' in output
-    assert 'content is already exposed' in output
-    assert 'Repository is public and verified.\n' in output
+    output = re.sub(r': +', ': ', capsys.readouterr().out)
+    assert 'Verify public repository anonymous-account/public-repo' in output
+    assert 'content is already public' in output
     assert (
-        'The host was already public; local configuration now records public visibility.\n'
+        'Recorded public visibility for anonymous-account/public-repo; it was already public.\n'
         in output
     )
-    assert 'prior Actions history and logs are now public\n' in output
-    assert f'Details: verified commit {commit}\n' in output
+    assert 'warning: its earlier Actions history and logs are now public too.\n' in output
+    assert f'verified commit {commit}' not in output
 
 
 def test_reveal_routes_account_requirement_with_configuration_authority(
@@ -1585,20 +1703,24 @@ def test_reveal_unknown_outcome_refuses_before_host_contact(
         replace(record, state=_candidate.STATE_UNKNOWN_OUTCOME),
     )
 
-    with pytest.raises(PubanonError, match='snapshot has an unknown publish outcome') as exc_info:
+    with pytest.raises(
+        PubanonError, match='the outcome of the last publication is unknown'
+    ) as exc_info:
         _lifecycle.reveal(paths, global_config, project)
 
     assert exc_info.value.recovery == 'pubanon publish --resolve'
     assert _gh_calls(tmp_path) == []
 
 
-def test_settings_mismatches_reports_all_five_fields_in_declared_order() -> None:
+def test_settings_mismatches_reports_all_seven_fields_in_declared_order() -> None:
     expected = Settings(
         description='Public repository',
         default_branch='main',
         issues=True,
         wiki=False,
         projects=True,
+        pull_requests=True,
+        discussions=False,
     )
     actual = _host.SettingsFacts(
         description='',
@@ -1606,6 +1728,8 @@ def test_settings_mismatches_reports_all_five_fields_in_declared_order() -> None
         issues=False,
         wiki=True,
         projects=False,
+        pull_requests=False,
+        discussions=True,
     )
 
     assert _lifecycle.settings_mismatches(expected, actual) == [
@@ -1614,6 +1738,8 @@ def test_settings_mismatches_reports_all_five_fields_in_declared_order() -> None
         'issues: expected true; actual false',
         'wiki: expected false; actual true',
         'projects: expected true; actual false',
+        'pull_requests: expected true; actual false',
+        'discussions: expected false; actual true',
     ]
 
 
@@ -1627,6 +1753,8 @@ def test_settings_refuse_non_main_before_host_mutation(tmp_path: Path) -> None:
             issues=True,
             wiki=False,
             projects=False,
+            pull_requests=False,
+            discussions=False,
         ),
     )
 
@@ -1650,7 +1778,7 @@ def test_verify_after_flip_accepts_public_repository_with_exact_refs_and_setting
         make_repo,
     )
     assert project.settings is not None
-    monkeypatch.setattr(_lifecycle, 'URL_TEMPLATE', destination.url)
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', destination.url)
     repository = {
         'owner': project.owner,
         'repo': project.repo,
@@ -1680,7 +1808,7 @@ def test_verify_after_flip_reports_settings_drift_as_public_partial_state(
         make_repo,
     )
     assert project.settings is not None
-    monkeypatch.setattr(_lifecycle, 'URL_TEMPLATE', destination.url)
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', destination.url)
     repository = {
         'owner': project.owner,
         'repo': project.repo,
@@ -1715,7 +1843,7 @@ def test_verify_after_flip_reports_unexpected_branch_in_public_partial_state(
         make_repo,
     )
     assert project.settings is not None
-    monkeypatch.setattr(_lifecycle, 'URL_TEMPLATE', destination.url)
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', destination.url)
     host = tmp_path / 'host.git'
     _git(host, 'update-ref', f'refs/heads/{term}', commit)
     repository = {
@@ -1790,8 +1918,8 @@ def test_verify_after_flip_wraps_malformed_published_ref_read(
 @pytest.mark.parametrize(
     ('field', 'error'),
     [
-        ('description', 'repository description failed content gates'),
-        ('default_branch', 'repository default branch failed content gates'),
+        ('description', 'repository description did not pass content checks'),
+        ('default_branch', 'repository default branch did not pass content checks'),
     ],
 )
 def test_verify_before_flip_gates_every_public_setting_before_disclosure_read(
@@ -1882,7 +2010,7 @@ def test_verify_before_flip_observes_selected_package_release_once(
     assert selections == [(paths, project.name, None)]
     assert check_calls == [(destination, commit, package.release_checks)]
     assert release_calls == [('pypi', 'demo', '2.0.0')]
-    assert 'package observation: demo 2.0.0 is published\n' in capsys.readouterr().out
+    assert re.search(r'Package: +demo 2.0.0 is published', capsys.readouterr().out)
     assert _SET_VISIBILITY_ARGS not in _gh_calls(tmp_path)
 
 
@@ -1914,6 +2042,7 @@ def test_verify_before_flip_refuses_enabled_package_observation_without_a_tag(
     assert 'package release' in raised.value.recovery
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     ('verdict', 'recovery'),
     [
@@ -1964,7 +2093,13 @@ def test_verify_before_flip_refuses_every_unsuccessful_required_check(
     with pytest.raises(PubanonError, match='required checks') as exc_info:
         _VERIFY_BEFORE_FLIP(paths, global_config, project, destination)
 
-    assert exc_info.value.fact == f'build: {verdict.state}'
+    expected = {
+        'pending': 'pending',
+        'missing': 'not found',
+        'ambiguous': 'could not be determined',
+        'unacceptable': 'failed',
+    }[verdict.state]
+    assert exc_info.value.fact == f'build: {expected}'
     assert exc_info.value.recovery == recovery
     assert _candidate.published_refs(paths, project.name) == published_before
     assert _SET_VISIBILITY_ARGS not in _gh_calls(tmp_path)
@@ -2011,7 +2146,7 @@ def test_verify_before_flip_refuses_hygiene_finding_from_any_published_commit(
     rendered = exc_info.value.render()
     assert term in rendered
     assert exc_info.value.recovery == (
-        'pubanon status --audit shows the findings; adjust the configuration or the '
+        'pubanon audit shows the findings; adjust the configuration or the '
         'published content decision. To replace all published history under the current '
         'publication identity, use `pubanon prepare --replace all`; existing clones and caches '
         'may retain the old history'
@@ -2036,7 +2171,7 @@ def test_verify_before_flip_refuses_hygiene_finding_from_any_published_commit(
                 _package.PackageRelease('1.2.3', ()),
                 'package release has no distribution files',
                 'demo 1.2.3 metadata has no distribution files',
-                'run `pubanon watch package`, then rerun `pubanon repo reveal`',
+                'run `pubanon package watch`, then rerun `pubanon repo reveal`',
             ),
             id='metadata-only',
         ),
@@ -2112,11 +2247,12 @@ def test_verify_before_flip_refuses_missing_local_published_main(
         _VERIFY_BEFORE_FLIP(paths, global_config, project, destination)
 
     if host_has_main:
-        assert exc_info.value.recovery == 'pubanon repo verify --repair-store'
+        assert exc_info.value.recovery == 'pubanon repo restore --to local'
     else:
         assert exc_info.value.recovery is None
 
 
+@pytest.mark.slow
 def test_verify_before_flip_refuses_refs_drift_before_host_api_reads(
     fake_gh: Path,
     tmp_path: Path,
@@ -2130,7 +2266,7 @@ def test_verify_before_flip_refuses_refs_drift_before_host_api_reads(
     host = tmp_path / 'host.git'
     _git(host, 'update-ref', 'refs/tags/v0.1.0', commit)
 
-    with pytest.raises(PubanonError, match='published refs') as exc_info:
+    with pytest.raises(PubanonError, match='saved published history') as exc_info:
         _VERIFY_BEFORE_FLIP(paths, global_config, project, destination)
 
     assert exc_info.value.expected is not None
@@ -2149,7 +2285,7 @@ def test_verify_before_flip_refuses_refs_drift_before_host_api_reads(
             (
                 CheckVerdict('Release', 'pending', 'queued'),
                 'package release checks are pending',
-                'wait for the check, then run `pubanon watch package`',
+                'wait for the check, then run `pubanon package watch`',
             ),
             id='pending',
         ),
@@ -2159,7 +2295,7 @@ def test_verify_before_flip_refuses_refs_drift_before_host_api_reads(
                 'package release checks are not acceptable',
                 (
                     'inspect the failed check and fix or rerun its workflow, then run '
-                    '`pubanon watch package`'
+                    '`pubanon package watch`'
                 ),
             ),
             id='failed',
@@ -2170,7 +2306,7 @@ def test_verify_before_flip_refuses_refs_drift_before_host_api_reads(
                 'package release checks are not acceptable',
                 (
                     'check the configured name and workflow trigger, then run '
-                    '`pubanon watch package`'
+                    '`pubanon package watch`'
                 ),
             ),
             id='missing',
@@ -2179,7 +2315,7 @@ def test_verify_before_flip_refuses_refs_drift_before_host_api_reads(
             (
                 CheckVerdict('Release', 'ambiguous', '2 check runs'),
                 'package release checks are not acceptable',
-                ('resolve the multiple matching check runs, then run `pubanon watch package`'),
+                ('resolve the multiple matching check runs, then run `pubanon package watch`'),
             ),
             id='ambiguous',
         ),
@@ -2221,7 +2357,13 @@ def test_verify_before_flip_refuses_unsuccessful_package_checks_before_index_rea
     with pytest.raises(PubanonError, match=message) as raised:
         _VERIFY_BEFORE_FLIP(paths, global_config, project, destination)
 
-    assert raised.value.fact == f'{verdict.name}: {verdict.state} ({verdict.detail})'
+    expected = {
+        'pending': 'pending',
+        'missing': 'not found',
+        'ambiguous': 'could not be determined',
+        'unacceptable': 'failed',
+    }[verdict.state]
+    assert raised.value.fact == f'{verdict.name}: {expected}'
     assert raised.value.recovery == recovery
     assert calls == 1
     assert _candidate.published_refs(paths, project.name) == published_before
@@ -2247,7 +2389,7 @@ def test_verify_before_flip_reports_escaped_unexpected_branch_at_refs_step(
 
     monkeypatch.setattr(_lifecycle, 'ls_remote', _branch_refs)
 
-    with pytest.raises(PubanonError, match='published refs') as exc_info:
+    with pytest.raises(PubanonError, match='saved published history') as exc_info:
         _VERIFY_BEFORE_FLIP(paths, global_config, project, destination)
 
     rendered = exc_info.value.render()
@@ -2300,7 +2442,7 @@ def test_verify_before_flip_requires_interactive_disclosure_acknowledgment(
 
     with (
         redirect_stdout(output_buffer),
-        pytest.raises(PubanonError, match=r'disclosure.*not acknowledged'),
+        pytest.raises(OperationCanceled, match=r'Canceled\. Nothing was changed.'),
     ):
         _VERIFY_BEFORE_FLIP(
             paths, global_config, project, destination, already_public=already_public
@@ -2310,12 +2452,12 @@ def test_verify_before_flip_requires_interactive_disclosure_acknowledgment(
     assert expected_wording in prompts[0]
     assert excluded_wording not in prompts[0]
     rendered = disclosure_output[0]
-    assert 'Git history passed the current content and identity checks.' in rendered
-    assert 'Actions inventory: 1 workflow run and 1 artifact.' in rendered
-    assert 'Pubanon has not scanned their logs or artifact contents.' in rendered
+    assert 'matches GitHub; no sensitive terms or identity problems' in rendered
+    assert 'Not checked by Pubanon: 1 workflow run and 1 artifact' in rendered
+    assert 'Pubanon has not scanned Actions logs, artifact contents' in rendered
     assert 'https://github.com/anonymous-account/public-repo/actions/runs/101' in rendered
     assert 'https://github.com/anonymous-account/public-repo/actions' in rendered
-    assert escape(str(paths.data_dir / 'projects' / project.name / 'disclosure.json')) in rendered
+    assert 'Saved inventory:' not in rendered
     assert not any('PATCH' in call for call in _gh_calls(tmp_path))
 
 
@@ -2344,15 +2486,13 @@ def test_verify_before_flip_returns_release_oid_and_reports_six_steps_in_order(
     result = _VERIFY_BEFORE_FLIP(paths, global_config, project, destination)
 
     assert result == commit
-    output = capsys.readouterr().out
+    output = re.sub(r': +', ': ', capsys.readouterr().out)
     reports = (
-        'published refs match host',
-        'required checks: none configured',
-        'package observation: not enabled',
-        'repository settings match configuration',
-        'sanitization and identity: clean',
-        'Git history passed the current content and identity checks.',
-        'Actions inventory: 0 workflow runs and 0 artifacts.',
+        'Published history: matches GitHub; no sensitive terms or identity problems',
+        'Required checks: none configured',
+        'Package: not enabled',
+        'Settings: match your configuration',
+        'Not checked by Pubanon: 0 workflow runs and 0 artifacts',
     )
     positions = [output.index(report) for report in reports]
     assert positions == sorted(positions)
@@ -2391,8 +2531,8 @@ def test_verify_before_flip_writes_complete_paginated_disclosure_owner_only(
     ]
     assert payload['artifacts'] == ['201 package', '202 report']
     assert_private_mode(disclosure_path, 0o600)
-    output = capsys.readouterr().out
-    assert 'Actions inventory: 150 workflow runs and 2 artifacts.' in output
+    output = re.sub(r': +', ': ', capsys.readouterr().out)
+    assert 'Not checked by Pubanon: 150 workflow runs and 2 artifacts' in output
     assert '  build: 100' in output
     assert '  docs: 50' in output
-    assert output.count(escape(str(disclosure_path))) == 1
+    assert escape(str(disclosure_path)) not in output

@@ -59,8 +59,8 @@ def test_narrowest_offer_groups_new_top_level_directory() -> None:
 def test_narrowest_offer_guided_mode_exposes_nested_internal_groups() -> None:
     paths = [
         'docs/guide.md',
-        'docs/internal/notes.md',
-        'docs/superpowers/design.md',
+        'docs/private/notes.md',
+        'docs/worknotes/design.md',
         '.agents/instructions.md',
     ]
 
@@ -68,23 +68,33 @@ def test_narrowest_offer_guided_mode_exposes_nested_internal_groups() -> None:
     allow: list[str] = []
     deny: list[str] = []
     for pattern, admitted in offers:
-        if admitted[0] in {'docs/guide.md', 'docs/superpowers/design.md'}:
+        if admitted[0] in {'docs/guide.md', 'docs/worknotes/design.md'}:
             allow.append(pattern)
         else:
             deny.append(pattern)
 
     assert [admitted for _pattern, admitted in offers] == [
         ['docs/guide.md'],
-        ['docs/internal/notes.md'],
-        ['docs/superpowers/design.md'],
+        ['docs/private/notes.md'],
+        ['docs/worknotes/design.md'],
         ['.agents/instructions.md'],
     ]
     assert evaluate_membership(paths, allow, deny) == Membership(
-        allowed=['docs/guide.md', 'docs/superpowers/design.md'],
-        denied=['docs/internal/notes.md', '.agents/instructions.md'],
+        allowed=['docs/guide.md', 'docs/worknotes/design.md'],
+        denied=['docs/private/notes.md', '.agents/instructions.md'],
         unmatched=[],
         reserved=[],
     )
+
+
+def test_narrowest_offer_guided_mode_groups_documentation_by_directory() -> None:
+    paths = ['docs/guide.md', 'docs/private/notes.md', 'docs/worknotes/design.md']
+
+    assert narrowest_offer(paths, guided=True) == [
+        ('docs/guide.md', ['docs/guide.md']),
+        ('docs/private/**', ['docs/private/notes.md']),
+        ('docs/worknotes/**', ['docs/worknotes/design.md']),
+    ]
 
 
 def test_operator_allow_precedes_unmatched_fallback() -> None:
@@ -119,12 +129,13 @@ def test_path_policy_full_grammar_is_platform_stable(
         literal_path,
         'Secrets/ID_RSA',
         'nested/.pubanon.toml',
+        'gLoBaL.md',
     ]
-    allow = ['docs/*', 'build/**/output.txt', offers[0][0], 'Secrets/**', 'nested/**']
+    allow = ['docs/*', 'build/**/output.txt', offers[0][0], 'Secrets/**', 'nested/**', 'gLoBaL.md']
     deny = ['docs/**/secret.txt', 'secrets/**']
     expected = Membership(
         allowed=['docs/a/b/guide.md', 'build/a/output.txt', literal_path, 'Secrets/ID_RSA'],
-        denied=['docs/a/b/secret.txt'],
+        denied=['docs/a/b/secret.txt', 'gLoBaL.md'],
         unmatched=['Docs/Guide.md', 'build/output.txt'],
         reserved=['nested/.pubanon.toml'],
     )
@@ -138,10 +149,10 @@ def test_path_policy_full_grammar_is_platform_stable(
     assert offers == [('Release[[]1].TXT', [literal_path])]
     assert secret_like(['Secrets/ID_RSA'], []) == ['Secrets/ID_RSA']
     monkeypatch.setattr(os.path, 'normcase', _identity)
-    assert evaluate_membership(paths, allow, deny) == expected
+    assert evaluate_membership(paths, allow, deny, global_deny=('GLOBAL.MD',)) == expected
 
     monkeypatch.setattr(os.path, 'normcase', _casefold)
-    assert evaluate_membership(paths, allow, deny) == expected
+    assert evaluate_membership(paths, allow, deny, global_deny=('GLOBAL.MD',)) == expected
     assert secret_like(['Secrets/ID_RSA'], []) == ['Secrets/ID_RSA']
 
 

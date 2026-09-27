@@ -125,6 +125,17 @@ def _clear_pause(paths: Paths, project: str, store: Path) -> None:
         )
 
 
+def _remove_completed_rewrite_record(paths: Paths, project: str) -> None:
+    """Report a failed final record removal with the safe retry command."""
+    try:
+        _records.rewrite_path(paths, project).unlink()
+    except OSError as exc:
+        raise PubanonError(
+            'cannot clean completed rewrite record',
+            recovery='pubanon prepare --continue',
+        ) from exc
+
+
 def _source_entry(
     paths: Paths, project: str, old: str, new: str, resolutions: tuple[Resolution, ...]
 ) -> ReplayEntry:
@@ -133,10 +144,7 @@ def _source_entry(
     source = None
     bookmark = None
     if publication is not None:
-        if publication.pinned is not None:
-            source = publication.pinned.commit
-        elif publication.derivation is not None:
-            source = publication.derivation.original_source
+        source = _records.publication_source(publication)
         bookmark = publication.source_bookmark
     return ReplayEntry(old, new, source, bookmark, resolutions=resolutions)
 
@@ -248,7 +256,7 @@ def continue_rewrite(
         raise PubanonError('no rewrite is in progress')
     if fingerprint(g, p) != record.fingerprint:
         raise PubanonError(
-            'publication configuration changed after prepare',
+            'the configuration changed after the snapshot was prepared',
             recovery='pubanon discard, then pubanon prepare',
         )
     store = _candidate.candidate_store_path(paths, p.name)
@@ -265,7 +273,7 @@ def continue_rewrite(
             raise PubanonError('rewrite record conflicts with completed snapshot')
         _candidate.verify_retained_candidate(paths, g, p, record, env=env)
         _clear_pause(paths, p.name, store)
-        _records.rewrite_path(paths, p.name).unlink()
+        _remove_completed_rewrite_record(paths, p.name)
         return record
     if progress is None:
         if record.prestate_main is None:
@@ -288,7 +296,7 @@ def continue_rewrite(
     complete = _complete(record, progress)
     _records.save_candidate(paths, p.name, complete)
     _candidate.verify_retained_candidate(paths, g, p, complete, env=env)
-    _records.rewrite_path(paths, p.name).unlink()
+    _remove_completed_rewrite_record(paths, p.name)
     return complete
 
 

@@ -180,6 +180,8 @@ def gate_unit(
         One hit per matching configured term entry, in rule and term order,
         regardless of the number of occurrences or matching text views.
     """
+    if not rules:
+        return []
     views = _views(data)
     return [
         GateHit(name, rule_class, term)

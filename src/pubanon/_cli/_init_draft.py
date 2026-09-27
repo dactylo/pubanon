@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import cast
 
 from pubanon import _filesystem
-from pubanon._config import Paths, create_data_dirs
+from pubanon._config import PUBLICATION_ROUTES, Paths, create_data_dirs
 from pubanon._errors import PubanonError
 
 _ACTIONS = frozenset({'exclude', 'include'})
@@ -18,11 +18,15 @@ _DEFAULT_PENDING = (
     'owner',
     'repo',
     'visibility',
+    'publication_route',
+    'source_tags',
     'checks',
     'description',
     'issues',
     'wiki',
     'projects',
+    'pull_requests',
+    'discussions',
     'review',
 )
 _DRAFT_KEYS = frozenset(
@@ -35,11 +39,15 @@ _DRAFT_KEYS = frozenset(
         'owner',
         'pending',
         'phase',
+        'publication_route',
         'projects',
+        'pull_requests',
+        'discussions',
         'repo',
         'required_checks',
         'reviewing',
         'self_publication',
+        'source_tags',
         'source',
         'version',
         'visibility',
@@ -73,11 +81,15 @@ class Draft:
         owner: Selected repository owner, when answered.
         repo: Selected repository name, when answered.
         visibility: Selected repository visibility, when answered.
+        publication_route: Selected publication route, when answered.
+        source_tags: Whether source version tags are selected.
         required_checks: Selected required checks, when answered.
         description: Selected repository description, when answered.
         issues: Selected issue-tracker setting, when answered.
         wiki: Selected wiki setting, when answered.
         projects: Selected projects setting, when answered.
+        pull_requests: Selected pull requests setting, when answered.
+        discussions: Selected discussions setting, when answered.
     """
 
     source: Path
@@ -91,18 +103,26 @@ class Draft:
     owner: str | None = None
     repo: str | None = None
     visibility: str | None = None
+    publication_route: str | None = None
+    source_tags: bool = False
     required_checks: tuple[str, ...] | None = None
     description: str | None = None
     issues: bool | None = None
     wiki: bool | None = None
     projects: bool | None = None
+    pull_requests: bool | None = None
+    discussions: bool | None = None
+
+
+class InvalidDraftError(PubanonError):
+    """Indicate that a saved setup draft cannot be resumed."""
 
 
 def _boolean(data: dict[str, object], key: str) -> bool:
     """Return one required JSON boolean."""
     value = data[key]
     if not isinstance(value, bool):
-        raise PubanonError('invalid init draft')
+        raise InvalidDraftError('invalid init draft')
     return value
 
 
@@ -112,7 +132,7 @@ def _optional_boolean(data: dict[str, object], key: str) -> bool | None:
     if value is None:
         return None
     if not isinstance(value, bool):
-        raise PubanonError('invalid init draft')
+        raise InvalidDraftError('invalid init draft')
     return value
 
 
@@ -122,7 +142,7 @@ def _optional_string(data: dict[str, object], key: str) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str):
-        raise PubanonError('invalid init draft')
+        raise InvalidDraftError('invalid init draft')
     return value
 
 
@@ -130,14 +150,14 @@ def _pairs(data: dict[str, object], key: str) -> tuple[tuple[str, str], ...]:
     """Return one required JSON list of string pairs."""
     value = data[key]
     if not isinstance(value, list):
-        raise PubanonError('invalid init draft')
+        raise InvalidDraftError('invalid init draft')
     pairs: list[tuple[str, str]] = []
     for pair in cast('list[object]', value):
         if not isinstance(pair, list):
-            raise PubanonError('invalid init draft')
+            raise InvalidDraftError('invalid init draft')
         items = cast('list[object]', pair)
         if len(items) != _PAIR_LENGTH or not all(isinstance(item, str) for item in items):
-            raise PubanonError('invalid init draft')
+            raise InvalidDraftError('invalid init draft')
         first, second = cast('list[str]', items)
         pairs.append((first, second))
     return tuple(pairs)
@@ -155,6 +175,7 @@ def _payload(draft: Draft) -> dict[str, object]:
         'source': str(draft.source),
         'commit': draft.commit,
         'self_publication': draft.self_publication,
+        'source_tags': draft.source_tags,
         'pending': list(draft.pending),
         'phase': draft.phase,
         'reviewing': draft.reviewing,
@@ -163,6 +184,7 @@ def _payload(draft: Draft) -> dict[str, object]:
         'owner': draft.owner,
         'repo': draft.repo,
         'visibility': draft.visibility,
+        'publication_route': draft.publication_route,
         'required_checks': (
             None if draft.required_checks is None else list(draft.required_checks)
         ),
@@ -170,6 +192,8 @@ def _payload(draft: Draft) -> dict[str, object]:
         'issues': draft.issues,
         'wiki': draft.wiki,
         'projects': draft.projects,
+        'pull_requests': draft.pull_requests,
+        'discussions': draft.discussions,
     }
 
 
@@ -177,7 +201,7 @@ def _string(data: dict[str, object], key: str) -> str:
     """Return one required JSON string."""
     value = data[key]
     if not isinstance(value, str):
-        raise PubanonError('invalid init draft')
+        raise InvalidDraftError('invalid init draft')
     return value
 
 
@@ -187,7 +211,7 @@ def _strings(data: dict[str, object], key: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not all(
         isinstance(item, str) for item in cast('list[object]', value)
     ):
-        raise PubanonError('invalid init draft')
+        raise InvalidDraftError('invalid init draft')
     return tuple(cast('list[str]', value))
 
 
@@ -201,24 +225,30 @@ def _optional_strings(data: dict[str, object], key: str) -> tuple[str, ...] | No
 def _draft(data: object) -> Draft:
     """Validate JSON data and return its init draft."""
     if not isinstance(data, dict):
-        raise PubanonError('invalid init draft')
+        raise InvalidDraftError('invalid init draft')
     values = cast('dict[str, object]', data)
-    if values.keys() != _DRAFT_KEYS or type(values['version']) is not int:
-        raise PubanonError('invalid init draft')
+    if type(values.get('version')) is not int:
+        raise InvalidDraftError('invalid init draft')
     if values['version'] != _VERSION:
-        raise PubanonError('invalid init draft version')
+        raise InvalidDraftError('invalid init draft version')
+    if values.keys() != _DRAFT_KEYS:
+        raise InvalidDraftError('invalid init draft')
     pending = _strings(values, 'pending')
     phase = _string(values, 'phase')
     flagged = _pairs(values, 'flagged')
     groups = _pairs(values, 'groups')
+    publication_route = _optional_string(values, 'publication_route')
+    source_tags = _boolean(values, 'source_tags')
     if (
         not pending
         or pending[-1] != 'review'
         or any(step not in _STEPS for step in pending)
         or phase not in _PHASES
         or any(action not in _ACTIONS for _pattern, action in (*flagged, *groups))
+        or (publication_route is None and 'publication_route' not in pending)
+        or (publication_route is not None and publication_route not in PUBLICATION_ROUTES)
     ):
-        raise PubanonError('invalid init draft')
+        raise InvalidDraftError('invalid init draft')
     return Draft(
         source=Path(_string(values, 'source')),
         commit=_string(values, 'commit'),
@@ -231,11 +261,15 @@ def _draft(data: object) -> Draft:
         owner=_optional_string(values, 'owner'),
         repo=_optional_string(values, 'repo'),
         visibility=_optional_string(values, 'visibility'),
+        publication_route=publication_route,
+        source_tags=source_tags,
         required_checks=_optional_strings(values, 'required_checks'),
         description=_optional_string(values, 'description'),
         issues=_optional_boolean(values, 'issues'),
         wiki=_optional_boolean(values, 'wiki'),
         projects=_optional_boolean(values, 'projects'),
+        pull_requests=_optional_boolean(values, 'pull_requests'),
+        discussions=_optional_boolean(values, 'discussions'),
     )
 
 
@@ -250,7 +284,8 @@ def load(paths: Paths, name: str) -> Draft | None:
         The validated draft, or `None` when no draft exists.
 
     Raises:
-        PubanonError: The draft cannot be read or contains invalid data.
+        InvalidDraftError: The draft contains invalid data.
+        PubanonError: The draft cannot be read.
     """
     try:
         content = _path(paths, name).read_text(encoding='utf-8')
@@ -261,7 +296,7 @@ def load(paths: Paths, name: str) -> Draft | None:
     try:
         data = json.loads(content)
     except json.JSONDecodeError as exc:
-        raise PubanonError('invalid init draft') from exc
+        raise InvalidDraftError('invalid init draft') from exc
     return _draft(data)
 
 

@@ -12,7 +12,11 @@ from pubanon._remote import _stage
 from tests._setup import configure
 
 
-def test_stage_clean_uses_concrete_operation_and_holds_project_lock(
+@pytest.mark.parametrize('operation', ['delete', 'forget', 'repair'])
+@pytest.mark.parametrize('yes', [False, True])
+def test_stage_operation_uses_concrete_operation_and_holds_project_lock(
+    operation: str,
+    yes: bool,
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
@@ -24,7 +28,7 @@ def test_stage_clean_uses_concrete_operation_and_holds_project_lock(
 
     class _StageModule:
         @staticmethod
-        def _stage_clean(
+        def _stage_operation(
             actual_paths: _config.Paths,
             actual_global: _config.GlobalConfig,
             actual_project: _config.ProjectConfig,
@@ -32,16 +36,19 @@ def test_stage_clean_uses_concrete_operation_and_holds_project_lock(
             yes: bool,
         ) -> None:
             with (
-                pytest.raises(PubanonError, match='active operation'),
+                pytest.raises(PubanonError, match='another Pubanon command is running'),
                 _config.project_lock(paths, project.name),
             ):
-                pytest.fail('stage clean did not hold its project lock')
+                pytest.fail('stage operation did not hold its project lock')
             received.append((actual_paths, actual_global, actual_project, yes))
 
-    monkeypatch.setattr(_stage, 'stage_clean', _StageModule._stage_clean)
+    monkeypatch.setattr(_stage, f'stage_{operation}', _StageModule._stage_operation)
 
-    assert _cli.main(['stage', 'clean', '--project', project.name, '--yes']) == 0
-    assert received == [(paths, global_config, project, True)]
+    argv = ['stage', operation, '--project', project.name]
+    if yes:
+        argv.append('--yes')
+    assert _cli.main(argv) == 0
+    assert received == [(paths, global_config, project, yes)]
 
 
 def test_stage_push_uses_concrete_operation_and_holds_project_lock(
@@ -64,7 +71,7 @@ def test_stage_push_uses_concrete_operation_and_holds_project_lock(
             yes: bool,
         ) -> None:
             with (
-                pytest.raises(PubanonError, match='active operation'),
+                pytest.raises(PubanonError, match='another Pubanon command is running'),
                 _config.project_lock(paths, project.name),
             ):
                 pytest.fail('stage push did not hold its project lock')
@@ -94,7 +101,7 @@ def test_stage_status_uses_concrete_operation_and_holds_project_lock(
             actual_project: _config.ProjectConfig,
         ) -> None:
             with (
-                pytest.raises(PubanonError, match='active operation'),
+                pytest.raises(PubanonError, match='another Pubanon command is running'),
                 _config.project_lock(paths, project.name),
             ):
                 pytest.fail('stage status did not hold its project lock')

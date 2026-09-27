@@ -20,11 +20,10 @@ from pubanon._config import (
     save_project,
     validate_settings,
 )
-from pubanon._errors import ObservationTimeoutError, PubanonError
+from pubanon._errors import ObservationTimeoutError, OperationCanceled, PubanonError
 from pubanon._gate import gate_unit
-from pubanon._remote import _package, _watch
+from pubanon._remote import _host, _package, _stage, _watch
 from pubanon._remote._host import (
-    URL_TEMPLATE,
     Destination,
     Disclosure,
     RemoteRefs,
@@ -45,7 +44,18 @@ from pubanon._remote._host import (
 )
 from pubanon._snapshots import _audit
 from pubanon._snapshots._candidate import STATE_UNKNOWN_OUTCOME, load_candidate, published_refs
-from pubanon._terminal import confirm, escape, heading, next_step, output, style
+from pubanon._terminal import (
+    confirm,
+    detail,
+    display_check_result,
+    display_path,
+    escape,
+    fields,
+    heading,
+    next_step,
+    output,
+    style,
+)
 
 
 def _ensure_candidate_outcome_known(paths: Paths, project: str) -> None:
@@ -53,22 +63,9 @@ def _ensure_candidate_outcome_known(paths: Paths, project: str) -> None:
     candidate = load_candidate(paths, project)
     if candidate is not None and candidate.state == STATE_UNKNOWN_OUTCOME:
         raise PubanonError(
-            'snapshot has an unknown publish outcome',
+            'the outcome of the last publication is unknown',
             recovery='pubanon publish --resolve',
         )
-
-
-def _preview_create(p: ProjectConfig, visibility: str) -> None:
-    """Print the exact configured repository creation plan."""
-    heading('Repository creation preview')
-    output(f'Create {escape(visibility)} GitHub repository {escape(p.owner)}/{escape(p.repo)}.')
-    if p.settings is None:
-        raise PubanonError('repository settings are missing')
-    output(f'  {style("Description:")} {escape(p.settings.description)}')
-    output(f'  The default branch is {escape(p.settings.default_branch)}.')
-    output(f'  {style("Issues:")} {"enabled" if p.settings.issues else "disabled"}')
-    output(f'  {style("Wiki:")} {"enabled" if p.settings.wiki else "disabled"}')
-    output(f'  {style("Projects:")} {"enabled" if p.settings.projects else "disabled"}')
 
 
 def _require_configured_coordinates(
@@ -99,7 +96,7 @@ def _require_supported_settings(paths: Paths, p: ProjectConfig) -> None:
         project_file = paths.config_dir / 'projects' / f'{p.name}.toml'
         raise PubanonError(
             str(exc),
-            recovery=(f'set settings.default_branch = "main" in {escape(str(project_file))}'),
+            recovery=(f'set settings.default_branch = "main" in {display_path(project_file)}'),
         ) from None
 
 
@@ -139,20 +136,21 @@ def _setting_value(value: str | bool) -> str:
     return str(value).lower() if isinstance(value, bool) else value
 
 
-def _verify_checks(p: ProjectConfig, commit: str) -> None:
+def _verify_checks(p: ProjectConfig, commit: str) -> str:
     """Verify every configured check for the exact release commit."""
     if not p.required_checks:
-        output(f'{style("required checks:")} none configured')
-        return
+        return 'none configured'
     verdicts = [check_result((p.owner, p.repo), commit, name) for name in p.required_checks]
     failing = [verdict for verdict in verdicts if verdict.state != 'success']
     if failing:
         raise PubanonError(
             'required checks are not acceptable for the release commit',
-            fact=', '.join(f'{escape(item.name)}: {escape(item.state)}' for item in failing),
+            fact=', '.join(
+                f'{escape(item.name)}: {display_check_result(item)}' for item in failing
+            ),
             recovery=check_recovery(failing, retry='rerun `pubanon repo reveal`'),
         )
-    output('required checks: all succeeded', kind='success')
+    return 'passed'
 
 
 def _verify_disclosure(
@@ -167,20 +165,19 @@ def _verify_disclosure(
     run_counts = Counter(entry.name for entry in inventory.runs)
     run_label = 'workflow run' if len(inventory.runs) == 1 else 'workflow runs'
     artifact_label = 'artifact' if len(inventory.artifacts) == 1 else 'artifacts'
-    output('Git history passed the current content and identity checks.', kind='success')
-    heading('Actions inventory', separate=True)
     output(
-        f'Actions inventory: {len(inventory.runs)} {run_label} and '
-        f'{len(inventory.artifacts)} {artifact_label}.'
+        f'{style("Not checked by Pubanon:")} {len(inventory.runs)} {run_label} and '
+        f'{len(inventory.artifacts)} {artifact_label}'
     )
     for name, count in sorted(run_counts.items()):
         output(f'  {style(escape(name) + ":")} {count}')
-    output(style('Artifacts:'))
     for entry in inventory.artifacts:
         output(f'  {escape(entry.name)} (id {entry.identifier})')
-    if not inventory.artifacts:
-        output('  none')
-    output('Pubanon has not scanned their logs or artifact contents.', kind='warning')
+    output(
+        'warning: Pubanon has not scanned Actions logs, artifact contents, '
+        'or other retained GitHub objects.',
+        kind='warning',
+    )
     review_links = {
         f'Workflow run link {index}': (
             f'https://github.com/{p.owner}/{p.repo}/actions/runs/{entry.identifier}'
@@ -188,17 +185,17 @@ def _verify_disclosure(
         for index, entry in enumerate(inventory.runs, start=1)
     }
     actions_url = f'https://github.com/{p.owner}/{p.repo}/actions'
-    review_links['Artifact review'] = actions_url
-    for label, url in review_links.items():
-        output(f'  {style(label + ":")} {url}')
-    output(f'{style("Saved inventory:")} {escape(str(path))}')
+    review_links['Activity'] = f'https://github.com/{p.owner}/{p.repo}/activity'
+    review_links['Review'] = actions_url
+    fields(list(review_links.items()), indent=2)
+    detail(f'Saved inventory: {display_path(path)}')
     prompt = (
         'These runs, logs, and artifacts are already public. Continue?'
         if already_public
         else 'These runs, logs, and artifacts become public with the repository. Continue?'
     )
     if not confirm(prompt):
-        raise PubanonError('public disclosure was not acknowledged')
+        raise OperationCanceled('Canceled. Nothing was changed.')
 
 
 def _verify_history(
@@ -224,25 +221,23 @@ def _verify_history(
                 ]
             ),
             recovery=(
-                'pubanon status --audit shows the findings; adjust the configuration or the '
+                'pubanon audit shows the findings; adjust the configuration or the '
                 'published content decision. To replace all published history under the current '
                 'publication identity, use `pubanon prepare --replace all`; existing clones and '
                 'caches may retain the old history'
             ),
         )
-    output('sanitization and identity: clean', kind='success')
 
 
 def _verify_package_observation(
     paths: Paths,
     p: ProjectConfig,
     dest: Destination,
-) -> None:
+) -> str:
     """Verify one configured package release without waiting or mutation."""
     package = p.package
     if package is None:
-        output(f'{style("package observation:")} not enabled')
-        return
+        return 'not enabled'
 
     version, commit = _watch.select_package_release(paths, p.name, None)
     verdicts = _watch.ci_verdicts(dest, commit, package.release_checks)
@@ -251,10 +246,9 @@ def _verify_package_observation(
     selected = bad or failing
     if selected:
         fact = ', '.join(
-            f'{escape(verdict.name)}: {escape(verdict.state)} ({escape(verdict.detail)})'
-            for verdict in selected
+            f'{escape(verdict.name)}: {display_check_result(verdict)}' for verdict in selected
         )
-        recovery = check_recovery(selected, retry='run `pubanon watch package`')
+        recovery = check_recovery(selected, retry='run `pubanon package watch`')
         if bad:
             raise PubanonError(
                 'package release checks are not acceptable',
@@ -284,12 +278,9 @@ def _verify_package_observation(
         raise PubanonError(
             'package release has no distribution files',
             fact=(f'{escape(package.name)} {escape(version)} metadata has no distribution files'),
-            recovery='run `pubanon watch package`, then rerun `pubanon repo reveal`',
+            recovery='run `pubanon package watch`, then rerun `pubanon repo reveal`',
         )
-    output(
-        f'package observation: {escape(package.name)} {escape(version)} is published',
-        kind='success',
-    )
+    return f'{escape(package.name)} {escape(version)} is published'
 
 
 def _verify_refs(
@@ -302,7 +293,7 @@ def _verify_refs(
     expected = RemoteRefs(local_main, local_tags, ())
     remote = ls_remote(dest, paths, p.name)
     if local_main is None:
-        recovery = 'pubanon repo verify --repair-store' if remote != expected else None
+        recovery = 'pubanon repo restore --to local' if remote != expected else None
         raise PubanonError(
             'nothing is published',
             expected=escape(remote_refs_text(expected)),
@@ -311,13 +302,52 @@ def _verify_refs(
         )
     if remote != expected:
         raise PubanonError(
-            'host refs do not match published refs',
+            'GitHub branches and tags do not match saved published history',
             expected=escape(remote_refs_text(expected)),
             actual=escape(remote_refs_text(remote)),
             recovery='pubanon repo verify',
         )
-    output('published refs match host', kind='success')
     return local_main, local_tags
+
+
+def feature_summary(settings: Settings) -> str:
+    """Summarize enabled features before disabled features for display."""
+    features = (
+        ('issues', settings.issues),
+        ('wiki', settings.wiki),
+        ('projects', settings.projects),
+        ('pull requests', settings.pull_requests),
+        ('discussions', settings.discussions),
+    )
+    enabled = [name for name, value in features if value]
+    disabled = [name for name, value in features if not value]
+
+    def _names(names: list[str]) -> str:
+        if not names:
+            return 'none'
+        first, *rest = names
+        if not rest:
+            return first
+        if len(rest) == 1:
+            return f'{first} and {rest[0]}'
+        return ', '.join(names[:-1]) + f', and {names[-1]}'
+
+    return f'{_names(enabled)} on; {_names(disabled)} off'
+
+
+def _preview_create(p: ProjectConfig, visibility: str) -> None:
+    """Print the exact configured repository creation plan."""
+    heading(f'Create repository {escape(p.owner)}/{escape(p.repo)}')
+    if p.settings is None:
+        raise PubanonError('repository settings are missing')
+    fields(
+        [
+            ('Visibility', escape(visibility)),
+            ('Description', escape(p.settings.description or '(empty)')),
+            ('Default branch', escape(p.settings.default_branch)),
+            ('Features', feature_summary(p.settings)),
+        ]
+    )
 
 
 def gate_host_fields(
@@ -349,7 +379,7 @@ def gate_host_fields(
         hits = gate_unit(unit, value.encode(), rules)
         if hits:
             raise PubanonError(
-                f'{unit} failed content gates',
+                f'{unit} did not pass content checks',
                 fact=f'{name}: {escape(value)}',
             )
 
@@ -388,9 +418,7 @@ def repo_create(
             fact='repository visibility',
             expected=escape(p.visibility),
             actual=escape(visibility),
-            recovery=(
-                'align the --private/--public flag with visibility in the project configuration'
-            ),
+            recovery=('align the requested visibility with the project configuration'),
         )
     gate_host_coordinates(paths, g, p, coordinates=(p.owner, p.repo))
     gate_host_fields(paths, g, p)
@@ -406,7 +434,7 @@ def repo_create(
         adapter=p.host,
         owner=p.owner,
         repo=p.repo,
-        url=URL_TEMPLATE.format(owner=p.owner, repo=p.repo),
+        url=_host.repository_url(p.owner, p.repo),
         account=account,
         visibility=visibility,
     )
@@ -414,9 +442,16 @@ def repo_create(
     if not yes and not confirm(
         f'Create {escape(p.owner)}/{escape(p.repo)} as a {visibility} repository?'
     ):
-        raise PubanonError('repository creation declined')
+        raise OperationCanceled('Canceled. Nothing was created.')
     try:
-        create_repository(dest, p.settings)
+        create_repository(
+            dest,
+            p.settings,
+            settings_recovery=(
+                "check the settings in the repository's GitHub settings, "
+                'then run pubanon repo verify'
+            ),
+        )
     except RepositoryCreationUncertainError as exc:
         raise PubanonError(
             'repository creation outcome is unknown; the repository may already exist',
@@ -438,16 +473,14 @@ def repo_create(
             'repository creation is partial; created repository is not empty',
             recovery='pubanon repo verify',
         )
-    output(f'Created and verified an empty {visibility} host repository.', kind='success')
-    output('The source repository and local publication state were not changed.')
+    output(
+        f'Created {escape(visibility)} repository {escape(p.owner)}/{escape(p.repo)}.',
+        kind='success',
+    )
     output()
-    if candidate is None:
-        next_step('pubanon prepare')
-    elif candidate.state == STATE_UNKNOWN_OUTCOME:
+    if candidate is not None and candidate.state == STATE_UNKNOWN_OUTCOME:
         output('The pending publication outcome needs resolution.')
-        next_step('pubanon publish --resolve')
-    else:
-        next_step('pubanon publish')
+    next_step(_stage.candidate_next_action(paths, g, p, candidate))
 
 
 def settings_mismatches(expected: Settings, actual: SettingsFacts) -> list[str]:
@@ -466,6 +499,8 @@ def settings_mismatches(expected: Settings, actual: SettingsFacts) -> list[str]:
         ('issues', expected.issues, actual.issues),
         ('wiki', expected.wiki, actual.wiki),
         ('projects', expected.projects, actual.projects),
+        ('pull_requests', expected.pull_requests, actual.pull_requests),
+        ('discussions', expected.discussions, actual.discussions),
     )
     return [
         f'{name}: expected {_setting_value(wanted)}; actual {_setting_value(observed)}'
@@ -515,7 +550,7 @@ def _verify_after_flip(
         adapter=p.host,
         owner=owner,
         repo=repo,
-        url=URL_TEMPLATE.format(owner=owner, repo=repo),
+        url=_host.repository_url(owner, repo),
         account=g.accounts[p.host],
         visibility=visibility,
     )
@@ -562,14 +597,15 @@ def _converge_public(
             fact=exc.render(),
             recovery='fix the configuration write, then rerun pubanon repo reveal',
         ) from exc
-    output('Repository is public and verified.', kind='success')
-    if host_changed:
-        output('Host visibility changed to public, and local configuration now records it.')
-    else:
-        output('The host was already public; local configuration now records public visibility.')
-    output('prior Actions history and logs are now public', kind='warning')
-    output()
-    output(f'{style("Details:")} {escape(f"verified commit {commit}")}')
+    repository = f'{escape(p.owner)}/{escape(p.repo)}'
+    output(
+        f'Made {repository} public.'
+        if host_changed
+        else f'Recorded public visibility for {repository}; it was already public.',
+        kind='success',
+    )
+    output('warning: its earlier Actions history and logs are now public too.', kind='warning')
+    detail(f'Verified commit: {escape(commit)}')
 
 
 def _verify_settings(
@@ -590,7 +626,6 @@ def _verify_settings(
             'repository settings do not match configuration',
             fact='; '.join(escape(item) for item in mismatches),
         )
-    output('repository settings match configuration', kind='success')
 
 
 def _verify_before_flip(
@@ -603,10 +638,18 @@ def _verify_before_flip(
 ) -> str:
     """Run the complete ordered verification before recording public visibility."""
     commit, tags = _verify_refs(paths, p, dest)
-    _verify_checks(p, commit)
-    _verify_package_observation(paths, p, dest)
+    checks = _verify_checks(p, commit)
+    package = _verify_package_observation(paths, p, dest)
     _verify_settings(paths, g, p)
     _verify_history(paths, g, p, (commit, tags))
+    fields(
+        [
+            ('Published history', 'matches GitHub; no sensitive terms or identity problems'),
+            ('Required checks', checks),
+            ('Package', package),
+            ('Settings', 'match your configuration'),
+        ]
+    )
     _verify_disclosure(paths, p, already_public=already_public)
     return commit
 
@@ -647,23 +690,26 @@ def reveal(
 
     if host_visibility == 'private' and p.visibility == 'private':
         destination = verify_destination(paths, g, p)
+        heading(f'Make {escape(owner)}/{escape(repo)} public')
         _verify_before_flip(paths, g, p, destination)
-        heading('Repository visibility change')
-        output(f'Change {escape(owner)}/{escape(repo)} from private to public.', kind='warning')
         if not confirm('Make it public?'):
-            raise PubanonError('repository reveal declined')
+            raise OperationCanceled('Canceled. Nothing was changed.')
         _set_public_visibility(p)
         _converge_public(paths, g, p, host_changed=True)
         return
 
     if host_visibility == 'public' and p.visibility == 'private':
-        output('host repository is already public; verifying before recording', kind='warning')
-        output('repository content is already exposed; no rollback is assumed', kind='warning')
+        heading(f'Verify public repository {escape(owner)}/{escape(repo)}')
+        output(
+            'warning: repository content is already public; '
+            'verification cannot undo that exposure.',
+            kind='warning',
+        )
         destination = Destination(
             adapter=p.host,
             owner=owner,
             repo=repo,
-            url=URL_TEMPLATE.format(owner=owner, repo=repo),
+            url=_host.repository_url(owner, repo),
             account=account,
             visibility=host_visibility,
         )
@@ -680,21 +726,24 @@ def reveal(
 
     if host_visibility == 'public' and p.visibility == 'public':
         commit = _verify_after_flip(paths, g, p)
-        output('Repository is already public.', kind='success')
-        output('Verified now: public visibility, published refs, and repository settings.')
-        output()
-        output(f'{style("Details:")} {escape(f"verified commit {commit}")}')
+        output(f'Repository {escape(owner)}/{escape(repo)} is already public.', kind='success')
+        output(
+            'Verified now: public visibility, published branches and tags, '
+            'and repository settings.'
+        )
+        detail(f'Verified commit: {escape(commit)}')
         output('Apply current privacy rules with a remote audit.')
-        next_step('pubanon status --audit --remote')
+        next_step('pubanon audit --remote')
         return
 
     if host_visibility == 'private' and p.visibility == 'public':
         project_file = paths.config_dir / 'projects' / f'{p.name}.toml'
         raise PubanonError(
-            'declared visibility is public but the host repository is private',
+            'declared visibility is public but the final repository is private',
             recovery=(
-                'decide the intended visibility; make the host public outside Pubanon or set '
-                f'visibility = "private" in {escape(str(project_file))}, then rerun '
+                'decide the intended visibility; make the repository public outside Pubanon '
+                'or set '
+                f'visibility = "private" in {display_path(project_file)}, then rerun '
                 'pubanon repo reveal'
             ),
         )

@@ -12,7 +12,7 @@ from pubanon import _config, _terminal
 from tests._git import git_env
 from tests._setup import configure
 
-_Script = Callable[[Sequence[tuple[str, str]]], None]
+_Script = Callable[[Sequence[str | tuple[str, str]]], None]
 
 _FAKE_GH_SCRIPT = """#!/usr/bin/env python
 import json
@@ -48,6 +48,14 @@ raise SystemExit(127)
 
 
 @pytest.fixture(autouse=True)
+def _isolate_user_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv('HOME', str(tmp_path / 'home'))
+    monkeypatch.setenv('USERPROFILE', str(tmp_path / 'home'))
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'config'))
+    monkeypatch.setenv('XDG_DATA_HOME', str(tmp_path / 'data'))
+
+
+@pytest.fixture(autouse=True)
 def _refuse_unscripted_input(monkeypatch: pytest.MonkeyPatch) -> None:
     def _refuse(prompt: object = '') -> str:
         pytest.fail(f'unscripted prompt: {prompt!r}')
@@ -62,17 +70,21 @@ def _refuse_unscripted_input(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def answers(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Script]:
-    remaining: list[tuple[str, str]] = []
+    remaining: list[str | tuple[str, str]] = []
 
     def _reply(prompt: object = '') -> str:
         assert remaining, f'unexpected prompt: {prompt!r}'
-        expected, response = remaining[0]
-        assert prompt == expected, f'expected prompt {expected!r}, got {prompt!r}'
+        reply = remaining[0]
+        if isinstance(reply, str):
+            response = reply
+        else:
+            expected, response = reply
+            assert prompt == expected, f'expected prompt {expected!r}, got {prompt!r}'
         del remaining[0]
         return response
 
-    def _script(pairs: Sequence[tuple[str, str]]) -> None:
-        remaining.extend(pairs)
+    def _script(replies: Sequence[str | tuple[str, str]]) -> None:
+        remaining.extend(replies)
         monkeypatch.setattr('builtins.input', _reply)
 
     yield _script

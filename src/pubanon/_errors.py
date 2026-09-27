@@ -1,5 +1,9 @@
 """Render failures with the facts needed for safe recovery."""
 
+from typing import Literal
+
+from pubanon import _terminal
+
 
 class ObservationTimeoutError(Exception):
     """Carry an unrendered observation-timeout signal between adapters.
@@ -13,7 +17,6 @@ class ObservationTimeoutError(Exception):
     def __init__(
         self,
         *,
-        detail: str | None = None,
         stage: str | None = None,
         stdout: bytes = b'',
         stderr: bytes = b'',
@@ -21,13 +24,11 @@ class ObservationTimeoutError(Exception):
         """Create an observation timeout with retained raw context.
 
         Args:
-            detail: Optional safe diagnostic derived from timed-out output.
             stage: Optional observation stage that exceeded its time budget.
             stdout: Raw standard output retained from the timed-out child.
             stderr: Raw standard error retained from the timed-out child.
         """
         super().__init__()
-        self._detail = detail
         self.stage = stage
         self.stderr = stderr
         self.stdout = stdout
@@ -73,25 +74,24 @@ class PubanonError(Exception):
         Returns:
             The message and diagnostic details.
         """
-        lines = [f'error: {self}']
-        for label, value in (
-            ('fact', self.fact),
-            ('expected', self.expected),
-            ('actual', self.actual),
-            ('recovery', self.recovery),
-        ):
-            if value is not None:
-                lines.append(f'{label}: {value}')
-        return '\n'.join(lines)
+        with _terminal.color_context('never'):
+            return _terminal.diagnostic(self)
 
 
-class OperationCancelled(PubanonError):  # noqa: N818
+class OperationCanceled(PubanonError):  # noqa: N818
     """Report operator interruption while preserving structured recovery facts.
 
     The CLI returns status 130 for this error. Diagnostic fields have the same
     contract as `PubanonError`.
+
+    Attributes:
+        diagnostic_kind: Presentation role for the known outcome, independent
+            of interruption status: warning for cancellation, error for an
+            unresolved problem, or success for a completed operation.
     """
 
+    diagnostic_kind: Literal['warning', 'error', 'success'] = 'warning'
 
-class PublicationCancelled(OperationCancelled):
+
+class PublicationCanceled(OperationCanceled):
     """Report publication cancelled before any push was attempted."""

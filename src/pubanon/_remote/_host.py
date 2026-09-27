@@ -19,7 +19,7 @@ from pubanon._config import (
     gate_host_coordinates,
     validate_host_segment,
 )
-from pubanon._errors import ObservationTimeoutError, OperationCancelled, PubanonError
+from pubanon._errors import ObservationTimeoutError, OperationCanceled, PubanonError
 from pubanon._run import OID_HEX, GitResult, run_credential_child
 from pubanon._snapshots._candidate import store_path
 from pubanon._terminal import escape
@@ -35,13 +35,15 @@ _DISCLOSURE_PAGE_SIZE = 100
 _GH: str = 'gh'
 _GH_HOST_ENV: dict[str, str] = {'GH_HOST': 'github.com'}
 _OID_PATTERN = re.compile(OID_HEX)
+_RELEASE_PAGE_SIZE = 100
 _REPOSITORY_QUERY = '{owner: .owner.login, repo: .name, visibility: .visibility}'
 _REPOSITORY_SETTINGS_QUERY = (
     '{description: .description, default_branch: .default_branch, '
-    'issues: .has_issues, wiki: .has_wiki, projects: .has_projects}'
+    'issues: .has_issues, wiki: .has_wiki, projects: .has_projects, '
+    'pull_requests: .has_pull_requests, discussions: .has_discussions}'
 )
+_URL_TEMPLATE = 'https://github.com/{owner}/{repo}.git'
 _monotonic = time.monotonic
-URL_TEMPLATE = 'https://github.com/{owner}/{repo}.git'
 
 type _CheckRun = tuple[str, str, str, str | None]
 
@@ -83,6 +85,27 @@ class Destination:
     url: str
     account: str
     visibility: str
+
+
+@dataclass(frozen=True)
+class GitHubRelease:
+    """Hold the content and status of one GitHub release page.
+
+    Attributes:
+        tag: Exact tag associated with the release.
+        title: Release page title.
+        notes: Complete Markdown release notes.
+        url: Browser URL of the release page.
+        draft: Whether the page is a draft.
+        prerelease: Whether the page is marked as a prerelease.
+    """
+
+    tag: str
+    title: str
+    notes: str
+    url: str
+    draft: bool
+    prerelease: bool
 
 
 class DisclosureEntry(NamedTuple):
@@ -141,6 +164,8 @@ class SettingsFacts(NamedTuple):
         issues: Whether the host issue tracker is enabled.
         wiki: Whether the host wiki is enabled.
         projects: Whether host projects are enabled.
+        pull_requests: Whether host pull requests are enabled.
+        discussions: Whether host discussions are enabled.
     """
 
     description: str
@@ -148,6 +173,8 @@ class SettingsFacts(NamedTuple):
     issues: bool
     wiki: bool
     projects: bool
+    pull_requests: bool
+    discussions: bool
 
 
 def _gh_error(returncode: int, stdout: bytes, stderr: bytes) -> PubanonError:
@@ -165,6 +192,7 @@ def _gh(
     *,
     check: Literal[True] = True,
     timeout: float | None = None,
+    input_bytes: bytes | None = None,
 ) -> bytes: ...
 
 
@@ -174,6 +202,7 @@ def _gh(
     *,
     check: Literal[False],
     timeout: float | None = None,
+    input_bytes: bytes | None = None,
 ) -> tuple[int, bytes, bytes]: ...
 
 
@@ -182,6 +211,7 @@ def _gh(
     *,
     check: bool = True,
     timeout: float | None = None,
+    input_bytes: bytes | None = None,
 ) -> bytes | tuple[int, bytes, bytes]:
     """Run one captured GitHub CLI command with escaped failures."""
     try:
@@ -191,6 +221,7 @@ def _gh(
             capture_output=True,
             env=os.environ | _GH_HOST_ENV,
             timeout=timeout,
+            input=input_bytes,
         )
     except subprocess.TimeoutExpired:
         pass
@@ -205,6 +236,51 @@ def _gh(
     raise ObservationTimeoutError
 
 
+def _apply_created_settings(dest: Destination, settings: Settings, settings_recovery: str) -> None:
+    """Apply remaining settings after creation and verify all declared creation fields."""
+    update_args = [
+        'api',
+        '-X',
+        'PATCH',
+        f'repos/{dest.owner}/{dest.repo}',
+        '-F',
+        f'has_pull_requests={str(settings.pull_requests).lower()}',
+    ]
+    if dest.owner != dest.account:
+        update_args.extend(['-F', f'has_discussions={str(settings.discussions).lower()}'])
+    try:
+        _gh(update_args)
+        actual = repository_settings(dest.owner, dest.repo)
+    except OperationCanceled:
+        raise
+    except PubanonError as exc:
+        raise PubanonError(
+            'repository was created, but its settings could not be verified',
+            fact=exc.render(),
+            recovery=settings_recovery,
+        ) from exc
+    differences: list[str] = []
+    fields = (
+        ('description', settings.description, actual.description),
+        ('issues', settings.issues, actual.issues),
+        ('wiki', settings.wiki, actual.wiki),
+        ('projects', settings.projects, actual.projects),
+        ('pull_requests', settings.pull_requests, actual.pull_requests),
+        ('discussions', settings.discussions, actual.discussions),
+    )
+    for name, declared, observed in fields:
+        if declared != observed:
+            declared_text = str(declared).lower() if isinstance(declared, bool) else declared
+            observed_text = str(observed).lower() if isinstance(observed, bool) else observed
+            differences.append(f'{name}: declared {declared_text}, observed {observed_text}')
+    if differences:
+        raise PubanonError(
+            'repository was created but its settings do not match',
+            fact='; '.join(escape(item) for item in differences),
+            recovery=settings_recovery,
+        )
+
+
 def _authenticated_account(*, timeout: float | None = None) -> str:
     """Read the authenticated GitHub account."""
     output = _gh(['api', 'user', '--jq', '.login'], timeout=timeout)
@@ -217,6 +293,32 @@ def _authenticated_account(*, timeout: float | None = None) -> str:
     if not account:
         raise PubanonError('invalid authenticated account response')
     return account
+
+
+def _ls_remote_output(
+    dest: Destination,
+    *,
+    store: Path | None = None,
+    timeout: float | None = None,
+) -> bytes:
+    """Read destination heads and tags with the credential-bearing transport."""
+    selector = ['--git-dir', str(store.absolute())] if store is not None else []
+    args = [
+        *selector,
+        *_CREDENTIAL_CONFIG,
+        'ls-remote',
+        dest.url,
+        'refs/heads/*',
+        'refs/tags/*',
+    ]
+    result = run_credential_child(
+        args,
+        cwd=store,
+        env_extra=_GH_HOST_ENV,
+        operation='ls-remote',
+        timeout=timeout,
+    )
+    return result.stdout
 
 
 def _parse_ref_line(line: str) -> tuple[str, str]:
@@ -284,31 +386,6 @@ def _remote_refs(output: bytes) -> RemoteRefs:
     return RemoteRefs(main, tags, tuple(sorted(branches.items())))
 
 
-def _stage_refs(output: bytes) -> tuple[str | None, tuple[str, ...]]:
-    """Parse the exact staging-reference universe."""
-    stage: str | None = None
-    unexpected: list[str] = []
-    seen: set[str] = set()
-    for line in _parse_ref_lines(output):
-        oid, ref = _parse_ref_line(line)
-        if ref in seen:
-            raise PubanonError('invalid remote reference response')
-        seen.add(ref)
-        if ref == 'refs/heads/stage':
-            stage = oid
-        elif ref.startswith('refs/heads/'):
-            if not ref.removeprefix('refs/heads/'):
-                raise PubanonError('invalid remote reference response')
-            unexpected.append(ref)
-        elif ref.startswith('refs/tags/'):
-            if not ref.removeprefix('refs/tags/'):
-                raise PubanonError('invalid remote reference response')
-            unexpected.append(ref)
-        else:
-            raise PubanonError('invalid remote reference response')
-    return stage, tuple(unexpected)
-
-
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     """Build a JSON object while refusing duplicate keys."""
     result: dict[str, object] = {}
@@ -324,24 +401,24 @@ def _check_runs_payload(output: bytes) -> tuple[int, list[_CheckRun]]:
     try:
         parsed = json.loads(output, object_pairs_hook=_unique_object)
     except (UnicodeDecodeError, ValueError) as exc:
-        raise PubanonError('invalid check-run response') from exc
+        raise PubanonError('GitHub returned check results Pubanon could not read') from exc
     if not isinstance(parsed, dict):
-        raise PubanonError('invalid check-run response')
+        raise PubanonError('GitHub returned check results Pubanon could not read')
     raw_payload = cast('dict[object, object]', parsed)
     if set(raw_payload) != {'total_count', 'check_runs'}:
-        raise PubanonError('invalid check-run response')
+        raise PubanonError('GitHub returned check results Pubanon could not read')
     payload = cast('dict[str, object]', raw_payload)
     total_count = payload['total_count']
     raw_runs = payload['check_runs']
     if type(total_count) is not int or total_count < 0 or not isinstance(raw_runs, list):
-        raise PubanonError('invalid check-run response')
+        raise PubanonError('GitHub returned check results Pubanon could not read')
     runs: list[_CheckRun] = []
     for raw_run in cast('list[object]', raw_runs):
         if not isinstance(raw_run, dict):
-            raise PubanonError('invalid check-run response')
+            raise PubanonError('GitHub returned check results Pubanon could not read')
         run = cast('dict[object, object]', raw_run)
         if not {'name', 'head_sha', 'status', 'conclusion'} <= set(run):
-            raise PubanonError('invalid check-run response')
+            raise PubanonError('GitHub returned check results Pubanon could not read')
         name = run['name']
         head_sha = run['head_sha']
         status = run['status']
@@ -351,9 +428,9 @@ def _check_runs_payload(output: bytes) -> tuple[int, list[_CheckRun]]:
             or not isinstance(head_sha, str)
             or not isinstance(status, str)
         ):
-            raise PubanonError('invalid check-run response')
+            raise PubanonError('GitHub returned check results Pubanon could not read')
         if conclusion is not None and not isinstance(conclusion, str):
-            raise PubanonError('invalid check-run response')
+            raise PubanonError('GitHub returned check results Pubanon could not read')
         runs.append((name, head_sha, status, conclusion))
     return total_count, runs
 
@@ -419,7 +496,7 @@ def _read_disclosure_page(
     target = f'{escape(owner)}/{escape(repo)}'
     try:
         output = _gh(['api', f'repos/{owner}/{repo}/actions/{resource}?per_page=100&page={page}'])
-    except OperationCancelled:
+    except OperationCanceled:
         raise
     except PubanonError as exc:
         raise PubanonError(
@@ -500,6 +577,56 @@ def _disclosure_entries(
     return tuple(DisclosureEntry(entry_id, name) for entry_id, name in sorted(first.items()))
 
 
+def _release_page(output: bytes) -> tuple[GitHubRelease, ...]:
+    """Parse one successful GitHub release-list response."""
+    try:
+        parsed = json.loads(output, object_pairs_hook=_unique_object)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise PubanonError('invalid release response') from exc
+    if not isinstance(parsed, list):
+        raise PubanonError('invalid release response')
+    releases: list[GitHubRelease] = []
+    for raw_release in cast('list[object]', parsed):
+        if not isinstance(raw_release, dict):
+            raise PubanonError('invalid release response')
+        release = cast('dict[str, object]', raw_release)
+        tag = release.get('tag_name')
+        title = release.get('name')
+        notes = release.get('body')
+        url = release.get('html_url')
+        draft = release.get('draft')
+        prerelease = release.get('prerelease')
+        if (
+            not isinstance(tag, str)
+            or not tag
+            or 'name' not in release
+            or (title is not None and not isinstance(title, str))
+            or (notes is not None and not isinstance(notes, str))
+            or not isinstance(url, str)
+            or not url
+            or type(draft) is not bool
+            or type(prerelease) is not bool
+        ):
+            raise PubanonError('invalid release response')
+        releases.append(GitHubRelease(tag, title or '', notes or '', url, draft, prerelease))
+    return tuple(releases)
+
+
+def _read_release_page(
+    dest: Destination, *, page: int, per_page: int
+) -> tuple[GitHubRelease, ...]:
+    """Read one explicit GitHub release-list page."""
+    output = _gh(
+        [
+            'api',
+            '--method',
+            'GET',
+            f'repos/{dest.owner}/{dest.repo}/releases?per_page={per_page}&page={page}',
+        ]
+    )
+    return _release_page(output)
+
+
 def _repository_not_found(stdout: bytes, stderr: bytes) -> bool:
     """Recognize GitHub's missing-or-inaccessible repository response."""
     try:
@@ -527,7 +654,7 @@ def authenticated_account(*, timeout: float | None = None) -> str:
     """
     try:
         account = _authenticated_account(timeout=timeout)
-    except OperationCancelled:
+    except OperationCanceled:
         raise
     except ObservationTimeoutError:
         pass
@@ -598,14 +725,14 @@ def check_result(
     total_count, runs = _check_runs_payload(output)
     if total_count == 0:
         if runs:
-            raise PubanonError('invalid check-run response')
+            raise PubanonError('GitHub returned check results Pubanon could not read')
         return CheckVerdict(name, 'missing', '')
     if total_count > _CHECK_RUN_PAGE_SIZE and len(runs) == _CHECK_RUN_PAGE_SIZE:
         return CheckVerdict(name, 'ambiguous', f'{total_count} check runs')
     if len(runs) != total_count:
-        raise PubanonError('invalid check-run response')
+        raise PubanonError('GitHub returned check results Pubanon could not read')
     if any(run_name != name or head_sha != commit for run_name, head_sha, _, _ in runs):
-        raise PubanonError('invalid check-run response')
+        raise PubanonError('GitHub returned check results Pubanon could not read')
     failures = [
         conclusion or 'null'
         for _, _, status, conclusion in runs
@@ -619,19 +746,52 @@ def check_result(
     return CheckVerdict(name, 'success', 'success')
 
 
+def create_release(dest: Destination, tag: str, *, title: str, notes: bytes) -> None:
+    """Create a release page for an existing tag in a verified repository.
+
+    Args:
+        dest: Previously verified GitHub destination.
+        tag: Existing tag for the new release page.
+        title: Exact title prepared by the caller.
+        notes: Exact UTF-8 notes prepared by the caller.
+
+    Raises:
+        PubanonError: GitHub CLI cannot complete the mutation.
+    """
+    _gh(
+        [
+            'release',
+            'create',
+            tag,
+            '--repo',
+            f'{dest.owner}/{dest.repo}',
+            '--verify-tag',
+            f'--title={title}',
+            '--notes-file',
+            '-',
+        ],
+        input_bytes=notes,
+    )
+
+
 def create_repository(
     dest: Destination,
     settings: Settings | None,
+    *,
+    settings_recovery: str = "check the settings in the repository's GitHub settings",
 ) -> None:
     """Create one empty repository at a verified destination.
 
     Args:
         dest: Destination coordinates and explicit visibility.
-        settings: Optional description, issues, wiki, and projects settings for
-            the create mutation. The default branch is not set here.
+        settings: Optional declared settings to apply and verify. The default
+            branch is not set or compared here.
+        settings_recovery: Caller guidance after settings cannot be verified or
+            do not match following successful creation.
 
     Raises:
-        PubanonError: The owner lookup fails or the owner is unsupported.
+        PubanonError: The owner lookup fails, the owner is unsupported, or
+            settings cannot be verified or do not match after creation.
         RepositoryCreationUncertainError: The GitHub CLI creation invocation
             fails, without establishing whether the repository was created.
     """
@@ -666,9 +826,11 @@ def create_repository(
                 f'has_projects={str(settings.projects).lower()}',
             ]
         )
+        if dest.owner == dest.account:
+            args.extend(['-F', f'has_discussions={str(settings.discussions).lower()}'])
     try:
         _gh(args)
-    except OperationCancelled:
+    except OperationCanceled:
         raise
     except PubanonError as exc:
         raise RepositoryCreationUncertainError(
@@ -678,6 +840,10 @@ def create_repository(
             actual=exc.actual,
             recovery=exc.recovery,
         ) from exc
+
+    if settings is None:
+        return
+    _apply_created_settings(dest, settings, settings_recovery)
 
 
 def delete_repository(owner: str, repo: str) -> None:
@@ -707,13 +873,13 @@ def delete_repository(owner: str, repo: str) -> None:
             recovery=(
                 'review the active account and repository permissions; a missing delete_repo '
                 'scope is one possible cause. You may delete the staging repository manually '
-                'and rerun pubanon stage clean'
+                'and use pubanon stage forget to remove local tracking'
             ),
         )
     if status == '404':
         raise PubanonError(
             'repository is absent or inaccessible',
-            recovery='verify repository access and state, then retry `pubanon stage clean`',
+            recovery='verify repository access and state, then retry `pubanon stage delete`',
         )
     raise _gh_error(returncode, stdout, stderr)
 
@@ -734,6 +900,34 @@ def disclosure(owner: str, repo: str) -> Disclosure:
     runs = _disclosure_entries(owner, repo, 'runs', 'workflow_runs')
     artifacts = _disclosure_entries(owner, repo, 'artifacts', 'artifacts')
     return Disclosure(runs, artifacts)
+
+
+def edit_release(dest: Destination, tag: str, *, title: str, notes: bytes) -> None:
+    """Replace the title and notes of one existing GitHub release page.
+
+    Args:
+        dest: Previously verified GitHub destination.
+        tag: Existing release tag to edit.
+        title: Exact resulting title prepared by the caller.
+        notes: Exact resulting UTF-8 notes prepared by the caller.
+
+    Raises:
+        PubanonError: GitHub CLI cannot complete the mutation.
+    """
+    _gh(
+        [
+            'release',
+            'edit',
+            tag,
+            '--repo',
+            f'{dest.owner}/{dest.repo}',
+            '--verify-tag',
+            f'--title={title}',
+            '--notes-file',
+            '-',
+        ],
+        input_bytes=notes,
+    )
 
 
 def fetch(dest: Destination, cwd: Path, refspecs: Iterable[str]) -> GitResult:
@@ -771,11 +965,41 @@ def fetch(dest: Destination, cwd: Path, refspecs: Iterable[str]) -> GitResult:
     )
 
 
+def list_releases(dest: Destination, *, limit: int) -> tuple[GitHubRelease, ...]:
+    """Read up to `limit` release pages from a verified destination.
+
+    Args:
+        dest: Previously verified GitHub destination.
+        limit: Positive maximum number of pages to return.
+
+    Returns:
+        Release pages in GitHub's listing order.
+
+    Raises:
+        ValueError: The limit is not positive.
+        PubanonError: A host request fails or a response is invalid.
+    """
+    if limit < 1:
+        raise ValueError('release limit must be positive')
+    releases: list[GitHubRelease] = []
+    page = 1
+    per_page = min(_RELEASE_PAGE_SIZE, limit)
+    while len(releases) < limit:
+        entries = _read_release_page(dest, page=page, per_page=per_page)
+        if len(entries) > per_page:
+            raise PubanonError('invalid release response')
+        releases.extend(entries)
+        if len(entries) < per_page:
+            break
+        page += 1
+    return tuple(releases[:limit])
+
+
 def login() -> None:
     """Hand GitHub authentication to an inherited operator terminal.
 
     Raises:
-        OperationCancelled: The operator interrupts login.
+        OperationCanceled: The operator interrupts login.
         PubanonError: The GitHub CLI cannot start or does not complete login.
     """
     interrupted = False
@@ -802,7 +1026,7 @@ def login() -> None:
         if completed.returncode == 0:
             return
     if interrupted:
-        raise OperationCancelled('setup cancelled')
+        raise OperationCanceled('Canceled.')
     raise PubanonError('GitHub login did not complete')
 
 
@@ -833,22 +1057,8 @@ def ls_remote(
             parsing fails.
         ObservationTimeoutError: The supplied transport timeout expires.
     """
-    args = [
-        *_CREDENTIAL_CONFIG,
-        'ls-remote',
-        dest.url,
-        'refs/heads/*',
-        'refs/tags/*',
-    ]
     store = store_path(paths, project)
-    result = run_credential_child(
-        ['--git-dir', str(store.absolute()), *args],
-        cwd=store,
-        env_extra=_GH_HOST_ENV,
-        operation='ls-remote',
-        timeout=timeout,
-    )
-    return _remote_refs(result.stdout)
+    return _remote_refs(_ls_remote_output(dest, store=store, timeout=timeout))
 
 
 def push(dest: Destination, cwd: Path, args: Iterable[str]) -> GitResult:
@@ -871,6 +1081,49 @@ def push(dest: Destination, cwd: Path, args: Iterable[str]) -> GitResult:
         env_extra=_GH_HOST_ENV,
         operation='push',
     )
+
+
+def read_release(dest: Destination, tag: str) -> GitHubRelease | None:
+    """Find an exact release tag after successfully exhausting the listing.
+
+    Args:
+        dest: Previously verified GitHub destination.
+        tag: Exact tag to find, without latest-release fallback.
+
+    Returns:
+        The matching page, or `None` after a complete successful lookup.
+
+    Raises:
+        PubanonError: A host request fails or a response is invalid.
+    """
+    page = 1
+    while True:
+        entries = _read_release_page(dest, page=page, per_page=_RELEASE_PAGE_SIZE)
+        if len(entries) > _RELEASE_PAGE_SIZE:
+            raise PubanonError('invalid release response')
+        for release in entries:
+            if release.tag == tag:
+                return release
+        if len(entries) < _RELEASE_PAGE_SIZE:
+            return None
+        page += 1
+
+
+def read_remote_refs(dest: Destination, *, timeout: float | None = None) -> RemoteRefs:
+    """Read destination references without creating an advisory store.
+
+    Args:
+        dest: Verified destination carrying the derived transport URL.
+        timeout: Optional maximum transport-read duration in seconds.
+
+    Returns:
+        The optional main tip, direct tags, and sorted non-main branches.
+
+    Raises:
+        PubanonError: Transport or reference parsing fails.
+        ObservationTimeoutError: The supplied transport timeout expires.
+    """
+    return _remote_refs(_ls_remote_output(dest, timeout=timeout))
 
 
 def remote_refs_text(refs: RemoteRefs) -> str:
@@ -935,20 +1188,29 @@ def repository_facts(
     )
 
 
-def repository_settings(owner: str, repo: str) -> SettingsFacts:
+def repository_settings(
+    owner: str,
+    repo: str,
+    *,
+    timeout: float | None = None,
+) -> SettingsFacts:
     """Read supported GitHub repository settings.
 
     Args:
         owner: GitHub repository owner.
         repo: GitHub repository name.
+        timeout: Optional maximum host-read duration in seconds.
 
     Returns:
         The strict repository settings facts.
 
     Raises:
         PubanonError: The GitHub response is invalid or cannot be read.
+        ObservationTimeoutError: The supplied host-read timeout expires.
     """
-    output = _gh(['api', f'repos/{owner}/{repo}', '--jq', _REPOSITORY_SETTINGS_QUERY])
+    output = _gh(
+        ['api', f'repos/{owner}/{repo}', '--jq', _REPOSITORY_SETTINGS_QUERY], timeout=timeout
+    )
     try:
         parsed = json.loads(output, object_pairs_hook=_unique_object)
     except (UnicodeDecodeError, ValueError) as exc:
@@ -956,7 +1218,15 @@ def repository_settings(owner: str, repo: str) -> SettingsFacts:
     if not isinstance(parsed, dict):
         raise PubanonError('invalid repository settings response')
     raw_payload = cast('dict[object, object]', parsed)
-    expected = {'description', 'default_branch', 'issues', 'wiki', 'projects'}
+    expected = {
+        'description',
+        'default_branch',
+        'issues',
+        'wiki',
+        'projects',
+        'pull_requests',
+        'discussions',
+    }
     if set(raw_payload) != expected:
         raise PubanonError('invalid repository settings response')
     payload = cast('dict[str, object]', raw_payload)
@@ -965,6 +1235,8 @@ def repository_settings(owner: str, repo: str) -> SettingsFacts:
     issues = payload['issues']
     wiki = payload['wiki']
     projects = payload['projects']
+    pull_requests = payload['pull_requests']
+    discussions = payload['discussions']
     if description is not None and not isinstance(description, str):
         raise PubanonError('invalid repository settings response')
     if not isinstance(default_branch, str):
@@ -973,9 +1245,23 @@ def repository_settings(owner: str, repo: str) -> SettingsFacts:
         not isinstance(issues, bool)
         or not isinstance(wiki, bool)
         or not isinstance(projects, bool)
+        or not isinstance(pull_requests, bool)
+        or not isinstance(discussions, bool)
     ):
         raise PubanonError('invalid repository settings response')
-    return SettingsFacts(description or '', default_branch, issues, wiki, projects)
+    return SettingsFacts(
+        description or '', default_branch, issues, wiki, projects, pull_requests, discussions
+    )
+
+
+def repository_url(owner: str, repo: str) -> str:
+    """Format the Git transport URL for validated repository coordinates.
+
+    Args:
+        owner: Repository owner already validated by the caller.
+        repo: Main or staging repository name already validated by the caller.
+    """
+    return _URL_TEMPLATE.format(owner=owner, repo=repo)
 
 
 def repository_visible(owner: str, repo: str) -> bool:
@@ -1075,6 +1361,38 @@ def _verify_destination(
     return expected
 
 
+def set_default_branch(
+    owner: str,
+    repo: str,
+    branch: str,
+    *,
+    timeout: float | None = None,
+) -> None:
+    """Request one GitHub repository default-branch update.
+
+    Args:
+        owner: GitHub repository owner.
+        repo: GitHub repository name.
+        branch: Requested default branch.
+        timeout: Optional maximum request duration in seconds.
+
+    Raises:
+        PubanonError: The GitHub request fails.
+        ObservationTimeoutError: The supplied request timeout expires.
+    """
+    _gh(
+        [
+            'api',
+            '-X',
+            'PATCH',
+            f'repos/{owner}/{repo}',
+            '-f',
+            f'default_branch={branch}',
+        ],
+        timeout=timeout,
+    )
+
+
 def set_visibility(owner: str, repo: str, visibility: str) -> None:
     """Set one repository's visibility.
 
@@ -1096,50 +1414,6 @@ def set_visibility(owner: str, repo: str, visibility: str) -> None:
             f'visibility={visibility}',
         ]
     )
-
-
-def stage_refs(
-    dest: Destination,
-    paths: Paths,
-    project: str,
-    *,
-    timeout: float | None = None,
-) -> tuple[str | None, tuple[str, ...]]:
-    """Read the staging repository's exact reference universe.
-
-    Initializes the project's local advisory store if it is absent.
-
-    Args:
-        dest: Staging destination carrying the derived transport URL.
-        paths: Derived Pubanon configuration and data paths.
-        project: Registered project name.
-        timeout: Optional maximum transport-read duration in seconds.
-
-    Returns:
-        The stage tip, or `None` when absent, and every unexpected head or tag
-        name.
-
-    Raises:
-        PubanonError: Local store initialization, transport, or reference
-            parsing fails.
-        ObservationTimeoutError: The supplied transport timeout expires.
-    """
-    args = [
-        *_CREDENTIAL_CONFIG,
-        'ls-remote',
-        dest.url,
-        'refs/heads/*',
-        'refs/tags/*',
-    ]
-    store = store_path(paths, project)
-    result = run_credential_child(
-        ['--git-dir', str(store.absolute()), *args],
-        cwd=store,
-        env_extra=_GH_HOST_ENV,
-        operation='ls-remote',
-        timeout=timeout,
-    )
-    return _stage_refs(result.stdout)
 
 
 def verify_destination(
@@ -1178,7 +1452,7 @@ def verify_destination(
         adapter=p.host,
         owner=p.owner,
         repo=p.repo,
-        url=URL_TEMPLATE.format(owner=p.owner, repo=p.repo),
+        url=repository_url(p.owner, p.repo),
         account=expected_account,
         visibility=p.visibility,
     )

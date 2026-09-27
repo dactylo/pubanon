@@ -45,7 +45,15 @@ def replacement_context(
     subprocess.run(['git', '-C', source, 'commit', '-qm', 'Descendant'], check=True, env=git_env())
     assert (
         _cli.main(
-            ['prepare', '--project', project.name, '--version', '1.0.1', '--acknowledge-new-paths']
+            [
+                'prepare',
+                '--project',
+                project.name,
+                '--version',
+                '1.0.1',
+                '--acknowledge-new-paths',
+                '--yes',
+            ]
         )
         == 0
     )
@@ -106,8 +114,10 @@ def test_prepare_excludes_denied_credential_path_with_metacharacters(
     _config.save_project(paths, replace(project, allow=('keys/**',)))
     monkeypatch.chdir(source)
 
+    decisions = iter(['e', 'c'])
+
     def _deny(_prompt: str) -> str:
-        return 'e'
+        return next(decisions)
 
     monkeypatch.setattr('builtins.input', _deny)
 
@@ -161,10 +171,12 @@ def test_prepare_gates_current_publication_coordinates_before_candidate_build(
     project = replace(project, repo=f'public-{term}', extra_terms=(term,))
     _config.save_project(paths, project)
 
-    assert _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths']) == 1
+    assert (
+        _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths', '--yes']) == 1
+    )
 
     rendered = capsys.readouterr().err
-    assert 'repository repo failed content gates' in rendered
+    assert 'repository name did not pass content checks' in rendered
     assert term in rendered
     assert _candidate.load_candidate(paths, project.name) is None
     assert not (tmp_path / 'fake-gh-calls.jsonl').exists()
@@ -185,10 +197,12 @@ def test_prepare_gates_default_staging_coordinates_before_candidate_build(
     )
     _config.save_project(paths, project)
 
-    assert _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths']) == 1
+    assert (
+        _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths', '--yes']) == 1
+    )
 
     rendered = capsys.readouterr().err
-    assert 'repository repo failed content gates' in rendered
+    assert 'repository name did not pass content checks' in rendered
     assert term in rendered
     assert _candidate.load_candidate(paths, project.name) is None
     assert not (tmp_path / 'fake-gh-calls.jsonl').exists()
@@ -209,10 +223,12 @@ def test_prepare_gates_explicit_staging_coordinates_before_candidate_build(
     )
     _config.save_project(paths, project)
 
-    assert _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths']) == 1
+    assert (
+        _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths', '--yes']) == 1
+    )
 
     rendered = capsys.readouterr().err
-    assert 'repository repo failed content gates' in rendered
+    assert 'repository name did not pass content checks' in rendered
     assert term in rendered
     assert _candidate.load_candidate(paths, project.name) is None
     assert not (tmp_path / 'fake-gh-calls.jsonl').exists()
@@ -265,7 +281,7 @@ socket.socket = OfflineSocket
 
 from pubanon._cli import main
 
-raise SystemExit(main(['prepare', '--acknowledge-new-paths']))
+raise SystemExit(main(['prepare', '--acknowledge-new-paths', '--yes']))
 """
 
     completed = subprocess.run(
@@ -281,6 +297,38 @@ raise SystemExit(main(['prepare', '--acknowledge-new-paths']))
     assert not (tmp_path / 'fake-gh-calls.jsonl').exists()
 
 
+def test_prepare_keeps_long_source_excerpts_readable_and_escapes_controls(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    terms = ('private-alpha', 'private-beta')
+    source = make_repo(
+        files={
+            'README.md': 'prefix ' * 100 + 'private-alpha\x1b[2J private-beta' + ' suffix' * 100,
+        }
+    )
+    paths, config, project = configure(tmp_path, monkeypatch, source)
+    assert project is not None
+    _config.save_global(
+        paths, replace(config, sensitive_terms=terms), paths.global_config.read_bytes()
+    )
+    assert (
+        _cli.main(['prepare', '--project', project.name, '--yes', '--acknowledge-new-paths']) == 1
+    )
+    error = capsys.readouterr().err
+    assert error.count('    README.md:1\n') == 1
+    excerpt = next(
+        line for line in error.splitlines() if 'private-alpha\\x1b[2J private-beta' in line
+    )
+    assert excerpt.strip().startswith('...')
+    assert excerpt.endswith('...')
+    assert len(excerpt) < 200
+    assert '\x1b' not in error
+
+
+@pytest.mark.slow
 def test_prepare_latest_refuses_bad_untouched_ancestor_before_reporting_ready(
     tmp_path: Path,
     make_repo: Callable[..., Path],
@@ -367,14 +415,17 @@ def test_prepare_refuses_intact_utf8_term_in_mixed_blob(
     _config.save_project(paths, replace(project, extra_terms=(term,)))
 
     answers([])
-    assert _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths']) == 1
+    assert (
+        _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths', '--yes']) == 1
+    )
 
     rendered = capsys.readouterr().err
-    assert 'snapshot failed content gates' in rendered
+    assert 'cannot prepare: blocked text in included files' in rendered
     assert term in rendered
     assert _candidate.load_candidate(paths, project.name) is None
 
 
+@pytest.mark.slow
 def test_prepare_refuses_reusing_inferred_package_version(
     tmp_path: Path,
     make_repo: Callable[..., Path],
@@ -409,12 +460,15 @@ def test_prepare_refuses_sensitive_term_in_path(
     assert project is not None
 
     answers([])
-    assert _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths']) == 1
+    assert (
+        _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths', '--yes']) == 1
+    )
 
-    assert 'snapshot failed content gates' in capsys.readouterr().err
+    assert 'cannot prepare: blocked text in included files' in capsys.readouterr().err
     assert _candidate.load_candidate(paths, project.name) is None
 
 
+@pytest.mark.slow
 def test_prepare_replacement_refuses_inferred_version_outside_moved_tags(
     tmp_path: Path,
     make_repo: Callable[..., Path],
@@ -442,6 +496,7 @@ def test_prepare_replacement_refuses_inferred_version_outside_moved_tags(
     assert _candidate.load_candidate(paths, project.name) is None
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize('selector', ['v1.0.0', 'all'])
 def test_prepare_replacement_replays_or_replaces_all_from_current_source(
     selector: str,
@@ -493,7 +548,7 @@ def test_prepare_replacement_replays_or_replaces_all_from_current_source(
         assert record.poststate_tags == {'v1.0.0': record.commit, 'v1.0.1': record.tip}
     captured = capsys.readouterr()
     assert 'Prepared snapshot' in captured.out
-    assert 'Operation: replacement' in captured.out
+    assert 'Operation:' not in captured.out
     assert effect in captured.out
     assert 'Tags to move:' not in captured.out
     assert captured.out.count('Next:') == 1
@@ -502,6 +557,7 @@ def test_prepare_replacement_replays_or_replaces_all_from_current_source(
     assert 'no rewrite is in progress' in capsys.readouterr().err
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize('selector', [(), ('latest',)])
 def test_prepare_replace_latest_preserves_earlier_publications(
     selector: tuple[str, ...],
@@ -530,6 +586,7 @@ def test_prepare_replace_latest_preserves_earlier_publications(
     assert not (tmp_path / 'fake-gh-calls.jsonl').exists()
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     'case',
     [
@@ -578,7 +635,7 @@ def test_prepare_replacement_uses_selected_publication_tags(
         assert record.poststate_tags is not None
         assert all(record.poststate_tags[tag] == record.commit for tag in tags)
         assert 'Prepared snapshot' in captured.out
-        assert 'Operation: replacement' in captured.out
+        assert 'Operation:' not in captured.out
         assert captured.out.count('Next:') == 1
         assert captured.out.rstrip().endswith('Next: pubanon inspect --project=demo')
 
@@ -598,12 +655,15 @@ def test_prepare_reports_gate_term_and_escaped_finding_unit(
     _config.save_project(paths, replace(project, hygiene_terms=(term,)))
 
     answers([])
-    assert _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths']) == 1
+    assert (
+        _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths', '--yes']) == 1
+    )
 
     rendered = capsys.readouterr().err
-    assert f'unit docs/{term}{escape(separator)}.txt' in rendered
-    assert 'project hygiene_terms entry 1' in rendered
-    assert 'filename bytes 5:19' in rendered
+    assert f'    docs/{term}{escape(separator)}.txt (filename)\n' in rendered
+    assert f'      Blocked text: {term}\n' in rendered
+    assert 'bytes' not in rendered
+    assert 'hygiene_terms' not in rendered
     assert separator not in rendered
     assert term in rendered
     assert _candidate.load_candidate(paths, project.name) is None
@@ -631,11 +691,9 @@ def test_prepare_reports_omitted_working_changes(
         'staged.txt': b'before\n',
     }
     output = capsys.readouterr().out
-    assert 'Selected source: HEAD' in output
-    assert f'Selected source commit: {record.pinned.commit}' in output
-    assert f'Selected source ref: {record.pinned.selector_name}' in output
-    assert 'Omitted working changes: staged 1, unstaged 1, untracked 1.' in output
-    assert 'git status' in output
+    assert f'at {record.pinned.commit[:12]}' in output
+    assert 'left out: 1 staged change, 1 unstaged change, 1 untracked change)' in output
+    assert 'Selected source ref:' not in output
     assert 'untracked.txt' not in output
 
 
@@ -646,14 +704,65 @@ def test_prepare_reports_operator_outcome_before_candidate_details(
     paths, _global_config, project = configured_project
     assert project is not None
 
-    assert _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths']) == 0
+    assert (
+        _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths', '--yes']) == 0
+    )
 
     record = _candidate.load_candidate(paths, project.name)
     assert record is not None
-    assert capsys.readouterr().out.endswith(
-        'Prepared snapshot\nVersion: untagged\nOperation: new\n'
-        'Next: pubanon inspect --project=demo\n'
+    output = capsys.readouterr().out
+    assert 'Prepared snapshot' in output
+    assert 'Prepared snapshot untagged with 1 file.' in output
+    assert 'Operation:' not in output
+    assert 'Next: pubanon inspect --project=demo' in output
+
+
+def test_prepare_review_excludes_included_file_only_after_acceptance(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = make_repo(files={'README.md': 'public\n', 'docs/draft.md': 'Private Person\n'})
+    paths, _global_config, project = configure(tmp_path, monkeypatch, source)
+    assert project is not None
+    prompts = iter(
+        [
+            ('Use this selection?', 'r'),
+            ('Include these files?', 'i'),
+            ('Include these files?', 'e'),
+            ('Use this selection?', 'c'),
+        ]
     )
+    previews: list[str] = []
+
+    def _answer(prompt: str) -> str:
+        expected, reply = next(prompts)
+        assert prompt.startswith(expected)
+        assert _config.load_project(paths, project.name) == project
+        assert _candidate.load_candidate(paths, project.name) is None
+        if prompt.startswith('Use this selection?'):
+            previews.append(capsys.readouterr().out)
+        return reply
+
+    monkeypatch.setattr('builtins.input', _answer)
+    assert _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths']) == 0
+    assert len(previews) == 2
+    first_included = previews[0].split('Files to publish', 1)[1].split('Excluded files', 1)[0]
+    second_included = previews[1].split('Files to publish', 1)[1].split('Excluded files', 1)[0]
+    second_excluded = previews[1].split('Excluded files', 1)[1]
+    assert 'README.md' in first_included
+    assert 'docs/draft.md' in first_included
+    assert 'README.md' in second_included
+    assert 'docs/draft.md' not in second_included
+    assert 'docs/draft.md' in second_excluded
+    saved = _config.load_project(paths, project.name)
+    assert saved.allow == ('README.md',)
+    assert saved.deny == ('docs/draft.md',)
+    record = _candidate.load_candidate(paths, project.name)
+    assert record is not None
+    snapshot = _source.read_snapshot(_candidate.store_path(paths, project.name), record.commit)
+    assert [entry.path for entry in snapshot] == ['README.md']
 
 
 def test_prepare_rewrite_continue_without_progress_refuses(
@@ -665,6 +774,7 @@ def test_prepare_rewrite_continue_without_progress_refuses(
     assert 'no rewrite is in progress' in capsys.readouterr().err
 
 
+@pytest.mark.slow
 def test_prepare_rewrite_invalidated_continuation_preserves_reprepare_inputs(
     tmp_path: Path,
     make_repo: Callable[..., Path],
@@ -680,11 +790,12 @@ def test_prepare_rewrite_invalidated_continuation_preserves_reprepare_inputs(
     capsys.readouterr()
     assert _cli.main(['prepare', '--project', project.name, '--continue']) == 1
     error = capsys.readouterr().err
-    assert 'publication configuration changed after prepare' in error
+    assert 'the configuration changed after the snapshot was prepared' in error
     assert f'pubanon prepare --project=demo --replace {original.commit}' in error
     assert f'--source {record.pinned.commit} --version 1.0.0' in error
 
 
+@pytest.mark.slow
 def test_prepare_rewrite_pause_and_continue_uses_saved_source(
     tmp_path: Path,
     make_repo: Callable[..., Path],
@@ -734,6 +845,51 @@ def test_prepare_rewrite_pause_and_continue_uses_saved_source(
     } == {'README.md': b'resolved\n'}
 
 
+def test_prepare_shows_included_files_and_committed_source_lines(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = make_repo(
+        files={
+            'Makefile': 'first\nEXCLUDES := private-alpha private-beta\n',
+            'README.md': 'private-beta\n',
+            'notes/ignored.txt': 'private-alpha\n',
+        }
+    )
+    paths, config, project = configure(tmp_path, monkeypatch, source)
+    assert project is not None
+    _config.save_global(
+        paths,
+        replace(
+            config,
+            sensitive_terms=('private-alpha', 'private-beta'),
+            ignored_directories=('notes',),
+        ),
+        paths.global_config.read_bytes(),
+    )
+    (source / 'Makefile').write_text('uncommitted correction\n')
+    assert (
+        _cli.main(['prepare', '--project', project.name, '--yes', '--acknowledge-new-paths']) == 1
+    )
+    error = capsys.readouterr().err
+    assert 'cannot prepare: blocked text in included files' in error
+    assert '2 files selected for publication need changes' in error
+    assert error.count('    Makefile:2\n') == 1
+    assert error.count('    README.md:1\n') == 1
+    assert '      EXCLUDES := private-alpha private-beta\n' in error
+    assert '      Blocked text: private-alpha, private-beta\n' in error
+    assert '      private-beta\n' in error
+    assert 'notes/ignored.txt' not in error
+    assert 'uncommitted correction' not in error
+    for bookkeeping in ('blob', 'bytes', 'sensitive_terms', 'entry 1', 'content unit'):
+        assert bookkeeping not in error
+    assert 'commit' in error
+    assert 'pubanon prepare' in error
+    assert _candidate.load_candidate(paths, project.name) is None
+
+
 def test_prepare_source_older_revision_uses_selected_bytes(
     tmp_path: Path,
     make_repo: Callable[..., Path],
@@ -767,7 +923,15 @@ def test_prepare_source_older_revision_uses_selected_bytes(
 
     assert (
         _cli.main(
-            ['prepare', '--project', project.name, '--source', 'HEAD~1', '--acknowledge-new-paths']
+            [
+                'prepare',
+                '--project',
+                project.name,
+                '--source',
+                'HEAD~1',
+                '--acknowledge-new-paths',
+                '--yes',
+            ]
         )
         == 0
     )
@@ -779,7 +943,7 @@ def test_prepare_source_older_revision_uses_selected_bytes(
     )
     assert snapshot[0].data == b'older\n'
     assert record.tag_intent == 'v0.0.1'
-    assert 'Selected revision differs from current HEAD' in capsys.readouterr().out
+    assert 'Source: HEAD~1 at ' in capsys.readouterr().out
 
 
 @pytest.mark.parametrize('requested', [None, '0.0.1', '0.0.2'])
@@ -812,7 +976,7 @@ def test_prepare_uses_committed_package_version_and_rejects_mismatch(
         assert record is not None
         assert record.tag_intent == 'v0.0.1'
         assert record.message == 'release: v0.0.1'
-        assert 'Version: v0.0.1' in captured.out
+        assert 'Prepared snapshot v0.0.1' in captured.out
 
 
 def test_prepare_validates_version_before_prompts(
@@ -865,6 +1029,7 @@ def test_prepare_yes_allows_first_release_new_paths_without_stdin(
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
@@ -878,6 +1043,21 @@ def test_prepare_yes_allows_first_release_new_paths_without_stdin(
     options = PrepareOptions('HEAD', None, None, acknowledge_new_paths=False, yes=True)
     record = prepare_locked(ctx, options)
     assert record.commit
+    output = capsys.readouterr().out
+    assert 'Files not in the last release' not in output
+    assert 'Saved list:' not in output
+    assert (paths.data_dir / 'projects' / project.name / 'new-paths.json').exists()
+    store = _candidate.candidate_store_path(paths, project.name)
+    run_git(['update-ref', 'refs/heads/main', record.commit], cwd=store)
+    _candidate.discard(paths, project.name, force=False)
+    (source / 'new.txt').write_text('new file\n')
+    subprocess.run(['git', '-C', source, 'add', 'new.txt'], check=True, env=git_env())
+    subprocess.run(['git', '-C', source, 'commit', '-qm', 'Add file'], check=True, env=git_env())
+    prepare_locked(ctx, replace(options, acknowledge_new_paths=True))
+    later = capsys.readouterr().out
+    assert 'Files not in the last release' in later
+    assert '  new.txt' in later
+    assert 'Saved list:' not in later
 
 
 @pytest.mark.parametrize('directory', ['publications', 'source-worktrees'])
@@ -890,8 +1070,103 @@ def test_publication_state_is_refused_before_prepare(
     selected = f'data/pubanon/projects/demo/{directory}/private.txt'
     source = make_repo(files={selected: 'private state', 'publications/ordinary.txt': 'ordinary'})
     paths, _global, _project = configure(source, monkeypatch, source)
-    assert _cli.main(['prepare', '--project', 'demo', '--acknowledge-new-paths']) == 1
+    assert _cli.main(['prepare', '--project', 'demo', '--acknowledge-new-paths', '--yes']) == 1
     error = capsys.readouterr().err
     assert 'publication state' in error
     assert escape(str(source / selected)) in error
     assert _candidate.load_candidate(paths, 'demo') is None
+
+
+@pytest.mark.parametrize('reference', ['', 'PRIVATE-MARKER', 'docs/private', 'notes/confidential'])
+def test_prepare_ignores_private_directories_but_blocks_references_in_makefile(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    reference: str,
+) -> None:
+    source = make_repo(
+        files={
+            'Makefile': f"EXCLUDES := --exclude '{reference}/**'\n" if reference else 'all:\n',
+            'docs/private/notes.md': 'Private Person',
+            'notes/confidential/design.md': 'Private Person',
+        }
+    )
+    paths, global_config, project = configure(tmp_path, monkeypatch, source)
+    assert project is not None
+    _config.save_global(
+        paths,
+        replace(
+            global_config,
+            sensitive_terms=(
+                *global_config.sensitive_terms,
+                'private-marker',
+                'docs/private',
+                'notes/confidential',
+            ),
+            ignored_directories=(
+                'DOCS/Private',
+                'Notes/CONFIDENTIAL',
+            ),
+        ),
+        paths.global_config.read_bytes(),
+    )
+    result = _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths', '--yes'])
+    record = _candidate.load_candidate(paths, project.name)
+    if reference:
+        assert result == 1
+        error = capsys.readouterr().err
+        assert 'cannot prepare: blocked text in included files' in error
+        assert 'Makefile' in error
+        assert record is None
+    else:
+        assert result == 0
+        assert record is not None
+        store = _candidate.candidate_store_path(paths, project.name)
+        snapshot = _source.read_snapshot(store, record.commit, git_dir=store)
+        assert [entry.path for entry in snapshot] == ['Makefile']
+
+
+@pytest.mark.parametrize('reference', ['', 'LOCAL.md'])
+def test_prepare_ignores_files_but_blocks_references_in_makefile(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    reference: str,
+) -> None:
+    source = make_repo(
+        files={
+            'Makefile': f"EXCLUDES := --exclude '{reference}/**'\n" if reference else 'all:\n',
+            'LOCAL.md': 'Private Person',
+            'nested/LOCAL.md': 'Private Person',
+        }
+    )
+    paths, global_config, project = configure(tmp_path, monkeypatch, source)
+    assert project is not None
+    _config.save_global(
+        paths,
+        replace(
+            global_config,
+            sensitive_terms=(
+                *global_config.sensitive_terms,
+                'LOCAL.md',
+            ),
+            ignored_files=('local.MD',),
+        ),
+        paths.global_config.read_bytes(),
+    )
+    result = _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths', '--yes'])
+    record = _candidate.load_candidate(paths, project.name)
+    if reference:
+        assert result == 1
+        error = capsys.readouterr().err
+        assert 'cannot prepare: blocked text in included files' in error
+        assert 'Makefile' in error
+        assert record is None
+    else:
+        assert result == 0
+        assert record is not None
+        store = _candidate.candidate_store_path(paths, project.name)
+        snapshot = _source.read_snapshot(store, record.commit, git_dir=store)
+        assert [entry.path for entry in snapshot] == ['Makefile']

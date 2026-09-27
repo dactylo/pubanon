@@ -55,11 +55,27 @@ class HistoryEvidence(NamedTuple):
         commit: Full witness commit ID, or None for a tag without a commit
             target.
         location: Byte unit and zero-based, end-exclusive matching offsets.
+        label: Human-readable location, with byte offsets for binary content.
+        excerpt: Bounded source context, or None for binary content.
+        excerpt_span: Character offsets of the matched source in `excerpt`, or
+            None when the byte match cannot be highlighted as text.
+        description: Combined location and context for compact diagnostics.
+            Callers escape all evidence for terminal output.
     """
 
     finding: AuditFinding
     commit: str | None
     location: str
+    label: str
+    excerpt: str | None = None
+    excerpt_span: tuple[int, int] | None = None
+
+    @property
+    def description(self) -> str:
+        """Combine the witness location and optional source text."""
+        if self.excerpt is None:
+            return self.label
+        return f'{self.label}; text {self.excerpt}'
 
 
 class HistoryAudit(NamedTuple):
@@ -106,6 +122,77 @@ class _ParsedCommit(NamedTuple):
     problems: tuple[str, ...]
 
 
+def _excerpt_span(data: bytes, start: int, end: int) -> tuple[int, int] | None:
+    """Map exact matched bytes to display characters without splitting UTF-8."""
+    if end > len(data):
+        return None
+    try:
+        matched = data[start:end].decode('utf-8')
+    except UnicodeDecodeError:
+        return None
+    prefix = len(data[:start].decode('utf-8', errors='replace'))
+    return prefix, prefix + len(matched)
+
+
+def _logical_commit_fields(
+    oid: str,
+    headers: bytes,
+) -> tuple[tuple[tuple[bytes, bytes], ...], tuple[str, ...]]:
+    """Join LF-delimited continuation records to their owning fields."""
+    logical_fields: list[tuple[bytes, bytes]] = []
+    problems: list[str] = []
+    current_field: int | None = None
+    for record in headers.split(b'\n'):
+        if record.startswith(b' '):
+            if current_field is None:
+                problems.append(f'{oid[:12]}: orphan commit header continuation')
+            else:
+                name, value = logical_fields[current_field]
+                logical_fields[current_field] = (name, value + b'\n' + record)
+            continue
+        current_field = None
+        name, separator, value = record.partition(b' ')
+        if not separator or _HEADER_FIELD_PATTERN.fullmatch(name) is None:
+            problems.append(f'{oid[:12]}: malformed commit header')
+            continue
+        logical_fields.append((name, value))
+        current_field = len(logical_fields) - 1
+    return tuple(logical_fields), tuple(problems)
+
+
+def _match_context(
+    unit: str, label: str, data: bytes, start: int, end: int
+) -> tuple[str, str | None, tuple[int, int] | None]:
+    """Locate a text witness and excerpt, retaining byte locations for binary data."""
+    if b'\x00' in data:
+        return f'{label} bytes {start}:{end}', None, None
+    try:
+        data.decode('utf-8')
+    except UnicodeDecodeError:
+        return f'{label} bytes {start}:{end}', None, None
+    line_start = data.rfind(b'\n', 0, start) + 1
+    line_end = data.find(b'\n', end)
+    if line_end < 0:
+        line_end = len(data)
+    left = max(line_start, start - 60)
+    right = min(line_end, end + 60)
+    raw_excerpt = data[left:right].rstrip(b'\r')
+    excerpt = raw_excerpt.decode('utf-8', errors='replace')
+    span = _excerpt_span(raw_excerpt, start - left, end - left)
+    if left > line_start:
+        excerpt = '...' + excerpt
+        if span is not None:
+            span = span[0] + 3, span[1] + 3
+    if right < line_end:
+        excerpt += '...'
+    line = data[:start].count(b'\n') + 1
+    if label == 'blob':
+        label = f'{unit.removeprefix("path:")}:{line}'
+    elif label == 'message':
+        label = f'commit message line {line}'
+    return label, excerpt, span
+
+
 def _add_findings(
     findings: dict[AuditFinding, HistoryEvidence],
     unit: str,
@@ -122,7 +209,13 @@ def _add_findings(
             raise PubanonError('gate match location could not be determined')
         start, end = span
         findings.setdefault(
-            finding, HistoryEvidence(finding, commit, f'{location} bytes {start}:{end}')
+            finding,
+            HistoryEvidence(
+                finding,
+                commit,
+                f'{location} bytes {start}:{end}',
+                *_match_context(unit, location, data, start, end),
+            ),
         )
 
 
@@ -166,32 +259,6 @@ def _apply_change(
     occurrence_findings = _entry_findings(change.path, data, rules)
     active_findings[change.raw_path] = occurrence_findings
     return occurrence_findings
-
-
-def _logical_commit_fields(
-    oid: str,
-    headers: bytes,
-) -> tuple[tuple[tuple[bytes, bytes], ...], tuple[str, ...]]:
-    """Join LF-delimited continuation records to their owning fields."""
-    logical_fields: list[tuple[bytes, bytes]] = []
-    problems: list[str] = []
-    current_field: int | None = None
-    for record in headers.split(b'\n'):
-        if record.startswith(b' '):
-            if current_field is None:
-                problems.append(f'{oid[:12]}: orphan commit header continuation')
-            else:
-                name, value = logical_fields[current_field]
-                logical_fields[current_field] = (name, value + b'\n' + record)
-            continue
-        current_field = None
-        name, separator, value = record.partition(b' ')
-        if not separator or _HEADER_FIELD_PATTERN.fullmatch(name) is None:
-            problems.append(f'{oid[:12]}: malformed commit header')
-            continue
-        logical_fields.append((name, value))
-        current_field = len(logical_fields) - 1
-    return tuple(logical_fields), tuple(problems)
 
 
 def _object_oid(raw_oid: bytes, *, absent: bool, oid_length: int) -> bytes | None:
@@ -561,10 +628,12 @@ def _walk_history(
 ) -> tuple[dict[AuditFinding, HistoryEvidence], dict[AuditFinding, HistoryEvidence]]:
     """Apply changes once and project active findings at focused commits."""
     current: dict[bytes, _HistoryEntry] = {}
+    symlinks: dict[bytes, Entry] = {}
     active_findings: dict[bytes, dict[AuditFinding, HistoryEvidence]] = {}
     full_findings: dict[AuditFinding, HistoryEvidence] = {}
     focused_findings: dict[AuditFinding, HistoryEvidence] = {}
     for raw_commit, changes in parsed_diff:
+        symlinks_changed = False
         for change in changes:
             occurrence_findings = _apply_change(
                 current,
@@ -573,16 +642,20 @@ def _walk_history(
                 objects,
                 rules,
             )
+            # Old modes have been checked against current state, including deletions.
+            if change.new_mode == _SYMLINK_MODE:
+                entry = current[change.raw_path]
+                symlinks[change.raw_path] = Entry(change.path, entry.mode, entry.kind, entry.data)
+                symlinks_changed = True
+            else:
+                symlinks_changed |= symlinks.pop(change.raw_path, None) is not None
             if occurrence_findings is not None:
                 for finding, evidence in occurrence_findings.items():
                     full_findings.setdefault(
                         finding, evidence._replace(commit=raw_commit.decode('ascii'))
                     )
-        snapshot = tuple(
-            Entry(raw_path.decode('utf-8'), entry.mode, entry.kind, entry.data)
-            for raw_path, entry in sorted(current.items())
-        )
-        validate_symlink_graph(snapshot)
+        if symlinks_changed:
+            validate_symlink_graph(tuple(symlinks[path] for path in sorted(symlinks)))
         if raw_commit.decode('ascii') in focused:
             for occurrence_findings in active_findings.values():
                 for finding, evidence in occurrence_findings.items():
@@ -624,9 +697,21 @@ def exposure_digest(findings: Iterable[AuditFinding]) -> str:
 
 
 def history_details(
-    audit: HistoryAudit, g: GlobalConfig, p: ProjectConfig, derived: Collection[str]
+    audit: HistoryAudit,
+    g: GlobalConfig,
+    p: ProjectConfig,
+    derived: Collection[str],
+    *,
+    short_commits: bool = False,
 ) -> dict[str, str]:
     """Collect literal history evidence for operator review.
+
+    Args:
+        audit: Findings and evidence to describe.
+        g: Global configuration supplying sensitive terms.
+        p: Project configuration supplying additional terms.
+        derived: Private path terms derived for this project.
+        short_commits: Display 12-character commit IDs instead of full IDs.
 
     Returns:
         One labeled detail per finding in established order. Values contain
@@ -636,9 +721,10 @@ def history_details(
     details: dict[str, str] = {}
     for index, finding in enumerate(audit.findings, 1):
         item = evidence[finding]
-        location = item.location
+        location = item.description
         if item.commit is not None:
-            location = f'commit {item.commit}; {location}'
+            commit = item.commit[:12] if short_commits else item.commit
+            location = f'commit {commit}; {location}'
         label = (
             'historical exposure'
             if finding.rule_class is RuleClass.IDENTITY_CRITICAL

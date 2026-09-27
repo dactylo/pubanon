@@ -22,9 +22,25 @@ from pubanon._remote._host import (
     verify_destination,
 )
 from pubanon._remote._package import PackageRelease, release_state
-from pubanon._remote._stage import load_stage, verify_staged_target
-from pubanon._snapshots._candidate import published_refs, tag_intent_for, version_from_tag
-from pubanon._terminal import escape, field, heading, next_step, output
+from pubanon._remote._stage import candidate_next_action, load_stage, verify_staged_target
+from pubanon._snapshots._candidate import (
+    load_candidate,
+    published_refs,
+    tag_intent_for,
+    version_from_tag,
+)
+from pubanon._terminal import (
+    detail,
+    detail_fields,
+    display_check_result,
+    display_duration,
+    escape,
+    field,
+    fields,
+    heading,
+    next_step,
+    output,
+)
 
 DEFAULT_TIMEOUT = 1800
 _POLL_SECONDS = 15
@@ -36,17 +52,14 @@ _sleep = time.sleep
 def _check_facts(verdicts: Sequence[CheckVerdict]) -> str:
     """Render exact check states for a refusal fact."""
     return ', '.join(
-        f'{escape(verdict.name)}: {escape(verdict.state)} ({escape(verdict.detail)})'
-        for verdict in verdicts
+        f'{escape(verdict.name)}: {display_check_result(verdict)}' for verdict in verdicts
     )
 
 
 def _check_status(verdict: CheckVerdict) -> str:
     """Render one check state for human observation."""
-    detail = verdict.detail or 'waiting for a matching check'
     kind = 'success' if verdict.state == 'success' else 'warning'
-    status = f'{escape(verdict.state)} ({escape(detail)})'
-    return '  ' + field(escape(verdict.name), status, kind=kind)
+    return field(escape(verdict.name), display_check_result(verdict), kind=kind)
 
 
 def _pause_or_expire(deadline: float, error: PubanonError) -> None:
@@ -65,24 +78,27 @@ def _published_next_action(
     """Choose the next configured step after a published observation."""
     if not package_complete and p.package is not None:
         selected = f' --version {escape(version)}' if version is not None else ''
-        return f'pubanon watch package{selected}'
+        return f'pubanon package watch{selected}'
     if p.visibility == 'private':
         return 'pubanon repo reveal'
     return ''
 
 
-def _report_ci(
-    verdicts: Sequence[CheckVerdict],
-    commit: str,
-    next_action: str,
+def _report_check_changes(
+    current: tuple[CheckVerdict, ...], previous: tuple[CheckVerdict, ...] | None
 ) -> None:
+    """Show each changed check state once, with diagnostic detail in verbose mode."""
+    for index, verdict in enumerate(current):
+        if previous is None or verdict.state != previous[index].state:
+            output(_check_status(verdict))
+        if previous is None or verdict != previous[index]:
+            detail(field('Check detail', escape(verdict.detail)))
+
+
+def _report_ci(next_action: str) -> None:
     """Report a conclusive successful CI observation."""
-    output('Required CI checks succeeded for the selected snapshot.', kind='success')
-    for verdict in verdicts:
-        status = f'{escape(verdict.state)} ({escape(verdict.detail)})'
-        output('  ' + field(escape(verdict.name), status, kind='success'))
+    output('Required checks passed.', kind='success')
     output()
-    output(field('Selected commit', escape(commit)))
     if next_action == 'pubanon repo reveal':
         output('Revealing the repository makes its history public.')
     next_step(next_action)
@@ -90,37 +106,43 @@ def _report_ci(
 
 def _report_ci_start(
     target: tuple[str, str],
-    commit: str,
+    selection: str,
+    commit: str | None,
     checks: Sequence[str],
     timeout: int,
 ) -> None:
     """Report the complete selected CI observation before host reads."""
     owner, repo = target
-    heading('Watch snapshot CI')
-    output(field('Repository', f'{escape(owner)}/{escape(repo)}'))
-    output(field('Selected commit', escape(commit)))
-    rendered = ', '.join(escape(name) for name in checks)
-    output(field('Required checks', rendered))
-    output(field('Timeout', f'{timeout} seconds. Ctrl-C stops waiting.'))
+    selected = f' ({escape(commit[:12])})' if commit is not None else ''
+    output(
+        f'Waiting for checks on {escape(selection)}{selected} in {escape(owner)}/{escape(repo)}'
+    )
+    if commit is not None:
+        detail_fields([('Selected commit', escape(commit))])
+    fields(
+        [
+            ('Checks', ', '.join(escape(name) for name in checks)),
+            (
+                'Timeout',
+                (
+                    f'{display_duration(timeout)}. Press Ctrl-C to stop waiting; '
+                    'rerun the command to continue.'
+                ),
+            ),
+        ]
+    )
 
 
 def _report_package(
     release: PackageRelease,
-    verdicts: Sequence[CheckVerdict],
-    commit: str,
     next_action: str,
 ) -> None:
     """Report a conclusive successful package observation."""
-    output(f'Package release {escape(release.version)} is published.', kind='success')
-    for verdict in verdicts:
-        status = f'{escape(verdict.state)} ({escape(verdict.detail)})'
-        output('  ' + field(escape(verdict.name), status, kind='success'))
+    output(f'Package release v{escape(release.version)} is published.', kind='success')
     heading('Published files:', separate=True)
     for filename in release.files:
         output(f'  {escape(filename)}')
     output()
-    output(field('Release tag', f'v{escape(release.version)}'))
-    output(field('Selected commit', escape(commit)))
     if next_action == 'pubanon repo reveal':
         output('Revealing the repository makes its history public.')
     next_step(next_action)
@@ -128,6 +150,7 @@ def _report_package(
 
 def _report_package_start(
     target: tuple[str, str],
+    selection: str,
     release: tuple[str, str],
     package: PackageObservation,
     timeout: int,
@@ -135,14 +158,24 @@ def _report_package_start(
     """Report the complete selected package observation before host reads."""
     owner, repo = target
     version, commit = release
-    heading('Watch package release')
-    output(field('Repository', f'{escape(owner)}/{escape(repo)}'))
-    output(field('Selected commit', escape(commit)))
-    output(field('Package name', escape(package.name)))
-    output(field('Package version', escape(version)))
+    output(
+        f'Waiting for package {escape(package.name)} v{escape(version)} '
+        f'({escape(commit[:12])}) in {escape(owner)}/{escape(repo)}'
+    )
+    detail_fields([('Selection', selection), ('Selected commit', escape(commit))])
     rendered = ', '.join(escape(name) for name in package.release_checks)
-    output(field('Release checks', rendered))
-    output(field('Timeout', f'{timeout} seconds. Ctrl-C stops waiting.'))
+    fields(
+        [
+            ('Checks', rendered),
+            (
+                'Timeout',
+                (
+                    f'{display_duration(timeout)}. Press Ctrl-C to stop waiting; '
+                    'rerun the command to continue.'
+                ),
+            ),
+        ]
+    )
 
 
 def _select_ci_commit(paths: Paths, project: str, version: str | None) -> str:
@@ -199,7 +232,7 @@ def _verified_published_destination(
 ) -> Destination:
     """Verify complete host refs against the local published-state copy."""
     local_main, local_tags = published_refs(paths, p.name)
-    output(field('Phase', 'verifying account and repository'))
+    detail(field('Phase', 'verifying account and repository'))
     try:
         destination = verify_destination(
             paths,
@@ -210,7 +243,7 @@ def _verified_published_destination(
     except ObservationTimeoutError as exc:
         raise _timeout_error('account/repository verification', retry=retry) from exc
     expected = RemoteRefs(local_main, local_tags, ())
-    output(field('Phase', 'reading published refs'))
+    detail(field('Phase', 'reading published refs'))
     try:
         remote = ls_remote(
             destination, paths, p.name, timeout=_remaining(deadline, 'refs', retry=retry)
@@ -225,7 +258,7 @@ def _verified_published_destination(
             recovery=(
                 'remove every destination branch except main, then rerun'
                 if remote.branches
-                else 'pubanon repo verify --repair-store'
+                else 'pubanon repo restore --to local'
             ),
         )
     return destination
@@ -264,8 +297,7 @@ def _wait_for_checks(
             verdicts.append(result)
         current = tuple(verdicts)
         if current != previous:
-            for verdict in verdicts:
-                output(_check_status(verdict))
+            _report_check_changes(current, previous)
             previous = current
         unresolved = [verdict for verdict in verdicts if verdict.state != 'success']
         if not unresolved:
@@ -290,8 +322,6 @@ def ci_verdicts(
     dest: Destination,
     commit: str,
     checks: Iterable[str],
-    *,
-    timeout: float | None = None,
 ) -> list[CheckVerdict]:
     """Read each configured CI check once for an exact commit.
 
@@ -300,18 +330,13 @@ def ci_verdicts(
         commit: Exact commit object ID to observe.
         checks: Configured check names in display order.
 
-        timeout: Optional maximum duration for each host check read.
-
     Returns:
         One current verdict per configured check.
 
     Raises:
         PubanonError: A host response is invalid or cannot be read.
-        ObservationTimeoutError: A supplied check-read timeout expires.
     """
-    return [
-        check_result((dest.owner, dest.repo), commit, name, timeout=timeout) for name in checks
-    ]
+    return [check_result((dest.owner, dest.repo), commit, name) for name in checks]
 
 
 def select_package_release(
@@ -402,20 +427,24 @@ def watch_ci(  # noqa: PLR0913
             recovery='add required_checks to the project configuration',
         )
     retry = (
-        'rerun `pubanon watch ci --staged`'
+        'rerun `pubanon stage watch`'
         if staged
-        else f'rerun `pubanon watch ci --version {escape(version)}`'
+        else f'rerun `pubanon repo watch --version {escape(version)}`'
         if version is not None
         else 'rerun the watch'
     )
     deadline = _monotonic() + timeout
     if staged:
         recorded = load_stage(paths, p.name)
-        selected_commit = recorded.commit if recorded is not None else 'recorded staged commit'
+        selected_commit = recorded.commit if recorded is not None else None
         _report_ci_start(
-            (p.owner, stage_repository(p)), selected_commit, p.required_checks, timeout
+            (p.owner, stage_repository(p)),
+            'recorded staged snapshot',
+            selected_commit,
+            p.required_checks,
+            timeout,
         )
-        output(field('Phase', 'verifying the staged target'))
+        detail(field('Phase', 'verifying the staged target'))
         try:
             dest, record = verify_staged_target(
                 paths,
@@ -430,12 +459,19 @@ def watch_ci(  # noqa: PLR0913
         commit = record.commit
     else:
         commit = _select_ci_commit(paths, p.name, version)
-        _report_ci_start((p.owner, p.repo), commit, p.required_checks, timeout)
+        selection = (
+            'recorded published main' if version is None else f'exact tag v{escape(version)}'
+        )
+        _report_ci_start((p.owner, p.repo), selection, commit, p.required_checks, timeout)
         dest = _verified_published_destination(paths, g, p, deadline, retry=retry)
-    output(field('Phase', 'reading CI checks'))
-    verdicts = _wait_for_checks(dest, commit, p.required_checks, deadline, retry=retry)
-    next_action = 'pubanon publish' if staged else _published_next_action(p, version=version)
-    _report_ci(verdicts, commit, next_action)
+    detail(field('Phase', 'reading CI checks'))
+    _wait_for_checks(dest, commit, p.required_checks, deadline, retry=retry)
+    next_action = (
+        candidate_next_action(paths, g, p, load_candidate(paths, p.name), checked_commit=commit)
+        if staged
+        else _published_next_action(p, version=version)
+    )
+    _report_ci(next_action)
 
 
 def watch_package(
@@ -478,15 +514,22 @@ def watch_package(
     deadline = _monotonic() + timeout
     selected_version, commit = select_package_release(paths, p.name, version)
     retry = (
-        f'rerun `pubanon watch package --version {escape(selected_version)}`'
+        f'rerun `pubanon package watch --version {escape(selected_version)}`'
         if version is not None
         else 'rerun the watch'
     )
-    _report_package_start((p.owner, p.repo), (selected_version, commit), package, timeout)
+    selection = (
+        'numerically greatest published X.Y.Z tag'
+        if version is None
+        else f'exact tag v{escape(version)}'
+    )
+    _report_package_start(
+        (p.owner, p.repo), selection, (selected_version, commit), package, timeout
+    )
     dest = _verified_published_destination(paths, g, p, deadline, retry=retry)
-    output(field('Phase', 'reading package release checks'))
-    verdicts = _wait_for_checks(dest, commit, package.release_checks, deadline, retry=retry)
-    output(field('Phase', 'reading the package index'))
+    detail(field('Phase', 'reading package release checks'))
+    _wait_for_checks(dest, commit, package.release_checks, deadline, retry=retry)
+    detail(field('Phase', 'reading the package index'))
     previous: str | None = None
     started = _monotonic()
     last_elapsed = started
@@ -502,9 +545,7 @@ def watch_package(
             raise _timeout_error('package release', retry=retry) from exc
         _remaining(deadline, 'package release', retry=retry)
         if release is not None and release.files:
-            _report_package(
-                release, verdicts, commit, _published_next_action(p, package_complete=True)
-            )
+            _report_package(release, _published_next_action(p, package_complete=True))
             return
         state = 'absent' if release is None else 'metadata found; no distribution files'
         if state != previous:

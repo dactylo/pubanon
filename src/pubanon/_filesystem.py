@@ -1,6 +1,8 @@
 """Provide platform-specific file attributes and durable state transitions."""
 
 import os
+import shutil
+import stat
 import tempfile
 from contextlib import suppress
 from pathlib import Path
@@ -26,6 +28,28 @@ def chmod(path: Path, mode: int, *, follow_symlinks: bool = True) -> None:
         path.chmod(mode, follow_symlinks=False)
 
 
+def _restore_tree_access(root: Path) -> None:
+    """Restore removable entries without following links or junctions."""
+    directories = [root]
+    while directories:
+        directory = directories.pop()
+        if os.name == 'nt':
+            _windows_fs.check_directory(directory)
+        mode = directory.lstat().st_mode
+        if not stat.S_ISDIR(mode):
+            continue
+        chmod(directory, stat.S_IMODE(mode) | stat.S_IRWXU, follow_symlinks=False)
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                path = Path(entry.path)
+                if path.is_symlink() or path.is_junction():
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    directories.append(path)
+                elif os.name == 'nt':
+                    chmod(path, 0o600, follow_symlinks=False)
+
+
 def fchmod(fd: int, mode: int) -> None:
     """Set permissions or read-only attributes on an open descriptor.
 
@@ -38,6 +62,27 @@ def fchmod(fd: int, mode: int) -> None:
         _windows_fs.fchmod(fd, mode)
     else:
         os.fchmod(fd, mode)
+
+
+def remove_tree(path: Path) -> bool:
+    """Remove a directory tree safely, restoring owner write access if needed.
+
+    Returns:
+        Whether the directory existed and was removed.
+    """
+    try:
+        if path.is_symlink() or path.is_junction():
+            raise OSError('cannot remove directory through a link or junction')
+        if os.name == 'nt':
+            _restore_tree_access(path)
+        try:
+            shutil.rmtree(path)
+        except PermissionError:
+            _restore_tree_access(path)
+            shutil.rmtree(path)
+    except FileNotFoundError:
+        return False
+    return True
 
 
 def replace(source: Path, target: Path) -> None:

@@ -5,7 +5,9 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -18,7 +20,8 @@ if os.name != 'nt':
     import termios
 
 from pubanon import _terminal
-from pubanon._errors import OperationCancelled, PubanonError
+from pubanon._errors import OperationCanceled, PubanonError
+from pubanon._remote._host import CheckVerdict
 
 _Script = Callable[[Sequence[tuple[str, str]]], None]
 
@@ -32,12 +35,6 @@ def test_ask_accepts_one_pass_choices(answers: _Script) -> None:
 def test_ask_blank_takes_default(answers: _Script) -> None:
     answers([('GitHub owner [acct]: ', '')])
     assert _terminal.ask('GitHub owner', default='acct') == 'acct'
-
-
-@pytest.mark.parametrize(('reply', 'expected'), [('s', 'save'), ('SAVE', 'save'), (' e ', 'edit')])
-def test_ask_choices_accept_letter_or_word(answers: _Script, reply: str, expected: str) -> None:
-    answers([('Save? [s]ave / [e]dit / [c]ancel: ', reply)])
-    assert _terminal.ask('Save?', choices=['save', 'edit', 'cancel']) == expected
 
 
 def test_ask_choices_add_colon_to_plain_question(answers: _Script) -> None:
@@ -116,37 +113,8 @@ def test_ask_two_choices_render_retry_hint(
 def test_cancellation_is_distinct_from_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv('NO_COLOR', raising=False)
     monkeypatch.setattr(sys.stdout, 'isatty', lambda: True)
-    rendered = _terminal.diagnostic(OperationCancelled('operation cancelled', fact='not saved'))
-    assert (
-        rendered
-        == '\x1b[33mcancelled: operation cancelled\x1b[0m\n  \x1b[1mfact:\x1b[0m not saved'
-    )
-
-
-@pytest.mark.parametrize(
-    ('mode', 'terminal', 'no_color', 'expected'),
-    [
-        ('auto', True, False, '\x1b[1mLabel\x1b[0m'),
-        ('auto', False, False, 'Label'),
-        ('auto', True, True, 'Label'),
-        ('always', False, True, '\x1b[1mLabel\x1b[0m'),
-        ('never', True, False, 'Label'),
-    ],
-)
-def test_color_context_controls_terminal_style(
-    monkeypatch: pytest.MonkeyPatch,
-    mode: str,
-    terminal: bool,
-    no_color: bool,
-    expected: str,
-) -> None:
-    monkeypatch.setattr(sys.stdout, 'isatty', lambda: terminal)
-    if no_color:
-        monkeypatch.setenv('NO_COLOR', '')
-    else:
-        monkeypatch.delenv('NO_COLOR', raising=False)
-    with _terminal.color_context(mode):
-        assert _terminal.style('Label') == expected
+    rendered = _terminal.diagnostic(OperationCanceled('Canceled.', fact='not saved'))
+    assert rendered == '\x1b[33mCanceled.\x1b[0m\n  not saved'
 
 
 def test_color_context_rejects_unknown_mode() -> None:
@@ -185,22 +153,6 @@ def test_confirm_reasks_on_blank_without_default(
     assert capsys.readouterr().out == 'Enter y or n.\n' * 3
 
 
-@pytest.mark.parametrize(
-    ('default', 'prompt', 'reply', 'expected'),
-    [
-        (None, 'Publish? [y/n] ', 'y', True),
-        (None, 'Publish? [y/n] ', 'NO', False),
-        (True, 'Publish? [Y/n] ', '', True),
-        (False, 'Publish? [y/N] ', '', False),
-    ],
-)
-def test_confirm_renders_default_and_accepts_answers(
-    answers: _Script, default: bool | None, prompt: str, reply: str, expected: bool
-) -> None:
-    answers([(prompt, reply)])
-    assert _terminal.confirm('Publish?', default=default) is expected
-
-
 def test_confirm_strips_surrounding_whitespace(answers: _Script) -> None:
     answers([('Publish? [y/n] ', ' yes ')])
     assert _terminal.confirm('Publish?') is True
@@ -221,9 +173,331 @@ def test_diagnostic_uses_destination_and_keeps_details(monkeypatch: pytest.Monke
     monkeypatch.setattr(sys.stderr, 'isatty', lambda: False)
     error = PubanonError('account mismatch', expected='configured', actual='authenticated')
     assert _terminal.diagnostic(error, stream=sys.stderr) == (
-        'error: account mismatch\n  expected: configured\n  actual: authenticated'
+        'error: account mismatch\n  Expected: configured\n  Found: authenticated'
     )
     assert _terminal.diagnostic(error).startswith('\x1b[1;31merror: account mismatch\x1b[0m')
+
+
+def test_display_path_abbreviates_home_and_escapes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home = tmp_path / 'home'
+    expected = r'~\\report\x1b.txt' if os.name == 'nt' else r'~/report\x1b.txt'
+    assert _terminal.display_path(home / 'report\x1b.txt') == expected
+    outside = tmp_path / 'elsewhere'
+    assert _terminal.display_path(outside) == _terminal.escape(str(outside))
+    monkeypatch.chdir(tmp_path)
+    assert _terminal.display_path(Path('elsewhere')) == _terminal.escape(str(outside))
+    command = _terminal.shell_command('cat', str(home / 'report.txt'))
+    assert command is not None
+    assert shlex.split(command) == ['cat', str(home / 'report.txt')]
+
+
+def test_display_time_uses_local_seconds_and_zone(monkeypatch: pytest.MonkeyPatch) -> None:
+    if sys.platform == 'win32':
+        pytest.skip('requires process timezone control')
+    try:
+        with monkeypatch.context() as context:
+            context.setenv('TZ', 'EST5')
+            time.tzset()
+            assert _terminal.display_time(datetime(2026, 9, 26, 20, 11, 44, tzinfo=UTC)) == (
+                '2026-09-26 15:11:44 EST'
+            )
+    finally:
+        time.tzset()
+
+
+def test_escape_renders_controls_and_backslashes_visibly() -> None:
+    assert _terminal.escape('a\x1b[31mb\\c') == 'a\\x1b[31mb\\\\c'
+
+
+def test_field_styles_label_and_optional_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('NO_COLOR', '')
+    monkeypatch.setattr(sys.stdout, 'isatty', lambda: False)
+    with _terminal.color_context('always'):
+        assert _terminal.field('Status', 'ready', kind='success') == (
+            '\x1b[1mStatus:\x1b[0m \x1b[32mready\x1b[0m'
+        )
+    assert _terminal.field('Status', 'ready', kind='success') == 'Status: ready'
+
+
+def test_fields_align_values_and_style_only_labels(capsys: pytest.CaptureFixture[str]) -> None:
+    with _terminal.color_context('always'):
+        _terminal.fields([('A', 'one'), ('Long', 'two')], indent=2)
+        _terminal.fields([])
+    assert capsys.readouterr().out == ('  \x1b[1mA:\x1b[0m    one\n  \x1b[1mLong:\x1b[0m two\n')
+
+
+def test_guidance_keeps_project_and_existing_command_options() -> None:
+    with _terminal.guidance_context(project='other'):
+        assert _terminal.guidance('run `pubanon publish --resolve`.') == (
+            'run `pubanon publish --project=other --resolve`.'
+        )
+        assert _terminal.guidance('pubanon stage forget') == (
+            'pubanon stage forget --project=other'
+        )
+        assert _terminal.guidance('pubanon stage delete --yes') == (
+            'pubanon stage delete --project=other --yes'
+        )
+        assert _terminal.guidance('pubanon stage repair or pubanon stage forget') == (
+            'pubanon stage repair --project=other or pubanon stage forget --project=other'
+        )
+        assert _terminal.guidance('pubanon repo watch --project demo --version 1.0.0') == (
+            'pubanon repo watch --project demo --version 1.0.0'
+        )
+        assert _terminal.guidance('pubanon stage watch --timeout 45') == (
+            'pubanon stage watch --project=other --timeout 45'
+        )
+        assert _terminal.guidance('pubanon package watch --version 1.0.0') == (
+            'pubanon package watch --project=other --version 1.0.0'
+        )
+        assert _terminal.guidance('pubanon audit --remote') == (
+            'pubanon audit --project=other --remote'
+        )
+        assert _terminal.guidance('pubanon release show v1.2.3') == (
+            'pubanon release show --project=other v1.2.3'
+        )
+        assert _terminal.guidance('pubanon setup --edit') == 'pubanon setup --edit'
+        assert (
+            _terminal.guidance('Read /tmp/pubanon inspect/notes')
+            == 'Read /tmp/pubanon inspect/notes'
+        )
+    assert _terminal.guidance('pubanon inspect') == 'pubanon inspect'
+
+
+def test_guidance_omits_project_selected_by_current_directory() -> None:
+    with _terminal.guidance_context(project='demo', implicit_project='demo'):
+        assert _terminal.guidance('run `pubanon inspect`.') == 'run `pubanon inspect`.'
+        assert _terminal.guidance('pubanon stage forget --project demo') == (
+            'pubanon stage forget'
+        )
+        assert _terminal.guidance('pubanon stage delete --project=demo --yes') == (
+            'pubanon stage delete --yes'
+        )
+        assert _terminal.guidance('run `pubanon publish --project demo --resolve`.') == (
+            'run `pubanon publish --resolve`.'
+        )
+        assert _terminal.guidance('run `pubanon publish --project other --resolve`.') == (
+            'run `pubanon publish --project other --resolve`.'
+        )
+        assert _terminal.guidance('run `pubanon show --project demo latest`.') == (
+            'run `pubanon show latest`.'
+        )
+        assert _terminal.guidance('run `pubanon delete --project demo latest`.') == (
+            'run `pubanon delete latest`.'
+        )
+        assert _terminal.guidance('pubanon audit --project=demo --remote') == (
+            'pubanon audit --remote'
+        )
+    assert _terminal.guidance('pubanon inspect') == 'pubanon inspect'
+
+
+def test_guidance_omits_shell_quoted_implicit_project() -> None:
+    with _terminal.guidance_context(project='my project', implicit_project='my project'):
+        assert _terminal.guidance("run `pubanon inspect --project 'my project'`.") == (
+            'run `pubanon inspect`.'
+        )
+
+
+def test_guidance_preserves_different_explicit_project_in_nested_workflow() -> None:
+    with (
+        _terminal.guidance_context(project='demo', implicit_project='demo'),
+        _terminal.guidance_context(project='other', workflow=True),
+    ):
+        assert _terminal.guidance('run `pubanon publish --resolve`.') == (
+            'run `pubanon publish --project=other --resolve`.'
+        )
+        assert _terminal.guidance('run `pubanon publish --project other`.') == (
+            'run `pubanon publish --project other`.'
+        )
+        assert _terminal.guidance('run `pubanon show latest`.') == (
+            'run `pubanon show --project=other latest`.'
+        )
+
+
+def test_guidance_qualifies_forget_recovery() -> None:
+    with _terminal.guidance_context(project='other'):
+        assert _terminal.guidance('pubanon forget --yes') == 'pubanon forget --project=other --yes'
+
+
+def test_guidance_shows_unrenderable_project_without_escaped_command() -> None:
+    with _terminal.guidance_context(project='line\nbreak'):
+        result = _terminal.guidance('run `pubanon clean`.')
+    assert 'line\\x0abreak' in result
+    assert 'rerun the clean action' in result
+    assert '--project=' not in result
+
+
+def test_guidance_stage_recovery_quotes_project_and_uses_safe_fallback() -> None:
+    with _terminal.guidance_context(project='my project'):
+        command = _terminal.guidance('pubanon stage forget')
+    assert shlex.split(command) == ['pubanon', 'stage', 'forget', '--project=my project']
+
+    with _terminal.guidance_context(project='line\nbreak'):
+        advice = _terminal.guidance('pubanon stage delete')
+    assert advice == (
+        'Choose project line\\x0abreak from its registered directory, '
+        'then rerun the stage delete action.'
+    )
+
+
+def test_guidance_uses_implicit_project_without_explicit_selection() -> None:
+    with _terminal.guidance_context(implicit_project='demo'):
+        assert _terminal.guidance('run `pubanon show --project demo latest`.') == (
+            'run `pubanon show latest`.'
+        )
+        assert _terminal.guidance('run `pubanon inspect`.') == 'run `pubanon inspect`.'
+
+
+def test_heading_starts_output_and_separates_later_sections(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv('NO_COLOR', raising=False)
+    monkeypatch.setattr(sys.stdout, 'isatty', lambda: True)
+    _terminal.heading('Included files')
+    print('A file')
+    _terminal.heading('Excluded files', separate=True)
+    assert capsys.readouterr().out == (
+        '\x1b[1;36mIncluded files\x1b[0m\nA file\n\n\x1b[1;36mExcluded files\x1b[0m\n'
+    )
+
+
+def test_interrupt_cancels(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _interrupted(_prompt: str) -> str:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr('builtins.input', _interrupted)
+    with pytest.raises(OperationCanceled, match=r'Canceled\.'):
+        _terminal.ask('Name')
+
+
+@pytest.mark.parametrize(
+    ('kind', 'message', 'headline', 'code'),
+    [
+        ('warning', 'Canceled. Nothing was published.', 'Canceled. Nothing was published.', '33'),
+        ('error', 'outcome is unknown', 'error: outcome is unknown', '1;31'),
+        ('success', 'Publication completed.', 'Publication completed.', '32'),
+    ],
+)
+def test_interruption_presentation_is_independent_of_status(
+    kind: Literal['warning', 'error', 'success'],
+    message: str,
+    headline: str,
+    code: str,
+) -> None:
+    error = OperationCanceled(message, fact='retained fact', recovery='pubanon status')
+    error.diagnostic_kind = kind
+    with _terminal.color_context('always'):
+        assert _terminal.diagnostic(error) == (
+            f'\x1b[{code}m{headline}\x1b[0m\n  retained fact\n\n'
+            '\x1b[1mNext:\x1b[0m \x1b[36mpubanon status\x1b[0m'
+        )
+        assert error.render() == f'{headline}\n  retained fact\n\nNext: pubanon status'
+
+
+@pytest.mark.parametrize(
+    ('seconds', 'expected'), [(60, '1 minute'), (1800, '30 minutes'), (90, '90 seconds')]
+)
+def test_display_duration_uses_whole_minutes(seconds: int, expected: str) -> None:
+    assert _terminal.display_duration(seconds) == expected
+
+
+@pytest.mark.parametrize(
+    ('state', 'detail', 'expected'),
+    [
+        ('missing', '', 'not found'),
+        ('ambiguous', '101 check runs', 'could not be determined'),
+        ('pending', 'queued', 'pending'),
+        ('success', 'success', 'passed'),
+        ('unacceptable', 'failure', 'failed'),
+        ('unacceptable', 'neutral', 'failed (neutral)'),
+        ('unacceptable', 'skipped', 'failed (skipped)'),
+        (
+            'unacceptable',
+            'action_required, cancelled, failure, timed_out',
+            'failed (needs action, canceled, timed out)',
+        ),
+        ('unacceptable', 'unknown\x1b', 'failed (unknown\\x1b)'),
+    ],
+)
+def test_display_check_result_preserves_nonpassing_verdicts(
+    state: str, detail: str, expected: str
+) -> None:
+    assert _terminal.display_check_result(CheckVerdict('build', state, detail)) == expected
+
+
+@pytest.mark.parametrize(
+    ('error', 'expected'),
+    [
+        (PubanonError('refused'), 'error: refused'),
+        (PubanonError('refused', fact='first\nsecond'), 'error: refused\n  first\n  second'),
+        (
+            PubanonError('refused', expected='one', actual='two'),
+            'error: refused\n  Expected: one\n  Found: two',
+        ),
+        (
+            PubanonError('refused', recovery='retry with\npubanon status'),
+            'error: refused\n\nNext: retry with\n      pubanon status',
+        ),
+        (
+            OperationCanceled('Canceled.', fact='kept', recovery='pubanon status'),
+            'Canceled.\n  kept\n\nNext: pubanon status',
+        ),
+    ],
+)
+def test_diagnostic_layout(error: PubanonError, expected: str) -> None:
+    with _terminal.color_context('never'):
+        assert _terminal.diagnostic(error) == expected
+
+
+@pytest.mark.parametrize(('reply', 'expected'), [('s', 'save'), ('SAVE', 'save'), (' e ', 'edit')])
+def test_ask_choices_accept_letter_or_word(answers: _Script, reply: str, expected: str) -> None:
+    answers([('Save? [s]ave / [e]dit / [c]ancel: ', reply)])
+    assert _terminal.ask('Save?', choices=['save', 'edit', 'cancel']) == expected
+
+
+@pytest.mark.parametrize(
+    ('mode', 'terminal', 'no_color', 'expected'),
+    [
+        ('auto', True, False, '\x1b[1mLabel\x1b[0m'),
+        ('auto', False, False, 'Label'),
+        ('auto', True, True, 'Label'),
+        ('always', False, True, '\x1b[1mLabel\x1b[0m'),
+        ('never', True, False, 'Label'),
+    ],
+)
+def test_color_context_controls_terminal_style(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    terminal: bool,
+    no_color: bool,
+    expected: str,
+) -> None:
+    monkeypatch.setattr(sys.stdout, 'isatty', lambda: terminal)
+    if no_color:
+        monkeypatch.setenv('NO_COLOR', '')
+    else:
+        monkeypatch.delenv('NO_COLOR', raising=False)
+    with _terminal.color_context(mode):
+        assert _terminal.style('Label') == expected
+
+
+@pytest.mark.parametrize(
+    ('default', 'prompt', 'reply', 'expected'),
+    [
+        (None, 'Publish? [y/n] ', 'y', True),
+        (None, 'Publish? [y/n] ', 'NO', False),
+        (True, 'Publish? [Y/n] ', '', True),
+        (False, 'Publish? [y/N] ', '', False),
+    ],
+)
+def test_confirm_renders_default_and_accepts_answers(
+    answers: _Script, default: bool | None, prompt: str, reply: str, expected: bool
+) -> None:
+    answers([(prompt, reply)])
+    assert _terminal.confirm('Publish?', default=default) is expected
 
 
 @pytest.mark.parametrize('failure', [EOFError(), OSError('closed')])
@@ -234,7 +508,7 @@ def test_end_of_input_requires_interactive_terminal(
         raise failure
 
     monkeypatch.setattr('builtins.input', _unavailable)
-    with pytest.raises(PubanonError, match='interactive input is required') as error:
+    with pytest.raises(PubanonError, match='this step needs an interactive terminal') as error:
         _terminal.confirm('Publish?')
     assert error.value.recovery == 'rerun in an interactive terminal'
 
@@ -252,22 +526,6 @@ def test_end_of_input_requires_interactive_terminal(
 )
 def test_escape_preserves_spelling_and_renders_unicode_controls(text: str, expected: str) -> None:
     assert _terminal.escape(text) == expected
-
-
-def test_escape_renders_controls_and_backslashes_visibly() -> None:
-    assert _terminal.escape('a\x1b[31mb\\c') == 'a\\x1b[31mb\\\\c'
-
-
-def test_field_styles_label_and_optional_value(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv('NO_COLOR', '')
-    monkeypatch.setattr(sys.stdout, 'isatty', lambda: False)
-    with _terminal.color_context('always'):
-        assert _terminal.field('Status', 'ready', kind='success') == (
-            '\x1b[1mStatus:\x1b[0m \x1b[32mready\x1b[0m'
-        )
-    assert _terminal.field('Status', 'ready', kind='success') == 'Status: ready'
 
 
 @pytest.mark.parametrize(
@@ -334,66 +592,9 @@ def test_free_text_prompt_marks_color_as_zero_width(
     assert _terminal.ask('Name') == 'value'
 
 
-def test_guidance_keeps_project_and_existing_command_options() -> None:
-    with _terminal.guidance_context(project='other'):
-        assert _terminal.guidance('run `pubanon publish --resolve`.') == (
-            'run `pubanon publish --project=other --resolve`.'
-        )
-        assert _terminal.guidance('pubanon watch ci --project demo --version 1.0.0') == (
-            'pubanon watch ci --project demo --version 1.0.0'
-        )
-        assert _terminal.guidance('pubanon setup --edit') == 'pubanon setup --edit'
-        assert (
-            _terminal.guidance('Read /tmp/pubanon inspect/notes')
-            == 'Read /tmp/pubanon inspect/notes'
-        )
-    assert _terminal.guidance('pubanon inspect') == 'pubanon inspect'
-
-
-def test_guidance_omits_project_selected_by_current_directory() -> None:
-    with _terminal.guidance_context(project='demo', implicit_project='demo'):
-        assert _terminal.guidance('run `pubanon inspect`.') == 'run `pubanon inspect`.'
-        assert _terminal.guidance('run `pubanon publish --project demo --resolve`.') == (
-            'run `pubanon publish --resolve`.'
-        )
-        assert _terminal.guidance('run `pubanon publish --project other --resolve`.') == (
-            'run `pubanon publish --project other --resolve`.'
-        )
-        assert _terminal.guidance('run `pubanon show --project demo latest`.') == (
-            'run `pubanon show latest`.'
-        )
-        assert _terminal.guidance('run `pubanon delete --project demo latest`.') == (
-            'run `pubanon delete latest`.'
-        )
-    assert _terminal.guidance('pubanon inspect') == 'pubanon inspect'
-
-
-def test_guidance_omits_shell_quoted_implicit_project() -> None:
-    with _terminal.guidance_context(project='my project', implicit_project='my project'):
-        assert _terminal.guidance("run `pubanon inspect --project 'my project'`.") == (
-            'run `pubanon inspect`.'
-        )
-
-
-def test_guidance_preserves_different_explicit_project_in_nested_workflow() -> None:
-    with (
-        _terminal.guidance_context(project='demo', implicit_project='demo'),
-        _terminal.guidance_context(project='other', workflow=True),
-    ):
-        assert _terminal.guidance('run `pubanon publish --resolve`.') == (
-            'run `pubanon publish --project=other --resolve`.'
-        )
-        assert _terminal.guidance('run `pubanon publish --project other`.') == (
-            'run `pubanon publish --project other`.'
-        )
-        assert _terminal.guidance('run `pubanon show latest`.') == (
-            'run `pubanon show --project=other latest`.'
-        )
-
-
 @pytest.mark.parametrize('name', ['my project', "it's mine", r'a\b', '-leading'])
 def test_guidance_preserves_explicit_quoted_project(name: str) -> None:
-    command = _terminal.shell_command('pubanon', 'inspect', f'--project={name}', '--clean')
+    command = _terminal.shell_command('pubanon', 'clean', f'--project={name}')
     assert command is not None
     with _terminal.guidance_context(project='other'):
         assert _terminal.guidance(command) == command
@@ -401,7 +602,7 @@ def test_guidance_preserves_explicit_quoted_project(name: str) -> None:
         assert _terminal.guidance(command) == command
     with _terminal.guidance_context(project=name, implicit_project=name):
         result = _terminal.guidance(command)
-    assert shlex.split(result) == ['pubanon', 'inspect', '--clean']
+    assert shlex.split(result) == ['pubanon', 'clean']
 
 
 @pytest.mark.parametrize(
@@ -409,7 +610,6 @@ def test_guidance_preserves_explicit_quoted_project(name: str) -> None:
     [
         ('pubanon publish --resolve', 'publish', '--resolve'),
         ('pubanon prepare --continue', 'prepare', '--continue'),
-        ('pubanon inspect --clean', 'inspect', '--clean'),
     ],
 )
 def test_guidance_retains_recovery_mode_for_unrenderable_project(
@@ -424,58 +624,19 @@ def test_guidance_retains_recovery_mode_for_unrenderable_project(
     assert '--project=' not in result
 
 
-def test_guidance_shows_unrenderable_project_without_escaped_command() -> None:
-    with _terminal.guidance_context(project='line\nbreak'):
-        result = _terminal.guidance('run `pubanon inspect --clean`.')
-    assert 'line\\x0abreak' in result
-    assert 'rerun the inspect action' in result
-    assert 'with --clean' in result
-    assert '--project=' not in result
-
-
-def test_guidance_uses_implicit_project_without_explicit_selection() -> None:
-    with _terminal.guidance_context(implicit_project='demo'):
-        assert _terminal.guidance('run `pubanon show --project demo latest`.') == (
-            'run `pubanon show latest`.'
-        )
-        assert _terminal.guidance('run `pubanon inspect`.') == 'run `pubanon inspect`.'
-
-
-def test_heading_starts_output_and_separates_later_sections(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    monkeypatch.delenv('NO_COLOR', raising=False)
-    monkeypatch.setattr(sys.stdout, 'isatty', lambda: True)
-    _terminal.heading('Included files')
-    print('A file')
-    _terminal.heading('Excluded files', separate=True)
-    assert capsys.readouterr().out == (
-        '\x1b[1;36mIncluded files\x1b[0m\nA file\n\n\x1b[1;36mExcluded files\x1b[0m\n'
-    )
-
-
-def test_interrupt_cancels(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _interrupted(_prompt: str) -> str:
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr('builtins.input', _interrupted)
-    with pytest.raises(OperationCancelled, match='operation cancelled'):
-        _terminal.ask('Name')
-
-
 @pytest.mark.parametrize(
     ('expression', 'keys', 'expected'),
     [
         ("ask('Action?', choices=['continue', 'quit'])", b'c', b'RESULT continue'),
         ("ask('Action?', choices=['continue', 'quit'])", b'Q', b'RESULT quit'),
         ("confirm('Proceed?')", b'y', b'RESULT True'),
-        ("ask('Action?', choices=['continue', 'quit'])", None, b'operation cancelled'),
+        ("ask('Action?', choices=['continue', 'quit'])", None, b'Canceled.'),
         ("ask('Name')", b'example', b'RESULT example'),
         ("confirm('Proceed?', default=False)", b'\r', b'RESULT False'),
         (
             "ask('Action?', choices=['continue', 'quit'])",
             b'\x04',
-            b'interactive input is required',
+            b'this step needs an interactive terminal',
         ),
     ],
 )
@@ -489,6 +650,9 @@ def test_menu_accepts_key_without_enter_and_restores_terminal(
     master, slave = pty.openpty()
     original = termios.tcgetattr(slave)
     script = (
+        # Background CI launchers may ignore SIGINT; emulate a foreground terminal.
+        'import signal\n'
+        'signal.signal(signal.SIGINT, signal.default_int_handler)\n'
         'from pubanon._terminal import ask, confirm\n'
         'from pubanon._errors import PubanonError\n'
         'try:\n'
@@ -673,7 +837,7 @@ def test_piped_stdin_never_reaches_a_question(
 ) -> None:
     monkeypatch.setattr(sys.stdin, 'isatty', lambda: False)
     # The autouse guard would fail the test if input() were called; the reader must not call it.
-    with pytest.raises(PubanonError, match='interactive input is required') as error:
+    with pytest.raises(PubanonError, match='this step needs an interactive terminal') as error:
         reader('Name')
     assert error.value.recovery == 'rerun in an interactive terminal'
 
@@ -681,6 +845,15 @@ def test_piped_stdin_never_reaches_a_question(
 def test_redirected_output_has_no_ansi(capsys: pytest.CaptureFixture[str]) -> None:
     _terminal.output('Saved.', kind='success')
     assert capsys.readouterr().out == 'Saved.\n'
+
+
+def test_render_fields_returns_text_without_printing(capsys: pytest.CaptureFixture[str]) -> None:
+    with _terminal.color_context('never'):
+        assert _terminal.render_fields([('A', 'one'), ('Long', 'two')], indent=2) == (
+            '  A:    one\n  Long: two'
+        )
+        assert _terminal.render_fields([]) == ''
+    assert capsys.readouterr().out == ''
 
 
 def test_shell_command_omits_unrepresentable_control() -> None:
@@ -705,13 +878,13 @@ def test_shell_command_preserves_windows_paths_and_spaces() -> None:
 
 @pytest.mark.parametrize('name', ['my project', "it's mine", r'a\b', '-leading'])
 def test_shell_command_selects_exact_project(name: str) -> None:
-    command = _terminal.shell_command('pubanon', 'inspect', f'--project={name}', '--clean')
+    command = _terminal.shell_command('pubanon', 'clean', f'--project={name}')
     assert command is not None
     argv = shlex.split(command)
-    assert argv == ['pubanon', 'inspect', f'--project={name}', '--clean']
+    assert argv == ['pubanon', 'clean', f'--project={name}']
     parsed = _arguments.build_parser().parse_args(argv[1:])
     assert parsed.project == name
-    assert parsed.command == 'inspect'
+    assert parsed.command == 'clean'
 
 
 def test_terminal_prompt_styles_question_and_choices(
@@ -721,6 +894,30 @@ def test_terminal_prompt_styles_question_and_choices(
     monkeypatch.setattr(sys.stdout, 'isatty', lambda: True)
     answers([('\x1b[1mSave?\x1b[0m \x1b[36m[s]ave / [c]ancel\x1b[0m: ', 's')])
     assert _terminal.ask('Save?', choices=['save', 'cancel']) == 'save'
+
+
+def test_verbose_details_are_scoped_and_restore_after_failure(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert not _terminal.verbose_enabled()
+    _terminal.detail('hidden')
+    _terminal.detail_fields([('Hidden', 'value')])
+    assert capsys.readouterr().out == ''
+
+    def _fail_with_details() -> None:
+        with _terminal.verbose_context(enabled=True):
+            assert _terminal.verbose_enabled()
+            _terminal.detail('visible')
+            _terminal.detail_fields([('Short', 'one'), ('Long label', 'two')], indent=2)
+            with _terminal.verbose_context(enabled=False):
+                _terminal.detail('nested hidden')
+            _terminal.detail()
+            raise RuntimeError
+
+    with pytest.raises(RuntimeError):
+        _fail_with_details()
+    assert not _terminal.verbose_enabled()
+    assert capsys.readouterr().out == 'visible\n  Short:      one\n  Long label: two\n\n'
 
 
 def test_windows_line_prompt_keeps_ansi_sequences(

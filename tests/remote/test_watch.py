@@ -1,11 +1,15 @@
 import json
+import re
 from collections.abc import Callable
+from contextlib import redirect_stdout
 from dataclasses import replace
+from io import StringIO
 from pathlib import Path
 from typing import Never, cast
 
 import pytest
 
+from pubanon import _config
 from pubanon._config import (
     GlobalConfig,
     PackageObservation,
@@ -19,6 +23,9 @@ from pubanon._remote._host import CheckVerdict, Destination, RemoteRefs
 from pubanon._remote._package import PackageRelease
 from pubanon._remote._stage import _save_stage
 from pubanon._snapshots import _candidate
+from pubanon._terminal import verbose_context
+from tests._cli import gh_calls, prepare
+from tests.remote.test_stage import _prepare_stage, _status_responses
 
 
 class _Clock:
@@ -48,13 +55,6 @@ def _absent_release(
 ) -> PackageRelease | None:
     del timeout
     return None
-
-
-def _calls(tmp_path: Path) -> list[list[str]]:
-    path = tmp_path / 'fake-gh-calls.jsonl'
-    if not path.exists():
-        return []
-    return [json.loads(line)['args'] for line in path.read_text().splitlines()]
 
 
 def _check_response(
@@ -299,6 +299,20 @@ def _stub_staged_destination(
     ) -> None:
         del recovery, timeout
 
+    def _settings(_owner: str, _repo: str, *, timeout: float | None = None) -> _host.SettingsFacts:
+        assert timeout is not None
+        assert timeout > 0
+        return _host.SettingsFacts(
+            '',
+            'main',
+            issues=True,
+            wiki=False,
+            projects=False,
+            pull_requests=False,
+            discussions=False,
+        )
+
+    monkeypatch.setattr(_stage, 'repository_settings', _settings)
     monkeypatch.setattr(_stage, '_stage_destination', _staging_destination)
     monkeypatch.setattr(_stage, 'require_authenticated_account', _require_account)
     monkeypatch.setattr(_stage, '_verify_stage_facts', _verify_facts)
@@ -385,10 +399,7 @@ def test_ci_verdicts_reads_each_configured_check_once_in_order(
         coordinates: tuple[str, str],
         commit: str,
         name: str,
-        *,
-        timeout: float | None = None,
     ) -> CheckVerdict:
-        assert timeout is None
         calls.append((*coordinates, commit, name))
         return CheckVerdict(name, 'success', 'success')
 
@@ -687,6 +698,70 @@ def test_published_package_watch_refuses_unexpected_tag_before_checks_or_index(
         _watch.watch_package(paths, global_config, project, version='1.2.3', timeout=30)
 
 
+@pytest.mark.slow
+def test_staged_watch_checks_older_snapshot_when_prepared_candidate_differs(
+    tmp_path: Path,
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _host_path, paths, global_config, project, candidate = _prepare_stage(
+        tmp_path, fake_gh, make_repo, monkeypatch, checks=('CI',)
+    )
+    newer = replace(candidate, commit='b' * 40)
+
+    def _candidate_read(_paths: Paths, _project: str) -> _candidate.CandidateRecord:
+        return newer
+
+    monkeypatch.setattr(_stage, 'load_candidate', _candidate_read)
+    _status_responses(fake_gh, project, candidate.commit, {'CI': 'success'})
+    capture = StringIO()
+    with redirect_stdout(capture):
+        _watch.watch_ci(paths, global_config, project, staged=True, version=None, timeout=30)
+    rendered = capture.getvalue()
+    assert candidate.commit[:12] in rendered
+    assert newer.commit not in rendered
+    assert 'Required checks passed.' in rendered
+    assert all(newer.commit not in ' '.join(call) for call in gh_calls(tmp_path))
+
+
+def test_staged_watch_does_not_publish_newer_candidate_after_old_checks_succeed(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = make_repo(files={'README.md': 'public\n'})
+    paths, configured, candidate = prepare(tmp_path, source, monkeypatch)
+    p = replace(configured, publication_route='staged', required_checks=('CI',))
+    g = _config.load_global(paths)
+    _candidate.save_candidate(
+        paths, p.name, replace(candidate, fingerprint=_candidate.fingerprint(g, p))
+    )
+    old_commit = 'a' * 40
+    assert old_commit != candidate.commit
+    old_stage = _stage.StageRecord(old_commit, p.owner, stage_repository(p))
+    _save_stage(paths, p.name, old_stage)
+
+    def _verified_old_stage(
+        *_args: object, **_kwargs: object
+    ) -> tuple[Destination, _stage.StageRecord]:
+        return _destination(owner=p.owner, repo=stage_repository(p)), old_stage
+
+    def _successful_old_checks(*_args: object, **_kwargs: object) -> list[CheckVerdict]:
+        return [CheckVerdict('CI', 'success', 'success')]
+
+    monkeypatch.setattr(_watch, 'verify_staged_target', _verified_old_stage)
+    monkeypatch.setattr(_watch, '_wait_for_checks', _successful_old_checks)
+    capsys.readouterr()
+
+    _watch.watch_ci(paths, g, p, staged=True, version=None, timeout=30)
+
+    output = re.sub(r': +', ': ', capsys.readouterr().out)
+    assert old_commit[:12] in output
+    assert output.rstrip().endswith('Next: pubanon stage push')
+
+
 def test_staged_watch_polls_missing_check_until_success(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -785,15 +860,13 @@ def test_staged_watch_uses_recorded_coordinates_and_commit(
 
     def _refs(
         dest: Destination,
-        _paths: Paths,
-        _project: str,
         *,
         timeout: float | None = None,
-    ) -> tuple[str | None, tuple[str, ...]]:
+    ) -> RemoteRefs:
         assert (dest.owner, dest.repo) == ('publication-owner', 'staging-repo')
         assert timeout is not None
         assert timeout > 0
-        return commit, ()
+        return RemoteRefs(commit, {}, ())
 
     def _check(
         coordinates: tuple[str, str],
@@ -808,20 +881,20 @@ def test_staged_watch_uses_recorded_coordinates_and_commit(
         return CheckVerdict(name, 'success', 'success')
 
     _stub_staged_destination(monkeypatch, _verify)
-    monkeypatch.setattr(_stage, 'stage_refs', _refs)
+    monkeypatch.setattr(_stage, 'read_remote_refs', _refs)
     monkeypatch.setattr(_watch, 'check_result', _check)
 
     _watch.watch_ci(paths, global_config, project, staged=True, version=None, timeout=30)
 
     assert verified == [('publication-owner', 'staging-repo', 'private')]
     assert checked == [('publication-owner', 'staging-repo', commit)]
-    output = capsys.readouterr().out
-    assert 'Next: pubanon publish\n' in output
+    output = re.sub(r': +', ': ', capsys.readouterr().out)
+    assert 'Next: pubanon prepare\n' in output
     assert 'Next: no action is required.\n' not in output
-    assert f'Selected commit: {commit}\n' in output
+    assert commit[:12] in output
     assert output.rstrip().splitlines()[-1].startswith('Next:')
-    assert 'Watch snapshot CI\n' in output
-    assert 'Repository: publication-owner/staging-repo\n' in output
+    assert 'Waiting for checks on recorded staged snapshot' in output
+    assert 'in publication-owner/staging-repo\n' in output
 
 
 def test_staged_watch_uses_shared_staged_target_verification_before_checks(
@@ -893,8 +966,26 @@ def test_staged_watch_uses_timeout_signal_stage_and_makes_no_later_call(
         _watch.watch_ci(paths, global_config, project, staged=True, version=None, timeout=30)
 
     assert exc_info.value.fact == 'refs: pending'
-    assert exc_info.value.recovery == 'rerun `pubanon watch ci --staged`'
+    assert exc_info.value.recovery == 'rerun `pubanon stage watch`'
     assert clock._sleeps == []
+
+
+def test_staged_watch_without_record_omits_commit_placeholder(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paths, global_config, project = _configs(tmp_path)
+
+    with pytest.raises(PubanonError, match='no staged commit is recorded') as raised:
+        _watch.watch_ci(paths, global_config, project, staged=True, version=None, timeout=30)
+
+    rendered = re.sub(r': +', ': ', capsys.readouterr().out)
+    assert (
+        'Waiting for checks on recorded staged snapshot in publication-owner/staging-repo'
+        in rendered
+    )
+    assert '(recorded sta)' not in rendered
+    assert raised.value.recovery == 'pubanon stage repair or pubanon stage push'
 
 
 @pytest.mark.parametrize('selector', [_watch._select_ci_commit, _watch.select_package_release])
@@ -928,18 +1019,18 @@ def test_supplied_version_requires_semantic_xyz_form(
     [
         (
             (CheckVerdict('Build', 'unacceptable', 'failure'),),
-            'Build: unacceptable (failure)',
+            'Build: failed',
         ),
         (
             (CheckVerdict('Build', 'ambiguous', '2 check runs'),),
-            'Build: ambiguous (2 check runs)',
+            'Build: could not be determined',
         ),
         (
             (
                 CheckVerdict('Build', 'missing', ''),
                 CheckVerdict('Test', 'unacceptable', 'failure'),
             ),
-            'Test: unacceptable (failure)',
+            'Test: failed',
         ),
     ],
 )
@@ -1004,7 +1095,7 @@ def test_watch_ci_failed_check_refuses_without_sleep_or_another_poll(
     with pytest.raises(PubanonError, match='not acceptable') as raised:
         _watch.watch_ci(paths, global_config, project, staged=False, version=None, timeout=30)
 
-    assert raised.value.fact == 'CI: unacceptable (failure)'
+    assert raised.value.fact == 'CI: failed'
     assert clock._sleeps == []
 
 
@@ -1025,10 +1116,10 @@ def test_watch_ci_pending_past_deadline_fails_closed_without_an_extra_poll(
     with pytest.raises(PubanonError, match='pending') as raised:
         _watch.watch_ci(paths, global_config, project, staged=False, version=None, timeout=10)
 
-    assert raised.value.fact == 'CI: pending (queued)'
+    assert raised.value.fact == 'CI: pending'
     assert raised.value.recovery == 'wait for the check, then rerun the watch'
     check_path = f'/commits/{commit}/check-runs?'
-    assert len([call for call in _calls(tmp_path) if check_path in call[-1]]) == 1
+    assert len([call for call in gh_calls(tmp_path) if check_path in call[-1]]) == 1
     assert clock._sleeps == [10]
 
 
@@ -1057,36 +1148,8 @@ def test_watch_ci_polls_missing_then_pending_check_until_success(
     _watch.watch_ci(paths, global_config, project, staged=False, version=None, timeout=45)
 
     check_path = f'/commits/{commit}/check-runs?'
-    assert len([call for call in _calls(tmp_path) if check_path in call[-1]]) == 3
+    assert len([call for call in gh_calls(tmp_path) if check_path in call[-1]]) == 3
     assert clock._sleeps == [15, 15]
-
-
-def test_watch_ci_polls_pending_check_then_succeeds(
-    tmp_path: Path,
-    fake_gh: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    commit = 'a' * 40
-    paths, global_config, project = _configs(tmp_path)
-    _published_refs(monkeypatch, commit, {})
-    _host_responses(
-        fake_gh,
-        _check_response(
-            commit,
-            'CI',
-            status='in_progress',
-            conclusion=None,
-            once=True,
-        ),
-        _check_response(commit, 'CI', status='completed', conclusion='success'),
-    )
-    clock = _patch_clock(monkeypatch)
-
-    _watch.watch_ci(paths, global_config, project, staged=False, version=None, timeout=30)
-
-    check_path = f'/commits/{commit}/check-runs?'
-    assert len([call for call in _calls(tmp_path) if check_path in call[-1]]) == 2
-    assert clock._sleeps == [15]
 
 
 def test_watch_ci_preserves_selected_version_in_package_next_step(
@@ -1111,9 +1174,49 @@ def test_watch_ci_preserves_selected_version_in_package_next_step(
 
     _watch.watch_ci(paths, global_config, project, staged=False, version='1.2.3', timeout=30)
 
-    output = capsys.readouterr().out
-    assert f'Selected commit: {selected_commit}\n' in output
-    assert output.rstrip().endswith('Next: pubanon watch package --version 1.2.3')
+    output = re.sub(r': +', ': ', capsys.readouterr().out)
+    assert selected_commit[:12] in output
+    assert output.rstrip().endswith('Next: pubanon package watch --version 1.2.3')
+
+
+def test_watch_ci_prints_each_final_result_once_when_other_checks_advance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    commit = 'a' * 40
+    paths, global_config, project = _configs(tmp_path)
+    project = replace(project, required_checks=('Build', 'Tests'))
+    _published_refs(monkeypatch, commit, {})
+    monkeypatch.setattr(_watch, 'verify_destination', _verify_selected)
+    states = iter(
+        [
+            CheckVerdict('Build', 'success', 'first run'),
+            CheckVerdict('Tests', 'pending', 'queued'),
+            CheckVerdict('Build', 'success', 'updated detail'),
+            CheckVerdict('Tests', 'success', 'success'),
+        ]
+    )
+
+    def _check(
+        _coordinates: tuple[str, str],
+        _commit: str,
+        _name: str,
+        *,
+        timeout: float | None = None,
+    ) -> CheckVerdict:
+        assert timeout is not None
+        return next(states)
+
+    monkeypatch.setattr(_watch, 'check_result', _check)
+    _patch_clock(monkeypatch)
+
+    _watch.watch_ci(paths, global_config, project, staged=False, version=None, timeout=30)
+
+    rendered = re.sub(r': +', ': ', capsys.readouterr().out)
+    assert rendered.count('Build: passed') == 1
+    assert rendered.count('Tests: passed') == 1
+    assert rendered.count('Tests: pending') == 1
 
 
 def test_watch_ci_refuses_conflicting_selectors_before_observation(
@@ -1180,24 +1283,23 @@ def test_watch_ci_reports_target_state_changes_and_elapsed_before_waiting(
     _watch.watch_ci(paths, global_config, project, staged=False, version=None, timeout=60)
 
     first = observed_before_first_sleep[0]
-    assert 'Watch snapshot CI\n' in first
-    assert 'Repository: publication-owner/public-repo\n' in first
-    assert 'Required checks: CI\n' in first
-    assert 'Timeout: 60 seconds. Ctrl-C stops waiting.\n' in first
+    assert 'Waiting for checks on recorded published main' in first
+    assert 'publication-owner/public-repo\n' in first
+    assert 'Checks:  CI\n' in first
+    assert (
+        'Timeout: 1 minute. Press Ctrl-C to stop waiting; rerun the command to continue.\n'
+        in first
+    )
     phases = [
         line.removeprefix('Phase: ').rstrip('.')
         for line in first.splitlines()
         if line.startswith('Phase: ')
     ]
-    assert phases == [
-        'verifying account and repository',
-        'reading published refs',
-        'reading CI checks',
-    ]
-    assert '  CI: pending (queued)\n' in first
-    output = capsys.readouterr().out
+    assert phases == []
+    assert 'CI: pending' in first
+    output = re.sub(r': +', ': ', capsys.readouterr().out)
     assert 'Elapsed: 30 seconds. Still waiting for CI.\n' in output
-    assert '  CI: success (success)\n' in output
+    assert output.count('CI: passed') == 1
     assert clock._sleeps == [15, 15, 15]
 
 
@@ -1218,17 +1320,20 @@ def test_watch_ci_success_reports_answers_and_keeps_oid_in_details(
 
     _watch.watch_ci(paths, global_config, project, staged=False, version=None, timeout=30)
 
-    output = capsys.readouterr().out
-    assert output.startswith('Watch snapshot CI\n')
-    assert 'Repository: publication-owner/public-repo\n' in output
-    assert 'Required checks: CI\n' in output
-    assert 'Timeout: 30 seconds. Ctrl-C stops waiting.\n' in output
-    assert 'Required CI checks succeeded for the selected snapshot.\n' in output
-    assert '  CI: success (success)\n' in output
-    assert 'Nothing was changed.\n' not in output
+    output = re.sub(r': +', ': ', capsys.readouterr().out)
+    assert output.startswith('Waiting for checks on recorded published main')
+    assert 'publication-owner/public-repo\n' in output
+    assert 'Checks: CI\n' in output
+    assert (
+        'Timeout: 30 seconds. Press Ctrl-C to stop waiting; rerun the command to continue.\n'
+        in output
+    )
+    assert 'Required checks passed.\n' in output
+    assert output.count('CI: passed') == 1
+    assert 'Phase:' not in output
     assert 'Revealing the repository makes its history public.\n' in output
     assert 'Next: pubanon repo reveal\n' in output
-    assert f'Selected commit: {commit}\n' in output
+    assert commit[:12] in output
     assert output.rstrip().splitlines()[-1].startswith('Next:')
     assert clock._sleeps == []
 
@@ -1313,7 +1418,10 @@ def test_watch_ci_translates_in_flight_expiry_and_makes_no_later_call(
     monkeypatch.setattr(_watch, 'check_result', _check)
     clock = _patch_clock(monkeypatch)
 
-    with pytest.raises(PubanonError, match='observation timed out') as exc_info:
+    with (
+        verbose_context(enabled=True),
+        pytest.raises(PubanonError, match='observation timed out') as exc_info,
+    ):
         _watch.watch_ci(paths, global_config, project, staged=False, version=None, timeout=30)
 
     assert exc_info.value.fact == fact
@@ -1444,7 +1552,7 @@ def test_watch_package_missing_check_expires_without_reading_index(
     with pytest.raises(PubanonError, match='pending') as raised:
         _watch.watch_package(paths, global_config, project, version=None, timeout=10)
 
-    assert raised.value.fact == 'Release: missing ()'
+    assert raised.value.fact == 'Release: not found'
     assert raised.value.recovery == (
         'check the configured name and workflow trigger, then rerun the watch'
     )
@@ -1512,8 +1620,8 @@ def test_watch_package_polls_absence_then_reports_published_files(
         *,
         timeout: float | None = None,
     ) -> Destination:
-        output = capsys.readouterr().out
-        assert f'Package name: demo-{"private-canary"}\\x1b\n' in output
+        output = re.sub(r': +', ': ', capsys.readouterr().out)
+        assert 'demo-private-canary\\x1b' in output
         assert 'private-canary' in output
         assert '\x1b' not in output
         startup.append(output)
@@ -1561,30 +1669,28 @@ def test_watch_package_polls_absence_then_reports_published_files(
 
     assert len(startup) == 1
     output = startup[0] + capsys.readouterr().out
-    assert output.startswith('Watch package release\n')
+    assert output.startswith('Waiting for package demo-private-canary\\x1b v1.2.3')
     assert all(
         item in output
         for item in (
-            'Repository: publication-owner/public-repo\n',
-            f'Selected commit: {commit}\n',
-            'Package version: 1.2.3\n',
-            'Release checks: Release\n',
-            'Timeout: 45 seconds. Ctrl-C stops waiting.\n',
+            'publication-owner/public-repo\n',
+            commit[:12],
+            'Checks: Release\n',
+            'Timeout: 45 seconds. Press Ctrl-C to stop waiting; rerun the command to continue.\n',
         )
     )
     assert '  Package: absent\n' in output
     assert '  Package: metadata found; no distribution files\n' in output
-    assert 'Package release 1.2.3 is published.\n' in output
-    assert '  Release: success (success)\n' in output
+    assert 'Package release v1.2.3 is published.\n' in output
+    assert output.count('Release: passed') == 1
     assert 'Published files\n' in output
     assert '  demo-1.2.3.tar.gz\n' in output
-    assert f'  demo-1.2.3\\x1b{"private-canary"}.whl' in output
+    assert '  demo-1.2.3\\x1bprivate-canary.whl' in output
     assert '\x1b' not in output
     assert 'private-canary' in output
-    assert 'Nothing was changed.\n' not in output
     assert 'Revealing the repository makes its history public.\n' in output
     assert 'Next: pubanon repo reveal\n' in output
-    assert 'Release tag: v1.2.3\n' in output
+    assert 'Release tag:' not in output
     assert output.rstrip().splitlines()[-1].startswith('Next:')
     assert check_calls == 1
     assert release_calls == [

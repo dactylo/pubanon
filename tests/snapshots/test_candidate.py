@@ -27,7 +27,7 @@ from pubanon._snapshots._source import (
     read_snapshot,
     snapshot_digest,
 )
-from pubanon._terminal import escape
+from pubanon._terminal import color_context, escape
 from tests._git import git_env
 from tests._permissions import assert_private_mode
 
@@ -408,7 +408,7 @@ def test_build_candidate_gates_tag_intent_with_custom_message(tmp_path: Path) ->
     global_config, project_config = _configs(tmp_path)
     global_config = replace(global_config, sensitive_terms=('v1.2.3',))
 
-    with pytest.raises(PubanonError, match='tag intent failed content gates'):
+    with pytest.raises(PubanonError, match='the release tag did not pass content checks'):
         _candidate.build_candidate(
             paths,
             global_config,
@@ -628,7 +628,7 @@ def test_build_candidate_uses_exact_gated_message_override(tmp_path: Path) -> No
     assert raw.partition(b'\n\n')[2] == b'public release message\n'
 
     _candidate.discard(paths, project_config.name, force=False)
-    with pytest.raises(PubanonError, match='content gates'):
+    with pytest.raises(PubanonError, match='content checks'):
         _candidate.build_candidate(
             paths,
             global_config,
@@ -977,7 +977,7 @@ def test_clean_inspect_refuses_a_symlink_root(tmp_path: Path) -> None:
     _filesystem.chmod(outside, 0o555)
 
     try:
-        with pytest.raises(PubanonError, match='cannot clean snapshot directory'):
+        with pytest.raises(PubanonError, match='cannot clean review copy'):
             _candidate.clean_inspect(paths, 'example')
         assert inspect.is_symlink()
         assert sentinel.read_bytes() == b'preserve'
@@ -1060,7 +1060,7 @@ def test_correction_infers_only_one_strict_release_tag(
 
 @pytest.mark.parametrize(('selected', 'scope'), [(0, 'one'), (1, 'one'), (2, 'one'), (2, 'all')])
 def test_correction_inherits_selected_parents_and_message(
-    tmp_path: Path, selected: int, scope: str
+    tmp_path: Path, selected: int, scope: Literal['one', 'all']
 ) -> None:
     paths, g, project, commits = _replacement_history(tmp_path)
     before = _candidate.published_refs(paths, project.name)
@@ -1074,7 +1074,7 @@ def test_correction_inherits_selected_parents_and_message(
             None,
             None,
             replaces=commits[selected],
-            replace_scope=cast("Literal['one', 'all']", scope),
+            replace_scope=scope,
         ),
     )
     assert record.message == f'release {selected}'
@@ -1248,7 +1248,9 @@ def test_discard_ignores_similarly_prefixed_archive_reference(tmp_path: Path) ->
     assert _git(store, 'rev-parse', ref).decode().strip() == record.commit
 
 
-def test_discard_protects_unknown_outcome_until_forced(tmp_path: Path) -> None:
+def test_discard_protects_unknown_outcome_until_forced(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     paths, project_config, record = _build(tmp_path)
     inspect = paths.data_dir / 'projects' / project_config.name / 'inspections' / record.commit
     inspect.mkdir(parents=True)
@@ -1260,15 +1262,18 @@ def test_discard_protects_unknown_outcome_until_forced(tmp_path: Path) -> None:
     )
 
     with pytest.raises(
-        PubanonError, match='could not confirm whether the last publication'
+        PubanonError, match='the outcome of the last publication is unknown'
     ) as error:
         _candidate.discard(paths, project_config.name, force=False)
     assert error.value.recovery == 'pubanon publish --resolve'
     assert (inspect / 'edited.txt').exists()
 
     _candidate.discard(paths, project_config.name, force=True)
+    warning = capsys.readouterr().out
+    assert 'snapshot recovery information' in warning
+    assert 'does not undo any possible GitHub publication' in warning
     assert _candidate.load_candidate(paths, project_config.name) is None
-    assert (inspect / 'edited.txt').read_text() == 'dirty\n'
+    assert not inspect.exists()
     store = _candidate.store_path(paths, project_config.name)
     assert _git(store, 'for-each-ref', '--format=%(refname)', _candidate.CANDIDATE_REF) == b''
 
@@ -1296,6 +1301,7 @@ def test_discard_refuses_confirmed_publication(
             '-d',
             _records.publication_ref(record.commit),
         )
+    _candidate.check_recovery_state(paths, project.name, force=force)
     with pytest.raises(PubanonError, match='confirmed publication'):
         _candidate.discard(paths, project.name, force=force)
     assert _candidate.load_candidate(paths, project.name) == record
@@ -1347,11 +1353,12 @@ def test_discard_reports_ref_failure_and_preserves_cleanup_policy(
     with pytest.raises(PubanonError) as error:
         _candidate.discard(paths, project.name, force=force)
     expected = r'exit status 7: diagnostic\x1b\\path'
-    assert error.value.fact == (f'advisory store snapshot ref: {expected}' if force else expected)
+    assert error.value.fact == (f'saved snapshot reference: {expected}' if force else expected)
     assert _candidate.load_candidate(paths, project.name) == (None if force else record)
-    assert error.value.recovery == ('pubanon repo verify --repair-store' if force else None)
+    assert error.value.recovery == ('pubanon repo restore --to local' if force else None)
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize('boundary', ['directory', 'bookmark', 'ref'])
 def test_discard_rewrite_cleanup_failure_retains_locator_for_retry(
     tmp_path: Path,
@@ -1492,7 +1499,7 @@ def test_force_discard_removes_record_with_broken_store(
     with pytest.raises(PubanonError) as exc_info:
         _candidate.discard(paths, project.name, force=True)
 
-    assert 'repair' in exc_info.value.render()
+    assert 'pubanon repo restore --to local' in exc_info.value.render()
     assert not (paths.data_dir / 'projects' / project.name / 'candidate.toml').exists()
     if nested:
         assert _git(tmp_path, 'for-each-ref') == ancestor_refs
@@ -1501,11 +1508,24 @@ def test_force_discard_removes_record_with_broken_store(
         )
 
 
+@pytest.mark.slow
 def test_frozen_publication_verification_rejects_substituted_tag_mapping(tmp_path: Path) -> None:
     paths, _g, project, record = _complete_replacement(tmp_path)
     changed = replace(record, poststate_tags={'v1.0.0': record.commit})
     with pytest.raises(PubanonError, match='poststate'):
         _candidate.verify_publication_objects(paths, project.name, changed)
+
+
+def test_incomplete_replacement_conflicts_with_archive_only(tmp_path: Path) -> None:
+    paths, _global_config, project, record = _complete_replacement(tmp_path)
+    store = _candidate.store_path(paths, project.name)
+    assert _records.load_publication(paths, project.name, record.commit) is None
+    _git(store, 'update-ref', _records.publication_ref(record.commit), record.commit)
+
+    with pytest.raises(
+        PubanonError, match='the incomplete snapshot conflicts with saved published history'
+    ):
+        _candidate.confirmed_publication(paths, project.name, replace(record, tip=None))
 
 
 def test_initial_record_sync_failure_removes_commit_point_and_reruns(
@@ -1711,7 +1731,7 @@ def test_inspect_refresh_replaces_only_selected_candidate_copy(tmp_path: Path) -
     selected = _candidate.materialize_inspect(paths, project.name, record)
     assert selected != previous
     assert selected.name == record.commit
-    _filesystem.chmod(previous, 0o700)
+    previous.mkdir()
     notes = previous / 'notes.txt'
     notes.write_text('keep previous notes')
     _filesystem.chmod(selected, 0o700)
@@ -1990,7 +2010,7 @@ def test_inspect_refuses_symlink_copy_or_parent_without_touching_target(
         (root / record.commit).symlink_to(outside, target_is_directory=True)
     with pytest.raises(PubanonError, match='symlink'):
         _candidate.materialize_inspect(paths, project.name, record)
-    with pytest.raises(PubanonError, match=r'symlink|cannot clean snapshot directory'):
+    with pytest.raises(PubanonError, match=r'symlink|cannot clean review copy'):
         _candidate.clean_inspect(paths, project.name)
     assert (outside / 'notes').read_text() == 'keep outside notes'
 
@@ -2026,7 +2046,7 @@ def test_inspect_refuses_unexpected_filesystem_directory_collision(
 
     monkeypatch.setattr(Path, 'mkdir', _case_insensitive_mkdir)
 
-    with pytest.raises(PubanonError, match='paths collide in the snapshot directory'):
+    with pytest.raises(PubanonError, match='paths collide in the review copy'):
         _candidate.materialize_inspect(paths, project_config.name, record)
     assert not inspect.exists()
     monkeypatch.setattr(Path, 'mkdir', original_mkdir)
@@ -2052,8 +2072,8 @@ def test_inspect_report_bounds_file_list_and_saves_complete_private_report(tmp_p
     assert_private_mode(complete, 0o600)
     assert 'file-000.txt' in complete.read_text()
     assert 'file-029.txt' in complete.read_text()
-    assert 'Version: untagged' in report
-    assert 'Checks\n' in report
+    assert 'Snapshot untagged (prepared)' in report
+    assert 'Checks:' in report
 
 
 def test_inspect_report_marks_changed_configuration_without_claiming_current_gates(
@@ -2065,8 +2085,8 @@ def test_inspect_report_marks_changed_configuration_without_claiming_current_gat
 
     report = _candidate.inspect_report(paths, record, global_config, changed)
 
-    assert 'No configured private terms were found when prepared\n' in report
-    assert 'Snapshot identity, files, and commit verified\n' in report
+    assert 'no sensitive terms found when prepared' in report
+    assert 'snapshot verified' in report
     assert 'Publication configuration: changed since prepare' in report
     assert 'checks have not been rerun with these settings' in report
     assert 'snapshot cannot publish' in report
@@ -2097,28 +2117,26 @@ def test_inspect_report_renders_first_release_facts_and_credential_exceptions(
 
     report = _candidate.inspect_report(paths, record, global_config, project_config)
 
-    assert report.startswith('Snapshot\n')
-    assert 'No configured private terms were found when prepared\n' in report
-    assert 'Snapshot identity, files, and commit verified\n' in report
-    assert 'Publication configuration: unchanged since prepare' in report
-    assert 'GitHub destination and visibility have not been rechecked\n' in report
+    assert report.startswith('Snapshot ')
+    assert 'no sensitive terms found when prepared' in report
+    assert 'snapshot verified' in report
+    assert 'Publication configuration:' not in report
+    assert 'GitHub not rechecked' in report
     assert _candidate.inspect_next_action(record, global_config, project_config) == (
         'pubanon publish'
     )
-    assert f'  Snapshot commit: {record.commit[:12]}' in report
-    assert f'  Source commit: {record.pinned.commit[:12]}' in report
-    assert '  Identity: Anonymous Publisher <anonymous@example.invalid>' in report
-    assert '  Message:\n    | release: v1.2.3\n    | \n' in report
-    assert r'    | Details: forged\x1b\x0dlabel' in report
-    assert '  Destination: GitHub public-owner/public-repo' in report
-    assert '  Visibility: PUBLIC' in report
-    assert '  Version: v1.2.3' in report
-    assert report.index('Version:') < report.index('Snapshot commit:')
-    assert report.index('Identity: Anonymous') < report.index('Snapshot commit:')
-    assert '  Changes: first release' in report
+    assert 'Snapshot commit:' not in report
+    assert 'Source commit:' not in report
+    assert 'Anonymous Publisher <anonymous@example.invalid>' in report
+    assert 'Message:' in report
+    assert '  release: v1.2.3\n  \n' in report
+    assert r'  Details: forged\x1b\x0dlabel' in report
+    assert 'Destination: public-owner/public-repo (public)' in report
+    assert 'Snapshot v1.2.3 (prepared)' in report
+    assert 'first release, 2 files' in report
     assert '2 files changed' in report
-    assert f'  Credential-like exceptions: {"canaryx"}.env' in report
-    assert 'canaryx' in report
+    assert 'credential-like' not in report
+    assert 'canaryx' not in report
 
     changed_report = _candidate.inspect_report(
         paths,
@@ -2126,9 +2144,8 @@ def test_inspect_report_renders_first_release_facts_and_credential_exceptions(
         replace(global_config, anon_name='Replacement Publisher'),
         replace(project_config, owner='replacement-owner', visibility='private'),
     )
-    assert 'Identity: Anonymous Publisher <anonymous@example.invalid>' in changed_report
-    assert 'Destination: GitHub public-owner/public-repo' in changed_report
-    assert 'Visibility: PUBLIC' in changed_report
+    assert 'Anonymous Publisher <anonymous@example.invalid>' in changed_report
+    assert re.search(r'Destination:\s+public-owner/public-repo \(public\)', changed_report)
     assert 'checks have not been rerun with these settings' in changed_report
     assert 'Replacement Publisher' not in changed_report
 
@@ -2151,6 +2168,8 @@ def test_inspect_report_renders_untrusted_fields_without_escaping_trusted_layout
         _candidate.CandidateInputs(_snapshot(), _pinned(), None, None),
     )
 
+    real_git_result = _candidate._git_result
+
     def _git_result(
         _args: Sequence[str],
         *,
@@ -2159,23 +2178,23 @@ def test_inspect_report_renders_untrusted_fields_without_escaping_trusted_layout
         input_bytes: bytes | None = None,
         env_extra: Mapping[str, str] | None = None,
     ) -> bytes:
-        del store, failure, input_bytes, env_extra
+        if '--stat' not in _args and '--numstat' not in _args:
+            return real_git_result(
+                _args, store=store, failure=failure, input_bytes=input_bytes, env_extra=env_extra
+            )
         return f'docs/changed\x1b{term}.txt | 1 +\nInjected: false detail\n'.encode()
 
     monkeypatch.setattr(_candidate, '_git_result', _git_result)
 
     report = _candidate.inspect_report(paths, record, global_config, project_config)
 
-    assert report.startswith('Snapshot\n')
+    assert report.startswith('Snapshot ')
     assert '\x1b' not in report
     assert term in report
-    assert (
-        '  Changes: first release\n'
-        f'    | docs/changed\\x1b{term}.txt | 1 +\n'
-        '    | Injected: false detail' in report
-    )
-    assert f'  Credential-like exceptions: fixtures/allowed\\x1b{term}.key' in report
-    assert report.splitlines().count('Snapshot') == 1
+    assert f'  docs/changed\\x1b{term}.txt | 1 +' in report
+    assert '  Injected: false detail' in report
+    assert 'Credential-like exceptions:' not in report
+    assert sum(line.startswith('Snapshot ') for line in report.splitlines()) == 1
 
 
 def test_inspect_report_routes_unknown_outcome_to_resolution_before_configuration_drift(
@@ -2333,6 +2352,42 @@ def test_inspect_verifies_retained_objects_before_reusing_or_refreshing_copy(
     assert (inspection / 'notes').read_text() == 'keep notes'
 
 
+def test_inspect_warns_only_about_credential_files_actually_in_snapshot(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    global_config, project = _configs(tmp_path)
+    project = replace(project, secret_exceptions=('kept.key', 'absent.key'))
+    record = _candidate.build_candidate(
+        paths,
+        global_config,
+        project,
+        _candidate.CandidateInputs(
+            (*_snapshot(), Entry('kept.key', 0o100644, 'blob', b'public fixture')),
+            _pinned(),
+            None,
+            None,
+        ),
+    )
+    changed = replace(project, secret_exceptions=())
+    report = _candidate.inspect_report(paths, record, global_config, changed)
+    assert 'warning: Snapshot includes 1 credential-like file: kept.key.' in report
+    assert 'absent.key' not in report
+
+
+def test_inspection_path_validates_components_without_creating_directories(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    commit = 'a' * 40
+
+    inspection = _candidate.inspection_path(paths, 'example', commit)
+
+    assert inspection == paths.data_dir / 'projects' / 'example' / 'inspections' / commit
+    assert not paths.data_dir.exists()
+    with pytest.raises(PubanonError, match='invalid project name'):
+        _candidate.inspection_path(paths, '../outside', commit)
+    with pytest.raises(PubanonError, match='invalid review copy commit'):
+        _candidate.inspection_path(paths, 'example', '../outside')
+    assert not paths.data_dir.exists()
+
+
 def test_materialization_explains_missing_windows_symlink_privilege(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2425,6 +2480,7 @@ def test_materialize_directory_validates_before_creation(
     assert not target.exists()
 
 
+@pytest.mark.slow
 def test_multi_snapshot_replacement_keeps_correction_and_final_facts_together(
     tmp_path: Path,
 ) -> None:
@@ -2436,14 +2492,14 @@ def test_multi_snapshot_replacement_keeps_correction_and_final_facts_together(
         _candidate.inspect_report(paths, record, global_config, project),
         _candidate.publication_report(paths, record, global_config, project),
     ):
-        assert report.startswith('Prepared snapshots\n')
-        assert 'Correction version: v0.0.0' in report
-        assert 'Correction message:\n    | release 0' in report
-        assert f'Correction source commit: {record.pinned.commit[:12]}' in report
-        assert f'Correction snapshot ID: {record.commit[:12]}' in report
-        assert 'Final version: v2.0.0' in report
-        assert f'Final snapshot ID: {record.tip[:12]}' in report
-        assert 'Final snapshot changes: since recorded publication base' in report
+        assert report.startswith('Prepared snapshots (prepared)\n')
+        assert re.search(r'Correction version:\s+v0.0.0', report)
+        assert re.search(r'Correction message:\s+release 0', report)
+        assert 'Correction source commit:' not in report
+        assert re.search(rf'Correction snapshot ID:\s+{record.commit[:12]}', report)
+        assert re.search(r'Final version:\s+v2.0.0', report)
+        assert re.search(rf'Final snapshot ID:\s+{record.tip[:12]}', report)
+        assert re.search(r'Final snapshot changes:\s+since recorded publication base', report)
         assert 'Snapshot commit:' not in report
 
 
@@ -2454,10 +2510,10 @@ def test_publication_report_leaves_live_facts_to_caller(tmp_path: Path) -> None:
     assert 'Next:' not in report
     assert 'Live destination and visibility: not rechecked now' not in report
     assert 'Verified destination' not in report
-    assert f'Snapshot commit: {record.commit[:12]}' in report
+    assert 'Snapshot commit:' not in report
     assert record.message in report
-    assert 'Identity: Anonymous Publisher <anonymous@example.invalid>' in report
-    assert 'Complete file report:' in report
+    assert 'Anonymous Publisher <anonymous@example.invalid>' in report
+    assert 'File list:' in report
 
 
 @pytest.mark.parametrize('directory', ['publications', 'source-worktrees'])
@@ -2613,6 +2669,14 @@ def test_replace_all_retires_old_tags_and_creates_only_intended_tag(
     assert record.replayed == ()
     assert _candidate.published_refs(paths, project.name) == before
     _candidate.verify_publication_objects(paths, project.name, record)
+    report = _candidate.inspect_report(paths, record, g, project)
+    assert re.search(r'Scope:\s+all published history \(3 snapshots\) -> one snapshot', report)
+    assert re.search(r'Removed tags:\s+v0.0.0, v2.0.0', report)
+    assert 'v1.0.0:' in report
+    assert 'GitHub not rechecked' in report
+    with color_context('always'):
+        colored = _candidate.inspect_report(paths, record, g, project)
+    assert '\x1b[33mv0.0.0, v2.0.0\x1b[0m' in colored
 
 
 def test_replacement_audits_untouched_earlier_commit_headers(tmp_path: Path) -> None:
@@ -2652,6 +2716,7 @@ def test_replacement_audits_untouched_earlier_commit_headers(tmp_path: Path) -> 
         _candidate.verify_retained_candidate(paths, g, project, record, env={})
 
 
+@pytest.mark.slow
 def test_replacement_checks_reserved_paths_in_every_replayed_tree(tmp_path: Path) -> None:
     relative = 'pubanon/projects/example/publications/private.txt'
     paths, g, project, record = _complete_replacement(
@@ -2669,6 +2734,7 @@ def test_replacement_checks_reserved_paths_in_every_replayed_tree(tmp_path: Path
         _candidate.verify_retained_candidate(paths, g, project, record, env={})
 
 
+@pytest.mark.slow
 def test_replacement_gates_complete_changed_path_names(tmp_path: Path) -> None:
     paths, g, project, record = _complete_replacement(
         tmp_path,
@@ -2677,11 +2743,14 @@ def test_replacement_gates_complete_changed_path_names(tmp_path: Path) -> None:
     g = replace(g, sensitive_terms=('old-name',))
     record = replace(record, fingerprint=fingerprint(g, project))
     _candidate.save_candidate(paths, project.name, record)
-    with pytest.raises(PubanonError, match='replayed publication failed') as error:
+    with pytest.raises(
+        PubanonError, match='the replayed snapshot did not pass current content checks'
+    ) as error:
         _candidate.verify_retained_candidate(paths, g, project, record, env={})
     assert 'old-name.txt' in str(error.value.fact)
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize('resolved', [False, True])
 @pytest.mark.parametrize('filename', ['new.txt', 'file.txt'])
 def test_replacement_gates_full_changed_blob_even_when_term_occurred_elsewhere(
@@ -2703,13 +2772,14 @@ def test_replacement_gates_full_changed_blob_even_when_term_occurred_elsewhere(
     record = replace(record, fingerprint=fingerprint(g, project))
     _candidate.save_candidate(paths, project.name, record)
     with pytest.raises(
-        PubanonError, match='replayed publication failed current content gates'
+        PubanonError, match='the replayed snapshot did not pass current content checks'
     ) as error:
         _candidate.verify_retained_candidate(paths, g, project, record, env={})
     assert filename in str(error.value.fact)
     assert record.replayed[0].old[:12] in str(error.value.fact)
 
 
+@pytest.mark.slow
 def test_replacement_inspection_defaults_to_tip(
     tmp_path: Path,
 ) -> None:
@@ -2719,6 +2789,7 @@ def test_replacement_inspection_defaults_to_tip(
     assert (tip / 'file.txt').read_bytes() == b'old 2'
 
 
+@pytest.mark.slow
 def test_replacement_inspection_keeps_complete_per_release_changes_privately(
     tmp_path: Path,
 ) -> None:
@@ -2744,6 +2815,7 @@ def test_replacement_inspection_keeps_complete_per_release_changes_privately(
     assert '1  0  changed/24.txt' in complete
 
 
+@pytest.mark.slow
 def test_replacement_inspection_rejects_untouched_earlier_tag(tmp_path: Path) -> None:
     paths, _g, project, record = _complete_replacement(tmp_path, selected=1, tagged=True)
     selected = _candidate.inspect_rewritten(paths, project.name, record, 'v1.0.0')
@@ -2760,6 +2832,7 @@ def test_replacement_inspection_rejects_untouched_earlier_tag(tmp_path: Path) ->
     assert _records.load_candidate(paths, project.name) == record
 
 
+@pytest.mark.slow
 def test_replacement_inspection_reports_each_original_to_new_change(tmp_path: Path) -> None:
     paths, g, project, record = _complete_replacement(tmp_path)
     report = _candidate.inspect_report(paths, record, g, project)
@@ -2792,6 +2865,7 @@ def test_replacement_inspection_reports_manual_resolution_paths(tmp_path: Path) 
     assert 'Manual resolution: resolved.txt' in complete
 
 
+@pytest.mark.slow
 def test_replacement_inspection_selects_only_rewritten_commits(tmp_path: Path) -> None:
     paths, _g, project, record = _complete_replacement(tmp_path)
     assert record.replaces is not None
@@ -2821,6 +2895,7 @@ def test_replacement_inspection_selects_only_rewritten_commits(tmp_path: Path) -
         _candidate.inspect_rewritten(paths, project.name, record, record.replaces[:12])
 
 
+@pytest.mark.slow
 def test_replacement_publication_proof_needs_neither_ref_nor_current_configuration(
     tmp_path: Path,
 ) -> None:
@@ -2831,6 +2906,7 @@ def test_replacement_publication_proof_needs_neither_ref_nor_current_configurati
     _candidate.verify_publication_objects(paths, project.name, record)
 
 
+@pytest.mark.slow
 def test_replacement_rejects_missing_untagged_descendant(tmp_path: Path) -> None:
     paths, g, project, record = _complete_replacement(tmp_path)
     store = _candidate.store_path(paths, project.name)
@@ -2857,6 +2933,7 @@ def test_replacement_rejects_missing_untagged_descendant(tmp_path: Path) -> None
         _candidate.verify_retained_candidate(paths, g, project, record, env={})
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize('anchor', ['correction', 'old-tip', 'intermediate'])
 def test_replacement_rejects_stale_or_substituted_candidate_anchor(
     tmp_path: Path,
@@ -2914,10 +2991,10 @@ def test_replacement_report_identifies_final_tip_and_correction_input(tmp_path: 
     paths, g, project, record = _complete_replacement(tmp_path)
     report = _candidate.inspect_report(paths, record, g, project)
     assert record.tip is not None
-    assert f'Final snapshot ID: {record.tip[:12]}' in report
-    assert f'Correction snapshot ID: {record.commit[:12]}' in report
-    assert f'Correction source commit: {record.pinned.commit[:12]}' in report
-    assert 'Final snapshot changes: since recorded publication base' in report
+    assert re.search(rf'Final snapshot ID:\s+{record.tip[:12]}', report)
+    assert re.search(rf'Correction snapshot ID:\s+{record.commit[:12]}', report)
+    assert 'Correction source commit:' not in report
+    assert re.search(r'Final snapshot changes:\s+since recorded publication base', report)
 
 
 def test_replacement_snapshot_report_shows_tag_movements(tmp_path: Path) -> None:
@@ -2925,12 +3002,14 @@ def test_replacement_snapshot_report_shows_tag_movements(tmp_path: Path) -> None
 
     report = _candidate.inspect_report(paths, record, global_config, project)
 
-    assert 'State: prepared' in report
-    assert 'Operation: replacement' in report
+    assert '(prepared)' in report
+    assert 'Operation:' not in report
+    assert 'one published snapshot and its replayed descendants' in report
     assert 'Tags moved\n' in report
     assert 'Replaced snapshots\n' in report
 
 
+@pytest.mark.slow
 def test_replacement_verification_returns_tip_and_allows_unchanged_historical_exposure(
     tmp_path: Path,
 ) -> None:
@@ -2938,9 +3017,16 @@ def test_replacement_verification_returns_tip_and_allows_unchanged_historical_ex
     g = replace(g, sensitive_terms=('old',))
     record = replace(record, fingerprint=fingerprint(g, project))
     _candidate.save_candidate(paths, project.name, record)
-    snapshot = _candidate.verify_retained_candidate(paths, g, project, record, env={})
+    with patch.object(_candidate, 'read_snapshot', wraps=_candidate.read_snapshot) as reads:
+        snapshot = _candidate.verify_retained_candidate(paths, g, project, record, env={})
     assert snapshot == (Entry('file.txt', 0o100644, 'blob', b'old 2'),)
     assert record.snapshot_digest == snapshot_digest(_snapshot())
+    read_commits = [call.args[1] for call in reads.call_args_list]
+    assert read_commits.count(record.commit) == 1
+    for entry in record.replayed:
+        assert read_commits.count(entry.old) == 1
+        assert read_commits.count(entry.new) == 1
+    assert len(read_commits) == 1 + 2 * len(record.replayed)
 
 
 @pytest.mark.parametrize('side', ['old', 'new'])
@@ -2961,6 +3047,7 @@ def test_replay_metadata_requires_available_commit_objects(
         )
 
 
+@pytest.mark.slow
 def test_replay_metadata_verification_uses_bounded_processes(tmp_path: Path) -> None:
     paths, g, project, record = _complete_replacement(tmp_path)
     store = _candidate.candidate_store_path(paths, project.name)
@@ -3039,6 +3126,7 @@ def test_rewritten_inspection_explains_invalid_utf8_retained_identity(tmp_path: 
     assert b'\xff' in _git(store, 'cat-file', 'commit', commit)
 
 
+@pytest.mark.slow
 def test_rewritten_inspection_verifies_before_reusing_editable_copy(tmp_path: Path) -> None:
     paths, _g, project, record = _complete_replacement(tmp_path)
     inspection = _candidate.inspect_rewritten(paths, project.name, record, record.commit)
@@ -3076,27 +3164,29 @@ def test_second_candidate_has_sole_parent_and_diff_summary(tmp_path: Path) -> No
     assert '|' in report
 
 
-def test_snapshot_reports_keep_operation_separate_from_state_and_offer_verbose_ids(
-    tmp_path: Path,
-) -> None:
+def test_snapshot_reports_hide_diagnostics_and_align_diffstat(tmp_path: Path) -> None:
     paths, project, record = _build(tmp_path)
     global_config, _ = _configs(tmp_path)
-
-    inspect = _candidate.inspect_report(paths, record, global_config, project)
-    preview = _candidate.publication_report(paths, record, global_config, project)
+    report = _candidate.inspect_report(paths, record, global_config, project)
     verbose = _candidate.inspect_report(paths, record, global_config, project, verbose=True)
-
-    for report in (inspect, preview):
-        assert 'Snapshot' in report
-        assert 'State: prepared' in report
-        assert 'Operation: new' in report
-        assert 'Destination: GitHub public-owner/public-repo' in report
-        assert 'Visibility: PUBLIC' in report
-        assert 'Snapshot commit: ' + record.commit[:12] in report
-        assert 'Complete file report:' in report
-        assert record.commit not in report.split('Complete file report:')[0]
-    assert 'Snapshot\n  State: prepared' in inspect
-    assert f'Snapshot commit: {record.commit}' in verbose
+    assert 'GitHub not rechecked' in report
+    assert 'Source commit:' not in report
+    assert 'Snapshot commit:' not in report
+    assert 'Operation:' not in report
+    field_lines = [
+        line
+        for line in report.splitlines()
+        if line.startswith(('Destination:', 'Identity:', 'Changes:', 'File list:', 'Checks:'))
+    ]
+    assert len(field_lines) == 5
+    assert len({len(line) - len(line.split(':', 1)[1].lstrip()) for line in field_lines}) == 1
+    assert record.pinned.commit in verbose
+    assert record.commit in verbose
+    assert 'Operation:' in verbose
+    diffstat = [line for line in report.splitlines() if ' | ' in line]
+    assert len(diffstat) == 2
+    assert all(line.startswith('  ') and not line.startswith('   ') for line in diffstat)
+    assert not any(line.lstrip().startswith('|') for line in diffstat)
 
 
 def test_store_path_initializes_project_bare_repository(tmp_path: Path) -> None:
@@ -3168,6 +3258,7 @@ def test_tree_paths_returns_git_order_without_reading_blob_bodies(tmp_path: Path
     assert _candidate.tree_paths(paths, project.name, record.commit) == ['a', 'b/c']
 
 
+@pytest.mark.slow
 def test_unchanged_correction_warns_and_stays_distinct_with_same_second_timestamp(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3208,7 +3299,9 @@ def test_verify_retained_candidate_refuses_intact_utf8_term_in_mixed_blob(
     current_record = replace(record, fingerprint=fingerprint(global_config, current_project))
     _candidate.save_candidate(paths, project.name, current_record)
 
-    with pytest.raises(PubanonError, match='snapshot failed current content gates') as exc_info:
+    with pytest.raises(
+        PubanonError, match='the snapshot did not pass current content checks'
+    ) as exc_info:
         _candidate.verify_retained_candidate(
             paths, global_config, current_project, current_record, env=os.environ
         )
@@ -3311,7 +3404,9 @@ def test_verify_retained_candidate_runs_every_current_gate(
     current_record = replace(record, fingerprint=fingerprint(current_config, project))
     _candidate.save_candidate(paths, project.name, current_record)
 
-    with pytest.raises(PubanonError, match='snapshot failed current content gates') as exc_info:
+    with pytest.raises(
+        PubanonError, match='the snapshot did not pass current content checks'
+    ) as exc_info:
         _candidate.verify_retained_candidate(
             paths, current_config, project, current_record, env=os.environ
         )
@@ -3340,10 +3435,10 @@ def test_windows_cleanup_restores_file_access_without_changing_link_targets(
     def _chmod(path: Path, mode: int, *, follow_symlinks: bool = True) -> None:
         changes.append((path, mode, follow_symlinks))
 
-    monkeypatch.setattr(_candidate, 'os', SimpleNamespace(name='nt', scandir=os.scandir))
-    monkeypatch.setattr(_candidate._windows_fs, 'check_directory', checked.append)
-    monkeypatch.setattr(_candidate._filesystem, 'chmod', _chmod)
-    _candidate._restore_inspect_access(directory)
+    monkeypatch.setattr(_filesystem, 'os', SimpleNamespace(name='nt', scandir=os.scandir))
+    monkeypatch.setattr(_filesystem._windows_fs, 'check_directory', checked.append)
+    monkeypatch.setattr(_filesystem, 'chmod', _chmod)
+    _filesystem._restore_tree_access(directory)
 
     assert checked == [directory, nested]
     assert {path for path, _mode, _follow in changes} == {directory, nested, artifact}
@@ -3375,7 +3470,7 @@ def test_windows_inspection_cleanup_never_traverses_junctions(
     )
     try:
         if junction_root:
-            with pytest.raises(PubanonError, match='cannot clean snapshot directory'):
+            with pytest.raises(PubanonError, match='cannot clean review copy'):
                 _candidate._clean_inspection_path(inspection)
             assert junction.is_junction()
         else:

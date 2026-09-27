@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import tomllib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, cast
@@ -12,15 +13,19 @@ from pubanon import (
     _run,
 )
 from pubanon._cli import _context, _selection, _status
-from pubanon._errors import PubanonError
+from pubanon._errors import OperationCanceled, PubanonError
+from pubanon._gate import first_match, gate_unit
 from pubanon._snapshots import _candidate, _records, _rewrite, _source
 from pubanon._terminal import (
     confirm,
+    detail,
+    detail_fields,
     escape,
     heading,
     next_step,
     output,
     style,
+    verbose_enabled,
 )
 from pubanon._terminal import (
     field as terminal_field,
@@ -28,6 +33,9 @@ from pubanon._terminal import (
 
 if TYPE_CHECKING:
     import argparse
+    from collections.abc import Mapping
+
+    from pubanon._gate import RuleClass
 
 
 @dataclass(frozen=True)
@@ -87,6 +95,56 @@ def _continue_rewrite(ctx: _context.ProjectContext) -> _candidate.CandidateRecor
             if record is not None and record.replaces is not None:
                 error.recovery = _candidate.reprepare_advice(record, project=ctx.project.name)
         raise
+
+
+def _gate_excerpt(data: bytes, start: int, end: int) -> str:
+    """Return bounded, escaped source context around the matching text."""
+    line_start = data.rfind(b'\n', 0, start) + 1
+    line_end = data.find(b'\n', end)
+    if line_end < 0:
+        line_end = len(data)
+    left = max(line_start, start - 60)
+    right = min(line_end, end + 60)
+    excerpt = escape(data[left:right].rstrip(b'\r').decode('utf-8', errors='replace'))
+    if left > line_start:
+        excerpt = '...' + excerpt
+    if right < line_end:
+        excerpt += '...'
+    return excerpt
+
+
+def _file_gate_findings(entry: _source.Entry, rules: Mapping[RuleClass, tuple[str, ...]]) -> str:
+    """Show blocked filename text and committed source excerpts for one included file."""
+    findings: list[str] = []
+    filename_terms = dict.fromkeys(
+        hit.term for hit in gate_unit(entry.path, entry.path.encode(), rules)
+    )
+    if filename_terms:
+        findings.append(
+            f'    {style(escape(entry.path), stream=sys.stderr)} (filename)\n'
+            f'      Blocked text: {escape(", ".join(filename_terms))}'
+        )
+    lines: dict[int, list[tuple[int, int, str]]] = {}
+    for hit in gate_unit(entry.path, entry.data, rules):
+        span = first_match(entry.data, hit.term)
+        if span is None:
+            raise PubanonError('gate match location could not be determined')
+        start, end = span
+        line = entry.data[:start].count(b'\n') + 1
+        lines.setdefault(line, []).append((start, end, hit.term))
+    for line, matches in sorted(lines.items()):
+        excerpt = _gate_excerpt(
+            entry.data,
+            min(start for start, _end, _term in matches),
+            max(end for _start, end, _term in matches),
+        )
+        terms = dict.fromkeys(term for _start, _end, term in matches)
+        findings.append(
+            f'    {style(f"{escape(entry.path)}:{line}", stream=sys.stderr)}\n'
+            f'      {excerpt}\n'
+            f'      Blocked text: {escape(", ".join(terms))}'
+        )
+    return '\n\n'.join(findings)
 
 
 def _new_paths(
@@ -193,12 +251,27 @@ def _run_gates(ctx: _context.ProjectContext, snapshot: _source.Snapshot) -> None
         ctx.paths, ctx.project, [entry.path for entry in snapshot]
     )
     derived = _config.derived_private_terms(ctx.paths, ctx.project, os.environ)
-    units = [(entry.path, entry.path.encode(), 'filename') for entry in snapshot]
-    units.extend((entry.path, entry.data, 'blob') for entry in snapshot)
-    details = _config.gate_details(units, ctx.global_config, ctx.project, derived)
-    if details:
+    rules = _config.assemble_rules(ctx.global_config, ctx.project, derived)
+    groups = [details for entry in snapshot if (details := _file_gate_findings(entry, rules))]
+    if groups:
+        count = len(groups)
+        subject = (
+            '1 file selected for publication needs'
+            if count == 1
+            else (f'{count} files selected for publication need')
+        )
         raise PubanonError(
-            'snapshot failed content gates', fact=escape('; '.join(details.values()))
+            'cannot prepare: blocked text in included files',
+            fact=(
+                f'{subject} changes:\n\n'
+                + '\n\n'.join(groups)
+                + '\n\n  Locations refer to the selected commit. '
+                'The first match for each blocked term is shown.'
+            ),
+            recovery=(
+                'Edit these files to remove the blocked text, or exclude them from publication.\n'
+                '  Commit source edits before rerunning pubanon prepare.'
+            ),
         )
 
 
@@ -206,29 +279,37 @@ def _show_source_selection(
     ctx: _context.ProjectContext, options: PrepareOptions, pinned: _source.PinnedSource
 ) -> None:
     """Identify the committed selection and count omitted working changes."""
-    values = {'Selected source': options.source, 'Selected source commit': pinned.commit}
+    changes = _source.working_changes(ctx.project.source_path)
+    selector = (pinned.selector_name or options.source).removeprefix('refs/heads/')
+    commit = pinned.commit if verbose_enabled() else pinned.commit[:12]
+    omitted = ', '.join(
+        f'{count} {label} {"change" if count == 1 else "changes"}'
+        for label, count in (
+            ('staged', changes.staged),
+            ('unstaged', changes.unstaged),
+            ('untracked', changes.untracked),
+        )
+        if count
+    )
+    suffix = f' (left out: {omitted})' if omitted else ''
+    print(terminal_field('Source', f'{escape(selector)} at {commit}{suffix}'))
+    rows = [('Selected source', escape(options.source))]
     if pinned.selector_name is not None:
-        values['Selected source ref'] = pinned.selector_name
-    heading('Source selection')
-    for label, value in values.items():
-        print(f'{style(escape(label) + ":")} {escape(value)}')
+        rows.append(('Selected source ref', escape(pinned.selector_name)))
+    detail_fields(rows)
     if options.source != 'HEAD':
         current = _run.run_git(
             ['rev-parse', '--verify', 'HEAD^{commit}'], cwd=ctx.project.source_path, check=False
         )
         if current.returncode != 0:
-            print('Using the selected revision; current HEAD is unavailable.')
+            detail('Using the selected revision; current HEAD is unavailable.')
         elif current.stdout != f'{pinned.commit}\n'.encode():
-            print('Selected revision differs from current HEAD; only the selected commit is used.')
+            detail(
+                'Selected revision differs from current HEAD; only the selected commit is used.'
+            )
         else:
-            print('The selected revision currently matches HEAD.')
-    changes = _source.working_changes(ctx.project.source_path)
-    print(
-        f'{style("Omitted working changes:")} staged {changes.staged}, '
-        f'unstaged {changes.unstaged}, untracked {changes.untracked}.'
-    )
-    print('Only committed bytes are selected.')
-    print('Run `git status` in the selected source for working-change details.')
+            detail('The selected revision currently matches HEAD.')
+    detail('Only committed files are selected. Run `git status` for working-change details.')
 
 
 def build_candidate(plan: PreparePlan, options: PrepareOptions) -> _candidate.CandidateRecord:
@@ -250,9 +331,13 @@ def build_candidate(plan: PreparePlan, options: PrepareOptions) -> _candidate.Ca
     if record.replaces is not None:
         return record
     tag = record.tag_intent or 'untagged'
-    output('Prepared snapshot', kind='success')
-    print(terminal_field('Version', escape(tag)))
-    print(terminal_field('Operation', 'new'))
+    count = len(plan.snapshot)
+    print()
+    output(
+        f'Prepared snapshot {escape(tag)} with {count} file{"s" if count != 1 else ""}.',
+        kind='success',
+    )
+    detail_fields([('Operation', 'new')])
     return record
 
 
@@ -302,7 +387,7 @@ def plan_prepare_locked(
     pinned = _source.pin(ctx.project.source_path, options.source)
     _show_source_selection(ctx, options, pinned)
     snapshot = _source.read_snapshot(ctx.project.source_path, pinned.commit)
-    ctx = _selection.apply_policy_offers(ctx, snapshot, yes=options.yes)
+    ctx = _selection.review_selection(ctx, snapshot, yes=options.yes)
     sanitized = _selection.sanitized_snapshot(ctx, snapshot)
     try:
         version = _candidate.replacement_version(
@@ -339,7 +424,7 @@ def plan_prepare_locked(
         )
     new_paths = _new_paths(ctx, sanitized, published[0])
     if new_paths:
-        _selection.show_new_paths(ctx, new_paths)
+        _selection.show_new_paths(ctx, new_paths, show=published[0] is not None)
     _run_gates(ctx, sanitized)
     return PreparePlan(ctx, sanitized, pinned, new_paths, published, version, replaces, scope)
 
@@ -363,7 +448,7 @@ def prepare_locked(
         if not confirm(
             f'Include these {len(plan.new_paths)} files that were not in the last release?'
         ):
-            raise PubanonError('new paths were not acknowledged')
+            raise OperationCanceled('Canceled. Nothing was created.')
     return build_candidate(plan, options)
 
 
@@ -402,7 +487,7 @@ def command_prepare(args: argparse.Namespace) -> None:
                 else 'Snapshot preparation incomplete'
             )
             print(terminal_field('Version', escape(record.tag_intent or 'untagged')))
-            print(terminal_field('Operation', 'replacement'))
+            detail_fields([('Operation', 'replacement')])
             print('\n'.join(_status.rewrite_status(paths, name, record, verbose=args.verbose)))
             if record.tip is None:
                 next_step(

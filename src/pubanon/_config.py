@@ -18,13 +18,18 @@ from typing import IO, NamedTuple, cast
 from pubanon import _filesystem, _locking
 from pubanon._errors import PubanonError
 from pubanon._gate import GateHit, RuleClass, first_match, gate_unit
-from pubanon._policy import RESERVED_DENY
+from pubanon._policy import RESERVED_DENY, literal_pattern
 from pubanon._terminal import escape
 from pubanon._toml import toml_array, toml_string
 
+PUBLICATION_ROUTES = frozenset({'direct', 'staged'})
+VISIBILITIES = frozenset({'private', 'public'})
+
 _ADAPTER_KEYS = frozenset({'github'})
 _EXPOSURE_DIGEST_LENGTH = 64
-_GLOBAL_KEYS = frozenset({'accounts', 'anon_email', 'anon_name', 'sensitive_terms'})
+_GLOBAL_KEYS = frozenset(
+    {'accounts', 'anon_email', 'anon_name', 'default_publication_route', 'sensitive_terms'}
+)
 _HOSTS = frozenset({'github'})
 _IDENTITY_SOURCE_RECOVERY: Mapping[str, str] = {
     'sensitive_terms': (
@@ -50,6 +55,7 @@ _PROJECT_KEYS = frozenset(
         'hygiene_terms',
         'name',
         'owner',
+        'publication_route',
         'repo',
         'required_checks',
         'secret_exceptions',
@@ -59,19 +65,22 @@ _PROJECT_KEYS = frozenset(
         'visibility',
     }
 )
-_PROJECT_OPTIONAL_KEYS = frozenset({'acknowledged_exposure', 'package', 'stage_repo', 'workflow'})
-_SETTINGS_KEYS = frozenset({'default_branch', 'description', 'issues', 'projects', 'wiki'})
-VISIBILITIES = frozenset({'private', 'public'})
+_PROJECT_OPTIONAL_KEYS = frozenset(
+    {'acknowledged_exposure', 'package', 'source_tags', 'stage_repo', 'workflow'}
+)
+_SETTINGS_KEYS = frozenset(
+    {'default_branch', 'description', 'discussions', 'issues', 'projects', 'pull_requests', 'wiki'}
+)
 _WORKFLOW_KEYS = frozenset({'stages'})
 _WORKFLOW_STAGES = (
     'prepare',
     'inspect',
     'stage push',
-    'watch ci --staged',
+    'stage watch',
     'publish',
-    'watch ci',
+    'repo watch',
     'repo reveal',
-    'watch package',
+    'package watch',
 )
 
 
@@ -87,12 +96,21 @@ class GlobalConfig:
         anon_email: Author and committer email used for publication commits.
         accounts: Expected authenticated account for each host adapter.
         sensitive_terms: Globally configured terms that must remain private.
+        default_publication_route: Route selected for newly initialized
+            projects.
+        ignored_files: Literal basenames at any depth or source-relative file
+            paths, matched case-insensitively.
+        ignored_directories: Literal source-relative directories excluded in
+            every project, matched case-insensitively.
     """
 
     anon_name: str
     anon_email: str
     accounts: Mapping[str, str]
     sensitive_terms: tuple[str, ...]
+    default_publication_route: str = 'staged'
+    ignored_directories: tuple[str, ...] = ()
+    ignored_files: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -136,6 +154,8 @@ class Settings:
         issues: Whether the host issue tracker should be enabled.
         wiki: Whether the host wiki should be enabled.
         projects: Whether host projects should be enabled.
+        pull_requests: Whether host pull requests should be enabled.
+        discussions: Whether host discussions should be enabled.
     """
 
     description: str
@@ -143,6 +163,8 @@ class Settings:
     issues: bool
     wiki: bool
     projects: bool
+    pull_requests: bool
+    discussions: bool
 
 
 @dataclass(frozen=True)
@@ -171,6 +193,9 @@ class ProjectConfig:
             findings.
         package: Optional package release to observe after publication.
         workflows: Named sequences of publication stages.
+        publication_route: Chosen route to the final publication repository.
+        source_tags: Whether to mark published versions in the source
+            repository.
     """
 
     name: str
@@ -191,6 +216,8 @@ class ProjectConfig:
     acknowledged_exposure: str = ''
     package: PackageObservation | None = None
     workflows: Mapping[str, tuple[str, ...]] = field(default_factory=dict[str, tuple[str, ...]])
+    publication_route: str = 'staged'
+    source_tags: bool = False
 
 
 def _close_lock_quietly(lock_file: IO[bytes]) -> None:
@@ -450,6 +477,8 @@ def _settings_from_mapping(data: Mapping[str, object]) -> Settings:
         issues=_require_boolean(data, 'issues'),
         wiki=_require_boolean(data, 'wiki'),
         projects=_require_boolean(data, 'projects'),
+        pull_requests=_require_boolean(data, 'pull_requests'),
+        discussions=_require_boolean(data, 'discussions'),
     )
     if settings.default_branch != 'main':
         raise PubanonError('settings.default_branch must be main')
@@ -590,6 +619,62 @@ def _write_global_temporary(directory: Path, payload: bytes) -> Path:
     return temporary
 
 
+def _write_registry(paths: Paths, registry: dict[str, str]) -> None:
+    """Durably replace registry contents while its lock is held."""
+    payload = (json.dumps(registry, separators=(',', ':')) + '\n').encode('utf-8')
+    descriptor: int | None = None
+    temporary: Path | None = None
+    replacement_attempted = False
+    try:
+        try:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix='.registry-', suffix='.tmp', dir=paths.registry.parent
+            )
+            temporary = Path(temporary_name)
+            _filesystem.fchmod(descriptor, 0o600)
+            handle = os.fdopen(descriptor, 'wb')
+            descriptor = None
+            try:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            except (OSError, RuntimeError, KeyboardInterrupt):
+                with suppress(OSError, RuntimeError):
+                    handle.close()
+                raise
+            handle.close()
+            replacement_attempted = True
+            _filesystem.replace(temporary, paths.registry)
+        except (OSError, RuntimeError) as exc:
+            raise PubanonError(
+                'cannot update project registry',
+                fact=f'registry file: {escape(str(paths.registry))}',
+            ) from exc
+        except KeyboardInterrupt as exc:
+            raise PubanonError(
+                (
+                    'project registry may have been saved'
+                    if replacement_attempted
+                    else 'cannot update project registry'
+                ),
+                fact=f'registry file: {escape(str(paths.registry))}',
+            ) from exc
+    finally:
+        if descriptor is not None:
+            with suppress(OSError, RuntimeError):
+                os.close(descriptor)
+        if temporary is not None:
+            with suppress(OSError, RuntimeError):
+                temporary.unlink(missing_ok=True)
+    try:
+        _sync_directory(paths.registry.parent)
+    except (OSError, RuntimeError, KeyboardInterrupt) as exc:
+        raise PubanonError(
+            'project registry may have been saved',
+            fact=f'registry file: {escape(str(paths.registry))}',
+        ) from exc
+
+
 def assemble_rules(
     g: GlobalConfig, p: ProjectConfig, derived: Iterable[str]
 ) -> dict[RuleClass, tuple[str, ...]]:
@@ -719,6 +804,8 @@ def fingerprint(g: GlobalConfig, p: ProjectConfig) -> str:
         Lowercase SHA-256 hexadecimal digest.
     """
     projection: dict[str, object] = {
+        'ignored_directories': g.ignored_directories,
+        'ignored_files': g.ignored_files,
         'accounts': dict(g.accounts),
         'allow': p.allow,
         'anon_email': g.anon_email,
@@ -737,8 +824,28 @@ def fingerprint(g: GlobalConfig, p: ProjectConfig) -> str:
         'source_path': str(p.source_path),
         'visibility': p.visibility,
     }
+    if g.ignored_directories or g.ignored_files:
+        # Rebuild snapshots prepared with the previous case-sensitive exclusions.
+        projection['global_deny_casefold'] = True
     serialized = json.dumps(projection, sort_keys=True, separators=(',', ':'))
     return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def global_deny(g: GlobalConfig) -> tuple[str, ...]:
+    """Return literal file and directory exclusion patterns for every project."""
+    return tuple(
+        pattern
+        for directory in g.ignored_directories
+        for pattern in (literal_pattern(directory), f'{literal_pattern(directory)}/**')
+    ) + tuple(
+        pattern
+        for file in g.ignored_files
+        for pattern in (
+            (literal_pattern(file), f'**/{literal_pattern(file)}')
+            if '/' not in file
+            else (literal_pattern(file),)
+        )
+    )
 
 
 def identity_refusal(sources: Sequence[str]) -> PubanonError:
@@ -900,7 +1007,7 @@ def project_lock(paths: Paths, name: str) -> Generator[None]:
     """
     create_data_dirs(paths, name)
     lock_path = paths.data_dir / 'projects' / name / 'project.lock'
-    with _exclusive_lock(lock_path, 'project has an active operation'):
+    with _exclusive_lock(lock_path, 'another Pubanon command is running for this project'):
         yield
 
 
@@ -939,10 +1046,46 @@ def registry_lookup(paths: Paths, cwd: Path) -> str | None:
     return max(matches, key=lambda item: len(item[0].parts))[1]
 
 
+def registry_remove(paths: Paths, name: str) -> bool:
+    """Remove every registration for a project under the registry lock.
+
+    Returns:
+        Whether any entry was removed.
+    """
+    create_data_dirs(paths, None)
+    with _exclusive_lock(paths.registry.with_name('registry.lock'), 'project registry is active'):
+        registry = _load_registry(paths.registry)
+        remaining = {source: project for source, project in registry.items() if project != name}
+        if remaining == registry:
+            return False
+        _write_registry(paths, remaining)
+        return True
+
+
+def registry_source(paths: Paths, name: str) -> str | None:
+    """Read a project's registered canonical source under the registry lock.
+
+    Returns:
+        The registered source, or `None` when no entry maps to the name.
+    """
+    if not paths.registry.exists() and not paths.data_dir.exists():
+        return None
+    create_data_dirs(paths, None)
+    with _exclusive_lock(paths.registry.with_name('registry.lock'), 'project registry is active'):
+        registry = _load_registry(paths.registry)
+    return next((source for source, project in registry.items() if project == name), None)
+
+
 def rule_labels(
     hit: GateHit, g: GlobalConfig, p: ProjectConfig | None, derived: Collection[str]
 ) -> tuple[str, ...]:
     """Name all active origins of a hit without exposing terms or paths.
+
+    Args:
+        hit: Gate match whose origins are labeled.
+        g: Global configuration supplying sensitive terms.
+        p: Project configuration, or `None` when no project is selected.
+        derived: Private path terms derived for this project.
 
     Returns:
         Source labels with one-based entry numbers in global, project, derived,
@@ -1041,58 +1184,7 @@ def _set_registry_entry(paths: Paths, canonical_source: str, name: str) -> None:
         if registered_name != name
     }
     registry[canonical_source] = name
-    payload = (json.dumps(registry, separators=(',', ':')) + '\n').encode('utf-8')
-    descriptor: int | None = None
-    temporary: Path | None = None
-    replacement_attempted = False
-    try:
-        try:
-            descriptor, temporary_name = tempfile.mkstemp(
-                prefix='.registry-', suffix='.tmp', dir=paths.registry.parent
-            )
-            temporary = Path(temporary_name)
-            _filesystem.fchmod(descriptor, 0o600)
-            handle = os.fdopen(descriptor, 'wb')
-            descriptor = None
-            try:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            except (OSError, RuntimeError, KeyboardInterrupt):
-                with suppress(OSError, RuntimeError):
-                    handle.close()
-                raise
-            handle.close()
-            replacement_attempted = True
-            _filesystem.replace(temporary, paths.registry)
-        except (OSError, RuntimeError) as exc:
-            raise PubanonError(
-                'cannot update project registry',
-                fact=f'registry file: {escape(str(paths.registry))}',
-            ) from exc
-        except KeyboardInterrupt as exc:
-            raise PubanonError(
-                (
-                    'project registry may have been saved'
-                    if replacement_attempted
-                    else 'cannot update project registry'
-                ),
-                fact=f'registry file: {escape(str(paths.registry))}',
-            ) from exc
-    finally:
-        if descriptor is not None:
-            with suppress(OSError, RuntimeError):
-                os.close(descriptor)
-        if temporary is not None:
-            with suppress(OSError, RuntimeError):
-                temporary.unlink(missing_ok=True)
-    try:
-        _sync_directory(paths.registry.parent)
-    except (OSError, RuntimeError, KeyboardInterrupt) as exc:
-        raise PubanonError(
-            'project registry may have been saved',
-            fact=f'registry file: {escape(str(paths.registry))}',
-        ) from exc
+    _write_registry(paths, registry)
 
 
 def registry_set(paths: Paths, source: Path, name: str) -> None:
@@ -1160,8 +1252,14 @@ def validate_host_segment(field: str, value: object) -> str:
     Raises:
         PubanonError: `value` is not a safe nonempty host coordinate segment.
     """
+    labels = {
+        'owner': 'GitHub owner',
+        'repo': 'repository name',
+        'stage_repo': 'staging repository name',
+    }
+    label = labels.get(field, field.replace('_', ' '))
     if not isinstance(value, str):
-        raise PubanonError(f'{field} must be a safe nonempty host coordinate segment')
+        raise PubanonError(f'invalid {label}')
     invalid = (
         not value
         or value != value.strip()
@@ -1173,7 +1271,7 @@ def validate_host_segment(field: str, value: object) -> str:
         )
     )
     if invalid:
-        raise PubanonError(f'{field} must be a safe nonempty host coordinate segment')
+        raise PubanonError(f'invalid {label}')
     return value
 
 
@@ -1229,8 +1327,9 @@ def gate_host_coordinates(
                     'your init command with --self-publication '
                     '(pubanon init --self-publication), then choose Resume.'
                 )
+            label = 'repository name' if field_name == 'repo' else unit
             raise PubanonError(
-                f'{unit} failed content gates',
+                f'{label} did not pass content checks',
                 fact=f'{field_name}: {escape(value)}',
                 recovery=recovery,
             )
@@ -1269,6 +1368,44 @@ def _require_identity(data: Mapping[str, object], key: str) -> str:
     return validate_identity(key, _require_string(data, key))
 
 
+def validate_ignored_directory(value: str) -> str:
+    """Validate a literal source-relative directory, accepting one trailing slash.
+
+    Returns:
+        The directory with one trailing slash removed, if present.
+
+    Raises:
+        PubanonError: The directory is empty, absolute, or contains
+            noncanonical components.
+    """
+    directory = value.removesuffix('/')
+    if (
+        not directory
+        or any(part in {'', '.', '..'} for part in directory.split('/'))
+        or '\\' in directory
+        or ':' in directory
+        or any(unicodedata.category(character) in {'Cc', 'Cs'} for character in directory)
+    ):
+        raise PubanonError('ignored_directories must contain source-relative directory paths')
+    return directory
+
+
+def validate_ignored_file(value: str) -> str:
+    """Validate a literal basename or source-relative file path.
+
+    Raises:
+        PubanonError: The value is not a canonical relative file path.
+    """
+    if value.endswith('/'):
+        raise PubanonError('ignored_files must not end with a slash')
+    try:
+        return validate_ignored_directory(value)
+    except PubanonError as error:
+        raise PubanonError(
+            'ignored_files must contain filenames or source-relative file paths'
+        ) from error
+
+
 def validate_settings(value: object) -> Settings | None:
     """Validate optional in-memory repository settings.
 
@@ -1292,6 +1429,8 @@ def validate_settings(value: object) -> Settings | None:
             'issues': value.issues,
             'wiki': value.wiki,
             'projects': value.projects,
+            'pull_requests': value.pull_requests,
+            'discussions': value.discussions,
         }
     )
 
@@ -1336,10 +1475,12 @@ def _validate_project_config(cfg: ProjectConfig, expected_name: str) -> None:
         'hygiene_terms': cfg.hygiene_terms,
         'name': cfg.name,
         'owner': cfg.owner,
+        'publication_route': cfg.publication_route,
         'repo': cfg.repo,
         'required_checks': cfg.required_checks,
         'secret_exceptions': cfg.secret_exceptions,
         'self_publication': cfg.self_publication,
+        'source_tags': cfg.source_tags,
         'source_path': cfg.source_path,
         'visibility': cfg.visibility,
     }
@@ -1347,6 +1488,7 @@ def _validate_project_config(cfg: ProjectConfig, expected_name: str) -> None:
     validate_host_segment('owner', cfg.owner)
     validate_host_segment('repo', cfg.repo)
     _require_choice(data, 'host', _HOSTS)
+    _require_choice(data, 'publication_route', PUBLICATION_ROUTES)
     _require_choice(data, 'visibility', VISIBILITIES)
     source_path = data['source_path']
     if not isinstance(source_path, Path):
@@ -1371,6 +1513,7 @@ def _validate_project_config(cfg: ProjectConfig, expected_name: str) -> None:
             except PubanonError:
                 raise PubanonError(f'{key} must not contain blank terms') from None
     _require_boolean(data, 'self_publication')
+    _require_boolean(data, 'source_tags')
     _validate_stage_repo(cfg._stage_repo, cfg.repo)
     validate_settings(cfg.settings)
     _validate_acknowledged_exposure(cfg.acknowledged_exposure)
@@ -1392,7 +1535,15 @@ def global_from_mapping(data: Mapping[str, object]) -> GlobalConfig:
     Raises:
         PubanonError: The mapping has missing, unknown, or invalid values.
     """
-    _require_exact_keys(data, _GLOBAL_KEYS, 'global configuration')
+    _require_exact_keys(
+        {
+            key: value
+            for key, value in data.items()
+            if key not in {'ignored_directories', 'ignored_files'}
+        },
+        _GLOBAL_KEYS,
+        'global configuration',
+    )
     accounts = _require_table(data, 'accounts')
     _require_exact_keys(accounts, _ADAPTER_KEYS, 'account adapter')
     return GlobalConfig(
@@ -1400,6 +1551,20 @@ def global_from_mapping(data: Mapping[str, object]) -> GlobalConfig:
         anon_email=_require_identity(data, 'anon_email'),
         accounts={'github': _require_string(accounts, 'github')},
         sensitive_terms=_require_terms(data, 'sensitive_terms', require_one=True),
+        ignored_files=tuple(
+            validate_ignored_file(value) for value in _require_strings(data, 'ignored_files')
+        )
+        if 'ignored_files' in data
+        else (),
+        ignored_directories=tuple(
+            validate_ignored_directory(value)
+            for value in _require_strings(data, 'ignored_directories')
+        )
+        if 'ignored_directories' in data
+        else (),
+        default_publication_route=_require_choice(
+            data, 'default_publication_route', PUBLICATION_ROUTES
+        ),
     )
 
 
@@ -1457,6 +1622,7 @@ def load_project(paths: Paths, name: str) -> ProjectConfig:
         host=_require_choice(data, 'host', _HOSTS),
         owner=validate_host_segment('owner', data['owner']),
         repo=repo,
+        publication_route=_require_choice(data, 'publication_route', PUBLICATION_ROUTES),
         visibility=_require_choice(data, 'visibility', VISIBILITIES),
         allow=_require_strings(data, 'allow'),
         deny=_require_strings(data, 'deny'),
@@ -1464,6 +1630,7 @@ def load_project(paths: Paths, name: str) -> ProjectConfig:
         extra_terms=_require_terms(data, 'extra_terms', require_one=False),
         hygiene_terms=_require_terms(data, 'hygiene_terms', require_one=False),
         self_publication=_require_boolean(data, 'self_publication'),
+        source_tags=(_require_boolean(data, 'source_tags') if 'source_tags' in data else False),
         required_checks=_require_strings(data, 'required_checks'),
         _stage_repo=_validate_stage_repo(data.get('stage_repo'), repo),
         settings=settings,
@@ -1507,12 +1674,18 @@ def save_global(paths: Paths, cfg: GlobalConfig, original: bytes | None) -> None
             'anon_email': cfg.anon_email,
             'accounts': accounts,
             'sensitive_terms': list(cfg.sensitive_terms),
+            'ignored_directories': list(cfg.ignored_directories),
+            'ignored_files': list(cfg.ignored_files),
+            'default_publication_route': cfg.default_publication_route,
         }
     )
     content = (
         f'anon_name = {_toml_string(config.anon_name)}\n'
         f'anon_email = {_toml_string(config.anon_email)}\n'
         f'sensitive_terms = {_toml_array(config.sensitive_terms)}\n'
+        f'ignored_files = {_toml_array(config.ignored_files)}\n'
+        f'ignored_directories = {_toml_array(config.ignored_directories)}\n'
+        f'default_publication_route = {_toml_string(config.default_publication_route)}\n'
         '[accounts]\n'
         f'github = {_toml_string(config.accounts["github"])}\n'
     )
@@ -1581,7 +1754,9 @@ def save_project(paths: Paths, cfg: ProjectConfig) -> None:
         f'extra_terms = {_toml_array(cfg.extra_terms)}\n'
         f'hygiene_terms = {_toml_array(cfg.hygiene_terms)}\n'
         f'self_publication = {str(cfg.self_publication).lower()}\n'
+        f'source_tags = {str(cfg.source_tags).lower()}\n'
         f'required_checks = {_toml_array(cfg.required_checks)}\n'
+        f'publication_route = {_toml_string(cfg.publication_route)}\n'
     )
     if cfg._stage_repo is not None:
         content += f'stage_repo = {_toml_string(cfg._stage_repo)}\n'
@@ -1594,6 +1769,8 @@ def save_project(paths: Paths, cfg: ProjectConfig) -> None:
         f'issues = {str(cfg.settings.issues).lower()}\n'
         f'wiki = {str(cfg.settings.wiki).lower()}\n'
         f'projects = {str(cfg.settings.projects).lower()}\n'
+        f'pull_requests = {str(cfg.settings.pull_requests).lower()}\n'
+        f'discussions = {str(cfg.settings.discussions).lower()}\n'
     )
     if cfg.package is not None:
         content += (

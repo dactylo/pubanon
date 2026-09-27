@@ -61,17 +61,22 @@ def evaluate_membership(
     paths: Iterable[str],
     allow: Collection[str],
     deny: Collection[str],
+    *,
+    global_deny: Collection[str] = (),
 ) -> Membership:
     """Partition paths by the configured publication policy.
 
     Reserved basenames take precedence over deny patterns, which take
     precedence over allow patterns. Patterns use case-sensitive `fnmatch`
     matching against the entire path; slashes are ordinary characters.
+    Global exclusions match case-insensitively and override project rules.
 
     Args:
         paths: Posix paths to classify.
         allow: Operator allow patterns.
         deny: Operator deny patterns.
+        global_deny: Global exclusion patterns, matched using Unicode case
+            folding.
 
     Returns:
         Paths partitioned by policy outcome, preserving input order within each
@@ -81,10 +86,13 @@ def evaluate_membership(
     denied: list[str] = []
     unmatched: list[str] = []
     reserved: list[str] = []
+    folded_global_deny = tuple(pattern.casefold() for pattern in global_deny)
     for path in paths:
         if is_reserved_path(path):
             reserved.append(path)
-        elif any(fnmatch.fnmatchcase(path, pattern) for pattern in deny):
+        elif any(
+            fnmatch.fnmatchcase(path.casefold(), pattern) for pattern in folded_global_deny
+        ) or any(fnmatch.fnmatchcase(path, pattern) for pattern in deny):
             denied.append(path)
         elif any(fnmatch.fnmatchcase(path, pattern) for pattern in allow):
             allowed.append(path)
@@ -114,33 +122,29 @@ def narrowest_offer(
 
     Args:
         unmatched: Paths outside the configured membership policy.
-        guided: Whether to expose the known nested documentation and agent
-            configuration groups used by initial project review.
+        guided: Whether to expose nested documentation and agent configuration
+            groups used by initial project review.
 
     Returns:
         Patterns paired with their supplied unmatched paths in first-seen
         order. Ordinary grouping uses top-level directories. Guided grouping
-        separates internal documentation and agent configuration. Directory
-        patterns can also admit paths outside the supplied input.
+        separates documentation subdirectories and agent configuration.
+        Directory patterns can also admit paths outside the supplied input.
     """
     paths = list(unmatched)
     nested_docs = guided and any(
-        path.startswith(('docs/internal/', 'docs/superpowers/')) for path in paths
+        path.startswith('docs/') and path.count('/') > 1 for path in paths
     )
     groups: dict[str, list[str]] = {}
     directory_groups: set[str] = set()
     for path in paths:
-        if guided and path.startswith('docs/internal/'):
-            group = 'docs/internal'
-            directory_groups.add(group)
-        elif guided and path.startswith('docs/superpowers/'):
-            group = 'docs/superpowers'
-            directory_groups.add(group)
-        elif guided and path.startswith('.agents/'):
+        if guided and path.startswith('.agents/'):
             group = '.agents'
             directory_groups.add(group)
         elif nested_docs and path.startswith('docs/'):
-            group = path
+            group = '/'.join(path.split('/')[:2])
+            if group != path:
+                directory_groups.add(group)
         else:
             group = path.split('/', maxsplit=1)[0]
         groups.setdefault(group, []).append(path)

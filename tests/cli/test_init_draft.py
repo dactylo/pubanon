@@ -25,11 +25,15 @@ def _draft(tmp_path: Path, *, commit: str = 'a' * 40) -> _init_draft.Draft:
         owner='public-owner',
         repo='public-repo',
         visibility='private',
+        publication_route='direct',
+        source_tags=True,
         required_checks=('test', 'lint'),
         description='Public repository',
         issues=True,
         wiki=False,
         projects=True,
+        pull_requests=False,
+        discussions=True,
     )
 
 
@@ -64,7 +68,12 @@ def test_directory_sync_failure_reports_possible_save(
 @pytest.mark.parametrize(
     ('key', 'value'),
     [
-        ('version', 2),
+        ('version', 99),
+        ('publication_route', _MISSING),
+        ('publication_route', 'other'),
+        ('publication_route', 3),
+        ('source_tags', _MISSING),
+        ('source_tags', 'yes'),
         ('phase', _MISSING),
         ('phase', 'done'),
         ('pending', ['selection', 1]),
@@ -75,6 +84,8 @@ def test_directory_sync_failure_reports_possible_save(
         ('flagged', [['README.md', 'ask']]),
         ('groups', [['src/**', 'ask']]),
         ('reviewing', 'false'),
+        ('pull_requests', 'yes'),
+        ('discussions', 1),
     ],
 )
 def test_load_refuses_invalid_shape_types_and_version(
@@ -92,7 +103,7 @@ def test_load_refuses_invalid_shape_types_and_version(
         payload[key] = value
     draft_path.write_text(json.dumps(payload), encoding='utf-8')
 
-    with pytest.raises(PubanonError, match='invalid init draft'):
+    with pytest.raises(_init_draft.InvalidDraftError, match='invalid init draft'):
         _init_draft.load(paths, 'demo')
 
 
@@ -127,7 +138,7 @@ def test_load_reports_malformed_json(tmp_path: Path) -> None:
     draft_path.parent.mkdir(parents=True)
     draft_path.write_text('{not JSON', encoding='utf-8')
 
-    with pytest.raises(PubanonError, match='invalid init draft') as exc_info:
+    with pytest.raises(_init_draft.InvalidDraftError, match='invalid init draft') as exc_info:
         _init_draft.load(paths, 'demo')
 
     assert isinstance(exc_info.value.__cause__, json.JSONDecodeError)
@@ -204,3 +215,17 @@ def test_save_syncs_directory_after_replace(
     _init_draft.save(paths, 'demo', draft)
 
     assert events == ['replace', 'directory sync']
+
+
+def test_unsupported_draft_version_is_rejected_without_rewriting_bytes(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    _init_draft.save(paths, 'demo', _draft(tmp_path))
+    draft_path = _init_draft._path(paths, 'demo')
+    payload = json.loads(draft_path.read_text(encoding='utf-8'))
+    payload['version'] = 99
+    old_bytes = json.dumps(payload).encode()
+    draft_path.write_bytes(old_bytes)
+
+    with pytest.raises(_init_draft.InvalidDraftError, match='invalid init draft version'):
+        _init_draft.load(paths, 'demo')
+    assert draft_path.read_bytes() == old_bytes

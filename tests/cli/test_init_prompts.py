@@ -104,6 +104,44 @@ def test_required_check_prompt_retries_malformed_quoting(answers: _Script) -> No
 
 
 @pytest.mark.parametrize(
+    ('numbers', 'expected'), [('1', ('quality',)), ('1 2 3', ('quality', 'optional', 'Upload'))]
+)
+def test_required_checks_needing_review_require_explicit_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    numbers: str,
+    expected: tuple[str, ...],
+) -> None:
+    snapshot = (
+        _source.Entry(
+            '.github/workflows/ci.yml',
+            0o100644,
+            'blob',
+            b'on: push\njobs:\n  quality: {}\n  optional:\n    if: inputs.extra\n',
+        ),
+        _source.Entry(
+            '.github/workflows/release.yml',
+            0o100644,
+            'blob',
+            b'on: workflow_dispatch\njobs:\n  upload:\n    name: Upload\n',
+        ),
+    )
+    answers = iter(['a', 's', numbers])
+
+    def _reply(_prompt: str) -> str:
+        return next(answers)
+
+    monkeypatch.setattr('builtins.input', _reply)
+
+    assert _init._required_checks_prompt(snapshot=snapshot) == expected
+    output = capsys.readouterr().out
+    assert '.github/workflows/ci.yml' in output
+    assert 'condition' in output
+    assert '.github/workflows/release.yml' in output
+    assert 'manually' in output
+
+
+@pytest.mark.parametrize(
     ('responses', 'expected'),
     [
         (['a'], ('quality', 'tests (linux, 3.13)')),
@@ -125,7 +163,8 @@ def test_workflow_check_selection_supports_all_subset_none_manual_and_keep(
             '.github/workflows/ci.yml',
             0o100644,
             'blob',
-            b'jobs:\n  quality:\n    runs-on: linux\n  test:\n    name: tests (linux, 3.13)\n',
+            b'on: push\njobs:\n  quality:\n    runs-on: linux\n'
+            b'  test:\n    name: tests (linux, 3.13)\n',
         ),
     )
     replies = iter(responses)

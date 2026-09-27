@@ -32,7 +32,7 @@ def prepare(
     version: str | None = None,
 ) -> tuple[_config.Paths, _config.ProjectConfig, _candidate.CandidateRecord]:
     paths, _global_config, project_config = configure(tmp_path, monkeypatch, source)
-    argv = ['prepare', '--project', 'demo', '--acknowledge-new-paths']
+    argv = ['prepare', '--project', 'demo', '--acknowledge-new-paths', '--yes']
     if version is not None:
         argv.extend(['--version', version])
     assert _cli.main(argv) == 0

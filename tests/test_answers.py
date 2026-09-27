@@ -3,7 +3,7 @@ from collections.abc import Callable, Sequence
 
 import pytest
 
-_Script = Callable[[Sequence[tuple[str, str]]], None]
+_Script = Callable[[Sequence[str | tuple[str, str]]], None]
 
 
 def test_answers_reject_an_unexpected_prompt(answers: _Script) -> None:
@@ -22,8 +22,8 @@ def test_answers_reject_more_prompts_than_replies(answers: _Script) -> None:
 
 
 def test_answers_return_scripted_replies_in_order(answers: _Script) -> None:
-    answers([('First: ', 'one'), ('Second: ', 'two')])
-    assert input('First: ') == 'one'
+    answers(['one', ('Second: ', 'two')])
+    assert input('A menu whose wording may change: ') == 'one'
     assert input('Second: ') == 'two'
 
 

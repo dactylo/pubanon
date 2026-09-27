@@ -25,8 +25,7 @@ After updating the checkout, update the installed command:
 uv tool install --reinstall .
 ```
 
-uv is needed for these installation commands. If you use make, `make install` and `make reinstall`
-run the same commands.
+`make install` and `make reinstall` run the same commands.
 
 ## Your first release
 
@@ -36,10 +35,12 @@ run the same commands.
 pubanon setup
 ```
 
-Setup asks for the name and email to use in published Git history and the terms you want to keep
-private. It verifies your GitHub CLI account and shows your answers before saving. Choose the name
-and email you want readers to see: existing publication commits keep that identity. Use
-`pubanon setup --edit` to change saved answers or `pubanon doctor` to check readiness.
+Setup asks for the name and email to use in published Git history, the terms you want to keep
+private, and the default publication route for new projects. The built-in route is `staged`; choose
+`direct` if you intend to publish without private staging. Setup verifies your GitHub CLI account
+and shows your answers before saving. Choose the name and email you want readers to see: existing
+publication commits keep that identity. Use `pubanon setup --edit` to change saved answers or
+`pubanon doctor` to check readiness.
 
 ### Select your project and files
 
@@ -50,67 +51,73 @@ cd /path/to/private-project
 pubanon init
 ```
 
-Follow the prompts to choose files, a GitHub destination, and repository settings. Choose `private`
-visibility for this walkthrough so you can check the result on GitHub before making it public.
-Review your choices and save. Pubanon stores its configuration outside the source repository.
+Follow the prompts to choose files, a GitHub destination, a publication route, and repository
+settings. Choose the `staged` route and `private` visibility for this walkthrough so you can test
+before the final upload and check the result on GitHub before making it public. Review your choices
+and save. Pubanon stores its configuration outside the source repository.
 
 ### Prepare and review
 
 Commit the changes you want to publish in your source repository, then run:
 
 ```sh
-pubanon repo create
 pubanon prepare
 pubanon inspect
+pubanon stage push
+pubanon stage watch
 ```
 
-`prepare` saves the selected committed files as a local *snapshot*. Uncommitted changes are left
+`prepare` saves the selected committed files as a local *snapshot*; uncommitted changes are left
 out. If the selected `pyproject.toml` declares a package version, Pubanon uses it for the release
 tag; otherwise the snapshot is untagged. See [version tags](docs/guide.md#version-tags) to choose
 an explicit version.
 
-`inspect` shows the release details and a directory of read-only files to review. Builds or tests
-that write files need a separate writable copy. Changes in either copy do not alter the snapshot.
-To correct it, edit and commit in the source, then run `pubanon discard` and `pubanon prepare`
-again.
+`inspect` shows the release details and a read-only review copy of the files. To run builds or
+tests, copy the files somewhere writable first. To change the snapshot, edit and commit in the
+source, then run `pubanon discard` and `pubanon prepare` again.
+
+`stage push` sends that exact snapshot to a separate private GitHub repository, asking before it
+creates the repository the first time. Staging never changes your source branches, and the same
+staging repository is reused for later releases. `stage watch` waits for its configured checks; if
+you haven't configured any, skip it and review the staging repository yourself.
 
 ### Publish and make it public
 
 When you are satisfied, run:
 
 ```sh
+pubanon repo create
 pubanon publish
+pubanon repo watch
 pubanon repo reveal
 ```
 
-`publish` asks for confirmation before sending the saved snapshot to your private destination.
-`repo reveal` checks the published history, settings, and any configured CI requirements before
-asking to make the repository public. It also provides links to Actions logs and artifacts for you
-to review; Pubanon does not scan their contents.
+`repo create` creates the final repository, still private; skip it if the repository already
+exists. Before the first upload, keep in mind that GitHub can retain old commits, activity, Actions
+logs, and artifacts even after history is replaced. Staging lets you test before anything reaches
+the final repository.
 
-For the next release, commit your changes and repeat `prepare`, `inspect`, and `publish`. For a
-versioned Python package, update and commit its version first. The
-[publication guide](docs/guide.md#quick-path) also explains the `release VERSION` shortcut.
+`publish` asks for confirmation, then sends the snapshot to the final repository. On the `staged`
+route, it first checks that the staged snapshot passed its configured checks. `repo watch` waits
+for the final repository's own checks; skip it if none are configured. `repo reveal` checks the
+published history and settings, links the repository's Activity and Actions pages for you to
+review, and asks before making the repository public. Pubanon does not scan logs or artifact
+contents.
 
-Still correcting the initial release privately? Commit your fixes, then use
-`pubanon prepare --replace all`, `pubanon inspect`, and `pubanon publish` to replace the entire
-published history while keeping the same version. To correct only the latest publication and keep
-earlier history, use `pubanon prepare --replace`. See
-[correcting published history](docs/guide.md#correcting-published-history) for the available
-scopes.
-
-After replacements, `pubanon clean` previews and removes superseded local snapshots with one
-confirmation. It keeps current published snapshots and prepared work. See
-[cleanup](docs/operations.md#cleanup) for other cleanup tasks.
+For the next release, commit your changes, updating the package version if you have one, and repeat
+these steps without `repo create` and `repo reveal`.
 
 ## Where to go next
 
 | If you want to...                                               | Read                                                                          |
 | --------------------------------------------------------------- | ----------------------------------------------------------------------------- |
 | Publish another release or choose a workflow                    | [Publication guide](docs/guide.md)                                            |
+| Publish without private staging                                 | [Direct publication](docs/guide.md#direct-publication)                        |
+| Add or edit a GitHub release page for a published tag           | [Release pages](docs/guide.md#github-release-pages)                           |
 | Change the selected files, CI checks, or other project settings | [Project configuration](docs/guide.md#edit-an-existing-project)               |
 | Run CI privately before publishing                              | [Private staging](docs/guide.md#private-first-ci)                             |
 | Inspect an earlier release or recover its private source        | [Published history](docs/operations.md#published-history-and-source-recovery) |
+| Fix a candidate that failed in staging                          | [Test privately](docs/guide.md#test-privately-and-publish)                    |
 | Correct a published release                                     | [History replacement](docs/guide.md#correcting-published-history)             |
 | Recover from an interruption, clean up, or make backups         | [Operations guide](docs/operations.md)                                        |
 | Check platform requirements                                     | [Platforms](docs/platforms.md)                                                |
@@ -121,12 +128,9 @@ a push outcome is unknown, follow the reported recovery command: `pubanon publis
 
 ## Development
 
-Provide the tools in `[dependency-groups].dev` through your environment or package manager, then
-run:
+The [development guide](docs/development.md) lists the required tools. With them installed, run:
 
 ```sh
+make setup
 make check
 ```
-
-`make format` applies the repository formatters. Tests run offline with temporary Git repositories
-and a fake GitHub CLI.

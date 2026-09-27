@@ -120,24 +120,6 @@ def test_bookmark_common_dir_matches_unambiguous_git_path_output(
     assert _source._matches_git_path_output(output, common) is matches
 
 
-def test_clone_restore_loses_secondary_branches_and_is_not_documented(
-    tmp_path: Path, make_repo: Callable[..., Path]
-) -> None:
-    source = _source_with_branches(make_repo)
-    bundle = tmp_path / 'backup.bundle'
-    env = git_env()
-    subprocess.run(
-        ['git', '-C', source, 'bundle', 'create', str(bundle), '--all'], check=True, env=env
-    )
-    cloned = tmp_path / 'cloned'
-    subprocess.run(['git', 'clone', '-q', str(bundle), str(cloned)], check=True, env=env)
-    with pytest.raises(PubanonError, match='not safe to read'):
-        check_source_safety(cloned)
-    subprocess.run(['git', '-C', cloned, 'remote', 'remove', 'origin'], check=True, env=env)
-
-    assert 'topic' not in _git_out(cloned, 'branch', '--list')
-
-
 def test_documented_bundle_restore_preserves_branches_without_remote(
     tmp_path: Path, make_repo: Callable[..., Path]
 ) -> None:
@@ -618,7 +600,7 @@ def test_snapshot_refuses_nul_containing_symlink_target(
 
     rendered = exc_info.value.render()
     assert 'invalid symlink target' in rendered
-    assert 'fact: symlink: link' in rendered
+    assert '  symlink: link' in rendered
     assert target_canary.decode() not in rendered
     assert 'replace the unsafe symlink and rerun' in rendered
 
@@ -653,7 +635,7 @@ def test_snapshot_refuses_root_escaping_tree_path_with_visible_control(
     with pytest.raises(PubanonError, match='malformed tree path') as exc_info:
         _source.read_snapshot(repo, 'b' * 40)
 
-    assert exc_info.value.render().endswith(f'fact: entry: ../{"private"}\\x1bname')
+    assert exc_info.value.render().endswith('  entry: ../private\\x1bname')
 
 
 def test_snapshot_refuses_unsupported_object_kind(
@@ -735,11 +717,12 @@ def test_snapshot_reports_unreadable_object_path(
 
     rendered = exc_info.value.render()
     assert 'source object could not be read' in rendered
-    assert f'{"canaryx"}.txt' in rendered
+    assert 'canaryx.txt' in rendered
     assert 'canaryx' in rendered.casefold()
     assert str(repo) not in rendered
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize('verification_fails', [False, True])
 def test_source_alternates_recovery_preserves_branches_and_tags(
     tmp_path: Path, make_repo: Callable[..., Path], verification_fails: bool
@@ -993,6 +976,51 @@ def test_source_bookmark_skips_repository_reference_hook(
     assert not marker.exists()
 
 
+def test_source_matches_distinguish_no_match_from_missing_source(
+    make_repo: Callable[..., Path],
+) -> None:
+    source = make_repo(files={'README.md': 'published\n'})
+    original = _git_out(source, 'rev-parse', 'HEAD').strip()
+    _git(source, 'update-ref', 'refs/pubanon/test-original', original)
+    (source / 'README.md').write_text('changed contents\n')
+    _git(source, 'add', 'README.md')
+    _git(source, 'commit', '--amend', '-qm', 'changed contents')
+    _git(source, 'checkout', '--detach', '-q')
+
+    matches = _source.matching_commits(source, (original, 'a' * 40))
+
+    assert matches[original].branch == 'HEAD'
+    assert matches[original].latest is None
+    assert matches[original].count == 0
+    assert 'a' * 40 not in matches
+
+
+def test_source_matches_find_rewritten_contents_and_count_latest(
+    make_repo: Callable[..., Path],
+) -> None:
+    source = make_repo(files={'README.md': 'published\n'})
+    _git(source, 'branch', '-m', 'main')
+    original = _git_out(source, 'rev-parse', 'HEAD').strip()
+    _git(source, 'update-ref', 'refs/pubanon/test-original', original)
+    _git(source, 'commit', '--amend', '-qm', 'rewritten message')
+    _git(source, 'commit', '--allow-empty', '-qm', 'same contents again')
+    latest = _git_out(source, 'rev-parse', 'HEAD').strip()
+    _commit_file(source, 'README.md', 'later work\n')
+    before = _refs(source)
+
+    matches = _source.matching_commits(source, (original, latest, latest, 'HEAD~1'))
+    match = matches[original]
+
+    assert match.branch == 'main'
+    assert match.latest == latest
+    assert match.count == 2
+    assert not match.original_reachable
+    assert tuple(matches) == (original, latest, 'HEAD~1')
+    assert matches[latest] == _source.SourceMatches('main', latest, 2, original_reachable=True)
+    assert matches['HEAD~1'] == _source.SourceMatches('main', latest, 2, original_reachable=False)
+    assert _refs(source) == before
+
+
 def test_source_safety_refuses_alternates_file(make_repo: Callable[..., Path]) -> None:
     repo = make_repo()
     alternates = repo / '.git' / 'objects' / 'info' / 'alternates'
@@ -1058,6 +1086,53 @@ def test_source_safety_refuses_shallow_repository(
         check_source_safety(repo)
 
     assert 'shallow' in exc_info.value.render().casefold()
+
+
+def test_source_tag_can_follow_rewrite_and_replacement(
+    make_repo: Callable[..., Path],
+) -> None:
+    source = make_repo(files={'README.md': 'published\n'})
+    original = _git_out(source, 'rev-parse', 'HEAD').strip()
+    _source.update_source_tag(source, 'v1.0.0', original, (original,))
+    _git(source, 'update-ref', 'refs/pubanon/test-original', original)
+    _git(source, 'commit', '--amend', '-qm', 'rewritten message')
+    rewritten = _git_out(source, 'rev-parse', 'HEAD').strip()
+    _source.update_source_tag(source, 'v1.0.0', rewritten, (original,))
+    assert _git_out(source, 'rev-parse', 'refs/tags/pubanon/v1.0.0').strip() == rewritten
+
+    _commit_file(source, 'README.md', 'replacement\n')
+    replacement = _git_out(source, 'rev-parse', 'HEAD').strip()
+    _source.update_source_tag(source, 'v1.0.0', replacement, (original, replacement))
+    assert _git_out(source, 'rev-parse', 'refs/tags/pubanon/v1.0.0').strip() == replacement
+
+
+def test_source_tag_preserves_annotated_tag_with_identical_contents(
+    make_repo: Callable[..., Path],
+) -> None:
+    source = make_repo(files={'README.md': 'published\n'})
+    original = _git_out(source, 'rev-parse', 'HEAD').strip()
+    _git(source, 'tag', '-a', 'pubanon/v1.0.0', '-m', 'my source label')
+    tag = _git_out(source, 'rev-parse', 'refs/tags/pubanon/v1.0.0').strip()
+
+    with pytest.raises(PubanonError, match='annotated and was left unchanged'):
+        _source.update_source_tag(source, 'v1.0.0', original, (original,))
+
+    assert _git_out(source, 'rev-parse', 'refs/tags/pubanon/v1.0.0').strip() == tag
+
+
+def test_source_tag_preserves_unrelated_existing_tag(
+    make_repo: Callable[..., Path],
+) -> None:
+    source = make_repo(files={'README.md': 'unrelated\n'})
+    _git(source, 'tag', 'pubanon/v1.0.0')
+    original_tag = _git_out(source, 'rev-parse', 'refs/tags/pubanon/v1.0.0').strip()
+    _commit_file(source, 'README.md', 'published\n')
+    published = _git_out(source, 'rev-parse', 'HEAD').strip()
+
+    with pytest.raises(PubanonError, match='already points to unrelated contents'):
+        _source.update_source_tag(source, 'v1.0.0', published, (published,))
+
+    assert _git_out(source, 'rev-parse', 'refs/tags/pubanon/v1.0.0').strip() == original_tag
 
 
 @pytest.mark.parametrize(

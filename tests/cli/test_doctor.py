@@ -37,9 +37,7 @@ def test_doctor_checks_floors_schema_and_expected_account(
     assert _cli.main(['doctor']) == 0
     assert floors == [None]
     assert requirements == [('anonymous-account', 'configuration')]
-    assert capsys.readouterr().out == (
-        'Pubanon configuration and GitHub authentication are ready.\n'
-    )
+    assert 'Your configuration and GitHub login are ready.' in capsys.readouterr().out
 
 
 def test_doctor_missing_configuration_reports_setup_recovery(
@@ -66,6 +64,7 @@ def test_doctor_refuses_identity_containing_machine_path(
         f'anon_name = {json.dumps(f"Publisher {home}")}\n'
         'anon_email = "anonymous@example.invalid"\n'
         'sensitive_terms = ["Private Person"]\n'
+        'default_publication_route = "staged"\n'
         '[accounts]\n'
         'github = "anonymous-account"\n'
     )
@@ -89,6 +88,7 @@ def test_doctor_refuses_identity_matching_sensitive_term(
         'anon_name = "Private Person"\n'
         'anon_email = "anonymous@example.invalid"\n'
         'sensitive_terms = ["Private Person"]\n'
+        'default_publication_route = "staged"\n'
         '[accounts]\n'
         'github = "anonymous-account"\n'
     )
@@ -154,4 +154,3 @@ def test_doctor_reports_unexpected_authenticated_account(
     error = capsys.readouterr().err
     assert 'anonymous-account' in error
     assert 'real-login-canary' in error
-    assert f'{"real-login-canary"}' in error

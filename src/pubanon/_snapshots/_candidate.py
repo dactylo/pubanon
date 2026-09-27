@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
-from pubanon import _filesystem, _windows_fs
+from pubanon import _filesystem, _policy, _windows_fs
 from pubanon._config import (
     GlobalConfig,
     Paths,
@@ -53,7 +53,14 @@ from pubanon._snapshots._source import (
     snapshot_digest,
     validate_symlink_graph,
 )
-from pubanon._terminal import escape, field, output, shell_command, style
+from pubanon._terminal import (
+    display_path,
+    escape,
+    output,
+    render_fields,
+    shell_command,
+    style,
+)
 
 CANDIDATE_REF = 'refs/pubanon/candidate'
 REWRITE_MERGED_REF = 'refs/pubanon/rewrite/merged'
@@ -106,20 +113,6 @@ class _BuildMetadata:
     _message: str | None
 
 
-def _candidate_for_discard(paths: Paths, project: str, *, force: bool) -> CandidateRecord | None:
-    """Read trusted discard metadata or explicitly abandon malformed evidence."""
-    try:
-        return load_candidate(paths, project)
-    except PubanonError:
-        if not force:
-            raise
-        output(
-            'Source-bookmark cleanup could not be verified from the malformed snapshot record.',
-            kind='warning',
-        )
-        return None
-
-
 def _candidate_gate_units(
     global_config: GlobalConfig,
     record: CandidateRecord,
@@ -134,6 +127,14 @@ def _candidate_gate_units(
     if record.tag_intent is not None:
         units.append(('tag intent', record.tag_intent.encode(), 'tag name'))
     return units
+
+
+def _clean_inspection_path(inspect: Path) -> bool:
+    """Remove one inspection directory without following its root symlink."""
+    try:
+        return _filesystem.remove_tree(inspect)
+    except (OSError, RuntimeError) as exc:
+        raise PubanonError('cannot clean review copy') from exc
 
 
 def _complete_unreplayed(record: CandidateRecord, metadata: _BuildMetadata) -> CandidateRecord:
@@ -190,7 +191,7 @@ def _git_result(
 def _inspection_mismatch() -> PubanonError:
     """Tell the operator how to replace a changed review directory explicitly."""
     return PubanonError(
-        'review directory does not match the saved snapshot',
+        'review copy does not match the saved snapshot',
         recovery='pubanon inspect --refresh',
     )
 
@@ -382,43 +383,23 @@ def _replacement_chain(store: Path, selected: str, main: str | None) -> tuple[st
         current = parents[0]
 
 
-def _restore_inspect_access(inspect: Path) -> None:
-    """Restore removable inspection entries without following links or junctions."""
-    directories = [inspect]
-    while directories:
-        directory = directories.pop()
-        if os.name == 'nt':
-            _windows_fs.check_directory(directory)
-        mode = directory.lstat().st_mode
-        if not stat.S_ISDIR(mode):
-            continue
-        _filesystem.chmod(directory, stat.S_IMODE(mode) | stat.S_IRWXU, follow_symlinks=False)
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                path = Path(entry.path)
-                if path.is_symlink() or path.is_junction():
-                    continue
-                if entry.is_dir(follow_symlinks=False):
-                    directories.append(path)
-                elif os.name == 'nt':
-                    _filesystem.chmod(path, 0o600, follow_symlinks=False)
-
-
-def _clean_inspection_path(inspect: Path) -> bool:
-    """Remove one inspection directory without following its root symlink."""
-    try:
-        if os.name == 'nt':
-            _restore_inspect_access(inspect)
-        try:
-            shutil.rmtree(inspect)
-        except PermissionError:
-            _restore_inspect_access(inspect)
-            shutil.rmtree(inspect)
-    except FileNotFoundError:
-        return False
-    except (OSError, RuntimeError) as exc:
-        raise PubanonError('cannot clean snapshot directory') from exc
-    return True
+def _replacement_scope_rows(
+    paths: Paths, project: str, record: CandidateRecord
+) -> list[tuple[str, str]]:
+    """Describe the replacement extent and tags absent from its completed poststate."""
+    if record.replace_scope == 'all':
+        if record.prestate_main is None:
+            raise PubanonError('replacement snapshot is incomplete')
+        count = len(_audit.published_commits(paths, project, new=record.prestate_main))
+        scope = f'all published history ({count} snapshots) -> one snapshot'
+    else:
+        scope = 'one published snapshot and its replayed descendants'
+    rows = [('Scope', scope)]
+    if record.poststate_tags is not None:
+        removed = sorted(record.prestate_tags.keys() - record.poststate_tags.keys())
+        if removed:
+            rows.append(('Removed tags', style(escape(', '.join(removed)), 'warning')))
+    return rows
 
 
 def _validate_tree_paths(snapshot: Snapshot) -> None:
@@ -492,7 +473,7 @@ def _validate_windows_materialization(snapshot: Snapshot) -> None:
 def _validate_materialization(commit: str, snapshot: Snapshot) -> None:
     """Reject unsafe commit names and snapshot paths before touching a copy."""
     if _OID_PATTERN.fullmatch(commit) is None:
-        raise PubanonError('invalid snapshot directory commit')
+        raise PubanonError('invalid review copy commit')
     _validate_tree_paths(snapshot)
     _validate_windows_materialization(snapshot)
 
@@ -824,7 +805,9 @@ def _rewritten_change_report(
     return '\n\n' + '\n'.join(lines)
 
 
-def _candidate_change_summary(paths: Paths, project: str, record: CandidateRecord) -> str:
+def _candidate_change_summary(
+    paths: Paths, project: str, record: CandidateRecord
+) -> tuple[str, Path]:
     """Bound terminal diff statistics and retain a complete private file report."""
     store = candidate_store_path(paths, project)
     args = ['diff-tree', '--no-commit-id', '-r', '--root', '--no-renames']
@@ -837,7 +820,7 @@ def _candidate_change_summary(paths: Paths, project: str, record: CandidateRecor
             failure='cannot render snapshot changes',
         )
         .decode(errors='surrogateescape')
-        .strip()
+        .rstrip('\n')
     )
     complete = _git_result(
         [*args, '--numstat', *revisions],
@@ -867,14 +850,10 @@ def _candidate_change_summary(paths: Paths, project: str, record: CandidateRecor
         'first release' if record.prestate_main is None else 'since recorded publication base'
     )
     lines = '\n'.join(
-        f'    | {escape(line)}' for line in (summary or '0 files changed').split('\n')
+        f'  {escape(line.removeprefix(" "))}'
+        for line in (summary or '0 files changed').split('\n')
     )
-    report_label = (
-        'Complete file report (including rewritten releases)'
-        if record.replaces is not None
-        else 'Complete file report'
-    )
-    return f'{heading}\n{lines}\n  {report_label}: {escape(str(path))}'
+    return f'{heading}\n{lines}', path
 
 
 def _verify_candidate_objects(
@@ -924,84 +903,6 @@ def _verify_candidate_objects(
     return snapshot, verified_identity
 
 
-def _candidate_report_details(
-    paths: Paths,
-    record: CandidateRecord,
-    g: GlobalConfig,
-    p: ProjectConfig,
-    *,
-    verbose: bool = False,
-) -> str:
-    """Verify retained objects and render their common factual report."""
-    _, verified_identity = _verify_candidate_objects(
-        paths, p.name, record, recovery='pubanon discard, then pubanon prepare'
-    )
-    identity = escape(verified_identity.decode(errors='surrogateescape'))
-    message = '\n'.join(f'    | {escape(line)}' for line in record.message.split('\n'))
-    summary = _candidate_change_summary(paths, p.name, record)
-    exceptions = ', '.join(escape(path) for path in p.secret_exceptions) or 'none'
-    configuration_unchanged = fingerprint(g, p) == record.fingerprint
-    if not configuration_unchanged:
-        exceptions += ' (current configuration; prepared exception list is not retained)'
-    tag = 'untagged' if record.tag_intent is None else escape(record.tag_intent)
-
-    def _oid(value: str) -> str:
-        return value if verbose else value[:12]
-
-    if record.state == STATE_UNKNOWN_OUTCOME:
-        state = 'publication outcome unknown'
-    elif record.replaces is not None and record.tip is None:
-        state = 'preparation incomplete'
-    else:
-        state = 'prepared'
-    operation = 'replacement' if record.replaces is not None else 'new'
-    replacement = (
-        f'\n  {field("Replaces", _oid(record.replaces))}' if record.replaces is not None else ''
-    )
-    tip = record.tip if record.tip is not None else record.commit
-    multi_snapshot = record.replaces is not None and tip != record.commit
-    if multi_snapshot:
-        final_tags = sorted(
-            tag for tag, commit in (record.poststate_tags or {}).items() if commit == tip
-        )
-        final_version = ', '.join(escape(tag) for tag in final_tags) or 'untagged'
-        version_field = field('Correction version', tag)
-        message_label = 'Correction message:'
-        source_label = 'Correction source commit'
-        commit_fields = (
-            f'{field("Correction snapshot ID", _oid(record.commit))}\n'
-            f'  {field("Final snapshot ID", _oid(tip))}\n'
-            f'  {field("Final version", final_version)}'
-        )
-        changes_label = 'Final snapshot changes:'
-        heading = 'Prepared snapshots'
-    else:
-        version_field = field('Version', tag)
-        message_label = 'Message:'
-        source_label = 'Source commit'
-        commit_fields = field('Snapshot commit', _oid(tip))
-        changes_label = 'Changes:'
-        heading = 'Snapshot'
-    destination = f'GitHub {escape(record.destination.owner)}/{escape(record.destination.repo)}'
-    tree_label = 'Correction snapshot tree' if multi_snapshot else 'Snapshot tree'
-    technical = f'\n  {field(tree_label, record.tree)}' if verbose else ''
-    return (
-        f'{style(heading, "heading")}\n'
-        f'  {field("State", state, kind="warning" if state != "prepared" else "success")}\n'
-        f'  {field("Operation", operation)}\n'
-        f'  {version_field}\n'
-        f'  {field("Destination", destination)}\n'
-        f'  {field("Visibility", escape(record.destination.visibility.upper()))}\n'
-        f'  {field("Identity", identity)}\n'
-        f'  {style(message_label)}\n{message}\n'
-        f'  {style(changes_label)} {summary}\n'
-        f'  {field("Credential-like exceptions", exceptions)}\n\n'
-        f'  {field(source_label, _oid(record.pinned.commit))}\n'
-        f'  {commit_fields}'
-        f'{replacement}{technical}'
-    )
-
-
 def _verify_replacement_content(
     paths: Paths,
     global_config: GlobalConfig,
@@ -1029,6 +930,7 @@ def _verify_replacement_content(
     # Historical content findings belong to the existing exposure acknowledgment
     # flow. Only complete changed entries are new publication content here.
     store = candidate_store_path(paths, project.name)
+    last_new: Snapshot | None = None
     for entry in record.replayed:
         old = read_snapshot(store, entry.old, git_dir=store)
         new = read_snapshot(store, entry.new, git_dir=store)
@@ -1040,10 +942,13 @@ def _verify_replacement_content(
         details = gate_details(units, global_config, project, derived)
         if details:
             raise PubanonError(
-                'replayed publication failed current content gates',
+                'the replayed snapshot did not pass current content checks',
                 fact=escape(f'{entry.old[:12]}: ' + '; '.join(details.values())),
                 recovery='pubanon discard, then pubanon prepare',
             )
+        last_new = new
+    if last_new is not None and record.replayed[-1].new == tip:
+        return last_new
     return read_snapshot(store, tip, git_dir=store)
 
 
@@ -1096,60 +1001,59 @@ def _verify_replacement_objects(
         )
 
 
-def inspect_report(
-    paths: Paths,
-    record: CandidateRecord,
-    g: GlobalConfig,
-    p: ProjectConfig,
-    *,
-    verbose: bool = False,
-) -> str:
-    """Render the complete candidate inspection report.
+def check_recovery_state(paths: Paths, project: str, *, force: bool) -> None:
+    """Refuse unreadable or unresolved publication evidence before local removal.
 
-    Verify the retained objects and compare their snapshot with the recorded
-    publication prestate. Current policy and live host checks are not rerun.
-    The returned terminal report bounds its displayed file list and writes a
-    separate complete private file report. The caller must hold the project
-    lock for the complete operation.
+    The caller holds the project lock. `force` abandons this evidence without
+    undoing any possible host publication; confirmed publications are accepted.
+    """
+    if force:
+        return
+    try:
+        record = load_candidate(paths, project)
+    except PubanonError as exc:
+        raise PubanonError(
+            str(exc),
+            fact=f'{escape(str(_records.candidate_path(paths, project)))}: {exc.render()}',
+        ) from exc
+    try:
+        _records.load_rewrite(paths, project)
+    except PubanonError as exc:
+        raise PubanonError(
+            str(exc), fact=f'{escape(str(_records.rewrite_path(paths, project)))}: {exc.render()}'
+        ) from exc
+    if record is not None and record.state == STATE_UNKNOWN_OUTCOME:
+        raise PubanonError(
+            'the outcome of the last publication is unknown',
+            recovery='pubanon publish --resolve',
+        )
 
-    Args:
-        paths: Derived Pubanon paths.
-        record: Retained candidate to report.
-        g: Active global configuration.
-        p: Active project configuration.
-        verbose: Include full Git object IDs and the snapshot tree.
 
-    Returns:
-        Publication identity, diff, exception, and gate facts.
+def _candidate_for_discard(paths: Paths, project: str, *, force: bool) -> CandidateRecord | None:
+    """Read trusted discard metadata or explicitly abandon malformed evidence."""
+    check_recovery_state(paths, project, force=force)
+    try:
+        return load_candidate(paths, project)
+    except PubanonError:
+        if not force:
+            raise
+        output(
+            'Source-bookmark cleanup could not be verified from the malformed snapshot record.',
+            kind='warning',
+        )
+        return None
+
+
+def inspection_path(paths: Paths, project: str, commit: str) -> Path:
+    """Return a validated inspection location without creating directories.
 
     Raises:
-        PubanonError: Retained objects disagree with the record, or the
-            candidate diff and complete private file report cannot be produced.
+        PubanonError: The project name or snapshot commit is invalid.
     """
-    configuration_unchanged = fingerprint(g, p) == record.fingerprint
-    if configuration_unchanged:
-        configuration = 'unchanged since prepare'
-    elif record.state == STATE_UNKNOWN_OUTCOME:
-        configuration = (
-            'changed since prepare; checks have not been rerun with these settings; '
-            'resolve the publication outcome first'
-        )
-    else:
-        configuration = (
-            'changed since prepare; checks have not been rerun with these settings; '
-            'snapshot cannot publish'
-        )
-    configuration_kind = 'success' if configuration_unchanged else 'warning'
-    details = _candidate_report_details(paths, record, g, p, verbose=verbose)
-    rewritten = _rewritten_change_report(paths, p.name, record)
-    return (
-        f'{details}{rewritten}\n\n'
-        f'{style("Checks", "heading")}\n'
-        f'  {style("No configured private terms were found when prepared", "success")}\n'
-        f'  {style("Snapshot identity, files, and commit verified", "success")}\n'
-        f'  {style("GitHub destination and visibility have not been rechecked", "warning")}\n'
-        f'  {field("Publication configuration", configuration, kind=configuration_kind)}'
-    )
+    project_dir = _project_dir(paths, project)
+    if _OID_PATTERN.fullmatch(commit) is None:
+        raise PubanonError('invalid review copy commit')
+    return project_dir / 'inspections' / commit
 
 
 def inspection_paths(paths: Paths, project: str) -> tuple[Path, ...]:
@@ -1174,25 +1078,6 @@ def inspection_paths(paths: Paths, project: str) -> tuple[Path, ...]:
     return tuple(sorted(copies))
 
 
-def clean_inspect(paths: Paths, project: str, *, commit: str | None = None) -> bool:
-    """Remove known project inspection copies, optionally selecting one commit.
-
-    The caller must hold the project lock for the complete operation.
-
-    Returns:
-        Whether an inspection copy was removed.
-
-    Raises:
-        PubanonError: Copies cannot be listed or safely removed.
-    """
-    removed = False
-    for inspection in inspection_paths(paths, project):
-        if commit is not None and inspection.name != commit:
-            continue
-        removed = _clean_inspection_path(inspection) or removed
-    return removed
-
-
 def materialize_directory(directory: Path, snapshot: Snapshot) -> None:
     """Create an exclusive directory containing exact snapshot entries.
 
@@ -1210,7 +1095,7 @@ def materialize_directory(directory: Path, snapshot: Snapshot) -> None:
             _windows_fs.check_directory(directory.parent)
         directory.mkdir(mode=0o700)
     except (OSError, RuntimeError) as exc:
-        raise PubanonError('cannot create snapshot directory') from exc
+        raise PubanonError('cannot create review copy') from exc
     try:
         _filesystem.chmod(directory, 0o700)
         _materialize_inspection_files(directory, snapshot)
@@ -1219,102 +1104,12 @@ def materialize_directory(directory: Path, snapshot: Snapshot) -> None:
         raise
     except FileExistsError as exc:
         _clean_inspection_path(directory)
-        raise PubanonError('snapshot paths collide in the snapshot directory') from exc
+        raise PubanonError('snapshot paths collide in the review copy') from exc
     except (OSError, RuntimeError, PubanonError) as exc:
         _clean_inspection_path(directory)
         if isinstance(exc, PubanonError):
             raise
-        raise PubanonError('cannot materialize snapshot directory') from exc
-
-
-def materialize_snapshot(
-    paths: Paths, project: str, commit: str, snapshot: Snapshot, *, refresh: bool = False
-) -> Path:
-    """Create or reuse an exact, read-only commit-keyed copy.
-
-    POSIX mode bits restrict the copy to owner-only access.
-
-    `commit` must be a full accepted object ID. The caller supplies the
-    corresponding snapshot; this function validates but does not derive that
-    association from Git. Invalid snapshots, unsafe paths, and changed copies
-    are refused.
-
-    Ordinary reuse verifies all saved entries before enforcing read-only
-    permissions. Refresh explicitly replaces only the selected copy.
-
-    The caller must hold the project lock for the complete operation.
-    """
-    _validate_materialization(commit, snapshot)
-    root = create_data_dirs(paths, project) / 'inspections'
-    inspect = root / commit
-    if root.is_symlink() or inspect.is_symlink():
-        raise PubanonError('cannot materialize snapshot directory through a symlink')
-    try:
-        root.mkdir(mode=0o700, exist_ok=True)
-        if os.name == 'nt':
-            _windows_fs.check_directory(root)
-        _filesystem.chmod(root, 0o700, follow_symlinks=False)
-        if inspect.exists():
-            if os.name == 'nt':
-                _windows_fs.check_directory(inspect)
-            if not inspect.is_dir():
-                raise PubanonError('snapshot path is not a directory')
-            if not refresh:
-                _verify_inspection_copy(inspect, snapshot)
-                try:
-                    _lock_inspection_copy(inspect, snapshot)
-                except (OSError, RuntimeError) as exc:
-                    raise PubanonError('cannot lock review directory') from exc
-                return inspect
-            _clean_inspection_path(inspect)
-    except (OSError, RuntimeError) as exc:
-        raise PubanonError('cannot create snapshot directory') from exc
-    materialize_directory(inspect, snapshot)
-    try:
-        _lock_inspection_copy(inspect, snapshot)
-    except (OSError, RuntimeError) as exc:
-        _clean_inspection_path(inspect)
-        raise PubanonError('cannot lock review directory') from exc
-    return inspect
-
-
-def materialize_inspect(
-    paths: Paths,
-    project: str,
-    record: CandidateRecord,
-    *,
-    refresh: bool = False,
-) -> Path:
-    """Create or reuse the verified resulting tip's read-only inspection copy.
-
-    Existing copies must match the saved snapshot on ordinary reuse. Refresh
-    explicitly replaces the selected copy. The copy is not publication
-    authority.
-
-    The caller must hold the project lock for the complete operation.
-
-    Args:
-        paths: Derived Pubanon paths.
-        project: Registered project name.
-        record: Retained candidate to inspect.
-
-        refresh: Replace the selected copy, including any local changes.
-
-    Returns:
-        Path to the candidate-specific inspection directory.
-
-    Raises:
-        PubanonError: Exact materialization fails.
-    """
-    snapshot, verified_identity = _verify_candidate_objects(
-        paths, project, record, recovery='pubanon discard, then pubanon prepare'
-    )
-    _verify_replacement_objects(paths, project, record, verified_identity)
-    commit = _records.candidate_tip(record)
-    if commit != record.commit:
-        store = candidate_store_path(paths, project)
-        snapshot = read_snapshot(store, commit, git_dir=store)
-    return materialize_snapshot(paths, project, commit, snapshot, refresh=refresh)
+        raise PubanonError('cannot materialize review copy') from exc
 
 
 def publication_archive(paths: Paths, project: str, commit: str) -> bool:
@@ -1437,40 +1232,6 @@ def publication_record(
     )
 
 
-def publication_report(
-    paths: Paths,
-    record: CandidateRecord,
-    g: GlobalConfig,
-    p: ProjectConfig,
-    *,
-    verbose: bool = False,
-) -> str:
-    """Render retained candidate facts for a publication preview.
-
-    Verify object integrity and report retained metadata, file changes, and
-    credential exceptions. The caller supplies current gate and live-host
-    verification facts; this report does not perform or claim those checks.
-    The returned terminal report bounds its displayed file list and writes a
-    separate complete private file report. The caller must hold the project
-    lock for the complete operation.
-
-    Args:
-        paths: Derived Pubanon paths.
-        record: Retained candidate to report.
-        g: Active global configuration.
-        p: Active project configuration.
-        verbose: Include full Git object IDs and the snapshot tree.
-
-    Returns:
-        The shared factual report without inspection-only instructions.
-
-    Raises:
-        PubanonError: Retained objects or the complete file report cannot be
-            verified.
-    """
-    return _candidate_report_details(paths, record, g, p, verbose=verbose)
-
-
 def published_refs(paths: Paths, project: str) -> tuple[str | None, dict[str, str]]:
     """Read the published main and tags from one advisory store.
 
@@ -1502,8 +1263,9 @@ def record_path(paths: Paths, project: str) -> Path:
 def replacement_descendants(store: Path, selected: str, main: str | None) -> tuple[str, ...]:
     """Prove linear main ancestry and return descendants after the selected commit.
 
-    Results are oldest first, exclude `selected`, and are empty when `selected`
-    equals `main`.
+    Returns:
+        Descendants in oldest-first order, excluding `selected`; empty when
+        `selected` equals `main`.
 
     Raises:
         PubanonError: Main is missing, history is nonlinear, or `selected` is
@@ -1512,40 +1274,13 @@ def replacement_descendants(store: Path, selected: str, main: str | None) -> tup
     return _replacement_chain(store, selected, main)
 
 
-def reprepare_advice(record: CandidateRecord, *, project: str | None = None) -> str:
-    """Describe how to rebuild the selected source revision and release tag."""
-    selection = [f'--project={project}'] if project is not None else []
-    prepare = ['pubanon', 'prepare', *selection]
-    if record.replaces is not None:
-        selector = 'all' if record.replace_scope == 'all' else record.replaces
-        prepare.extend(('--replace', selector))
-    prepare.extend(('--source', record.pinned.commit))
-    if record.tag_intent is not None:
-        prepare.extend(('--version', record.tag_intent[1:]))
-    discard_command = shell_command('pubanon', 'discard', *selection)
-    prepare_command = shell_command(*prepare)
-    if discard_command is None or prepare_command is None:
-        return (
-            f'Select project {escape(project or "")}, then rerun discard and prepare '
-            'for this snapshot.'
-        )
-    return f'{discard_command} && {prepare_command}'
-
-
-def inspect_next_action(record: CandidateRecord, g: GlobalConfig, p: ProjectConfig) -> str:
-    """Return the next inspection action, prioritizing an unknown publish outcome."""
-    if record.state == STATE_UNKNOWN_OUTCOME:
-        return 'pubanon publish --resolve'
-    if fingerprint(g, p) == record.fingerprint:
-        return 'pubanon publish'
-    return reprepare_advice(record, project=p.name)
-
-
 def select_rewritten_commit(record: CandidateRecord, selector: str | None) -> str:
     """Resolve a rewritten commit or moved tag from one candidate record.
 
-    `None` selects the candidate tip. Otherwise an exact moved tag or unique
-    case-insensitive object-ID prefix selects a rewritten commit.
+    Args:
+        record: Candidate containing the rewritten commits and moved tags.
+        selector: `None` for the candidate tip, or an exact moved tag or unique
+            case-insensitive object-ID prefix for a rewritten commit.
 
     Raises:
         PubanonError: The candidate is not a replacement, the selector is
@@ -1570,53 +1305,6 @@ def select_rewritten_commit(record: CandidateRecord, selector: str | None) -> st
             'selector does not name a replaced snapshot', fact=escape(selector or '')
         )
     return selected
-
-
-def inspect_rewritten(
-    paths: Paths,
-    project: str,
-    record: CandidateRecord,
-    selector: str | None,
-    *,
-    refresh: bool = False,
-) -> Path:
-    """Materialize a verified corrected or replayed commit selected by tag or OID.
-
-    `None` selects the candidate tip; other selectors follow
-    `select_rewritten_commit`. Ordinary reuse refuses local edits, while
-    `refresh` replaces the selected copy. The caller must hold the project lock
-    for the complete operation.
-
-    Returns:
-        Path to the selected commit's read-only inspection directory.
-
-    Raises:
-        PubanonError: Retained replacement evidence, selection, or exact
-            materialization fails.
-    """
-    snapshot, identity = _verify_candidate_objects(
-        paths, project, record, recovery='pubanon discard, then pubanon prepare'
-    )
-    try:
-        _verify_replacement_objects(paths, project, record, identity)
-    except UnicodeDecodeError as exc:
-        raise PubanonError(
-            'retained replacement commit identity is not valid UTF-8',
-            fact=record.commit,
-            recovery='pubanon discard, then pubanon prepare',
-        ) from exc
-    selected = select_rewritten_commit(record, selector)
-    if selected != record.commit:
-        store = candidate_store_path(paths, project)
-        snapshot = read_snapshot(store, selected, git_dir=store)
-    try:
-        return materialize_snapshot(paths, project, selected, snapshot, refresh=refresh)
-    except PubanonError as exc:
-        if exc.recovery != 'pubanon inspect --refresh':
-            raise
-        raise PubanonError(
-            str(exc), recovery=f'pubanon inspect --rewritten {selected} --refresh'
-        ) from exc
 
 
 def store_path(paths: Paths, project: str) -> Path:
@@ -1672,9 +1360,9 @@ def _commit_message(
     if identity_hits:
         raise identity_refusal(identity_rule_sources(identity_hits, g, p, derived))
     if tag_intent is not None and gate_unit('tag intent', tag_intent.encode(), rules):
-        raise PubanonError('tag intent failed content gates')
+        raise PubanonError('the release tag did not pass content checks')
     if gate_unit('commit message', controlled.encode(), rules):
-        raise PubanonError('commit message failed content gates')
+        raise PubanonError('the snapshot commit message did not pass content checks')
     return tag_intent, controlled
 
 
@@ -1704,6 +1392,394 @@ def tree_paths(paths: Paths, project: str, commit: str) -> list[str]:
         return [record.decode('utf-8') for record in records[:-1]]
     except UnicodeDecodeError as exc:
         raise PubanonError('cannot read published paths') from exc
+
+
+def credential_warning(paths: Paths, project: str, record: CandidateRecord) -> str:
+    """Describe credential-like files included in the prepared publication history."""
+    commits = (record.commit, *(entry.new for entry in record.replayed))
+    secrets = sorted(
+        {
+            path
+            for commit in commits
+            for path in _policy.secret_like(tree_paths(paths, project, commit), ())
+        }
+    )
+    if not secrets:
+        return ''
+    count = len(secrets)
+    return style(
+        f'warning: Snapshot includes {count} credential-like file{"s" if count != 1 else ""}: '
+        + ', '.join(escape(path) for path in secrets)
+        + '.',
+        'warning',
+    )
+
+
+def _candidate_report_details(
+    paths: Paths,
+    record: CandidateRecord,
+    _g: GlobalConfig,
+    p: ProjectConfig,
+    *,
+    verbose: bool = False,
+    extra_rows: Sequence[tuple[str, str]] = (),
+) -> str:
+    """Verify retained objects and render their common factual report."""
+    snapshot, verified_identity = _verify_candidate_objects(
+        paths, p.name, record, recovery='pubanon discard, then pubanon prepare'
+    )
+    identity = escape(verified_identity.decode(errors='surrogateescape'))
+    summary, file_list = _candidate_change_summary(paths, p.name, record)
+    tip = record.tip if record.tip is not None else record.commit
+    if tip != record.commit:
+        snapshot = read_snapshot(candidate_store_path(paths, p.name), tip)
+    tag = 'untagged' if record.tag_intent is None else escape(record.tag_intent)
+    if record.state == STATE_UNKNOWN_OUTCOME:
+        state = 'publication outcome unknown'
+    elif record.replaces is not None and record.tip is None:
+        state = 'preparation incomplete'
+    else:
+        state = 'prepared'
+    multi_snapshot = record.replaces is not None and tip != record.commit
+    title = f'Prepared snapshots ({state})' if multi_snapshot else f'Snapshot {tag} ({state})'
+    rows = [
+        (
+            'Destination',
+            (
+                f'{escape(record.destination.owner)}/{escape(record.destination.repo)} '
+                f'({escape(record.destination.visibility)})'
+            ),
+        ),
+        ('Identity', identity),
+    ]
+    if multi_snapshot:
+        rows.append(('Correction version', tag))
+        final_tags = sorted(
+            tag for tag, commit in (record.poststate_tags or {}).items() if commit == tip
+        )
+        rows.append(('Final version', ', '.join(escape(tag) for tag in final_tags) or 'untagged'))
+    message_label = 'Correction message' if multi_snapshot else 'Message'
+    message_lines = record.message.rstrip('\n').split('\n')
+    message = (
+        escape(message_lines[0])
+        if len(message_lines) == 1
+        else ('\n' + '\n'.join('  ' + escape(line) for line in message_lines))
+    )
+    rows.append((message_label, message))
+    summary_heading, _, rest = summary.partition('\n')
+    if record.prestate_main is None:
+        summary_heading += f', {len(snapshot)} file{"s" if len(snapshot) != 1 else ""}'
+    rows.append(
+        ('Final snapshot changes' if multi_snapshot else 'Changes', summary_heading + '\n' + rest)
+    )
+    if record.replaces is not None:
+        width = 40 if verbose else 12
+        rows.append(('Replaces', record.replaces[:width]))
+        rows.extend(_replacement_scope_rows(paths, p.name, record))
+        if multi_snapshot:
+            rows.extend(
+                [
+                    ('Correction snapshot ID', record.commit[:width]),
+                    ('Final snapshot ID', tip[:width]),
+                ]
+            )
+    rows.extend(extra_rows)
+    rows.append(('File list', display_path(file_list)))
+    if verbose:
+        rows.extend(
+            [
+                ('Operation', 'replacement' if record.replaces is not None else 'new'),
+                (
+                    'Correction source commit' if multi_snapshot else 'Source commit',
+                    record.pinned.commit,
+                ),
+                ('Snapshot commit', tip),
+                ('Snapshot tree', record.tree),
+            ]
+        )
+    lines = [style(title, 'heading'), render_fields(rows)]
+    warning = credential_warning(paths, p.name, record)
+    if warning:
+        lines.append(warning)
+    return '\n'.join(lines)
+
+
+def inspect_report(
+    paths: Paths,
+    record: CandidateRecord,
+    g: GlobalConfig,
+    p: ProjectConfig,
+    *,
+    verbose: bool = False,
+) -> str:
+    """Render the complete candidate inspection report.
+
+    Verify the retained objects and compare their snapshot with the recorded
+    publication prestate. Current policy and live host checks are not rerun.
+    The returned terminal report bounds its displayed file list and writes a
+    separate complete private file report. The caller must hold the project
+    lock for the complete operation.
+
+    Args:
+        paths: Derived Pubanon paths.
+        record: Retained candidate to report.
+        g: Active global configuration.
+        p: Active project configuration.
+        verbose: Include full Git object IDs and the snapshot tree.
+
+    Returns:
+        Publication identity, diff, exception, and gate facts.
+
+    Raises:
+        PubanonError: Retained objects disagree with the record, or the
+            candidate diff and complete private file report cannot be produced.
+    """
+    configuration_unchanged = fingerprint(g, p) == record.fingerprint
+    if configuration_unchanged:
+        configuration = 'unchanged since prepare'
+    elif record.state == STATE_UNKNOWN_OUTCOME:
+        configuration = (
+            'changed since prepare; checks have not been rerun with these settings; '
+            'resolve the publication outcome first'
+        )
+    else:
+        configuration = (
+            'changed since prepare; checks have not been rerun with these settings; '
+            'snapshot cannot publish'
+        )
+    configuration_kind = 'success' if configuration_unchanged else 'warning'
+    checks = 'no sensitive terms found when prepared; snapshot verified; '
+    checks += style('GitHub not rechecked', 'warning')
+    rows = [('Checks', checks)]
+    if verbose or not configuration_unchanged:
+        rows.append(('Publication configuration', style(configuration, configuration_kind)))
+    details = _candidate_report_details(paths, record, g, p, verbose=verbose, extra_rows=rows)
+    return details + _rewritten_change_report(paths, p.name, record)
+
+
+def clean_inspect(paths: Paths, project: str, *, commit: str | None = None) -> bool:
+    """Remove known project inspection copies, optionally selecting one commit.
+
+    The caller must hold the project lock for the complete operation.
+
+    Returns:
+        Whether an inspection copy was removed.
+
+    Raises:
+        PubanonError: Copies cannot be listed or safely removed.
+    """
+    removed = False
+    for inspection in inspection_paths(paths, project):
+        if commit is not None and inspection.name != commit:
+            continue
+        removed = _clean_inspection_path(inspection) or removed
+    return removed
+
+
+def materialize_snapshot(
+    paths: Paths, project: str, commit: str, snapshot: Snapshot, *, refresh: bool = False
+) -> Path:
+    """Create or reuse an exact, read-only commit-keyed copy.
+
+    POSIX mode bits restrict the copy to owner-only access.
+
+    `commit` must be a full accepted object ID. The caller supplies the
+    corresponding snapshot; this function validates but does not derive that
+    association from Git. Invalid snapshots, unsafe paths, and changed copies
+    are refused.
+
+    Ordinary reuse verifies all saved entries before enforcing read-only
+    permissions. Refresh explicitly replaces only the selected copy.
+
+    The caller must hold the project lock for the complete operation.
+    """
+    _validate_materialization(commit, snapshot)
+    create_data_dirs(paths, project)
+    inspect = inspection_path(paths, project, commit)
+    root = inspect.parent
+    if root.is_symlink() or inspect.is_symlink():
+        raise PubanonError('cannot materialize review copy through a symlink')
+    try:
+        root.mkdir(mode=0o700, exist_ok=True)
+        if os.name == 'nt':
+            _windows_fs.check_directory(root)
+        _filesystem.chmod(root, 0o700, follow_symlinks=False)
+        if inspect.exists():
+            if os.name == 'nt':
+                _windows_fs.check_directory(inspect)
+            if not inspect.is_dir():
+                raise PubanonError('snapshot path is not a directory')
+            if not refresh:
+                _verify_inspection_copy(inspect, snapshot)
+                try:
+                    _lock_inspection_copy(inspect, snapshot)
+                except (OSError, RuntimeError) as exc:
+                    raise PubanonError('cannot lock review directory') from exc
+                return inspect
+            _clean_inspection_path(inspect)
+    except (OSError, RuntimeError) as exc:
+        raise PubanonError('cannot create review copy') from exc
+    materialize_directory(inspect, snapshot)
+    try:
+        _lock_inspection_copy(inspect, snapshot)
+    except (OSError, RuntimeError) as exc:
+        _clean_inspection_path(inspect)
+        raise PubanonError('cannot lock review directory') from exc
+    return inspect
+
+
+def materialize_inspect(
+    paths: Paths,
+    project: str,
+    record: CandidateRecord,
+    *,
+    refresh: bool = False,
+) -> Path:
+    """Create or reuse the verified resulting tip's read-only inspection copy.
+
+    Existing copies must match the saved snapshot on ordinary reuse. Refresh
+    explicitly replaces the selected copy. The copy is not publication
+    authority.
+
+    The caller must hold the project lock for the complete operation.
+
+    Args:
+        paths: Derived Pubanon paths.
+        project: Registered project name.
+        record: Retained candidate to inspect.
+
+        refresh: Replace the selected copy, including any local changes.
+
+    Returns:
+        Path to the candidate-specific inspection directory.
+
+    Raises:
+        PubanonError: Exact materialization fails.
+    """
+    snapshot, verified_identity = _verify_candidate_objects(
+        paths, project, record, recovery='pubanon discard, then pubanon prepare'
+    )
+    _verify_replacement_objects(paths, project, record, verified_identity)
+    commit = _records.candidate_tip(record)
+    if commit != record.commit:
+        store = candidate_store_path(paths, project)
+        snapshot = read_snapshot(store, commit, git_dir=store)
+    return materialize_snapshot(paths, project, commit, snapshot, refresh=refresh)
+
+
+def publication_report(
+    paths: Paths,
+    record: CandidateRecord,
+    g: GlobalConfig,
+    p: ProjectConfig,
+    *,
+    verbose: bool = False,
+) -> str:
+    """Render retained candidate facts for a publication preview.
+
+    Verify object integrity and report retained metadata, file changes, and
+    credential exceptions. The caller supplies current gate and live-host
+    verification facts; this report does not perform or claim those checks.
+    The returned terminal report bounds its displayed file list and writes a
+    separate complete private file report. The caller must hold the project
+    lock for the complete operation.
+
+    Args:
+        paths: Derived Pubanon paths.
+        record: Retained candidate to report.
+        g: Active global configuration.
+        p: Active project configuration.
+        verbose: Include full Git object IDs and the snapshot tree.
+
+    Returns:
+        The shared factual report without inspection-only instructions.
+
+    Raises:
+        PubanonError: Retained objects or the complete file report cannot be
+            verified.
+    """
+    return _candidate_report_details(paths, record, g, p, verbose=verbose)
+
+
+def reprepare_advice(record: CandidateRecord, *, project: str | None = None) -> str:
+    """Describe how to rebuild the selected source revision and release tag."""
+    selection = [f'--project={project}'] if project is not None else []
+    prepare = ['pubanon', 'prepare', *selection]
+    if record.replaces is not None:
+        selector = 'all' if record.replace_scope == 'all' else record.replaces
+        prepare.extend(('--replace', selector))
+    prepare.extend(('--source', record.pinned.commit))
+    if record.tag_intent is not None:
+        prepare.extend(('--version', record.tag_intent[1:]))
+    discard_command = shell_command('pubanon', 'discard', *selection)
+    prepare_command = shell_command(*prepare)
+    if discard_command is None or prepare_command is None:
+        return (
+            f'Select project {escape(project or "")}, then rerun discard and prepare '
+            'for this snapshot.'
+        )
+    return f'{discard_command} && {prepare_command}'
+
+
+def inspect_next_action(record: CandidateRecord, g: GlobalConfig, p: ProjectConfig) -> str:
+    """Return the next inspection action, prioritizing an unknown publish outcome."""
+    if record.state == STATE_UNKNOWN_OUTCOME:
+        return 'pubanon publish --resolve'
+    if fingerprint(g, p) == record.fingerprint:
+        return 'pubanon publish'
+    return reprepare_advice(record, project=p.name)
+
+
+def inspect_rewritten(
+    paths: Paths,
+    project: str,
+    record: CandidateRecord,
+    selector: str | None,
+    *,
+    refresh: bool = False,
+) -> Path:
+    """Materialize a verified corrected or replayed commit selected by tag or OID.
+
+    The caller must hold the project lock for the complete operation.
+
+    Args:
+        paths: Paths derived for this command.
+        project: Registered project name.
+        record: Candidate containing the rewritten commits.
+        selector: `None` for the candidate tip; other selectors follow
+            `select_rewritten_commit`.
+        refresh: Replace the selected copy instead of refusing local edits.
+
+    Returns:
+        Path to the selected commit's read-only inspection directory.
+
+    Raises:
+        PubanonError: Retained replacement evidence, selection, or exact
+            materialization fails.
+    """
+    snapshot, identity = _verify_candidate_objects(
+        paths, project, record, recovery='pubanon discard, then pubanon prepare'
+    )
+    try:
+        _verify_replacement_objects(paths, project, record, identity)
+    except UnicodeDecodeError as exc:
+        raise PubanonError(
+            'retained replacement commit identity is not valid UTF-8',
+            fact=record.commit,
+            recovery='pubanon discard, then pubanon prepare',
+        ) from exc
+    selected = select_rewritten_commit(record, selector)
+    if selected != record.commit:
+        store = candidate_store_path(paths, project)
+        snapshot = read_snapshot(store, selected, git_dir=store)
+    try:
+        return materialize_snapshot(paths, project, selected, snapshot, refresh=refresh)
+    except PubanonError as exc:
+        if exc.recovery != 'pubanon inspect --refresh':
+            raise
+        raise PubanonError(
+            str(exc), recovery=f'pubanon inspect --rewritten {selected} --refresh'
+        ) from exc
 
 
 def verify_publication_objects(paths: Paths, project: str, record: CandidateRecord) -> None:
@@ -1746,7 +1822,7 @@ def confirmed_publication(paths: Paths, project: str, record: CandidateRecord) -
         if _records.load_publication(
             paths, project, record.commit
         ) is not None or publication_archive(paths, project, record.commit):
-            raise PubanonError('incomplete snapshot has conflicting confirmation evidence')
+            raise PubanonError('the incomplete snapshot conflicts with saved published history')
         return False
     tip = _records.candidate_tip(record)
     published = _records.load_publication(paths, project, tip)
@@ -1794,22 +1870,17 @@ def _discard_preflight(paths: Paths, project: str, *, force: bool) -> CandidateR
             raise PubanonError(
                 'confirmed publication cannot be discarded', recovery='pubanon publish --resolve'
             )
-        if not force and record.state == STATE_UNKNOWN_OUTCOME:
-            raise PubanonError(
-                'Pubanon could not confirm whether the last publication completed',
-                recovery='pubanon publish --resolve',
-            )
         if force and record.state == STATE_UNKNOWN_OUTCOME:
             output(
-                'Abandoning unresolved snapshot evidence; this does not undo any possible '
-                'host publication.',
+                'Abandoning unresolved snapshot recovery information; this does not undo any '
+                'possible GitHub publication.',
                 kind='warning',
             )
     return record
 
 
 def discard(paths: Paths, project: str, *, force: bool) -> bool:
-    """Discard one candidate while preserving its inspection copies.
+    """Discard one candidate and its review copies.
 
     The caller must hold the project lock for the complete operation.
 
@@ -1832,6 +1903,11 @@ def discard(paths: Paths, project: str, *, force: bool) -> bool:
     """
     replayed = _replayed_for_discard(paths, project, force=force)
     record = _discard_preflight(paths, project, force=force)
+    commits = [entry.new for entry in replayed]
+    if record is not None:
+        commits.extend((record.commit, record.tip or record.commit))
+    for commit in dict.fromkeys(commits):
+        clean_inspect(paths, project, commit=commit)
     try:
         rewrite_present = _discard_rewrite(paths, project, replayed)
     except PubanonError as exc:
@@ -1869,7 +1945,7 @@ def discard(paths: Paths, project: str, *, force: bool) -> bool:
         if result.returncode != 0:
             if not force:
                 raise PubanonError('cannot discard snapshot ref', fact=git_failure_fact(result))
-            leftovers.append(f'advisory store snapshot ref: {git_failure_fact(result)}')
+            leftovers.append(f'saved snapshot reference: {git_failure_fact(result)}')
     candidate_record = record_path(paths, project)
     record_present = candidate_record.exists()
     try:
@@ -1881,7 +1957,7 @@ def discard(paths: Paths, project: str, *, force: bool) -> bool:
         raise PubanonError(
             'snapshot record discarded; local cleanup is incomplete',
             fact=', '.join(leftovers),
-            recovery='pubanon repo verify --repair-store',
+            recovery='pubanon repo restore --to local',
         )
     return ref_present or record_present or rewrite_present
 
@@ -1920,12 +1996,12 @@ def verify_retained_candidate(
     _verify_replacement_objects(paths, project.name, record, identity)
     if record.state == STATE_UNKNOWN_OUTCOME:
         raise PubanonError(
-            'snapshot has an unknown outcome',
+            'the outcome of the last publication is unknown',
             recovery='pubanon publish --resolve',
         )
     if fingerprint(global_config, project) != record.fingerprint:
         raise PubanonError(
-            'publication configuration changed after prepare',
+            'the configuration changed after the snapshot was prepared',
             recovery=recovery,
         )
     current_identity = f'{global_config.anon_name} <{global_config.anon_email}>'.encode()
@@ -1942,7 +2018,7 @@ def verify_retained_candidate(
     )
     if details:
         raise PubanonError(
-            'snapshot failed current content gates',
+            'the snapshot did not pass current content checks',
             fact=escape('; '.join(details.values())),
             recovery=recovery,
         )

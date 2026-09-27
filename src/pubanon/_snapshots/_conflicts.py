@@ -615,9 +615,19 @@ def read_resolutions(
     Undeclared export edits are reported and ignored. Errors retain the export
     and saved state; no publication refs, ordinary index, or host are modified.
 
+    Args:
+        store: Publication object store containing the frozen rewrite inputs.
+        directory: Conflict export produced by `export_conflicts`, including
+            its manifest and `tree/` directory.
+        pause: Frozen conflict state against which decisions are validated.
+
     Returns:
         The new Git tree ID and validated, deduplicated decisions in canonical
         path order, suitable for recording replay provenance.
+
+    Raises:
+        PubanonError: The conflict export, manifest, or a declared resolution
+            is invalid or cannot be read.
     """
     snapshot = _validate_pause(store, pause)
     try:

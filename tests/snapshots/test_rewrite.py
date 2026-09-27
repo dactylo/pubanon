@@ -125,6 +125,7 @@ def _run_to_completion(paths: Paths, g: GlobalConfig, project: ProjectConfig) ->
     _rewrite.continue_rewrite(paths, g, project, env={})
 
 
+@pytest.mark.slow
 def test_awaiting_refusal_preserves_edits_and_progress(tmp_path: Path) -> None:
     paths, g, project, _, _ = _prepare(tmp_path, conflict=True)
     _rewrite.continue_rewrite(paths, g, project, env={})
@@ -148,13 +149,14 @@ def test_clear_pause_deletes_symbolic_private_ref_without_changing_main(tmp_path
     assert _git(store, 'for-each-ref', '--format=%(refname)', _candidate.REWRITE_MERGED_REF) == b''
 
 
+@pytest.mark.slow
 def test_completion_gate_refusal_retains_complete_provenance(tmp_path: Path) -> None:
     paths, g, project, _, correction = _prepare(tmp_path, conflict=True)
     _rewrite.continue_rewrite(paths, g, project, env={})
     _resolve(paths, project)
     directory = _records.rewrite_directory(paths, project.name)
     (directory / 'tree' / 'base.txt').write_bytes(b'Private Person\n')
-    with pytest.raises(PubanonError, match='failed current content gates'):
+    with pytest.raises(PubanonError, match='did not pass current content checks'):
         _rewrite.continue_rewrite(paths, g, project, env={})
     complete = _records.load_candidate(paths, project.name)
     assert complete is not None
@@ -165,6 +167,7 @@ def test_completion_gate_refusal_retains_complete_provenance(tmp_path: Path) -> 
     assert _candidate.discard(paths, project.name, force=False)
 
 
+@pytest.mark.slow
 def test_discard_removes_paused_rewrite_without_published_refs_or_inspection(
     tmp_path: Path,
 ) -> None:
@@ -179,7 +182,7 @@ def test_discard_removes_paused_rewrite_without_published_refs_or_inspection(
     _candidate.discard(paths, project.name, force=False)
     assert not _records.rewrite_path(paths, project.name).exists()
     assert not _records.rewrite_directory(paths, project.name).exists()
-    assert inspect.exists()
+    assert not inspect.exists()
     assert _candidate.published_refs(paths, project.name)[0] == old[-1]
     assert (
         _git(
@@ -192,6 +195,7 @@ def test_discard_removes_paused_rewrite_without_published_refs_or_inspection(
     )
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     'boundary',
     [
@@ -242,6 +246,39 @@ def test_every_durable_boundary_resumes_without_losing_decisions(
     assert _records.load_candidate(paths, project.name) == result
 
 
+@pytest.mark.slow
+def test_completed_rewrite_cleanup_failure_preserves_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths, g, project, _, _ = _prepare(tmp_path)
+    with monkeypatch.context() as fault:
+        _install_faults(fault, 'complete-candidate')
+        with pytest.raises(RuntimeError, match='interrupted'):
+            _rewrite.continue_rewrite(paths, g, project, env={})
+    completed = _records.load_candidate(paths, project.name)
+    progress = _records.load_rewrite(paths, project.name)
+    assert completed is not None
+    assert completed.tip is not None
+    assert progress is not None
+    unlink = Path.unlink
+
+    def _fail_remove(path: Path, *, missing_ok: bool = False) -> None:
+        if path == _records.rewrite_path(paths, project.name):
+            raise OSError('interrupted completed rewrite cleanup')
+        unlink(path, missing_ok=missing_ok)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(Path, 'unlink', _fail_remove)
+        with pytest.raises(PubanonError, match='cannot clean completed rewrite record') as error:
+            _rewrite.continue_rewrite(paths, g, project, env={})
+    assert error.value.recovery == 'pubanon prepare --continue'
+    assert isinstance(error.value.__cause__, OSError)
+    assert _records.load_candidate(paths, project.name) == completed
+    assert _records.load_rewrite(paths, project.name) == progress
+    assert _rewrite.continue_rewrite(paths, g, project, env={}) == completed
+    assert _records.load_rewrite(paths, project.name) is None
+
+
 @pytest.mark.parametrize('scope', ['one', 'all'])
 def test_latest_and_all_are_complete_without_replay(tmp_path: Path, scope: str) -> None:
     paths, g, project, old = _history(tmp_path)
@@ -277,6 +314,7 @@ def test_latest_and_all_are_complete_without_replay(tmp_path: Path, scope: str) 
         _rewrite.continue_rewrite(paths, g, project, env={})
 
 
+@pytest.mark.slow
 def test_pause_retains_partial_chain_through_gc_and_preserves_edits(tmp_path: Path) -> None:
     paths, g, project, old, correction = _prepare(tmp_path, conflict=True)
     assert _rewrite.continue_rewrite(paths, g, project, env={}) == correction
@@ -305,6 +343,7 @@ def test_replay_configuration_change_refuses_before_merge(tmp_path: Path) -> Non
         _rewrite.continue_rewrite(paths, replace(g, anon_name='Other Publisher'), project, env={})
 
 
+@pytest.mark.slow
 def test_replay_preserves_each_release_including_empty_descendant(tmp_path: Path) -> None:
     paths, g, project, old, correction = _prepare(tmp_path, empty=True)
     store = _candidate.store_path(paths, project.name)
@@ -351,6 +390,7 @@ def test_replay_preserves_each_release_including_empty_descendant(tmp_path: Path
     assert _records.load_candidate(paths, project.name) == result
 
 
+@pytest.mark.slow
 def test_replay_retains_original_locator_without_reading_or_reusing_it(
     tmp_path: Path, make_repo: Callable[..., Path]
 ) -> None:

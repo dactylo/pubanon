@@ -861,6 +861,7 @@ def test_history_audit_reports_signed_commit(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.slow
 def test_history_batch_matches_oracle_for_unchanged_and_shared_blobs(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     empty = _write_snapshot_commit(paths, (), b'empty root\n')
@@ -879,7 +880,7 @@ def test_history_batch_matches_oracle_for_unchanged_and_shared_blobs(tmp_path: P
     changed_snapshot = (
         Entry('binary.bin', 0o100644, 'blob', b'\x00removed-secret\xff'),
         *shared,
-        Entry('link', 0o120000, 'symlink', b'nested/private-path.txt'),
+        Entry('link', 0o120000, 'symlink', b'mode.txt'),
         Entry('mode.txt', 0o100755, 'blob', b'run me\n'),
         Entry('nested/private-path.txt', 0o100644, 'blob', b'inherited-secret\n'),
         Entry('new.txt', 0o100644, 'blob', b'new\n'),
@@ -891,11 +892,22 @@ def test_history_batch_matches_oracle_for_unchanged_and_shared_blobs(tmp_path: P
         author_name='Private Author',
         parent=added,
     )
-    deleted_snapshot = tuple(entry for entry in changed_snapshot if entry.path != 'binary.bin')
+    deleted_snapshot = (
+        *(
+            entry
+            for entry in changed_snapshot
+            if entry.path not in {'binary.bin', 'link', 'mode.txt'}
+        ),
+        # Removing link makes this new target safe, even though link used to target mode.txt.
+        Entry('mode.txt', 0o120000, 'symlink', b'link'),
+    )
     deleted = _write_snapshot_commit(paths, deleted_snapshot, b'delete binary\n', parent=changed)
     readded_snapshot = (
         Entry('binary.bin', 0o100644, 'blob', b'public again\n'),
-        *deleted_snapshot,
+        Entry('link', 0o120000, 'symlink', b'mode.txt'),
+        # Replacing the symlink with a file makes the reintroduced link safe.
+        Entry('mode.txt', 0o100644, 'blob', b'run me\n'),
+        *(entry for entry in deleted_snapshot if entry.path != 'mode.txt'),
     )
     readded = _write_snapshot_commit(
         paths,
@@ -961,6 +973,7 @@ def test_history_batch_matches_oracle_for_unchanged_and_shared_blobs(tmp_path: P
     ) == ('path:copy-one.txt', 'path:nested/copy-two.txt')
 
 
+@pytest.mark.slow
 def test_history_batch_process_count_does_not_scale_per_commit_or_blob(tmp_path: Path) -> None:
     counts: list[int] = []
     rules = {RuleClass.IDENTITY_CRITICAL: ('payload-canary', 'removed-canary')}
@@ -1170,12 +1183,60 @@ def test_history_batch_refuses_malformed_object_stream(
     )
 
 
-def test_history_batch_refuses_unsafe_symlink_from_reconstructed_history(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ('previous', 'changed', 'problem', 'path'),
+    [
+        (
+            (Entry('link', 0o120000, 'symlink', b'target.txt'),),
+            (Entry('link', 0o120000, 'symlink', b'/target.txt'),),
+            'absolute',
+            'link',
+        ),
+        (
+            (),
+            (Entry('link', 0o120000, 'symlink', b'/target.txt'),),
+            'absolute',
+            'link',
+        ),
+        (
+            (Entry('link', 0o100644, 'blob', b'/target.txt'),),
+            (Entry('link', 0o120000, 'symlink', b'/target.txt'),),
+            'absolute',
+            'link',
+        ),
+        (
+            (Entry('a-link', 0o120000, 'symlink', b'z-link'),),
+            (
+                Entry('a-link', 0o120000, 'symlink', b'z-link'),
+                Entry('z-link', 0o120000, 'symlink', b'target.txt'),
+            ),
+            'unresolvable',
+            'a-link',
+        ),
+        (
+            (Entry('z-link', 0o120000, 'symlink', b'target.txt'),),
+            (
+                Entry('a-link', 0o120000, 'symlink', b'/target.txt'),
+                Entry('z-link', 0o120000, 'symlink', b'/target.txt'),
+            ),
+            'absolute',
+            'a-link',
+        ),
+    ],
+    ids=('retarget', 'introduction', 'mode-transition', 'unchanged-link', 'path-order'),
+)
+def test_history_batch_refuses_unsafe_symlink_from_reconstructed_history(
+    tmp_path: Path,
+    previous: Snapshot,
+    changed: Snapshot,
+    problem: str,
+    path: str,
+) -> None:
     paths = _paths(tmp_path)
     safe = _write_snapshot_commit(
         paths,
         (
-            Entry('link', 0o120000, 'symlink', b'target.txt'),
+            *previous,
             Entry('target.txt', 0o100644, 'blob', b'public\n'),
         ),
         b'safe link\n',
@@ -1183,16 +1244,17 @@ def test_history_batch_refuses_unsafe_symlink_from_reconstructed_history(tmp_pat
     unsafe = _write_snapshot_commit(
         paths,
         (
-            Entry('link', 0o120000, 'symlink', b'/target.txt'),
+            *changed,
             Entry('target.txt', 0o100644, 'blob', b'public\n'),
         ),
         b'unsafe link\n',
         parent=safe,
     )
 
-    with pytest.raises(PubanonError, match='absolute symlink target') as exc_info:
+    with pytest.raises(PubanonError, match=f'{problem} symlink target') as exc_info:
         _audit_history(paths, (unsafe, safe), tip=unsafe)
 
+    assert exc_info.value.fact == f'symlink: {path}'
     assert exc_info.value.recovery == 'replace the unsafe symlink and rerun'
 
 
@@ -1224,6 +1286,49 @@ def test_history_changes_share_source_tree_grammar(
         _audit._parse_change(metadata, raw_path, 40)
 
     assert history_error.value.render() == source_error.value.render()
+
+
+@pytest.mark.parametrize(
+    ('label', 'data', 'term', 'description'),
+    [
+        ('blob', b'first\r\nblocked context\r\n', 'blocked', 'notes.txt:2; text blocked context'),
+        (
+            'message',
+            b'subject\n\nblocked detail\n',
+            'blocked',
+            'commit message line 3; text blocked detail',
+        ),
+        ('filename', b'blocked.txt', 'blocked', 'filename; text blocked.txt'),
+        ('tag name', b'blocked-tag', 'blocked', 'tag name; text blocked-tag'),
+        ('header x-note value', b'blocked', 'blocked', 'header x-note value; text blocked'),
+        ('blob', b'\x00blocked', 'blocked', 'blob bytes 1:8'),
+        ('blob', b'\xffblocked', 'blocked', 'blob bytes 1:8'),
+        (
+            'blob',
+            'first\ncafe\u0301 context'.encode(),
+            'caf\u00e9',
+            'notes.txt:2; text cafe\u0301 context',
+        ),
+        ('blob', b'first\nblocked\x1b[31m', 'blocked', 'notes.txt:2; text blocked\x1b[31m'),
+        (
+            'blob',
+            b'x' * 100 + b'blocked' + b'y' * 100,
+            'blocked',
+            'notes.txt:1; text ...' + 'x' * 60 + 'blocked' + 'y' * 60 + '...',
+        ),
+    ],
+)
+def test_history_evidence_describes_text_and_retains_binary_offsets(
+    label: str, data: bytes, term: str, description: str
+) -> None:
+    findings: dict[_audit.AuditFinding, _audit.HistoryEvidence] = {}
+
+    _audit._add_findings(
+        findings, 'path:notes.txt', data, {RuleClass.IDENTITY_CRITICAL: (term,)}, ('a' * 40, label)
+    )
+
+    assert len(findings) == 1
+    assert next(iter(findings.values())).description == description
 
 
 def test_history_evidence_identifies_filename_blob_message_header_and_tag_bytes(

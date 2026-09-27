@@ -72,9 +72,10 @@ def fchmod(fd: int, mode: int) -> None:
 def read_entry(path: Path) -> tuple[int, bytes]:
     """Read an accepted entry as its file-type bits and exact byte payload.
 
-    Regular files return `(stat.S_IFREG, content)`. Symbolic links return
-    `(stat.S_IFLNK, os.fsencode(target))`, preserving the target spelling
-    without following the leaf link.
+    Returns:
+        `(stat.S_IFREG, content)` for regular files, or `(stat.S_IFLNK,
+        os.fsencode(target))` for symbolic links. The target spelling is
+        preserved without following the leaf link.
 
     Raises:
         OSError: The entry is neither a regular file nor a symbolic link, or

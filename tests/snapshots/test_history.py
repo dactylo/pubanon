@@ -12,7 +12,7 @@ import pytest
 from pubanon import _filesystem
 from pubanon._cli import _arguments
 from pubanon._config import Paths, ProjectConfig
-from pubanon._errors import OperationCancelled, PubanonError
+from pubanon._errors import OperationCanceled, PubanonError
 from pubanon._run import GitResult
 from pubanon._snapshots import _candidate, _history, _records, _rewrite, _source
 from pubanon._snapshots._source import (
@@ -287,6 +287,7 @@ def test_deleting_archive_tip_keeps_other_listed_snapshots(tmp_path: Path) -> No
     assert _history.select_publication(paths, project.name, old).commit == old
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     'changed', ['symbolic-source', 'symbolic-archive', 'wrong-archive', 'malformed-archive']
 )
@@ -321,6 +322,7 @@ def test_derived_delete_refuses_conflicting_owned_refs(
     assert any('protected' in line for line in _history.source_guidance(paths, project, original))
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize('moved', [False, True])
 def test_derived_delete_retries_partial_cleanup_after_verified_relocation(
     tmp_path: Path, make_repo: Callable[..., Path], monkeypatch: pytest.MonkeyPatch, moved: bool
@@ -341,12 +343,12 @@ def test_derived_delete_retries_partial_cleanup_after_verified_relocation(
         args: list[str], *, cwd: Path | None, check: bool = True, input_bytes: bytes | None = None
     ) -> GitResult:
         if args[2:3] == ['update-ref']:
-            raise OperationCancelled('injected archive interruption')
+            raise OperationCanceled('injected archive interruption')
         return real_git(args, cwd=cwd, check=check, input_bytes=input_bytes)
 
     with monkeypatch.context() as scoped:
         scoped.setattr(_history, 'run_git', _interrupt)
-        with pytest.raises(OperationCancelled, match='cleanup is incomplete'):
+        with pytest.raises(OperationCanceled, match='cleanup is incomplete'):
             _history.delete_publication(paths, project, derived)
     saved = _records.load_publication(paths, project.name, derived.commit)
     assert saved is not None
@@ -366,6 +368,7 @@ def test_derived_delete_retries_partial_cleanup_after_verified_relocation(
     assert any('protected' in line for line in _history.source_guidance(paths, project, original))
 
 
+@pytest.mark.slow
 def test_derived_source_cleanup_uses_input_commit_and_keeps_worktree(
     tmp_path: Path, make_repo: Callable[..., Path]
 ) -> None:
@@ -469,6 +472,7 @@ def test_history_combines_records_and_recorded_refs(tmp_path: Path) -> None:
     assert by_commit[archived].record is not None
 
 
+@pytest.mark.slow
 def test_history_delete_accepts_absent_archive_and_verified_relocation(
     tmp_path: Path, make_repo: Callable[..., Path]
 ) -> None:
@@ -569,7 +573,7 @@ def test_history_delete_interrupt_after_unlink_reports_completed_cleanup(
 
     with monkeypatch.context() as scoped:
         scoped.setattr(_filesystem, 'durable_unlink', _interrupt_after_unlink)
-        with pytest.raises(OperationCancelled, match='durability could not be confirmed') as error:
+        with pytest.raises(OperationCanceled, match='durability could not be confirmed') as error:
             _history.delete_publication(paths, project, entry)
     assert 'private recovery record removed' in error.value.render()
     assert 'No further bookmark cleanup is needed' in error.value.render()
@@ -592,13 +596,13 @@ def test_history_delete_interrupt_reports_completed_source_deletion(
     ) -> GitResult:
         if args[2:3] == ['update-ref']:
             if cancelled:
-                raise OperationCancelled('injected Git cancellation')
+                raise OperationCanceled('injected Git cancellation')
             raise KeyboardInterrupt
         return original(args, cwd=cwd, check=check, input_bytes=input_bytes)
 
     with monkeypatch.context() as scoped:
         scoped.setattr(_history, 'run_git', _interrupt_archive)
-        with pytest.raises(OperationCancelled) as error:
+        with pytest.raises(OperationCanceled) as error:
             _history.delete_publication(paths, project, entry)
     assert 'source bookmark released' in error.value.render()
     assert 'Remaining: archive bookmark, private recovery record' in error.value.render()
@@ -783,6 +787,7 @@ def test_history_delete_refuses_active_candidate_evidence(
     assert _candidate.publication_archive(paths, project.name, entry.commit)
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize('operational', [False, True])
 def test_history_delete_releases_only_owned_preservation(
     tmp_path: Path, make_repo: Callable[..., Path], operational: bool
@@ -828,6 +833,7 @@ def test_history_delete_releases_only_owned_preservation(
         assert _history.publications(paths, project.name) == ()
 
 
+@pytest.mark.slow
 def test_history_delete_relocated_partial_failure_retains_verified_locator(
     tmp_path: Path, make_repo: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -961,6 +967,7 @@ def test_history_delete_retries_record_unlink_failure(
     assert _records.load_publication(paths, project.name, entry.commit) is None
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize('derived_first', [False, True])
 def test_history_derived_recovery_survives_independent_delete_and_repeat_replacement(
     tmp_path: Path, make_repo: Callable[..., Path], derived_first: bool
@@ -1053,6 +1060,7 @@ def test_history_record_without_store_does_not_create_one(tmp_path: Path) -> Non
     assert not _candidate.candidate_store_path(paths, 'example').exists()
 
 
+@pytest.mark.slow
 def test_history_records_repeated_replay_as_input_chain(tmp_path: Path) -> None:
     paths, g, project, _, _ = _prepare_rewrite(tmp_path)
     first = _rewrite.continue_rewrite(paths, g, project, env={})
@@ -1115,6 +1123,7 @@ def test_history_records_repeated_replay_as_input_chain(tmp_path: Path) -> None:
     assert any('may differ' in line for line in lines)
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize('descendant', [1, 2], ids=['intermediate', 'tip'])
 @pytest.mark.parametrize(
     ('tags', 'intent'),
@@ -1305,7 +1314,7 @@ def test_inspect_missing_store_reports_unavailable_commit(tmp_path: Path) -> Non
     entry = _history.PublicationEntry(record.commit, (), None, record)
     with pytest.raises(PubanonError, match='published commit is unavailable') as error:
         _history.inspect_publication(paths, 'example', entry)
-    assert 'repair-store' in error.value.render()
+    assert 'pubanon repo restore --to local' in error.value.render()
 
 
 def test_inspect_publication_refuses_missing_or_conflicting_objects_before_refresh(
@@ -1326,7 +1335,7 @@ def test_inspect_publication_refuses_missing_or_conflicting_objects_before_refre
     _git(_candidate.candidate_store_path(paths, 'example'), 'prune', '--expire=now')
     with pytest.raises(PubanonError) as error:
         _history.inspect_publication(paths, 'example', entry, refresh=True)
-    assert 'repair-store' in error.value.render()
+    assert 'pubanon repo restore --to local' in error.value.render()
     assert (copy / 'README.md').read_bytes() == b'keep edits\n'
 
 

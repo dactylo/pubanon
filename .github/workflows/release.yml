@@ -1,4 +1,4 @@
-name: Release
+name: Publish package
 
 # Run manually after reviewing CI for the selected branch or tag.
 # Configure the PyPI Trusted Publisher with release.yml and environment pypi.

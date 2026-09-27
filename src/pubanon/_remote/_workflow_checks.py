@@ -20,16 +20,34 @@ _WORKFLOW_PATH = re.compile(r'\.github/workflows/[^/]+\.ya?ml')
 
 
 @dataclass(frozen=True)
+class CheckCaution:
+    """Explain why a discovered check needs review before being required.
+
+    Attributes:
+        name: Discovered GitHub check name.
+        path: Workflow file defining this check.
+        reasons: Trigger or condition limitations for ordinary branch pushes.
+    """
+
+    name: str
+    path: str
+    reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class Discovery:
     """Contain ordered workflow check names and discovery limitations.
 
     Attributes:
         names: Unique check names in workflow and matrix declaration order.
         notes: Reasons the discovered list may be incomplete.
+        cautions: Checks whose execution on a branch push needs explicit
+            review.
     """
 
     names: tuple[str, ...]
     notes: tuple[str, ...]
+    cautions: tuple[CheckCaution, ...] = ()
 
 
 class _YamlLoader(Protocol):
@@ -67,6 +85,22 @@ def _is_scalar(value: object) -> TypeGuard[_Scalar]:
     if isinstance(value, str):
         return '${{' not in value
     return value is None or isinstance(value, (int, float, bool))
+
+
+def _load_workflow(data: bytes) -> tuple[Mapping[object, object] | None, str | None]:
+    """Parse one workflow mapping or return a diagnostic."""
+    try:
+        text = data.decode('utf-8')
+        yaml = YAML(typ='safe', pure=True)
+        yaml.version = (1, 2)
+        loader = cast('_YamlLoader', yaml)
+        document = loader.load(text)
+    except (UnicodeDecodeError, YAMLError):
+        return None, 'could not be parsed as YAML 1.2'
+    root = _as_mapping(document)
+    if root is None:
+        return None, 'does not contain a workflow mapping'
+    return root, None
 
 
 def _matches(combination: _Combination, pattern: _Combination) -> bool:
@@ -198,6 +232,25 @@ def _job_combinations(
     return _parse_matrix(strategy_mapping['matrix'])
 
 
+def _push_cautions(value: object) -> tuple[str, ...]:
+    """Describe literal filters that may prevent a workflow running on a branch push."""
+    if value is None:
+        return ()
+    filters = _as_mapping(value)
+    if filters is None:
+        return ('push trigger could not be interpreted',)
+    if ('tags' in filters or 'tags-ignore' in filters) and not (
+        'branches' in filters or 'branches-ignore' in filters
+    ):
+        return ('workflow runs on tags, not branch pushes',)
+    reasons: list[str] = []
+    if ('branches' in filters and filters['branches'] != ['**']) or 'branches-ignore' in filters:
+        reasons.append('workflow filters branches and may not run for the published branch')
+    if 'paths' in filters or 'paths-ignore' in filters:
+        reasons.append('workflow filters changed paths and may not run for every push')
+    return tuple(reasons)
+
+
 def _render_explicit_name(name: str, combination: _Combination) -> str | None:
     """Substitute supported matrix references in an explicit job name."""
     unresolved = False
@@ -241,23 +294,22 @@ def _job_names(job_id: str, job: Mapping[object, object]) -> tuple[list[str] | N
     return names, None
 
 
-def _workflow_jobs(data: bytes) -> tuple[Mapping[object, object] | None, str | None]:
-    """Parse one workflow and return its jobs mapping or a diagnostic."""
-    try:
-        text = data.decode('utf-8')
-        yaml = YAML(typ='safe', pure=True)
-        yaml.version = (1, 2)
-        loader = cast('_YamlLoader', yaml)
-        document = loader.load(text)
-    except (UnicodeDecodeError, YAMLError):
-        return None, 'could not be parsed as YAML 1.2'
-    root = _as_mapping(document)
-    if root is None:
-        return None, 'does not contain a workflow mapping'
-    jobs = _as_mapping(root.get('jobs'))
-    if jobs is None:
-        return None, 'does not contain a jobs mapping'
-    return jobs, None
+def _workflow_cautions(events: object) -> tuple[str, ...]:
+    """Describe a workflow's declared availability for ordinary branch pushes."""
+    mapping = _as_mapping(events)
+    if mapping is not None:
+        triggers = tuple(mapping)
+    elif isinstance(events, str):
+        triggers = (events,)
+    elif (sequence := _as_sequence(events)) is not None:
+        triggers = tuple(sequence)
+    else:
+        return ('workflow trigger could not be determined',)
+    if 'push' in triggers:
+        return _push_cautions(mapping['push'] if mapping is not None else None)
+    if triggers == ('workflow_dispatch',):
+        return ('workflow starts manually; a push does not start it',)
+    return ('workflow does not run on branch pushes',)
 
 
 def _discover_workflow(
@@ -265,12 +317,18 @@ def _discover_workflow(
     names: list[str],
     notes: list[str],
     seen: set[str],
+    cautions: list[CheckCaution],
 ) -> None:
     """Add discoverable names and notes from one workflow entry."""
-    jobs, problem = _workflow_jobs(entry.data)
-    if jobs is None:
+    root, problem = _load_workflow(entry.data)
+    if root is None:
         notes.append(f'{entry.path}: {problem}')
         return
+    jobs = _as_mapping(root.get('jobs'))
+    if jobs is None:
+        notes.append(f'{entry.path}: does not contain a jobs mapping')
+        return
+    workflow_cautions = _workflow_cautions(root.get('on'))
 
     for raw_job_id, raw_job in jobs.items():
         job_id = raw_job_id if isinstance(raw_job_id, str) else repr(raw_job_id)
@@ -283,7 +341,13 @@ def _discover_workflow(
         if discovered is None:
             notes.append(f'{context}: {problem}')
             continue
+        reasons = workflow_cautions
+        if 'if' in job:
+            reasons += ('job has a condition and may be skipped',)
         for name in discovered:
+            caution = CheckCaution(name, entry.path, reasons)
+            if reasons and caution not in cautions:
+                cautions.append(caution)
             if name in seen:
                 notes.append(f'{context}: duplicate discovered check name {name!r}')
                 continue
@@ -302,11 +366,13 @@ def discover(snapshot: _source.Snapshot) -> Discovery:
         snapshot: Selected committed source entries to inspect.
 
     Returns:
-        Ordered unique names and notes for jobs that could not be resolved.
+        Ordered unique names, notes for unresolved jobs, and execution
+        cautions.
     """
     names: list[str] = []
     notes: list[str] = []
     seen: set[str] = set()
+    cautions: list[CheckCaution] = []
 
     for entry in snapshot:
         if (
@@ -315,6 +381,6 @@ def discover(snapshot: _source.Snapshot) -> Discovery:
             or _WORKFLOW_PATH.fullmatch(entry.path) is None
         ):
             continue
-        _discover_workflow(entry, names, notes, seen)
+        _discover_workflow(entry, names, notes, seen, cautions)
 
-    return Discovery(tuple(names), tuple(notes))
+    return Discovery(tuple(names), tuple(notes), tuple(cautions))

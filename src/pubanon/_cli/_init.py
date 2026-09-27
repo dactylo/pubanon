@@ -15,14 +15,18 @@ from pubanon import (
     _config,
     _policy,
 )
-from pubanon._errors import OperationCancelled, PubanonError
+from pubanon._config import stage_repository
+from pubanon._errors import OperationCanceled, PubanonError
 from pubanon._remote import _lifecycle, _workflow_checks
-from pubanon._snapshots import _source
+from pubanon._snapshots import _candidate, _source
 from pubanon._terminal import (
     ask,
     confirm,
+    detail,
     diagnostic,
+    display_path,
     escape,
+    fields,
     heading,
     next_step,
     output,
@@ -59,6 +63,37 @@ def _checkpoint_init(ctx: _context.ProjectContext, draft: _init_draft.Draft) -> 
     return draft
 
 
+def _choose_saved_draft(
+    ctx: _context.ProjectContext, draft: _init_draft.Draft, resume: str
+) -> str:
+    """Offer only choices valid for a saved draft's source."""
+    heading('Saved setup draft', separate=True)
+    print(f'{style("Source:")} {escape(str(draft.source))}')
+    same_source = _config.same_source(draft.source, ctx.project.source_path)
+    choices = ['resume', 'start over', 'quit'] if same_source else ['start over', 'quit']
+    if not same_source:
+        print('This draft belongs to another source repository.')
+    try:
+        choice = ask('Saved setup:', choices=choices)
+    except OperationCanceled:
+        choice = 'quit'
+    if choice == 'quit':
+        if same_source:
+            output(f'Setup progress saved. Rerun {escape(resume)} to resume.', kind='note')
+            recovery = f'rerun {escape(resume)} to resume'
+        else:
+            recovery = (
+                f'rerun {escape(resume)} from the draft source shown above, '
+                'or rerun here and choose start over'
+            )
+        raise OperationCanceled(
+            'Canceled. The setup draft is kept.',
+            fact='project configuration was not saved',
+            recovery=recovery,
+        ) from None
+    return choice
+
+
 def _description_prompt(current: str | None, source: Path | None = None) -> str:
     """Suggest local project metadata only when no description has been saved."""
     label = 'Current description:'
@@ -91,14 +126,26 @@ def _draft_description(draft: _init_draft.Draft) -> str:
 def _draft_edit(draft: _init_draft.Draft) -> _init_draft.Draft:
     """Queue the selected settings section while retaining all existing answers."""
     action = ask(
-        'Edit:', choices=['destination', 'visibility', 'policy', 'checks', 'settings', 'back']
+        'Edit:',
+        choices=[
+            'destination',
+            'visibility',
+            'route',
+            'tags',
+            'policy',
+            'checks',
+            'settings',
+            'back',
+        ],
     )
     steps = {
         'destination': ('owner', 'repo'),
         'visibility': ('visibility',),
+        'route': ('publication_route',),
+        'tags': ('source_tags',),
         'policy': ('selection',),
         'checks': ('checks',),
-        'settings': ('description', 'issues', 'wiki', 'projects'),
+        'settings': ('description', 'issues', 'wiki', 'projects', 'pull_requests', 'discussions'),
         'back': (),
     }[action]
     return replace(draft, pending=(*steps, 'review'), phase='preview')
@@ -118,7 +165,7 @@ def _draft_flagged_choice(paths: list[str], draft: _init_draft.Draft) -> _init_d
     print(f'\n{style("File:")} {escape(remaining[0])}')
     choice = ask('Include it?', choices=['include', 'exclude', 'back', 'quit'])
     if choice == 'quit':
-        raise OperationCancelled('operation cancelled')
+        raise OperationCanceled('Canceled.')
     if choice == 'back':
         # Before the group review, Back returns to the preceding filename warning.
         if draft.flagged:
@@ -142,36 +189,6 @@ def _init_source(paths: _config.Paths) -> tuple[Path, str | None]:
     """Resolve the canonical source repository and its registration."""
     source = _source.repository_root(Path.cwd())
     return source, _config.registry_lookup(paths, source)
-
-
-def _load_init_draft(ctx: _context.ProjectContext, commit: str) -> _init_draft.Draft:
-    """Offer a saved draft without silently discarding or finalizing it."""
-    draft = _init_draft.load(ctx.paths, ctx.project.name)
-    if draft is not None:
-        heading('Saved setup draft', separate=True)
-        print(f'{style("Source:")} {escape(str(draft.source))}')
-        same_source = _config.same_source(draft.source, ctx.project.source_path)
-        choices = ['resume', 'start over', 'quit'] if same_source else ['start over', 'quit']
-        if not same_source:
-            print('This draft belongs to another source repository.')
-        choice = ask('Saved setup:', choices=choices)
-        if choice == 'quit':
-            raise OperationCancelled(
-                'operation cancelled', fact='existing setup draft was retained'
-            )
-        if choice == 'start over':
-            draft = None
-    if draft is None:
-        draft = _init_draft.Draft(ctx.project.source_path, commit, ctx.project.self_publication)
-    elif draft.commit != commit:
-        print(
-            'The source changed. Review the updated selection; your earlier choices are retained.'
-        )
-        pending = ('selection', *(step for step in draft.pending if step != 'selection'))
-        draft = replace(draft, commit=commit, phase='flagged', pending=pending)
-    if ctx.project.self_publication:
-        draft = replace(draft, self_publication=True)
-    return _checkpoint_init(ctx, draft)
 
 
 def _manual_required_checks(default: tuple[str, ...]) -> tuple[str, ...]:
@@ -202,37 +219,122 @@ def _manual_required_checks(default: tuple[str, ...]) -> tuple[str, ...]:
 def _project_review(
     project: _config.ProjectConfig,
     snapshot: _source.Snapshot,
+    global_config: _config.GlobalConfig,
 ) -> None:
     """Display the complete project snapshot before its save decision."""
     membership = _policy.evaluate_membership(
         [entry.path for entry in snapshot],
         project.allow,
         project.deny,
+        global_deny=_config.global_deny(global_config),
     )
     settings = project.settings
     if settings is None:
         raise PubanonError('repository settings are missing')
     checks = _check_names_csv(project.required_checks) if project.required_checks else 'none'
-    values = {
-        'Source': str(project.source_path),
-        'Destination': f'{project.owner}/{project.repo}',
-        'Visibility': project.visibility,
-        'Selection scope': (
-            f'{len(membership.allowed)} included; '
-            f'{len(membership.denied) + len(membership.reserved)} excluded'
+    included_count = len(membership.allowed)
+    excluded_count = len(membership.denied) + len(membership.reserved)
+    values = [
+        ('Source', display_path(project.source_path)),
+        (
+            'Final repository',
+            f'{escape(project.owner)}/{escape(project.repo)} ({escape(project.visibility)})',
         ),
-        'Required checks': checks,
-        'Description': settings.description or '(empty)',
-        'Issues': 'yes' if settings.issues else 'no',
-        'Wiki': 'yes' if settings.wiki else 'no',
-        'Projects': 'yes' if settings.projects else 'no',
-    }
+    ]
+    if project.publication_route == 'staged':
+        values.append(
+            (
+                'Staging repository',
+                f'{escape(project.owner)}/{escape(stage_repository(project))} (private)',
+            )
+        )
+    values.extend(
+        [
+            ('Route', escape(project.publication_route)),
+            ('Files', f'{included_count} included, {excluded_count} excluded'),
+            ('Required checks', escape(checks)),
+            ('Source tags', 'yes' if project.source_tags else 'no'),
+            ('Description', escape(settings.description or '(empty)')),
+            ('Features', _lifecycle.feature_summary(settings)),
+        ]
+    )
     heading('Project configuration to save', separate=True)
-    for label, value in values.items():
-        print(f'{style(escape(label) + ":")} {escape(value)}')
-    output('Publication uses the main branch.')
-    if not project.required_checks:
+    fields(values)
+    if project.publication_route == 'staged' and not project.required_checks:
         output('No CI checks configured; CI waiting is optional.', kind='warning')
+
+
+def _publication_route_prompt(*, default: str) -> str:
+    """Read an explicit route while showing the global default."""
+    print('Staged: try snapshots privately before final publication.')
+    print('Direct: upload straight to the final repository.')
+    while True:
+        route = ask('Publication route (staged/direct)', default=default).casefold()
+        if route in _config.PUBLICATION_ROUTES:
+            return route
+        output('Choose staged or direct.', kind='warning')
+
+
+def _recover_invalid_draft(ctx: _context.ProjectContext, resume: str) -> None:
+    """Offer to discard an unusable saved draft or retain it on cancellation."""
+    heading('Saved setup draft', separate=True)
+    print('This saved setup draft cannot be resumed.')
+    try:
+        choice = ask('Saved setup:', choices=['start over', 'quit'])
+    except OperationCanceled:
+        choice = 'quit'
+    if choice == 'quit':
+        raise OperationCanceled(
+            'Canceled. The setup draft is kept.',
+            fact='project configuration was not saved',
+            recovery=f'rerun {escape(resume)} and choose start over',
+        ) from None
+    _init_draft.remove(ctx.paths, ctx.project.name)
+
+
+def _read_init_draft(ctx: _context.ProjectContext, resume: str) -> _init_draft.Draft | None:
+    """Load a saved draft, offering recovery when its contents are unusable."""
+    try:
+        return _init_draft.load(ctx.paths, ctx.project.name)
+    except _init_draft.InvalidDraftError:
+        _recover_invalid_draft(ctx, resume)
+        return None
+
+
+def _load_init_draft(
+    ctx: _context.ProjectContext,
+    commit: str,
+    route: str | None,
+    source_tags: bool | None,
+    resume: str,
+) -> _init_draft.Draft:
+    """Offer a saved draft without silently discarding or finalizing it."""
+    draft = _read_init_draft(ctx, resume)
+    if draft is not None and _choose_saved_draft(ctx, draft, resume) == 'start over':
+        draft = None
+    if draft is None:
+        draft = _init_draft.Draft(ctx.project.source_path, commit, ctx.project.self_publication)
+    elif draft.commit != commit:
+        print(
+            'The source changed. Review the updated selection; your earlier choices are retained.'
+        )
+        pending = ('selection', *(step for step in draft.pending if step != 'selection'))
+        draft = replace(draft, commit=commit, phase='flagged', pending=pending)
+    if ctx.project.self_publication:
+        draft = replace(draft, self_publication=True)
+    if route is not None:
+        draft = replace(
+            draft,
+            publication_route=route,
+            pending=tuple(step for step in draft.pending if step != 'publication_route'),
+        )
+    if source_tags is not None:
+        draft = replace(
+            draft,
+            source_tags=source_tags,
+            pending=tuple(step for step in draft.pending if step != 'source_tags'),
+        )
+    return _checkpoint_init(ctx, draft)
 
 
 def _replace_project_context(
@@ -247,7 +349,12 @@ def _project_from_draft(
     ctx: _context.ProjectContext, snapshot: _source.Snapshot, draft: _init_draft.Draft
 ) -> _context.ProjectContext:
     """Derive a proposed configuration from saved choices and the current tree."""
-    paths = [entry.path for entry in snapshot]
+    paths = _policy.evaluate_membership(
+        [entry.path for entry in snapshot],
+        ('**',),
+        (),
+        global_deny=_config.global_deny(ctx.global_config),
+    ).allowed
     flagged = set(_policy.secret_like(paths, ()))
     ordinary = [
         path for path in paths if path not in flagged and not _policy.is_reserved_path(path)
@@ -272,9 +379,17 @@ def _project_from_draft(
         and draft.issues is not None
         and draft.wiki is not None
         and draft.projects is not None
+        and draft.pull_requests is not None
+        and draft.discussions is not None
     ):
         settings = _config.Settings(
-            draft.description, 'main', draft.issues, draft.wiki, draft.projects
+            draft.description,
+            'main',
+            draft.issues,
+            draft.wiki,
+            draft.projects,
+            draft.pull_requests,
+            draft.discussions,
         )
     project = replace(
         ctx.project,
@@ -284,7 +399,9 @@ def _project_from_draft(
         owner=draft.owner if draft.owner is not None else ctx.project.owner,
         repo=draft.repo if draft.repo is not None else ctx.project.repo,
         visibility=draft.visibility or 'private',
+        publication_route=draft.publication_route or ctx.project.publication_route,
         required_checks=draft.required_checks or (),
+        source_tags=draft.source_tags,
         settings=settings,
         self_publication=draft.self_publication,
     )
@@ -296,29 +413,27 @@ def _draft_group_choice(
 ) -> _init_draft.Draft:
     """Resolve one unmatched group and retain its decision for resume or Back."""
     proposed = _project_from_draft(ctx, snapshot, draft)
-    paths = [entry.path for entry in snapshot]
+    paths = _policy.evaluate_membership(
+        [entry.path for entry in snapshot],
+        ('**',),
+        (),
+        global_deny=_config.global_deny(ctx.global_config),
+    ).allowed
     flagged = set(_policy.secret_like(paths, ()))
     ordinary = [path for path in paths if path not in flagged]
     unmatched = _policy.evaluate_membership(
-        ordinary, proposed.project.allow, proposed.project.deny
+        ordinary,
+        proposed.project.allow,
+        proposed.project.deny,
+        global_deny=_config.global_deny(ctx.global_config),
     ).unmatched
     if not unmatched:
         return replace(draft, phase='preview')
     pattern, admitted = _policy.narrowest_offer(unmatched, guided=True)[0]
-    print(style('Files to include or exclude:'))
-    for path in admitted:
-        print(f'  {escape(path)}')
-    print(f'Selection pattern: {escape(pattern)} (also applies to future matching files).')
-    choice = ask(
-        'Include these files?', choices=['include', 'exclude', 'customize', 'back', 'quit']
-    )
-    if choice == 'quit':
-        raise OperationCancelled('operation cancelled')
-    if choice == 'back':
+    action, pattern = _selection.policy_decision(pattern, admitted, back=True)
+    if action == 'back':
         return _back_init_selection(draft)
-    if choice == 'customize':
-        pattern = ask('Replacement pattern')
-        choice = 'include'
+    choice = 'include' if action == 'publish' else 'exclude'
     return replace(draft, groups=(*draft.groups, (pattern, choice)))
 
 
@@ -326,6 +441,8 @@ def _draft_review(
     ctx: _context.ProjectContext, snapshot: _source.Snapshot, draft: _init_draft.Draft
 ) -> _init_draft.Draft:
     """Require an explicit final save even after resuming a complete draft."""
+    if draft.publication_route is None:
+        raise PubanonError('choose a publication route before saving')
     proposed = _project_from_draft(ctx, snapshot, draft)
     try:
         _config.gate_host_coordinates(
@@ -339,10 +456,10 @@ def _draft_review(
         print(diagnostic(error))
         output('Edit the field named in the error before saving.', kind='warning')
         return _checkpoint_init(ctx, _draft_edit(draft))
-    _project_review(proposed.project, snapshot)
+    _project_review(proposed.project, snapshot, ctx.global_config)
     action = ask('Save this configuration?', choices=['save', 'edit', 'cancel'])
     if action == 'cancel':
-        raise OperationCancelled('project initialization cancelled')
+        raise OperationCanceled('Canceled. Nothing was saved.')
     if action == 'edit':
         return _checkpoint_init(ctx, _draft_edit(draft))
     # Keep the on-disk draft at review until configuration installation succeeds.
@@ -359,12 +476,15 @@ def _draft_selection(
     """Review a resumable selection and allow correction before continuing."""
     print('Choose the files to publish. Nothing is published now.')
     paths = [entry.path for entry in snapshot]
+    decision_paths = _policy.evaluate_membership(
+        paths, ('**',), (), global_deny=_config.global_deny(ctx.global_config)
+    ).allowed
     heading('Files needing your decision:', separate=True)
-    if not _policy.secret_like(paths, ()):
+    if not _policy.secret_like(decision_paths, ()):
         print('  None.')
     while True:
         if draft.phase == 'flagged':
-            draft = _checkpoint_init(ctx, _draft_flagged_choice(paths, draft))
+            draft = _checkpoint_init(ctx, _draft_flagged_choice(decision_paths, draft))
         elif draft.phase == 'groups':
             draft = _checkpoint_init(ctx, _draft_group_choice(ctx, snapshot, draft))
         else:
@@ -373,7 +493,7 @@ def _draft_selection(
             )
             choice = ask('Use this selection?', choices=['continue', 'review', 'back', 'quit'])
             if choice == 'quit':
-                raise OperationCancelled('operation cancelled')
+                raise OperationCanceled('Canceled.')
             if choice == 'continue':
                 return _checkpoint_init(ctx, replace(draft, pending=draft.pending[1:]))
             if choice == 'back':
@@ -385,27 +505,40 @@ def _draft_selection(
 
 
 def _report_existing_project_init(
+    paths: _config.Paths,
     project: _config.ProjectConfig,
-    project_file: Path,
     *,
     relocated: bool,
+    route_changed: bool,
+    source_tags_changed: bool,
 ) -> None:
     """Report the state changes made by initialization of an existing project."""
+    heading(f'Project {escape(project.name)}')
+    fields(
+        [
+            ('Route', escape(project.publication_route)),
+            ('Source tags', 'yes' if project.source_tags else 'no'),
+        ]
+    )
+    project_file = paths.config_dir / 'projects' / f'{project.name}.toml'
+    detail(f'Project configuration: {escape(str(project_file))}')
     if relocated:
         output(
             f'Relocated project {escape(project.name)} to the current source repository.',
             kind='success',
         )
-        print('The project configuration and source registration were updated.')
     else:
         output(
-            f'Project {escape(project.name)} is already configured and registered.',
+            f'Updated project {escape(project.name)} and its source registration.'
+            if route_changed or source_tags_changed
+            else f'Refreshed source registration for project {escape(project.name)}.',
             kind='success',
         )
-        print('Only the source registration was refreshed.')
-    print()
-    print(f'{style("Details:")} project configuration {escape(str(project_file))}')
-    next_step('pubanon status')
+    try:
+        known_existing = _candidate.published_refs(paths, project.name)[0] is not None
+    except PubanonError:
+        known_existing = False
+    next_step('pubanon prepare' if known_existing else 'pubanon repo create')
 
 
 def _review_relocation(project: _config.ProjectConfig, source: Path, *, yes: bool) -> None:
@@ -423,7 +556,7 @@ def _review_relocation(project: _config.ProjectConfig, source: Path, *, yes: boo
         kind='warning',
     )
     if not confirm('Move this project to the new source path?'):
-        raise PubanonError('source relocation declined')
+        raise OperationCanceled('Canceled. Nothing was changed.')
 
 
 def _select_check_numbers(names: tuple[str, ...]) -> tuple[str, ...] | None:
@@ -439,6 +572,20 @@ def _select_check_numbers(names: tuple[str, ...]) -> tuple[str, ...] | None:
         if indexes and all(1 <= index <= len(names) for index in indexes):
             return tuple(dict.fromkeys(names[index - 1] for index in indexes))
         output(f'Choose numbers from 1 to {len(names)}.', kind='warning')
+
+
+def _show_discovered_checks(discovered: _workflow_checks.Discovery) -> None:
+    """List check names and the execution limitations needing review."""
+    heading('GitHub checks found in selected workflow files', separate=True)
+    print('Choose which results Pubanon waits for. This does not change which jobs GitHub runs.')
+    for number, name in enumerate(discovered.names, start=1):
+        print(f'  {number}. {escape(name)}')
+        for caution in discovered.cautions:
+            if caution.name == name:
+                print(f'     {escape(caution.path)}: {escape("; ".join(caution.reasons))}')
+    if discovered.cautions or discovered.notes:
+        print('\nSelect checks individually after reviewing when they run.')
+        print('A required check that never runs cannot pass; a skipped check is rejected.')
 
 
 def _required_checks_prompt(
@@ -459,11 +606,10 @@ def _required_checks_prompt(
         )
     if not discovered.names:
         return _manual_required_checks(default)
-    heading('GitHub checks found in selected workflow files', separate=True)
-    print('Choose which results Pubanon waits for. This does not change which jobs GitHub runs.')
-    for number, name in enumerate(discovered.names, start=1):
-        print(f'  {number}. {escape(name)}')
-    choices = ['all listed', 'select', 'none', 'manual']
+    _show_discovered_checks(discovered)
+    choices = ['select', 'none', 'manual']
+    if not discovered.cautions and not discovered.notes:
+        choices.insert(0, 'all listed')
     if default:
         print(f'\n{style("Current requirements:")} {escape(_check_names_csv(default))}')
         choices.append('keep current')
@@ -506,6 +652,13 @@ def _draft_field(
         draft = replace(
             draft, visibility=_visibility_prompt(default=draft.visibility or 'private')
         )
+    elif step == 'publication_route':
+        draft = replace(
+            draft,
+            publication_route=_publication_route_prompt(
+                default=draft.publication_route or ctx.global_config.default_publication_route
+            ),
+        )
     elif step == 'checks':
         draft = replace(
             draft,
@@ -518,17 +671,33 @@ def _draft_field(
         )
     elif step == 'description':
         draft = replace(draft, description=_draft_description(draft))
-        print('Publication uses the main branch.')
+    elif step == 'source_tags':
+        draft = replace(
+            draft,
+            source_tags=confirm(
+                'Create local tags marking the source of each publication?',
+                default=draft.source_tags,
+            ),
+        )
     else:
         default = getattr(draft, step)
+        if step == 'pull_requests':
+            output('Pubanon publishes from the private source and does not merge on GitHub.')
+        label = step.replace('_', ' ')
         enabled = confirm(
-            f'Enable {step}?', default=(step == 'issues') if default is None else default
+            f'Enable {label}?', default=(step == 'issues') if default is None else default
         )
         draft = replace(draft, **{step: enabled})
     return _checkpoint_init(ctx, replace(draft, pending=draft.pending[1:]))
 
 
-def _initial_project(ctx: _context.ProjectContext, *, verbose: bool) -> _config.ProjectConfig:
+def _initial_project(
+    ctx: _context.ProjectContext,
+    *,
+    verbose: bool,
+    route: str | None,
+    source_tags: bool | None,
+) -> _config.ProjectConfig:
     """Resume or collect a project draft without installing it before final save."""
     source = ctx.project.source_path
     _source.check_source_safety(source)
@@ -536,13 +705,12 @@ def _initial_project(ctx: _context.ProjectContext, *, verbose: bool) -> _config.
     snapshot = _source.read_snapshot(source, pinned.commit)
     heading('Project source')
     print(f'{style("Source repository root:")} {escape(str(source))}')
-    draft = _load_init_draft(ctx, pinned.commit)
     resume = (
         'pubanon init'
         if ctx.project.name == source.name
         else shlex.join(['pubanon', 'init', f'--project={ctx.project.name}'])
     )
-    output(f'Setup progress saved. Rerun {escape(resume)} to resume.', kind='note')
+    draft = _load_init_draft(ctx, pinned.commit, route, source_tags, resume)
     try:
         while draft.pending:
             step = draft.pending[0]
@@ -552,7 +720,9 @@ def _initial_project(ctx: _context.ProjectContext, *, verbose: bool) -> _config.
                 draft = _draft_review(ctx, snapshot, draft)
             else:
                 draft = _draft_field(ctx, snapshot, draft)
-    except (OperationCancelled, PubanonError) as error:
+    except (OperationCanceled, PubanonError) as error:
+        if isinstance(error, OperationCanceled):
+            output(f'Setup progress saved. Rerun {escape(resume)} to resume.', kind='note')
         error.fact = 'project configuration was not saved; setup draft was saved'
         error.recovery = f'rerun {escape(resume)} to resume'
         raise
@@ -581,6 +751,12 @@ def command_init(args: argparse.Namespace) -> None:
         if project_file.exists():
             project = _config.load_project(paths, name)
             relocated = False
+            route_changed = args.publication_route is not None and (
+                args.publication_route != project.publication_route
+            )
+            source_tags_changed = (
+                args.source_tags is not None and args.source_tags != project.source_tags
+            )
             if not _config.same_source(project.source_path, source):
                 if not args.relocate:
                     raise PubanonError(
@@ -590,12 +766,34 @@ def command_init(args: argparse.Namespace) -> None:
                 _review_relocation(project, source, yes=args.yes)
 
                 _source.check_source_safety(source)
-                project = replace(project, source_path=source)
+                project = replace(
+                    project,
+                    source_path=source,
+                    publication_route=args.publication_route or project.publication_route,
+                    source_tags=(
+                        project.source_tags if args.source_tags is None else args.source_tags
+                    ),
+                )
                 _config.install_project(paths, project)
                 relocated = True
             else:
+                if route_changed or source_tags_changed:
+                    project = replace(
+                        project,
+                        publication_route=args.publication_route or project.publication_route,
+                        source_tags=(
+                            project.source_tags if args.source_tags is None else args.source_tags
+                        ),
+                    )
+                    _config.save_project(paths, project)
                 _config.registry_set(paths, source, name)
-            _report_existing_project_init(project, project_file, relocated=relocated)
+            _report_existing_project_init(
+                paths,
+                project,
+                relocated=relocated,
+                route_changed=route_changed,
+                source_tags_changed=source_tags_changed,
+            )
             return
         preliminary = _config.ProjectConfig(
             name=name,
@@ -611,14 +809,17 @@ def command_init(args: argparse.Namespace) -> None:
             hygiene_terms=(),
             self_publication=args.self_publication,
             required_checks=(),
+            publication_route=global_config.default_publication_route,
         )
         project = _initial_project(
-            _context.ProjectContext(paths, global_config, preliminary), verbose=args.verbose
+            _context.ProjectContext(paths, global_config, preliminary),
+            verbose=args.verbose,
+            route=args.publication_route,
+            source_tags=args.source_tags,
         )
         _config.install_project(paths, project)
         _init_draft.remove(paths, name)
 
-    output(f'Configured and registered project {escape(name)}.', kind='success')
-    print()
-    print(f'{style("Details:")} project configuration {escape(str(project_file))}')
-    next_step('pubanon status')
+    output(f'Saved project {escape(name)}.', kind='success')
+    detail(f'Project configuration: {escape(str(project_file))}')
+    next_step('pubanon repo create')

@@ -220,7 +220,6 @@ def test_credential_child_timeout_discards_both_streams(
         run_credential_child(['ls-remote', 'example'], cwd=None, timeout=3.25)
 
     assert type(exc_info.value).__name__ == 'ObservationTimeoutError'
-    assert exc_info.value._detail is None
     assert exc_info.value.stdout == b''
     assert exc_info.value.stderr == b''
     graph = _exception_graph(exc_info.value)
@@ -230,7 +229,10 @@ def test_credential_child_timeout_discards_both_streams(
 
 
 def test_git_spawn_failure_is_a_domain_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(_run_module, '_GIT', '/nonexistent/pubanon-test-git')
+    def _fail_spawn(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        raise FileNotFoundError('git')
+
+    monkeypatch.setattr(_run_module.subprocess, 'run', _fail_spawn)
 
     with pytest.raises(PubanonError, match='cannot run Git'):
         run_git(['version'], cwd=None)
@@ -329,7 +331,7 @@ def test_run_git_reports_failure_output(make_repo: Callable[..., Path]) -> None:
         run_git(['show', 'canaryx'], cwd=repo)
 
     message = str(exc_info.value)
-    assert f'{"canaryx"}' in message
+    assert 'canaryx' in message
     assert 'canaryx' in message.casefold()
 
 
@@ -345,7 +347,7 @@ def test_run_git_reports_filesystem_terms_and_escapes_unprintable_path(tmp_path:
         run_git(['status'], cwd=missing)
 
     message = str(exc_info.value)
-    assert f'{"canaryx"}' in message
+    assert 'canaryx' in message
     assert 'canaryx' in message.casefold()
     assert escaped in message
     assert '\ufffd' not in message
@@ -397,7 +399,7 @@ def test_run_git_skips_repository_reference_hook(
     assert marker.read_text() == 'invoked'
 
 
-def test_run_git_timeout_keeps_only_safely_rendered_streams(
+def test_run_git_timeout_discards_streams_and_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[float | None] = []
@@ -419,10 +421,9 @@ def test_run_git_timeout_keeps_only_safely_rendered_streams(
         run_git(['ls-remote', 'example'], cwd=None, timeout=4.5)
 
     assert type(exc_info.value).__name__ == 'ObservationTimeoutError'
-    assert exc_info.value._detail == f'stdout-{"private-canary"}-\\udcffstderr-{"private-canary"}'
     assert exc_info.value.stdout == b''
     assert exc_info.value.stderr == b''
     graph = _exception_graph(exc_info.value)
     assert graph == (exc_info.value,)
-    assert 'private-canary' in (exc_info.value._detail or '')
+    assert 'private-canary' not in repr([vars(error) for error in graph])
     assert calls == [4.5]

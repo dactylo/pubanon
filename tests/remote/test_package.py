@@ -109,7 +109,7 @@ def _patch_fetch_process(
     times: list[float],
 ) -> list[list[str]]:
     ticks = iter(times)
-    monkeypatch.setattr(_package, '_monotonic', lambda: next(ticks), raising=False)
+    monkeypatch.setattr(_package, '_monotonic', lambda: next(ticks))
     commands: list[list[str]] = []
 
     def launch(command: list[str], **kwargs: object) -> _FetchProcess:
@@ -317,7 +317,6 @@ def test_fetch_http_timeout_raises_private_signal(
         _package._fetch_http('https://example.invalid', timeout=7.0)
 
     assert type(exc_info.value).__name__ == 'ObservationTimeoutError'
-    assert exc_info.value._detail is None
     assert 'private-transport-canary' not in repr(exc_info.value)
 
 

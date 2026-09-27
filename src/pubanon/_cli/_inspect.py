@@ -11,9 +11,12 @@ from pubanon import (
 )
 from pubanon._cli import _context
 from pubanon._errors import PubanonError
+from pubanon._remote import _stage
 from pubanon._snapshots import _candidate, _history, _records
 from pubanon._terminal import (
+    display_path,
     escape,
+    fields,
     guidance,
     heading,
     next_step,
@@ -40,14 +43,42 @@ def _inspection_details(
     lines: list[str] = []
     if snapshot is not None:
         lines.extend(['  ' + terminal_field('Snapshot', snapshot), ''])
-    lines.extend([style('Snapshot directory', 'heading'), f'  {escape(str(selected))}'])
+    lines.append(terminal_field('Review copy', display_path(selected)))
     if verbose:
         older = [copy for copy in copies if copy != selected]
         if older:
             lines.extend(['', style('Directories from earlier snapshots', 'heading')])
-            lines.extend(f'  {escape(str(copy))}' for copy in older)
-        lines.append(guidance('Remove review directories with `pubanon inspect --clean`.'))
+            lines.extend(f'  {display_path(copy)}' for copy in older)
+        lines.append(guidance('Remove review copies with `pubanon clean`.'))
     return '\n'.join(lines)
+
+
+def _inspect_published(
+    ctx: _context.ProjectContext, selector: str, *, refresh: bool, verbose: bool = False
+) -> None:
+    """Inspect the verified read-only files of one saved publication."""
+    entry = _history.select_publication(ctx.paths, ctx.project.name, selector)
+    selected = _candidate.inspection_path(ctx.paths, ctx.project.name, entry.commit)
+    copies = _candidate.inspection_paths(ctx.paths, ctx.project.name)
+    if refresh:
+        print(f'{style("Replacing review copy:")} {display_path(selected)}')
+        output('All current contents of this directory will be replaced.', kind='warning')
+        sys.stdout.flush()
+    inspection = _history.inspect_publication(ctx.paths, ctx.project.name, entry, refresh=refresh)
+    identity = escape(', '.join(entry.tags) or 'untagged')
+    snapshot_id = entry.commit if verbose else entry.commit[:12]
+    heading('Published snapshot', separate=refresh)
+    fields([('Snapshot', snapshot_id), ('Version', identity)])
+    print('\n' + _inspection_details(inspection, copies, verbose=verbose))
+    print()
+    next_step(
+        _context.project_command(
+            ctx.project.name,
+            'show',
+            f'--project={ctx.project.name}',
+            entry.commit if verbose else entry.commit[:12],
+        )
+    )
 
 
 def _inspect_rewritten_copy(
@@ -60,10 +91,10 @@ def _inspect_rewritten_copy(
 ) -> None:
     """Show the exact copy targeted by refresh before materializing it."""
     commit = _candidate.select_rewritten_commit(record, selector)
-    selected_path = ctx.paths.data_dir / 'projects' / ctx.project.name / 'inspections' / commit
+    selected_path = _candidate.inspection_path(ctx.paths, ctx.project.name, commit)
     copies = _candidate.inspection_paths(ctx.paths, ctx.project.name)
     if refresh:
-        print(terminal_field('Replacing snapshot directory', escape(str(selected_path))))
+        print(terminal_field('Replacing review copy', display_path(selected_path)))
         output('All current contents of this directory will be replaced.', kind='warning')
         sys.stdout.flush()
     selected = _candidate.inspect_rewritten(
@@ -84,7 +115,7 @@ def _inspect_rewritten_copy(
         )
     )
     print()
-    next_step(_candidate.inspect_next_action(record, ctx.global_config, ctx.project))
+    next_step(_stage.candidate_next_action(ctx.paths, ctx.global_config, ctx.project, record))
 
 
 def _inspection_listing(paths: _config.Paths, name: str) -> list[str]:
@@ -94,9 +125,9 @@ def _inspection_listing(paths: _config.Paths, name: str) -> list[str]:
         return []
     return [
         f'{style("Preserved snapshot directories:")} {len(copies)}',
-        *(f'  {escape(str(copy))}' for copy in copies),
+        *(f'  {display_path(copy)}' for copy in copies),
         'Open these directories in your editor to review their files.',
-        guidance('Remove review directories with `pubanon inspect --clean`.'),
+        guidance('Remove review copies with `pubanon clean`.'),
     ]
 
 
@@ -133,16 +164,12 @@ def inspection_copy(
         The inspection directory, retained until explicitly cleaned or
         refreshed.
     """
-    selected = (
-        ctx.paths.data_dir
-        / 'projects'
-        / ctx.project.name
-        / 'inspections'
-        / _records.candidate_tip(record)
+    selected = _candidate.inspection_path(
+        ctx.paths, ctx.project.name, _records.candidate_tip(record)
     )
     copies = _candidate.inspection_paths(ctx.paths, ctx.project.name)
     if refresh:
-        print(f'{style("Replacing snapshot directory:")} {escape(str(selected))}')
+        print(f'{style("Replacing review copy:")} {display_path(selected)}')
         print(
             style('All current contents of this directory will be replaced.', 'warning'),
             flush=True,
@@ -160,67 +187,20 @@ def inspection_copy(
     print('\n' + details)
     print()
     if not workflow:
-        next_step(_candidate.inspect_next_action(record, ctx.global_config, ctx.project))
+        next_step(_stage.candidate_next_action(ctx.paths, ctx.global_config, ctx.project, record))
     return inspection
 
 
-def _inspect_published(
-    ctx: _context.ProjectContext, selector: str, *, refresh: bool, verbose: bool = False
-) -> None:
-    """Inspect the verified read-only files of one saved publication."""
-    entry = _history.select_publication(ctx.paths, ctx.project.name, selector)
-    selected = ctx.paths.data_dir / 'projects' / ctx.project.name / 'inspections' / entry.commit
-    copies = _candidate.inspection_paths(ctx.paths, ctx.project.name)
-    if refresh:
-        print(f'{style("Replacing snapshot directory:")} {escape(str(selected))}')
-        output('All current contents of this directory will be replaced.', kind='warning')
-        sys.stdout.flush()
-    inspection = _history.inspect_publication(ctx.paths, ctx.project.name, entry, refresh=refresh)
-    identity = escape(', '.join(entry.tags) or 'untagged')
-    snapshot_id = entry.commit if verbose else entry.commit[:12]
-    heading('Published snapshot', separate=refresh)
-    print(terminal_field('Snapshot', snapshot_id))
-    print(terminal_field('Version', identity))
-    print('\n' + _inspection_details(inspection, copies, verbose=verbose))
-    print()
-    next_step(
-        _context.project_command(
-            ctx.project.name,
-            'show',
-            f'--project={ctx.project.name}',
-            entry.commit if verbose else entry.commit[:12],
-        )
-    )
-
-
 def command_inspect(args: argparse.Namespace) -> None:
-    """Materialize, report, or clean one retained snapshot inspection."""
+    """Materialize or report one retained snapshot inspection."""
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
-    if args.rewritten is not None and (args.published is not None or args.clean):
-        raise PubanonError('--rewritten cannot be combined with --published or --clean')
+    if args.rewritten is not None and args.published is not None:
+        raise PubanonError('--rewritten cannot be combined with --published')
     with _config.project_lock(paths, name):
         ctx = _context.load_context(paths, name)
         if args.published is not None:
             _inspect_published(ctx, args.published, refresh=args.refresh, verbose=args.verbose)
-            return
-        if args.clean:
-            copies = _candidate.inspection_paths(paths, name)
-            if copies:
-                heading('Removing snapshot directories')
-                for copy in copies:
-                    print(f'  {escape(str(copy))}')
-                output(
-                    'All listed directories and their contents will be removed.', kind='warning'
-                )
-                sys.stdout.flush()
-            removed = _candidate.clean_inspect(paths, name)
-            if removed:
-                output('Removed the listed snapshot directories.', kind='success')
-            else:
-                output('No snapshot directories to remove.', kind='note')
-            if _candidate.record_path(paths, name).exists():
-                print('The prepared snapshot is still available.')
             return
         record = _candidate.load_candidate(paths, name)
         if record is None:

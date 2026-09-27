@@ -1,49 +1,59 @@
 """Build and validate command-line arguments."""
 
-# pyright: reportPrivateUsage=false
-
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, NoReturn, Protocol, cast, override
 
 from pubanon._remote import _watch
 from pubanon._terminal import (
+    color_enabled,
     style,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Generator
 
 
 _COMMAND_HELP_GROUPS = (
-    ('publish', ('prepare', 'inspect', 'publish', 'status', 'discard')),
-    ('snapshots', ('list', 'show', 'delete', 'clean')),
-    ('setup and repositories', ('setup', 'init', 'repo', 'doctor')),
-    ('automation and verification', ('release', 'run', 'stage', 'watch')),
+    ('publish', ('prepare', 'inspect', 'publish', 'discard', 'status', 'run')),
+    ('local snapshots', ('list', 'show', 'delete', 'clean', 'audit')),
+    ('remote repositories', ('stage', 'repo', 'release', 'package')),
+    ('setup', ('setup', 'init', 'forget', 'doctor')),
 )
 
 
-class _ArgumentParser(argparse.ArgumentParser):
-    """Style command-line parser errors."""
+@contextmanager
+def _help_color_context() -> Generator[None]:
+    """Keep argparse's color override active through lazy help rendering."""
+    previous = os.environ.get('PYTHON_COLORS')
+    os.environ['PYTHON_COLORS'] = '1' if color_enabled() else '0'
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop('PYTHON_COLORS', None)
+        else:
+            os.environ['PYTHON_COLORS'] = previous
 
-    def _add_presentation_options(self, *, root: bool = False) -> None:
+
+class _ArgumentParser(argparse.ArgumentParser):
+    """Group command options and style parser errors."""
+
+    def _add_common_options(self, *, root: bool = False, project: bool = True) -> None:
         """Register shared options without nested defaults hiding parent selections."""
-        self.color = False
-        self.add_argument(
-            '-p',
-            '--project',
-            metavar='NAME',
-            default=None if root else argparse.SUPPRESS,
-            help='registered project name',
-        )
-        self.add_argument(
-            '--color',
-            choices=('auto', 'always', 'never'),
-            default='auto' if root else argparse.SUPPRESS,
-            help='control terminal color (default: auto)',
-        )
+        self._optionals.title = 'common options'
+        if project:
+            self.add_argument(
+                '-p',
+                '--project',
+                metavar='NAME',
+                default=None if root else argparse.SUPPRESS,
+                help='registered project name',
+            )
         self.add_argument(
             '-v',
             '--verbose',
@@ -51,11 +61,23 @@ class _ArgumentParser(argparse.ArgumentParser):
             default=False if root else argparse.SUPPRESS,
             help='show full identifiers, paths, and supporting details',
         )
-        for action in self._actions:
-            choices = action.choices
-            if isinstance(choices, dict):
-                for child in cast('dict[str, _ArgumentParser]', choices).values():
-                    child._add_presentation_options()
+        self.add_argument(
+            '--color',
+            choices=('auto', 'always', 'never'),
+            default='auto' if root else argparse.SUPPRESS,
+            help='control terminal color (default: auto)',
+        )
+        if root:
+            self.add_argument(
+                '--version',
+                dest='root_version',
+                action='store_true',
+                help='show installed Pubanon version',
+            )
+        else:
+            # Route subsequent options into the command's own native argument group.
+            command = self.prog.removeprefix('pubanon ')
+            self._optionals = self.add_argument_group(f'{command} options')
 
     def _resolved_option(self, option: str) -> argparse.Action | None:
         """Resolve an option using this parser's accepted long-option prefixes."""
@@ -77,6 +99,20 @@ class _ArgumentParser(argparse.ArgumentParser):
         self.print_usage(sys.stderr)
         rendered = f'{self.prog}: error: {message}'
         self.exit(2, style(rendered, 'error', stream=sys.stderr) + '\n')
+
+    @override
+    @_help_color_context()
+    def format_help(self, formatter: argparse.HelpFormatter | None = None) -> str:
+        if sys.version_info >= (3, 15):
+            return super().format_help(formatter=formatter)
+        return super().format_help()
+
+    @override
+    @_help_color_context()
+    def format_usage(self, formatter: argparse.HelpFormatter | None = None) -> str:
+        if sys.version_info >= (3, 15):
+            return super().format_usage(formatter=formatter)
+        return super().format_usage()
 
     def selected_color_mode(self, arguments: list[str]) -> str:
         """Find the last color option accepted at its parser level."""
@@ -126,11 +162,7 @@ class _Commands(Protocol):
 
 
 class _HelpFormatter(argparse.RawDescriptionHelpFormatter):
-    """Style argparse section headings."""
-
-    @override
-    def start_section(self, heading: str | None) -> None:
-        super().start_section(style(heading, 'heading') if heading is not None else None)
+    """Use native help colors for command descriptions."""
 
     def _add_command_groups(self, action: argparse.Action) -> None:
         """Render registered command descriptions in workflow groups."""
@@ -145,39 +177,50 @@ class _RootParser(_ArgumentParser):
     """Group top-level commands using argparse's action rendering."""
 
     @override
-    def format_help(self) -> str:
-        formatter = cast('_HelpFormatter', self._get_formatter())
+    @_help_color_context()
+    def format_help(self, formatter: argparse.HelpFormatter | None = None) -> str:
+        if formatter is None:
+            formatter = self._get_formatter()
+        formatter = cast('_HelpFormatter', formatter)
         formatter.add_usage(self.usage, self._actions, self._mutually_exclusive_groups)
         formatter.add_text(self.description)
         for action in self._get_positional_actions():
-            formatter._add_command_groups(action)
-        formatter.start_section('options')
+            formatter._add_command_groups(action)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        formatter.start_section('common options')
         formatter.add_arguments(self._get_optional_actions())
         formatter.end_section()
         formatter.add_text(self.epilog)
         return formatter.format_help()
 
 
-def _add_project_parser(
+def _add_command_parser(
     commands: _Commands,
     name: str,
     help_text: str,
+    *,
+    description: str | None = None,
+    project: bool = True,
 ) -> argparse.ArgumentParser:
-    """Add one project command parser."""
-    return commands.add_parser(
-        name,
-        help=help_text,
-        description=help_text,
-        formatter_class=_HelpFormatter,
+    """Add a command parser with common options registered first."""
+    parser = cast(
+        '_ArgumentParser',
+        commands.add_parser(
+            name,
+            help=help_text,
+            description=help_text if description is None else description,
+            formatter_class=_HelpFormatter,
+        ),
     )
+    parser._add_common_options(project=project)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    return parser
 
 
 def _add_init_parser(commands: _Commands) -> None:
     """Add project initialization options."""
-    init = _add_project_parser(
+    init = _add_command_parser(
         commands,
         'init',
-        'choose files and a GitHub destination; publication uses main',
+        'register a project and choose its files and destination',
     )
     init.add_argument(
         '--relocate', action='store_true', help='move the registered project to the current source'
@@ -187,6 +230,25 @@ def _add_init_parser(commands: _Commands) -> None:
         action='store_true',
         help='publish Pubanon itself without blocking its own name',
     )
+    init.add_argument(
+        '--publication-route',
+        choices=['direct', 'staged'],
+        help='choose direct upload or private staging before final publication',
+    )
+    source_tags = init.add_mutually_exclusive_group()
+    source_tags.add_argument(
+        '--source-tags',
+        dest='source_tags',
+        action='store_true',
+        help='create local source tags for published versions',
+    )
+    source_tags.add_argument(
+        '--no-source-tags',
+        dest='source_tags',
+        action='store_false',
+        help='disable local source tags for published versions',
+    )
+    init.set_defaults(source_tags=None)
     init.add_argument(
         '--yes',
         action='store_true',
@@ -198,11 +260,11 @@ def _add_init_parser(commands: _Commands) -> None:
 
 
 def _add_inspect_parser(commands: _Commands) -> None:
-    """Add explicit inspection refresh and cleanup options."""
-    inspect = _add_project_parser(
+    """Add explicit inspection selection and refresh options."""
+    inspect = _add_command_parser(
         commands,
         'inspect',
-        'review a snapshot, published files, or preserved snapshot directories',
+        'show snapshot details and where its review copy is',
     )
     inspect.add_argument(
         '--published',
@@ -216,44 +278,34 @@ def _add_inspect_parser(commands: _Commands) -> None:
         metavar='SELECTOR',
         help='inspect a replacement snapshot by moved tag or new commit prefix',
     )
-    inspect_mode = inspect.add_mutually_exclusive_group()
-    inspect_mode.add_argument(
-        '--clean',
-        action='store_true',
-        help='remove all project review directories',
-    )
-    inspect_mode.add_argument(
+    inspect.add_argument(
         '--refresh',
         action='store_true',
-        help='restore the selected review directory from the saved snapshot',
+        help='restore the selected review copy from the saved snapshot',
     )
 
 
 def _add_list_parser(commands: _Commands) -> None:
     """Add commands for locally known snapshots."""
-    _add_project_parser(commands, 'list', 'list locally known snapshots')
-    show = _add_project_parser(commands, 'show', 'show a snapshot and its source recovery')
+    _add_command_parser(commands, 'list', 'list saved snapshots')
+    show = _add_command_parser(commands, 'show', 'show a snapshot and how to recover its source')
     show.add_argument(
         'selector', metavar='SELECTOR', help='prepared, latest, release tag, or commit prefix'
     )
-    deletion = _add_project_parser(
-        commands, 'delete', 'delete one local snapshot, its review directory, and recovery'
+    deletion = _add_command_parser(
+        commands, 'delete', 'delete a saved snapshot and its review copies'
     )
-    deletion.add_argument(
-        'selector', metavar='SELECTOR', help='prepared, latest, tag, or commit prefix'
-    )
+    deletion.add_argument('selector', metavar='SELECTOR', help='latest, tag, or commit prefix')
     deletion.add_argument('--yes', action='store_true', help='confirm selected local deletion')
-    cleanup = _add_project_parser(commands, 'clean', 'remove superseded local snapshots')
-    cleanup.add_argument('--yes', action='store_true', help='confirm superseded snapshot cleanup')
+    cleanup = _add_command_parser(
+        commands, 'clean', 'delete superseded snapshots and all review copies'
+    )
+    cleanup.add_argument('--yes', action='store_true', help='remove without confirmation')
 
 
 def _add_prepare_parser(commands: _Commands) -> None:
     """Add preparation and saved-rewrite continuation options."""
-    prepare = _add_project_parser(commands, 'prepare', 'prepare a snapshot from committed files')
-    prepare.add_argument(
-        '--version',
-        help='release version X.Y.Z (default: selected committed pyproject.toml version)',
-    )
+    prepare = _add_command_parser(commands, 'prepare', 'create a snapshot from committed files')
     prepare.add_argument(
         '--source',
         default=None,
@@ -273,6 +325,10 @@ def _add_prepare_parser(commands: _Commands) -> None:
         action='store_true',
         help='resume the saved publication rewrite',
     )
+    prepare.add_argument(
+        '--version',
+        help='release version X.Y.Z (default: selected committed pyproject.toml version)',
+    )
     prepare.add_argument('--message', metavar='MSG', help='publication commit message')
     prepare.add_argument(
         '--acknowledge-new-paths',
@@ -291,7 +347,7 @@ def _add_prepare_parser(commands: _Commands) -> None:
 
 def _add_run_parser(commands: _Commands) -> None:
     """Add the declared-workflow parser."""
-    run = _add_project_parser(commands, 'run', 'run one declared workflow')
+    run = _add_command_parser(commands, 'run', 'run a declared release workflow')
     run.add_argument('name', help='configured workflow name')
     run.add_argument('--version', help='release version in X.Y.Z form')
     run.add_argument(
@@ -309,6 +365,51 @@ def _add_run_parser(commands: _Commands) -> None:
     )
 
 
+def _positive_release_limit(value: str) -> int:
+    """Parse a positive release-list count."""
+    try:
+        limit = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError('--limit must be a positive integer') from exc
+    if limit <= 0:
+        raise argparse.ArgumentTypeError('--limit must be a positive integer')
+    return limit
+
+
+def _add_release_parser(commands: _Commands) -> None:
+    """Add explicit release-page creation, editing, and observation."""
+    release = _add_command_parser(
+        commands,
+        'release',
+        'manage GitHub release pages in the final repository',
+    )
+    subcommands = release.add_subparsers(dest='release_command', required=True)
+    create = _add_command_parser(
+        subcommands, 'create', 'create a page for an existing published tag'
+    )
+    create.add_argument('tag', metavar='TAG', help='existing vX.Y.Z publication tag')
+    create.add_argument('--title', help='page title (default: TAG)')
+    create.add_argument(
+        '--notes-file', required=True, metavar='FILE', help='UTF-8 Markdown notes file'
+    )
+    create.add_argument('--yes', action='store_true', help='skip the confirmation prompt')
+    edit = _add_command_parser(subcommands, 'edit', 'edit an existing page title or notes')
+    edit.add_argument('tag', metavar='TAG', help='existing vX.Y.Z publication tag')
+    edit.add_argument('--title', help='replacement page title')
+    edit.add_argument('--notes-file', metavar='FILE', help='replacement UTF-8 Markdown notes')
+    edit.add_argument('--yes', action='store_true', help='skip the confirmation prompt')
+    listing = _add_command_parser(subcommands, 'list', 'list pages in the final repository')
+    listing.add_argument(
+        '--limit',
+        type=_positive_release_limit,
+        default=30,
+        metavar='COUNT',
+        help='maximum pages to show (default: 30)',
+    )
+    show = _add_command_parser(subcommands, 'show', 'show a page and its full notes')
+    show.add_argument('tag', metavar='TAG', help='exact release tag')
+
+
 def _positive_timeout(value: str) -> int:
     """Parse one positive timeout in seconds."""
     message = '--timeout must be a positive integer number of seconds'
@@ -321,37 +422,49 @@ def _positive_timeout(value: str) -> int:
     return timeout
 
 
-def _add_watch_parsers(commands: _Commands) -> None:
-    """Add the grouped observation command parsers."""
-    watch = commands.add_parser(
-        'watch',
-        help='observe CI and package publication',
-        description='observe CI and package publication',
-        formatter_class=_HelpFormatter,
-    )
-    watch_commands = watch.add_subparsers(dest='watch_command', required=True)
-    watch_ci = _add_project_parser(watch_commands, 'ci', 'wait for required CI checks')
-    watch_ci.add_argument(
-        '--staged', action='store_true', help='watch checks for the exact staged snapshot'
-    )
-    watch_ci.add_argument('--version', help='published release version to select')
-    watch_ci.add_argument(
+def _add_watch_timeout(parser: argparse.ArgumentParser) -> None:
+    """Add the shared wait limit to one observation command."""
+    parser.add_argument(
         '--timeout',
         type=_positive_timeout,
         default=_watch.DEFAULT_TIMEOUT,
         help=f'maximum wait in seconds (default: {_watch.DEFAULT_TIMEOUT})',
     )
-    watch_package = _add_project_parser(
-        watch_commands,
+
+
+def _add_package_parser(commands: _Commands) -> None:
+    """Add package observation under its target group."""
+    package = _add_command_parser(
+        commands,
         'package',
-        'wait for package publication',
+        'observe package publication',
     )
-    watch_package.add_argument('--version', help='published package version to select')
-    watch_package.add_argument(
-        '--timeout',
-        type=_positive_timeout,
-        default=_watch.DEFAULT_TIMEOUT,
-        help=f'maximum wait in seconds (default: {_watch.DEFAULT_TIMEOUT})',
+    package_commands = package.add_subparsers(dest='package_command', required=True)
+    package_watch = _add_command_parser(
+        package_commands,
+        'watch',
+        'wait for the numerically greatest published version or an exact published version',
+    )
+    package_watch.add_argument('--version', help='exact published package version to select')
+    _add_watch_timeout(package_watch)
+
+
+def _add_repo_watch_parser(commands: _Commands) -> None:
+    """Add checks on published main or an exact published tag."""
+    repo_watch = _add_command_parser(
+        commands,
+        'watch',
+        'wait for required checks on recorded published main or an exact published tag',
+    )
+    repo_watch.add_argument('--version', help='exact published release version to select')
+    _add_watch_timeout(repo_watch)
+
+
+def _add_stage_observation_parsers(commands: _Commands) -> None:
+    """Add staging status and check observation in command order."""
+    _add_command_parser(commands, 'status', 'show staging facts, tracking, and snapshot checks')
+    _add_watch_timeout(
+        _add_command_parser(commands, 'watch', 'wait for checks on the recorded staged snapshot')
     )
 
 
@@ -361,37 +474,55 @@ def build_parser() -> _RootParser:
         prog='pubanon',
         formatter_class=_HelpFormatter,
         description=(
-            'Initial workflow: setup -> init\nTypical workflow: prepare -> inspect -> publish'
+            'Initial workflow: setup -> init\n'
+            'Staged route: prepare -> inspect -> stage push -> stage watch -> publish\n'
+            'Direct route: prepare -> inspect -> publish'
         ),
     )
+    parser._add_common_options(root=True)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
     commands = parser.add_subparsers(
-        dest='command', required=True, metavar='COMMAND', parser_class=_ArgumentParser
+        dest='command', metavar='COMMAND', parser_class=_ArgumentParser
     )
-    setup = commands.add_parser(
+    setup = _add_command_parser(
+        commands,
         'setup',
-        help='create, verify, or edit global configuration',
-        description='create, verify, or edit global configuration',
-        formatter_class=_HelpFormatter,
+        'create, verify, or edit global configuration',
+        project=False,
     )
     setup.add_argument(
         '--edit',
         action='store_true',
-        help='review and correct saved identity, terms, or expected account',
+        help=(
+            'review and correct saved identity, terms, expected account, route, '
+            'and ignored files or directories'
+        ),
     )
-    commands.add_parser(
+    _add_command_parser(
+        commands,
         'doctor',
-        help='check configuration, Python, Git, and GitHub authentication',
-        formatter_class=_HelpFormatter,
+        'check configuration, tools, and GitHub login',
+        description='',
+        project=False,
     )
 
     _add_init_parser(commands)
-
-    status = _add_project_parser(commands, 'status', 'show current project status')
-    status.add_argument(
-        '--audit', action='store_true', help='audit published history under current privacy rules'
+    forget = _add_command_parser(commands, 'forget', "remove a project's local Pubanon data")
+    forget.add_argument(
+        '--force',
+        action='store_true',
+        help='abandon unreadable or unresolved publication evidence',
     )
+    forget.add_argument('--yes', action='store_true', help='remove without confirmation')
+
+    status = _add_command_parser(commands, 'status', "show the project's current state")
     status.add_argument(
         '--remote', action='store_true', help='compare the recorded publication with GitHub'
+    )
+    audit = _add_command_parser(
+        commands, 'audit', 'check published history against current privacy rules'
+    )
+    audit.add_argument(
+        '--remote', action='store_true', help='verify the recorded history against GitHub'
     )
 
     _add_prepare_parser(commands)
@@ -399,15 +530,11 @@ def build_parser() -> _RootParser:
     _add_inspect_parser(commands)
     _add_list_parser(commands)
 
-    publish = _add_project_parser(commands, 'publish', 'publish the prepared snapshot')
-    publish_mode = publish.add_mutually_exclusive_group()
-    publish_mode.add_argument(
-        '--resolve', action='store_true', help='check whether an interrupted publication completed'
+    publish = _add_command_parser(
+        commands, 'publish', 'send the prepared snapshot to the final repository'
     )
-    publish_mode.add_argument(
-        '--sync',
-        action='store_true',
-        help='restore saved snapshot history to an empty or older destination',
+    publish.add_argument(
+        '--resolve', action='store_true', help='check whether an interrupted publication completed'
     )
     publish.add_argument(
         '--yes',
@@ -418,8 +545,8 @@ def build_parser() -> _RootParser:
         ),
     )
 
-    discard = _add_project_parser(
-        commands, 'discard', 'discard prepared work and keep its review directories'
+    discard = _add_command_parser(
+        commands, 'discard', 'drop the prepared snapshot and its review copies'
     )
     discard.add_argument(
         '--force',
@@ -427,100 +554,91 @@ def build_parser() -> _RootParser:
         help='abandon recovery information needed to resolve an interrupted publication',
     )
 
-    release = _add_project_parser(commands, 'release', 'prepare, inspect, and publish')
-    release.add_argument('version', help='release version in X.Y.Z form')
-    release.add_argument(
-        '--yes',
-        action='store_true',
-        help=(
-            'skip publication confirmation; cannot approve file choices, source changes, '
-            'or earlier privacy findings'
-        ),
-    )
-
     _add_run_parser(commands)
+    _add_release_parser(commands)
 
-    repo = commands.add_parser(
+    repo = _add_command_parser(
+        commands,
         'repo',
-        help='create, reveal, or verify the GitHub repository',
-        description='create, reveal, or verify the GitHub repository',
-        formatter_class=_HelpFormatter,
+        'create, reveal, verify, or restore the final repository',
     )
     repo_commands = repo.add_subparsers(dest='repo_command', required=True)
-    create = _add_project_parser(
-        repo_commands, 'create', 'create the GitHub repository using the saved visibility'
-    )
-    visibility = create.add_mutually_exclusive_group()
-    visibility.add_argument(
-        '--private',
-        dest='visibility',
-        action='store_const',
-        const='private',
-        help='require private visibility; must match the saved setting',
-    )
-    visibility.add_argument(
-        '--public',
-        dest='visibility',
-        action='store_const',
-        const='public',
-        help='require public visibility; must match the saved setting',
+    create = _add_command_parser(
+        repo_commands, 'create', 'create the final repository using the saved visibility'
     )
     create.add_argument(
         '--yes',
         action='store_true',
         help='create the repository without asking for confirmation',
     )
-    _add_project_parser(repo_commands, 'reveal', 'make the GitHub repository public')
-    verify = repo_commands.add_parser(
-        'verify',
-        help='compare saved snapshot history with GitHub',
-        formatter_class=_HelpFormatter,
+    _add_command_parser(repo_commands, 'reveal', 'make the final repository public')
+    _add_command_parser(
+        repo_commands, 'verify', 'compare saved published history with the final repository'
     )
-    verify.add_argument(
-        '--repair-store',
-        action='store_true',
-        help='replace saved snapshot history with verified GitHub history',
+    restore = _add_command_parser(
+        repo_commands, 'restore', 'restore remote or local saved publication history'
     )
-    verify.add_argument(
+    restore.add_argument(
+        '--to',
+        choices=('remote', 'local'),
+        required=True,
+        help=(
+            'restore the remote repository from saved history or local saved history '
+            'from the remote'
+        ),
+    )
+    restore.add_argument(
         '--yes',
         action='store_true',
-        help='replace saved snapshot history with --repair-store without confirmation',
+        help='restore the selected destination without ordinary confirmation',
     )
+    _add_repo_watch_parser(repo_commands)
 
-    stage = commands.add_parser(
+    stage = _add_command_parser(
+        commands,
         'stage',
-        help='manage the private staging repository',
-        description='push a snapshot, check its status, or delete the private staging repository',
-        formatter_class=_HelpFormatter,
+        'manage the private staging repository',
+        description='push, check, repair, forget, or delete private staging',
     )
-    stage_commands = stage.add_subparsers(dest='stage_command', required=True)
-    stage_push = _add_project_parser(stage_commands, 'push', 'push the prepared snapshot')
+    stage_commands = stage.add_subparsers(
+        dest='stage_command', required=True, metavar='{push,status,repair,forget,delete,watch}'
+    )
+    stage_push = _add_command_parser(stage_commands, 'push', 'push the prepared snapshot')
     stage_push.add_argument(
         '--yes',
         action='store_true',
         help='approve the staged push; cannot approve first-use repository creation',
     )
-    _add_project_parser(stage_commands, 'status', 'show required checks for the staged commit')
-    stage_clean = _add_project_parser(
-        stage_commands,
-        'clean',
-        'delete the selected staging repository',
+    _add_stage_observation_parsers(stage_commands)
+    stage_repair = _add_command_parser(stage_commands, 'repair', 'repair staging tracking')
+    stage_repair.add_argument('--yes', action='store_true', help='approve the previewed repair')
+    stage_forget = _add_command_parser(
+        stage_commands, 'forget', 'remove local staged-candidate tracking'
     )
-    stage_clean.add_argument(
+    stage_forget.add_argument('--yes', action='store_true', help='forget without confirmation')
+    stage_delete = _add_command_parser(
+        stage_commands, 'delete', 'delete the configured private staging repository'
+    )
+    stage_delete.add_argument(
         '--yes',
         action='store_true',
-        help=(
-            'delete without confirmation; cannot approve abandoning evidence '
-            'of an unverified deletion'
-        ),
+        help='delete without confirmation',
     )
-    _add_watch_parsers(commands)
-    parser._add_presentation_options(root=True)
+    _add_package_parser(commands)
     return parser
 
 
 def validate_options(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     """Reject conflicting modes before dispatch."""
+    if args.command is None:
+        parser.error('the following arguments are required: COMMAND')
+    if args.command in {'setup', 'doctor'} and args.project is not None:
+        parser.error('--project cannot be used with a global command')
+    if args.command == 'release':
+        if args.release_command in {'create', 'edit'} and args.title == '':
+            parser.error('--title must not be empty')
+        if args.release_command == 'edit' and args.title is None and args.notes_file is None:
+            parser.error('release edit requires --title or --notes-file')
     if (
         args.command == 'prepare'
         and args.continue_rewrite
@@ -533,12 +651,3 @@ def validate_options(parser: argparse.ArgumentParser, args: argparse.Namespace) 
         )
     ):
         parser.error('--continue cannot be combined with construction options')
-    if args.command == 'inspect' and args.clean and args.published is not None:
-        parser.error('--clean cannot be combined with --published')
-    if (
-        args.command == 'repo'
-        and args.repo_command == 'verify'
-        and args.yes
-        and not args.repair_store
-    ):
-        parser.error('--yes requires --repair-store')

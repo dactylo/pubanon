@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 from collections.abc import Callable, Iterable, Sequence
@@ -17,10 +18,10 @@ from pubanon import (
 )
 from pubanon._cli import _prepare, _workflow
 from pubanon._config import PackageObservation, Settings
-from pubanon._remote import _host, _lifecycle, _package, _publish, _stage, _watch
+from pubanon._remote import _host, _package, _publish, _stage, _watch
 from pubanon._run import GitResult
 from pubanon._snapshots import _candidate, _records, _source
-from pubanon._terminal import escape
+from pubanon._terminal import display_path
 from tests._git import git_env
 
 _ACCOUNT_CALL: dict[str, object] = {
@@ -45,6 +46,8 @@ _REAL_SETTINGS = Settings(
     issues=True,
     wiki=False,
     projects=False,
+    pull_requests=False,
+    discussions=False,
 )
 _REAL_TERM = 'internal-host.example'
 
@@ -309,11 +312,15 @@ def _init_answers(
         (f'GitHub owner [{account}]: ', owner),
         ('GitHub repository [demo]: ', 'public-repo'),
         ('Repository visibility (private/public) [private]: ', 'private'),
+        ('Publication route (staged/direct) [direct]: ', ''),
+        ('Create local tags marking the source of each publication? [y/N] ', ''),
         ('Required CI checks (comma separated, blank for none): ', checks),
         ('Repository description (blank for none): ', description),
         ('Enable issues? [Y/n] ', 'yes'),
         ('Enable wiki? [y/N] ', 'no'),
         ('Enable projects? [y/N] ', 'no'),
+        ('Enable pull requests? [y/N] ', 'no'),
+        ('Enable discussions? [y/N] ', 'no'),
         ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 'save'),
     ]
 
@@ -355,10 +362,10 @@ def _prepare_guided_review(
     subprocess.run(['git', '-C', fixture._source, 'add', 'README.md'], check=True, env=git_env())
     (fixture._source / 'docs/guide.md').write_text('omitted unstaged edit\n')
     (fixture._source / 'untracked.txt').write_text('omitted untracked edit\n')
-    assert _cli.main(['prepare', '--version', '1.0.0']) == 0
+    assert _cli.main(['prepare', '--version', '1.0.0', '--yes']) == 0
     prepared = capsys.readouterr()
     cli_output.extend((prepared.out, prepared.err))
-    assert 'Omitted working changes: staged 1, unstaged 1, untracked 1.' in prepared.out
+    assert 'left out: 1 staged change, 1 unstaged change, 1 untracked change' in prepared.out
     candidate = _candidate.load_candidate(fixture._paths, 'demo')
     assert candidate is not None
 
@@ -376,7 +383,7 @@ def _prepare_guided_review(
     assert _cli.main(['inspect']) == 0
     reused = capsys.readouterr()
     cli_output.extend((reused.out, reused.err))
-    assert f'Snapshot directory\n  {escape(str(inspection))}\n' in reused.out
+    assert f'Review copy: {display_path(inspection)}' in reused.out
     assert (inspection / 'README.md').read_text() == 'sanitized release\n'
 
     return candidate, inspection
@@ -430,6 +437,7 @@ def _reveal_after_disclosure_review(
     owner: str,
     repo: str,
 ) -> None:
+    prior_calls = len(_host_call_args())
     reveal_prompts = [
         'These runs, logs, and artifacts become public with the repository. Continue? [y/n] ',
         'Make it public? [y/n] ',
@@ -438,14 +446,12 @@ def _reveal_after_disclosure_review(
     def _reveal_answer(prompt: str) -> str:
         assert reveal_prompts, f'unexpected prompt: {prompt}'
         assert prompt == reveal_prompts.pop(0)
-        assert not any('PATCH' in call for call in _host_call_args())
+        assert not any('PATCH' in call for call in _host_call_args()[prior_calls:])
         if reveal_prompts:
             before_disclosure, _ = capture_output()
-            assert (
-                'Git history passed the current content and identity checks.' in before_disclosure
-            )
-            assert 'Pubanon has not scanned their logs or artifact contents.' in before_disclosure
-            assert 'Saved inventory:' in before_disclosure
+            assert 'matches GitHub; no sensitive terms or identity problems' in before_disclosure
+            assert 'Pubanon has not scanned Actions logs, artifact contents' in before_disclosure
+            assert 'Saved inventory:' not in before_disclosure
             assert f'https://github.com/{owner}/{repo}/actions' in before_disclosure
         return 'yes'
 
@@ -541,10 +547,10 @@ def _assert_negative_gates(
         monkeypatch,
         [],
     )
-    assert _cli.main(['prepare', '--version', '1.2.0']) == 1
+    assert _cli.main(['prepare', '--version', '1.2.0', '--yes']) == 1
     assert_answers()
     gate_error = capsys.readouterr().err
-    assert 'snapshot failed content gates' in gate_error
+    assert 'cannot prepare: blocked text in included files' in gate_error
     assert 'private-canary' in gate_error
     assert _candidate.load_candidate(paths, 'demo') is None
 
@@ -556,8 +562,7 @@ def _assert_negative_gates(
     assert_answers()
     credential_walk = capsys.readouterr()
     assert 'Credential-like file: .env' in credential_walk.out
-    assert 'operation cancelled' in credential_walk.err
-    assert 'fact: nothing was saved' in credential_walk.err
+    assert 'Canceled. Nothing was saved.' in credential_walk.err
     assert _candidate.load_candidate(paths, 'demo') is None
 
 
@@ -578,9 +583,7 @@ def _initialize_lifecycle(
     publication_host = tmp_path / 'public-repo.git'
     staging_host = tmp_path / 'staging-repo.git'
     url_template = f'{tmp_path.as_uri()}/{{repo}}.git'
-    monkeypatch.setattr(_host, 'URL_TEMPLATE', url_template)
-    monkeypatch.setattr(_lifecycle, 'URL_TEMPLATE', url_template)
-    monkeypatch.setattr(_stage, 'URL_TEMPLATE', url_template)
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', url_template)
     monkeypatch.chdir(source)
 
     paths = _config.derive_paths(os.environ)
@@ -589,6 +592,7 @@ def _initialize_lifecycle(
         'anon_name = "Anonymous Publisher"\n'
         'anon_email = "anonymous@example.invalid"\n'
         'sensitive_terms = ["private-canary"]\n'
+        'default_publication_route = "direct"\n'
         '[accounts]\n'
         f'github = "{account}"\n'
     )
@@ -603,6 +607,8 @@ def _initialize_lifecycle(
         issues=True,
         wiki=False,
         projects=False,
+        pull_requests=False,
+        discussions=False,
     )
     project = replace(
         _config.load_project(paths, 'demo'),
@@ -649,10 +655,30 @@ def _settings_response(
                 'issues': settings.issues,
                 'wiki': settings.wiki,
                 'projects': settings.projects,
+                'pull_requests': settings.pull_requests,
+                'discussions': settings.discussions,
             }
         ),
         'once': once,
     }
+
+
+def _created_settings_responses(
+    owner: str, repo: str, settings: Settings
+) -> list[dict[str, object]]:
+    return [
+        {
+            'args': [
+                'api',
+                '-X',
+                'PATCH',
+                f'repos/{owner}/{repo}',
+                '-F',
+                f'has_pull_requests={str(settings.pull_requests).lower()}',
+            ],
+        },
+        _settings_response(owner, repo, settings),
+    ]
 
 
 def _verify_host_excludes_source(
@@ -709,15 +735,20 @@ def _verify_publication_history(
     paths, source = locations
     capsys.readouterr()
     assert _cli.main(['list']) == 0
-    listed = capsys.readouterr().out
+    listed = re.sub(r': +', ': ', capsys.readouterr().out)
     assert 'v1.0.0' in listed
     assert published[:12] in listed
     assert _cli.main(['show', 'v1.0.0', '--verbose']) == 0
-    shown = capsys.readouterr().out
+    shown = re.sub(r': +', ': ', capsys.readouterr().out)
     assert f'Snapshot commit: {published}' in shown
-    assert f'Source commit: {original}' in shown
-    assert rewritten not in shown
-    assert 'Visibility at publication: PRIVATE' in shown
+    assert f'Original source: {original}' in shown
+    assert f'Original source: {rewritten}' not in shown
+    assert any(
+        line.startswith('Latest match on ') and line.endswith(f': {rewritten}')
+        for line in shown.splitlines()
+    )
+    assert 'Number of matches: 1\n' in shown
+    assert 'Visibility at publication: private' in shown
     commands = [
         shlex.split(line.partition(': ')[2])
         for line in shown.splitlines()
@@ -741,7 +772,7 @@ def _verify_published_inspection(paths: _config.Paths, published: str) -> Path:
     assert (copy / 'README.md').read_text() == 'local edit\n'
     assert _cli.main(['inspect', '--published', 'v1.0.0', '--refresh']) == 0
     assert (copy / 'README.md').read_text() == 'first release\n'
-    assert _cli.main(['inspect', '--clean']) == 0
+    assert _cli.main(['clean', '--yes']) == 0
     assert not copy.exists()
     assert _cli.main(['inspect', '--published', 'v1.0.0']) == 0
     assert (copy / 'README.md').read_text() == 'first release\n'
@@ -791,7 +822,7 @@ def _initialize(
     host = tmp_path / 'host.git'
     subprocess.run(['git', 'init', '--bare', '-q', host], check=True, env=git_env())
     _write_host_responses(fake_gh)
-    monkeypatch.setattr(_host, 'URL_TEMPLATE', str(host))
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', str(host))
     monkeypatch.chdir(source)
 
     paths = _config.derive_paths(os.environ)
@@ -800,6 +831,7 @@ def _initialize(
         'anon_name = "Anonymous Publisher"\n'
         'anon_email = "anonymous@example.invalid"\n'
         'sensitive_terms = ["private-canary"]\n'
+        'default_publication_route = "direct"\n'
         '[accounts]\n'
         'github = "release-account"\n'
     )
@@ -821,22 +853,30 @@ def _assert_policy_growth_acknowledgment(
     fixture: _LifecycleFixture,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    *,
+    published_commit: str,
 ) -> None:
+    assert _cli.main(['init', '--project', 'demo', '--publication-route', 'direct']) == 0
+    assert _config.load_project(fixture._paths, 'demo').publication_route == 'direct'
     fixture._paths.global_config.write_text(
         'anon_name = "Anonymous Publisher"\n'
         'anon_email = "anonymous@example.invalid"\n'
         'sensitive_terms = ["private-canary", "historical-canary"]\n'
+        'default_publication_route = "direct"\n'
         '[accounts]\n'
         f'github = "{fixture._account}"\n'
     )
     capsys.readouterr()
-    assert _cli.main(['status', '--audit']) == 0
-    exposure_audit = capsys.readouterr().out
-    assert 'historical exposure: path:README.md' in exposure_audit
-    assert 'exposure unacknowledged: publish will require interactive acknowledgment' in (
-        exposure_audit
+    assert _cli.main(['audit']) == 0
+    exposure_audit = re.sub(r': +', ': ', capsys.readouterr().out)
+    assert 'Warning: historical exposure' in exposure_audit
+    assert f'Published snapshot: v1.0.0 ({published_commit[:12]})' in exposure_audit
+    assert '  README.md:1\n' in exposure_audit
+    assert (
+        'Historical exposure unacknowledged; publish requires interactive acknowledgment.'
+        in exposure_audit
     )
-    assert 'historical-canary' in exposure_audit
+    assert 'Text: historical-canary' in exposure_audit
 
     new_path = 'release-notes.txt'
     (fixture._source / new_path).write_text('public release notes\n')
@@ -848,9 +888,12 @@ def _assert_policy_growth_acknowledgment(
     )
 
     def _include_new_path(prompt: str) -> str:
+        if prompt == 'Use this selection? [c]ontinue / [r]eview / [q]uit: ':
+            return 'c'
         assert prompt == 'Include these 1 files that were not in the last release? [y/n] '
-        displayed = capsys.readouterr().out
-        assert displayed.index(f'  {new_path}\n') < displayed.index('Saved list:')
+        displayed = re.sub(r': +', ': ', capsys.readouterr().out)
+        assert f'  {new_path}\n' in displayed
+        assert 'Saved list:' not in displayed
         return 'yes'
 
     monkeypatch.setattr('builtins.input', _include_new_path)
@@ -887,10 +930,7 @@ def _assert_policy_growth_acknowledgment(
         [
             ('Continue despite this earlier exposure? [y/n] ', 'yes'),
             (
-                (
-                    f'Publish main at {fresh.commit[:7]} and tag v1.1.0 to '
-                    f'{fixture._owner}/{fixture._publication_repo} (public)? [y/n] '
-                ),
+                (f'Publish v1.1.0 to {fixture._owner}/{fixture._publication_repo}? [y/n] '),
                 'yes',
             ),
         ],
@@ -919,22 +959,24 @@ def _complete_guided_publication(
 
     def _publication_answer(prompt: str) -> str:
         assert prompt == (
-            f'Publish main at {candidate.commit[:7]} and tag v1.0.0 to '
-            f'{fixture._owner}/{fixture._publication_repo} (private)? [y/n] '
+            f'Publish v1.0.0 to {fixture._owner}/{fixture._publication_repo}? [y/n] '
         )
         assert answers, f'unexpected prompt: {prompt}'
         preview = capsys.readouterr()
         cli_output.extend((preview.out, preview.err))
-        assert 'Publish prepared snapshot' in preview.out
-        assert candidate.commit in preview.out
-        assert 'Identity: Publication Alias <publication@example.invalid>' in preview.out
+        assert 'Publish v1.0.0' in preview.out
+        assert candidate.commit not in preview.out
+        assert 'Checked:' in preview.out
+        assert 'content, identity, and destination' in preview.out
+        assert f'{fixture._owner}/{fixture._publication_repo} (private)' in preview.out
         assert _git_refs(fixture._publication_host) == {}
         assert (inspection / 'README.md').read_text() == 'sanitized release\n'
         return answers.pop(0)
 
     monkeypatch.setattr('builtins.input', _publication_answer)
-    assert _cli.main(['publish']) == 1
+    assert _cli.main(['publish']) == 130
     declined = capsys.readouterr()
+    assert 'Canceled. Nothing was published.' in declined.err
     cli_output.extend((declined.out, declined.err))
     assert _git_refs(fixture._publication_host) == {}
     retained = _candidate.load_candidate(fixture._paths, 'demo')
@@ -977,6 +1019,8 @@ def _create_lifecycle_repository(
         'has_wiki=false',
         '-F',
         'has_projects=false',
+        '-F',
+        'has_discussions=false',
     ]
     _write_responses(
         fixture._fake_gh,
@@ -994,10 +1038,13 @@ def _create_lifecycle_repository(
                 'once': True,
             },
             {'args': create_publication},
+            *_created_settings_responses(
+                fixture._owner, fixture._publication_repo, fixture._settings
+            ),
             _repository_response(fixture._owner, fixture._publication_repo, 'private'),
         ],
     )
-    assert _cli.main(['repo', 'create', '--private', '--yes']) == 0
+    assert _cli.main(['repo', 'create', '--yes']) == 0
     assert {'args': create_publication, 'stdin': ''} in _host_calls()
 
 
@@ -1011,15 +1058,19 @@ def _edit_real_name_identity(
     _write_responses(fake_gh, [_account_response(_REAL_ACCOUNT)])
     prompts = [
         ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 'e'),
-        ('Edit: [i]dentity / [t]erms / [a]ccount / [b]ack: ', 'i'),
+        'i',
         (f'Publication name [{_REAL_NAME}]: ', publication_name),
         (f'Publication email [{_REAL_EMAIL}]: ', ''),
         ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
     ]
 
     def _answer(prompt: str) -> str:
-        expected, response = prompts.pop(0)
-        assert prompt == expected
+        reply = prompts.pop(0)
+        if isinstance(reply, str):
+            response = reply
+        else:
+            expected, response = reply
+            assert prompt == expected
         if not prompts:
             before_save, _ = capture_output()
             assert f'{_REAL_NAME} <{_REAL_EMAIL}>' in before_save
@@ -1038,7 +1089,7 @@ def _initialize_guided_first_run(
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    answers: Callable[[Sequence[tuple[str, str]]], None],
+    answers: Callable[[Sequence[str | tuple[str, str]]], None],
     *,
     login_needed: bool,
 ) -> tuple[_LifecycleFixture, list[str], dict[str, str], str]:
@@ -1054,7 +1105,7 @@ def _initialize_guided_first_run(
         files={
             'README.md': 'sanitized release\n',
             'docs/guide.md': 'public guide\n',
-            'docs/internal/notes.md': 'private-canary\n',
+            'docs/private/notes.md': 'private-canary\n',
         },
     )
     subprocess.run(['git', '-C', source, 'branch', 'private-work'], check=True, env=git_env())
@@ -1062,9 +1113,7 @@ def _initialize_guided_first_run(
     source_refs, source_remotes = _git_source_state(source)
     publication_host = tmp_path / 'public-repo.git'
     url_template = f'{tmp_path.as_uri()}/{{repo}}.git'
-    monkeypatch.setattr(_host, 'URL_TEMPLATE', url_template)
-    monkeypatch.setattr(_lifecycle, 'URL_TEMPLATE', url_template)
-    monkeypatch.setattr(_stage, 'URL_TEMPLATE', url_template)
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', url_template)
     monkeypatch.chdir(source)
 
     paths = _config.derive_paths(os.environ)
@@ -1102,10 +1151,11 @@ def _initialize_guided_first_run(
             ('Publication email: ', 'publication@example.invalid'),
             ('Sensitive term: ', 'private-canary'),
             ('Sensitive term: ', ''),
+            ('Default publication route (staged/direct) [staged]: ', 'direct'),
             *([('Authentication: [r]etry / [l]ogin / [c]ancel: ', 'l')] if login_needed else []),
             ('Use this GitHub account? [Y/n] ', ''),
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 'e'),
-            ('Edit: [i]dentity / [t]erms / [a]ccount / [b]ack: ', 'i'),
+            'i',
             ('Publication name [Publication Alais]: ', 'Publication Alias'),
             ('Publication email [publication@example.invalid]: ', ''),
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
@@ -1117,9 +1167,6 @@ def _initialize_guided_first_run(
     setup_output = capsys.readouterr()
     output.extend((setup_output.out, setup_output.err))
     assert '  1. private-canary' in setup_output.out
-    assert 'typing hidden' not in setup_output.out
-    assert 'Allow this GitHub CLI login session' not in setup_output.out
-    assert 'Show the exact' not in setup_output.out
     assert paths.global_config.exists(), 'setup did not create global configuration'
     assert not (paths.config_dir / 'projects').exists()
     setup_calls = _host_call_args()
@@ -1147,6 +1194,7 @@ def _initialize_guided_first_run(
     assert _cli.main(['doctor']) == 0
     doctor_output = capsys.readouterr()
     output.extend((doctor_output.out, doctor_output.err))
+    assert 'Your configuration and GitHub login are ready.' in doctor_output.out
 
     assert_answers = _script_answers(
         monkeypatch,
@@ -1172,7 +1220,7 @@ def _initialize_guided_first_run(
     init_output = capsys.readouterr()
     output.extend((init_output.out, init_output.err))
     project = _config.load_project(paths, 'demo')
-    assert (project.allow, project.deny) == (('README.md', 'docs/guide.md'), ('docs/internal/**',))
+    assert (project.allow, project.deny) == (('README.md', 'docs/guide.md'), ('docs/private/**',))
     assert project.settings is not None
     assert _git_source_state(source) == (source_refs, source_remotes)
     fixture = _LifecycleFixture(
@@ -1205,9 +1253,7 @@ def _initialize_real_name(
     monkeypatch.setenv('XDG_DATA_HOME', str(home / 'data'))
     source = make_repo('source', files={'README.md': 'first release\n'})
     host = tmp_path / 'host.git'
-    monkeypatch.setattr(_host, 'URL_TEMPLATE', str(host))
-    monkeypatch.setattr(_lifecycle, 'URL_TEMPLATE', str(host))
-    monkeypatch.setattr(_stage, 'URL_TEMPLATE', str(host))
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', str(host))
     monkeypatch.chdir(source)
 
     paths = _config.derive_paths(os.environ)
@@ -1216,6 +1262,7 @@ def _initialize_real_name(
         f'anon_name = "{_REAL_NAME}"\n'
         f'anon_email = "{_REAL_EMAIL}"\n'
         f'sensitive_terms = ["{_REAL_TERM}"]\n'
+        'default_publication_route = "direct"\n'
         '[accounts]\n'
         f'github = "{_REAL_ACCOUNT}"\n'
     )
@@ -1252,7 +1299,7 @@ def _initialize_release_walk(
         monkeypatch,
         guided_continue=True,
     )
-    initialized = capsys.readouterr().out
+    initialized = re.sub(r': +', ': ', capsys.readouterr().out)
     assert 'README.md' in initialized
     proposed = fixture._paths.data_dir / 'projects' / 'demo' / 'proposed-selection.json'
     assert json.loads(proposed.read_text(encoding='utf-8')) == ['README.md']
@@ -1261,17 +1308,17 @@ def _initialize_release_walk(
         _config.load_project(fixture._paths, 'demo'),
         package=PackageObservation('pypi', 'demo-package', ('Release',)),
         workflows={
-            'ship': ('prepare', 'inspect', 'publish', 'watch ci'),
+            'ship': ('prepare', 'inspect', 'publish', 'repo watch'),
             'published': ('publish',),
-            'staged': ('prepare', 'stage push', 'watch ci --staged', 'publish'),
+            'staged': ('prepare', 'stage push', 'stage watch', 'publish'),
             'reveal-declared': ('repo reveal',),
         },
     )
     _config.save_project(fixture._paths, project)
 
     _create_lifecycle_repository(fixture)
-    created = capsys.readouterr().out
-    assert 'Created and verified an empty private host repository.' in created
+    created = re.sub(r': +', ': ', capsys.readouterr().out)
+    assert 'Created private repository release-account/public-repo.' in created
 
     walk = _ReleaseWalk(fixture, [], [], [], [], 0, 0)
     real_build_candidate = _prepare.build_candidate
@@ -1324,7 +1371,7 @@ def _initialize_release_walk(
         walk._stage_pushes.append((cwd, tuple(args)))
         commit, separator, destination_ref = args[-1].partition(':')
         assert separator
-        assert destination_ref == 'refs/heads/stage'
+        assert destination_ref == 'refs/heads/main'
         _append_response(
             fixture._fake_gh,
             _check_response(
@@ -1453,9 +1500,10 @@ def _reveal_clean_and_restore(
             },
         ],
     )
-    assert _cli.main(['stage', 'clean', '--yes']) == 0
+    assert _cli.main(['stage', 'delete', '--yes']) == 0
     assert {'args': delete_stage, 'stdin': ''} in _host_calls()
     assert _stage.load_stage(fixture._paths, 'demo') is None
+    assert _config.load_project(fixture._paths, 'demo').publication_route == 'staged'
 
     original_host = fixture._tmp_path / 'published-before-recreation.git'
     fixture._publication_host.rename(original_host)
@@ -1469,7 +1517,7 @@ def _reveal_clean_and_restore(
             _repository_response(fixture._owner, fixture._publication_repo, 'public'),
         ],
     )
-    assert _cli.main(['publish', '--sync', '--yes']) == 0
+    assert _cli.main(['repo', 'restore', '--to', 'remote', '--yes']) == 0
     assert _git_refs(fixture._publication_host) == _git_refs(
         _candidate.store_path(fixture._paths, 'demo')
     )
@@ -1504,9 +1552,9 @@ def _run_release_failed_ship(
     first_run = capsys.readouterr()
     first_refs = _git_refs(fixture._publication_host)
     walk._first_oid = first_refs['refs/tags/v0.1.0']
-    assert 'fact: Acceptance: unacceptable (failure)' in first_run.err
-    assert 'publication already completed before this stage stopped' in first_run.err
-    assert 'pubanon watch ci' in first_run.err
+    assert '  Acceptance: failed' in first_run.err
+    assert 'The publication itself completed.' in first_run.err
+    assert 'pubanon repo watch' in first_run.err
     assert '--version 0.1.0' in first_run.err
     assert len(walk._publication_pushes) == 1
     assert _candidate.load_candidate(fixture._paths, 'demo') is None
@@ -1527,11 +1575,13 @@ def _run_release_green_release(
             _repository_response(fixture._owner, fixture._publication_repo, 'private'),
         ],
     )
-    assert _cli.main(['release', '0.2.0', '--yes']) == 0
-    second_run = capsys.readouterr().out
+    assert _cli.main(['prepare', '--version', '0.2.0', '--yes']) == 0
+    assert _cli.main(['inspect']) == 0
+    assert _cli.main(['publish', '--yes']) == 0
+    second_run = re.sub(r': +', ': ', capsys.readouterr().out)
     second_refs = _git_refs(fixture._publication_host)
     walk._second_oid = second_refs['refs/tags/v0.2.0']
-    assert 'Published snapshot' in second_run
+    assert 'Published v0.2.0 to ' in second_run
     assert walk._second_oid != walk._first_oid
     assert len(walk._publication_pushes) == 2
 
@@ -1562,16 +1612,15 @@ def _run_release_old_version_resume(
     )
     calls_before_resume = len(_host_calls())
     assert _cli.main(['run', 'ship', '--version', '0.1.0', '--yes']) == 0
-    resumed = capsys.readouterr().out
+    resumed = re.sub(r': +', ': ', capsys.readouterr().out)
     resume_calls = _host_calls()[calls_before_resume:]
     resume_log = json.dumps(resume_calls)
-    assert '  prepare (already published)' in resumed
-    assert '  inspect (already published)' in resumed
-    assert '  publish (already published)' in resumed
-    assert 'Required CI checks succeeded for the selected snapshot.' in resumed
+    assert 'Workflow ship (direct route)' in resumed
+    assert 'Repo watch' in resumed
+    assert 'Required checks passed.' in resumed
     assert len(walk._publication_pushes) == 2
     assert _candidate.load_candidate(fixture._paths, 'demo') is None
-    assert walk._executed_stages[first_stage:] == ['watch ci']
+    assert walk._executed_stages[first_stage:] == ['repo watch']
     assert walk._candidate_builds == builds_before
     assert f'/commits/{walk._first_oid}/check-runs?' in resume_log
     assert f'/commits/{walk._second_oid}/check-runs?' not in resume_log
@@ -1641,10 +1690,10 @@ def _run_release_package_watch(
             ),
         ],
     )
-    assert _cli.main(['watch', 'package', '--timeout', '30']) == 0
+    assert _cli.main(['package', 'watch', '--timeout', '30']) == 0
     _record_release_host_events(walk)
-    package_watch = capsys.readouterr().out
-    assert 'Package release 0.3.0 is published.' in package_watch
+    package_watch = re.sub(r': +', ': ', capsys.readouterr().out)
+    assert 'Package release v0.3.0 is published.' in package_watch
     assert 'demo_package-0.3.0-py3-none-any.whl' in package_watch
     assert 'demo_package-0.3.0.tar.gz' in package_watch
     assert len(package_urls) == 2
@@ -1681,9 +1730,8 @@ def _run_release_published_noop(
     )
     stage_before_noop = _stage.load_stage(fixture._paths, 'demo')
     assert _cli.main(['run', 'published', '--version', '0.1.0', '--yes']) == 0
-    noop = capsys.readouterr().out
-    assert 'version 0.1.0 is already published' in noop
-    assert 'No stage or mutation ran.' in noop
+    noop = re.sub(r': +', ': ', capsys.readouterr().out)
+    assert 'Nothing to do: v0.1.0 is already published.' in noop
     assert len(walk._publication_pushes) == 2
     assert _stage.load_stage(fixture._paths, 'demo') == stage_before_noop
     assert _candidate.load_candidate(fixture._paths, 'demo') is None
@@ -1764,15 +1812,12 @@ def _run_release_reveal_with_package_gate(
 
     def _reveal_answer(prompt: str) -> str:
         assert prompt == expected_prompts.pop(0)
-        visible = capsys.readouterr().out
+        visible = re.sub(r': +', ': ', capsys.readouterr().out)
         reveal_output.append(visible)
         if expected_prompts:
-            assert 'Artifacts:\n  release-package (id 201)\n  checks-report (id 202)' in visible
+            assert '  release-package (id 201)\n  checks-report (id 202)' in visible
         else:
-            assert (
-                f'Change {fixture._owner}/{fixture._publication_repo} from private to public.'
-                in visible
-            )
+            assert 'Make it public?' in prompt
         return 'yes'
 
     monkeypatch.setattr('builtins.input', _reveal_answer)
@@ -1780,8 +1825,8 @@ def _run_release_reveal_with_package_gate(
     assert expected_prompts == []
     _record_release_host_events(walk)
     reveal = ''.join((*reveal_output, capsys.readouterr().out))
-    assert 'package observation: demo-package 0.3.0 is published' in reveal
-    assert 'Repository is public and verified.' in reveal
+    assert re.search(r'Package: +demo-package 0.3.0 is published', reveal)
+    assert f'Made {fixture._owner}/{fixture._publication_repo} public.' in reveal
     assert len(package_urls) == 3
     check_prefix = (
         f'repos/{fixture._owner}/{fixture._publication_repo}/commits/{walk._third_oid}/check-runs?'
@@ -1808,6 +1853,8 @@ def _run_release_staged_release(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     fixture = walk._fixture
+    project = _config.load_project(fixture._paths, 'demo')
+    _config.save_project(fixture._paths, replace(project, publication_route='staged'))
 
     _commit(fixture._source, 'third release\n')
     subprocess.run(
@@ -1833,6 +1880,16 @@ def _run_release_staged_release(
         f'name={fixture._staging_repo}',
         '-F',
         'private=true',
+        '-f',
+        f'description={fixture._settings.description}',
+        '-F',
+        'has_issues=true',
+        '-F',
+        'has_wiki=false',
+        '-F',
+        'has_projects=false',
+        '-F',
+        'has_discussions=false',
     ]
     create_stage_response: dict[str, object] = {'args': create_stage}
     _write_responses(
@@ -1844,6 +1901,7 @@ def _run_release_staged_release(
             stage_missing,
             stage_missing,
             create_stage_response,
+            *_created_settings_responses(fixture._owner, fixture._staging_repo, fixture._settings),
             _repository_response(fixture._owner, fixture._staging_repo, 'private'),
         ],
     )
@@ -1851,6 +1909,9 @@ def _run_release_staged_release(
     staged_output: list[str] = []
 
     def _staged_answer(prompt: str) -> str:
+        if prompt.startswith('Use this selection?'):
+            assert _candidate.load_candidate(fixture._paths, 'demo') is None
+            return 'continue'
         record = _candidate.load_candidate(fixture._paths, 'demo')
         assert record is not None
         expected = [
@@ -1858,16 +1919,13 @@ def _run_release_staged_release(
                 f'Create the private staging repository '
                 f'{fixture._owner}/{fixture._staging_repo}? [y/n] '
             ),
-            f'Push {record.commit[:7]} to the staging repository? [y/n] ',
-            (
-                f'Publish main at {record.commit[:7]} and tag v0.3.0 to '
-                f'{fixture._owner}/{fixture._publication_repo} (private)? [y/n] '
-            ),
+            f'Push {record.commit[:12]} to the staging repository? [y/n] ',
+            (f'Publish v0.3.0 to {fixture._owner}/{fixture._publication_repo}? [y/n] '),
         ]
         assert prompt == expected[len(prompts_seen)]
-        visible = capsys.readouterr().out
+        visible = re.sub(r': +', ': ', capsys.readouterr().out)
         staged_output.append(visible)
-        assert record.commit[:7] in visible
+        assert record.commit[:12] in visible if len(prompts_seen) < 2 else 'v0.3.0' in visible
         prompts_seen.append(prompt)
         return 'yes'
 
@@ -1883,10 +1941,10 @@ def _run_release_staged_release(
         fixture._owner,
         fixture._staging_repo,
     )
-    assert _git_refs(fixture._staging_host) == {'refs/heads/stage': walk._third_oid}
+    assert _git_refs(fixture._staging_host) == {'refs/heads/main': walk._third_oid}
     assert 'create staging repository' in staged_run
-    assert 'watch ci --staged' in staged_run
-    assert 'Required CI checks succeeded for the selected snapshot.' in staged_run
+    assert 'stage watch' in staged_run
+    assert 'Required checks passed.' in staged_run
     assert len(walk._stage_pushes) == 1
     assert len(walk._publication_pushes) == 3
     assert (
@@ -1900,7 +1958,9 @@ def _stage_and_publish_lifecycle_candidate(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> str:
-    assert _cli.main(['prepare', '--version', '1.0.0']) == 0
+    project = _config.load_project(fixture._paths, 'demo')
+    _config.save_project(fixture._paths, replace(project, publication_route='staged'))
+    assert _cli.main(['prepare', '--version', '1.0.0', '--yes']) == 0
     candidate = _candidate.load_candidate(fixture._paths, 'demo')
     assert candidate is not None
 
@@ -1933,8 +1993,19 @@ def _stage_and_publish_lifecycle_candidate(
                     f'name={fixture._staging_repo}',
                     '-F',
                     'private=true',
+                    '-f',
+                    f'description={fixture._settings.description}',
+                    '-F',
+                    'has_issues=true',
+                    '-F',
+                    'has_wiki=false',
+                    '-F',
+                    'has_projects=false',
+                    '-F',
+                    'has_discussions=false',
                 ]
             },
+            *_created_settings_responses(fixture._owner, fixture._staging_repo, fixture._settings),
             _repository_response(fixture._owner, fixture._staging_repo, 'private'),
         ],
     )
@@ -1953,7 +2024,7 @@ def _stage_and_publish_lifecycle_candidate(
     )
     assert _cli.main(['stage', 'push', '--yes']) == 0
     assert_answers()
-    staged_oid = _git_refs(fixture._staging_host)['refs/heads/stage']
+    staged_oid = _git_refs(fixture._staging_host)['refs/heads/main']
     assert staged_oid == candidate.commit
 
     _write_responses(
@@ -1961,6 +2032,7 @@ def _stage_and_publish_lifecycle_candidate(
         [
             _account_response(fixture._account),
             _repository_response(fixture._owner, fixture._staging_repo, 'private'),
+            _settings_response(fixture._owner, fixture._staging_repo, fixture._settings),
             _check_response(
                 fixture._owner,
                 fixture._staging_repo,
@@ -1971,40 +2043,45 @@ def _stage_and_publish_lifecycle_candidate(
     )
     capsys.readouterr()
     assert _cli.main(['stage', 'status']) == 0
-    staged = capsys.readouterr().out
-    assert 'All configured required checks succeeded for the staged snapshot.' in staged
-    assert f'Staged commit: {staged_oid}' in staged
+    staged = re.sub(r': +', ': ', capsys.readouterr().out)
+    assert 'Checks: Acceptance passed' in staged
+    assert f'Staged: v1.0.0 ({staged_oid[:12]})' in staged
 
     _write_responses(
         fixture._fake_gh,
         [
             _account_response(fixture._account),
             _repository_response(fixture._owner, fixture._publication_repo, 'private'),
+            _repository_response(fixture._owner, fixture._staging_repo, 'private'),
+            _settings_response(fixture._owner, fixture._staging_repo, fixture._settings),
+            _check_response(fixture._owner, fixture._staging_repo, staged_oid, fixture._check),
         ],
     )
     assert _cli.main(['publish', '--yes']) == 0
-    publication_output = capsys.readouterr().out
-    assert 'The staged snapshot matches the prepared snapshot.' in publication_output
+    publication_output = re.sub(r': +', ': ', capsys.readouterr().out)
+    assert 'Published v1.0.0' in publication_output
+    assert 'Verified staged commit:' not in publication_output
     assert _git_refs(fixture._publication_host) == {
         'refs/heads/main': staged_oid,
         'refs/tags/v1.0.0': staged_oid,
     }
 
-    assert _cli.main(['status', '--audit']) == 0
-    clean_audit = capsys.readouterr().out
+    assert _cli.main(['audit']) == 0
+    clean_audit = re.sub(r': +', ': ', capsys.readouterr().out)
     assert 'audit: local copy of published history' in clean_audit
-    assert 'historical exposure:' not in clean_audit
-    assert 'policy mismatch:' not in clean_audit
+    assert 'Warning: historical exposure' not in clean_audit
+    assert 'Warning: policy mismatch' not in clean_audit
     assert 'identity problem:' not in clean_audit
     return staged_oid
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize('login_needed', [False, True], ids=['authenticated', 'login-needed'])
 def test_guided_first_publication_works_from_empty_roots(
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    answers: Callable[[Sequence[tuple[str, str]]], None],
+    answers: Callable[[Sequence[str | tuple[str, str]]], None],
     login_needed: bool,
 ) -> None:
     fixture, cli_output, source_refs, source_remotes = _initialize_guided_first_run(
@@ -2063,20 +2140,20 @@ def test_guided_first_publication_works_from_empty_roots(
             _repository_response(fixture._owner, fixture._publication_repo, 'private'),
         ],
     )
-    assert _cli.main(['status', '--audit', '--remote']) == 0
+    assert _cli.main(['audit', '--remote']) == 0
     audited = capsys.readouterr()
     cli_output.extend((audited.out, audited.err))
-    assert 'GitHub matches the recorded published snapshot.' in audited.out
-    assert 'historical exposure:' not in audited.out
-    assert 'policy mismatch:' not in audited.out
+    assert 'audit: local copy of published history; verified against GitHub' in audited.out
+    assert 'Warning: historical exposure' not in audited.out
+    assert 'Warning: policy mismatch' not in audited.out
     assert 'identity problem:' not in audited.out
 
     assert _git_source_state(fixture._source) == (source_refs, source_remotes)
     rendered = ''.join(cli_output)
     for expected in (
-        'Publication identity: Publication Alias <publication@example.invalid>',
+        'Publication Alias <publication@example.invalid>',
         'GitHub account: release-account',
-        'Sensitive terms:\n  1. private-canary',
+        '  1. private-canary',
     ):
         assert expected in rendered
     assert 'private-canary' in rendered
@@ -2084,6 +2161,7 @@ def test_guided_first_publication_works_from_empty_roots(
         assert 'ghp_PRIVATE_CREDENTIAL' in rendered
 
 
+@pytest.mark.slow
 def test_guided_release_flow_works_offline_end_to_end(
     tmp_path: Path,
     fake_gh: Path,
@@ -2101,6 +2179,7 @@ def test_guided_release_flow_works_offline_end_to_end(
     _run_release_unattended_reveal_refusal(walk, capsys)
 
 
+@pytest.mark.slow
 def test_lifecycle_and_policy_growth_work_offline(
     tmp_path: Path,
     fake_gh: Path,
@@ -2131,9 +2210,11 @@ def test_lifecycle_and_policy_growth_work_offline(
         fixture,
         monkeypatch,
         capsys,
+        published_commit=staged_oid,
     )
 
 
+@pytest.mark.slow
 def test_publication_history_survives_rebase_and_cleanup(
     tmp_path: Path,
     fake_gh: Path,
@@ -2148,7 +2229,10 @@ def test_publication_history_survives_rebase_and_cleanup(
 
     assert_answers = _script_answers(
         monkeypatch,
-        [('Include these files? [i]nclude / [e]xclude / [c]ustomize / [q]uit: ', 'e')],
+        [
+            ('Include these files? [i]nclude / [e]xclude / [c]ustomize / [q]uit: ', 'e'),
+            ('Use this selection? [c]ontinue / [r]eview / [q]uit: ', 'c'),
+        ],
     )
     assert _cli.main(['prepare', '--version', '1.0.0']) == 0
     assert_answers()
@@ -2199,6 +2283,7 @@ def test_publication_history_survives_rebase_and_cleanup(
     assert not any('refs/pubanon/' in arg for call in push_calls for arg in call)
 
 
+@pytest.mark.slow
 def test_real_name_identity_two_releases_audit_and_reveal_work_offline(
     tmp_path: Path,
     fake_gh: Path,
@@ -2246,6 +2331,8 @@ def test_real_name_identity_two_releases_audit_and_reveal_work_offline(
         'has_wiki=false',
         '-F',
         'has_projects=false',
+        '-F',
+        'has_discussions=false',
     ]
     _write_responses(
         fake_gh,
@@ -2258,10 +2345,11 @@ def test_real_name_identity_two_releases_audit_and_reveal_work_offline(
                 'once': True,
             },
             {'args': create_publication},
+            *_created_settings_responses(owner, repo, _REAL_SETTINGS),
             _repository_response(owner, repo, 'private'),
         ],
     )
-    assert _cli.main(['repo', 'create', '--private', '--yes']) == 0
+    assert _cli.main(['repo', 'create', '--yes']) == 0
     _capture_output()
 
     _write_responses(
@@ -2275,14 +2363,13 @@ def test_real_name_identity_two_releases_audit_and_reveal_work_offline(
     def _publish_first(prompt: str) -> str:
         record = _candidate.load_candidate(paths, 'demo')
         assert record is not None
-        assert prompt == (
-            f'Publish main at {record.commit[:7]} and tag v0.1.0 to '
-            f'{owner}/{repo} (private)? [y/n] '
-        )
+        assert prompt == (f'Publish v0.1.0 to {owner}/{repo}? [y/n] ')
         return 'yes'
 
+    assert _cli.main(['prepare', '--version', '0.1.0', '--yes']) == 0
+    assert _cli.main(['inspect']) == 0
     monkeypatch.setattr('builtins.input', _publish_first)
-    assert _cli.main(['release', '0.1.0']) == 0
+    assert _cli.main(['publish']) == 0
     _capture_output()
     first = _git_refs(host)['refs/tags/v0.1.0']
 
@@ -2294,7 +2381,9 @@ def test_real_name_identity_two_releases_audit_and_reveal_work_offline(
             _repository_response(owner, repo, 'private'),
         ],
     )
-    assert _cli.main(['release', '0.2.0', '--yes']) == 0
+    assert _cli.main(['prepare', '--version', '0.2.0', '--yes']) == 0
+    assert _cli.main(['inspect']) == 0
+    assert _cli.main(['publish', '--yes']) == 0
     _capture_output()
     second = _git_refs(host)['refs/tags/v0.2.0']
 
@@ -2313,9 +2402,9 @@ def test_real_name_identity_two_releases_audit_and_reveal_work_offline(
         assert parents == expected_parents
         assert signed is False
 
-    assert _cli.main(['status', '--audit', '--remote']) == 0
+    assert _cli.main(['audit', '--remote']) == 0
     audit, _ = _capture_output()
-    assert 'GitHub matches the recorded published snapshot.' in audit
+    assert 'audit: local copy of published history; verified against GitHub' in audit
     assert 'historical exposure' not in audit
     assert 'identity problem' not in audit
 
@@ -2336,11 +2425,12 @@ def test_real_name_identity_two_releases_audit_and_reveal_work_offline(
     )
     _reveal_after_disclosure_review(monkeypatch, _capture_output, owner, repo)
     reveal, _ = _capture_output()
-    assert 'Repository is public and verified.' in reveal
+    assert f'Made {owner}/{repo} public.' in reveal
     assert _config.load_project(paths, 'demo').visibility == 'public'
     assert _REAL_TERM in ''.join(cli_output)
 
 
+@pytest.mark.slow
 def test_stepwise_publish_path_and_gates_work_offline(
     tmp_path: Path,
     fake_gh: Path,
@@ -2350,7 +2440,7 @@ def test_stepwise_publish_path_and_gates_work_offline(
 ) -> None:
     paths, source, host = _initialize(tmp_path, fake_gh, make_repo, monkeypatch)
 
-    assert _cli.main(['prepare', '--version', '1.0.0']) == 0
+    assert _cli.main(['prepare', '--version', '1.0.0', '--yes']) == 0
     first = _candidate.load_candidate(paths, 'demo')
     assert first is not None
     assert _cli.main(['inspect']) == 0
@@ -2368,7 +2458,7 @@ def test_stepwise_publish_path_and_gates_work_offline(
     }
 
     _commit(source, 'second release\n')
-    assert _cli.main(['prepare', '--version', '1.1.0']) == 0
+    assert _cli.main(['prepare', '--version', '1.1.0', '--yes']) == 0
     second = _candidate.load_candidate(paths, 'demo')
     assert second is not None
     assert second.prestate_main == first.commit
@@ -2387,11 +2477,8 @@ def test_stepwise_publish_path_and_gates_work_offline(
 
     capsys.readouterr()
     assert _cli.main(['status']) == 0
-    status = capsys.readouterr().out
-    assert 'Prepared snapshot: none' in status
-    assert (
-        'Last published snapshot\nVersion: v1.1.0\n'
-        'Destination: release-owner/public-repo\nVisibility at publication: PRIVATE' in status
-    )
+    status = re.sub(r': +', ': ', capsys.readouterr().out)
+    assert 'Prepared: none' in status
+    assert 'Published: v1.1.0 to release-owner/public-repo (private)' in status
 
     _assert_negative_gates(paths, source, monkeypatch, capsys)

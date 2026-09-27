@@ -11,7 +11,7 @@ from pubanon import (
     _config,
     _filesystem,
 )
-from pubanon._remote import _host
+from pubanon._remote import _host, _stage
 from pubanon._snapshots import _candidate, _history, _source
 from pubanon._terminal import escape
 from tests._cli import prepare, record_published_main
@@ -20,43 +20,56 @@ from tests._permissions import assert_private_mode
 from tests._setup import configure
 
 
-def test_inspect_clean_and_discard_report_changes_and_next_actions(
+@pytest.mark.parametrize(
+    'case',
+    [
+        ('direct', 'malformed', 'pubanon publish --project=demo'),
+        ('staged', 'absent', 'pubanon stage push --project=demo'),
+        ('staged', 'matching', 'pubanon stage watch --project=demo'),
+        ('staged', 'malformed', 'pubanon stage repair --project=demo'),
+    ],
+)
+def test_inspect_guides_saved_route_without_host_reads_and_keeps_review_copy(
+    case: tuple[str, str, str],
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    route, tracking, expected = case
     source = make_repo(files={'README.md': 'public\n'})
     paths, project, record = prepare(tmp_path, source, monkeypatch)
-    inspection = _candidate.materialize_inspect(paths, project.name, record)
-    assert_private_mode(inspection, 0o500)
-    assert_private_mode(inspection / 'README.md', 0o400)
+    project = replace(project, publication_route=route)
+    _config.save_project(paths, project)
+    if tracking == 'matching':
+        _stage._save_stage(
+            paths,
+            project.name,
+            _stage.StageRecord(record.commit, project.owner, _config.stage_repository(project)),
+        )
+        project = replace(project, required_checks=('build',))
+        _config.save_project(paths, project)
+        record = replace(
+            record, fingerprint=_candidate.fingerprint(_config.load_global(paths), project)
+        )
+        _candidate.save_candidate(paths, project.name, record)
+    elif tracking == 'malformed':
+        stage_path = paths.data_dir / 'projects' / project.name / 'stage.toml'
+        stage_path.parent.mkdir(parents=True, exist_ok=True)
+        stage_path.write_text('invalid = true\n')
+
+    def _unexpected_host(*_args: object, **_kwargs: object) -> Never:
+        pytest.fail('host read')
+
+    monkeypatch.setattr(_host, 'verify_destination', _unexpected_host)
     capsys.readouterr()
 
-    assert _cli.main(['inspect', '--project', project.name, '--clean']) == 0
-    assert not inspection.exists()
+    assert _cli.main(['inspect', '--project', project.name]) == 0
+
     output = capsys.readouterr().out
-    assert escape(str(inspection)) in output
-    assert 'Removed the listed snapshot directories.' in output
-    assert 'The prepared snapshot is still available.' in output
-
-    assert _cli.main(['discard', '--project', project.name]) == 0
-    assert capsys.readouterr().out == 'Discarded the prepared snapshot.\n'
-
-
-def test_inspect_clean_reports_when_inspection_directory_is_already_absent(
-    tmp_path: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    source = make_repo(files={'README.md': 'public\n'})
-    _paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
-
-    assert _cli.main(['inspect', '--project', project.name, '--clean']) == 0
-
-    assert capsys.readouterr().out == ('No snapshot directories to remove.\n')
+    assert output.rstrip().endswith(f'Next: {expected}')
+    inspection = paths.data_dir / 'projects' / project.name / 'inspections' / record.commit
+    assert (inspection / 'README.md').read_text() == 'public\n'
 
 
 def test_inspect_lists_preserved_copies_without_a_candidate(
@@ -84,7 +97,7 @@ def test_inspect_lists_preserved_copies_without_a_candidate(
         assert output.count(escape(str(copy)) + '\n') == 1
         assert (copy / 'notes.txt').read_text() == 'Keep my review edits.\n'
     assert 'Open these directories in your editor to review their files.' in output
-    assert output.rstrip().endswith('`pubanon inspect --project=demo --clean`.')
+    assert output.rstrip().endswith('`pubanon clean --project=demo`.')
     assert 'pubanon prepare' not in output
     assert _candidate.load_candidate(paths, project.name) is None
 
@@ -106,6 +119,7 @@ def test_inspect_materializes_retained_candidate_after_configuration_drift(
         'anon_name = "Changed Publisher"\n'
         'anon_email = "changed@example.invalid"\n'
         'sensitive_terms = ["public"]\n'
+        'default_publication_route = "staged"\n'
         '[accounts]\n'
         'github = "changed-account"\n',
         encoding='utf-8',
@@ -137,7 +151,6 @@ def test_inspect_materializes_retained_candidate_after_configuration_drift(
     assert 'checks have not been rerun with these settings' in output
     assert output.index('Publication configuration:') < output.index(escape(str(inspection)))
     assert escape(str(older)) not in output
-    assert '--clean' not in output
     assert output.count('Next:') == 1
     assert f'pubanon prepare --project=demo --source {_record.pinned.commit}' in output
     assert (inspection / 'README.md').read_text(encoding='utf-8') == 'public\n'
@@ -150,7 +163,7 @@ def test_inspect_materializes_retained_candidate_after_configuration_drift(
     assert (inspection / 'README.md').read_text() == 'public\n'
     assert 'Directories from earlier snapshots\n' in verbose
     assert escape(str(older)) in verbose
-    assert '--clean' in verbose
+    assert 'pubanon clean' in verbose
     assert verbose.rstrip().splitlines()[-1].startswith('Next:')
 
 
@@ -179,6 +192,7 @@ def test_inspect_published_materializes_files_without_source_or_candidate(
     assert output.rstrip().endswith(f'Next: pubanon show --project=demo {candidate.commit[:12]}')
 
 
+@pytest.mark.slow
 def test_inspect_published_refuses_modified_copy_until_refresh(
     tmp_path: Path,
     make_repo: Callable[..., Path],
@@ -217,7 +231,6 @@ def test_inspect_published_refuses_modified_copy_until_refresh(
     output = capsys.readouterr().out
     assert escape(str(inspection)) in output
     assert escape(str(older)) not in output
-    assert '--clean' not in output
     assert (inspection / 'README.md').read_text() == 'public\n'
     assert_private_mode(inspection, 0o500)
     assert_private_mode(inspection / 'README.md', 0o400)
@@ -225,7 +238,7 @@ def test_inspect_published_refuses_modified_copy_until_refresh(
     assert output.rstrip().endswith(f'Next: pubanon show --project=demo {candidate.commit[:12]}')
 
 
-def test_inspect_refresh_and_clean_report_exact_locations_before_removal(
+def test_inspect_refresh_reports_exact_location_before_removal(
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
@@ -257,10 +270,6 @@ def test_inspect_refresh_and_clean_report_exact_locations_before_removal(
     assert removals == [inspection]
     assert (inspection / 'README.md').read_text() == 'public\n'
     assert (older / 'notes').read_text() == 'older notes'
-    notices.clear()
-    capsys.readouterr()
-    assert _cli.main(['inspect', '--project', project.name, '--clean']) == 0
-    assert set(removals) == {inspection, older}
     assert _candidate.load_candidate(paths, project.name) == record
 
 
@@ -312,13 +321,10 @@ def test_inspect_rewrite_delegates_selector_and_refresh(
     )
     assert calls == [('v1.0.0', True)]
     output = capsys.readouterr().out
-    assert f'Replacing snapshot directory: {escape(str(selected))}' in output
+    assert f'Replacing review copy: {escape(str(selected))}' in output
     assert escape(str(selected)) in output
     assert f'  Snapshot: {record.commit[:12]}\n' in output
-    assert output.index('Saved report') < output.index('Snapshot directory')
-    assert (
-        _cli.main(['inspect', '--project', project.name, '--rewritten', 'v1.0.0', '--clean']) == 1
-    )
+    assert output.index('Saved report') < output.index('Review copy')
     assert (
         _cli.main(['inspect', '--project', project.name, '--rewritten', 'v1.0.0', '--published'])
         == 1

@@ -24,6 +24,7 @@ def configure(
         'anon_name = "Anonymous Publisher"\n'
         'anon_email = "anonymous@example.invalid"\n'
         'sensitive_terms = ["Private Person"]\n'
+        'default_publication_route = "staged"\n'
         '[accounts]\n'
         'github = "anonymous-account"\n'
     )
@@ -44,7 +45,16 @@ def configure(
         hygiene_terms=(),
         self_publication=True,
         required_checks=(),
-        settings=_config.Settings('', 'main', issues=True, wiki=False, projects=False),
+        publication_route='direct',
+        settings=_config.Settings(
+            '',
+            'main',
+            issues=True,
+            wiki=False,
+            projects=False,
+            pull_requests=False,
+            discussions=False,
+        ),
     )
     _config.save_project(paths, project_config)
     _config.registry_set(paths, source, project)

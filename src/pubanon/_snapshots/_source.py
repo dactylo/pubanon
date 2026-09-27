@@ -81,6 +81,23 @@ class SourceBookmark:
 
 
 @dataclass(frozen=True)
+class SourceMatches:
+    """Describe identical source contents in the current checkout's history.
+
+    Attributes:
+        branch: Current branch name, or `HEAD` for a detached checkout.
+        latest: First matching commit in Git's topological history order.
+        count: Number of matching commits reachable from HEAD.
+        original_reachable: Whether the recorded source itself is reachable.
+    """
+
+    branch: str
+    latest: str | None
+    count: int
+    original_reachable: bool
+
+
+@dataclass(frozen=True)
 class SourceRecovery:
     """Describe whether an exact source commit remains available.
 
@@ -392,6 +409,46 @@ def ensure_bookmark(bookmark: SourceBookmark, source_commit: str) -> None:
     result = _bookmark_git(bookmark, ['update-ref', '--no-deref', '--stdin'], input_bytes=command)
     if result.returncode != 0:
         raise PubanonError('cannot preserve source bookmark', fact=git_failure_fact(result))
+
+
+def matching_commits(root: Path, sources: Collection[str]) -> dict[str, SourceMatches]:
+    """Find exact source-tree matches with one walk of the current history.
+
+    No refs or files change.
+
+    Returns:
+        Matches keyed by source commit, omitting missing original source
+        objects. A present source with no matching history has a zero count.
+
+    Raises:
+        PubanonError: The current repository history cannot be read.
+    """
+    if not sources:
+        return {}
+    history = run_git(['log', '--topo-order', '--format=%H %T', 'HEAD', '--'], cwd=root)
+    branch_result = run_git(['symbolic-ref', '--quiet', '--short', 'HEAD'], cwd=root, check=False)
+    branch = branch_result.stdout.decode(errors='surrogateescape').strip() or 'HEAD'
+    trees: dict[str, list[str]] = {}
+    reachable: dict[str, str] = {}
+    for line in history.stdout.decode('ascii').splitlines():
+        commit, tree = line.split()
+        trees.setdefault(tree, []).append(commit)
+        reachable[commit] = tree
+    matches: dict[str, SourceMatches] = {}
+    for source in dict.fromkeys(sources):
+        tree = reachable.get(source)
+        if tree is None:
+            result = run_git(
+                ['rev-parse', '--verify', f'{source}^{{tree}}'], cwd=root, check=False
+            )
+            if result.returncode != 0:
+                continue
+            tree = _parse_oid(result.stdout)
+        commits = trees.get(tree, [])
+        matches[source] = SourceMatches(
+            branch, commits[0] if commits else None, len(commits), source in reachable
+        )
+    return matches
 
 
 def path_portability_keys(path: str) -> list[str]:
@@ -723,6 +780,49 @@ def _parse_tree(output: bytes) -> list[_TreeEntry]:
         raise PubanonError('Git returned duplicate tree entries')
     entries.sort(key=lambda entry: entry[0])
     return entries
+
+
+def update_source_tag(root: Path, label: str, target: str, known_sources: Collection[str]) -> None:
+    """Create or refresh a local `pubanon/` tag for a recorded publication.
+
+    Existing lightweight tags may move only from recorded source contents.
+    Annotated tags and tags pointing elsewhere are left unchanged.
+
+    Args:
+        root: Registered source repository.
+        label: Publication label used for the managed tag.
+        target: Source commit to tag.
+        known_sources: Recorded source commits whose trees permit moving an
+            existing lightweight tag.
+
+    Raises:
+        PubanonError: A conflicting tag exists or Git cannot update the ref.
+    """
+    ref = f'refs/tags/pubanon/{label}'
+    current = run_git(['show-ref', '--verify', '--hash', ref], cwd=root, check=False)
+    old = _parse_oid(current.stdout) if current.returncode == 0 else None
+    if old == target:
+        return
+    if old is not None:
+        kind = run_git(['cat-file', '-t', old], cwd=root).stdout
+        if kind != b'commit\n':
+            raise PubanonError(f'existing tag pubanon/{label} is annotated and was left unchanged')
+        old_tree = run_git(['rev-parse', '--verify', f'{old}^{{tree}}'], cwd=root, check=False)
+        allowed = any(
+            (
+                tree := run_git(
+                    ['rev-parse', '--verify', f'{source}^{{tree}}'], cwd=root, check=False
+                )
+            ).returncode
+            == 0
+            and tree.stdout == old_tree.stdout
+            for source in known_sources
+        )
+        if not allowed:
+            raise PubanonError(
+                f'local source tag pubanon/{label} already points to unrelated contents'
+            )
+    run_git(['update-ref', '--no-deref', ref, target, old or '0' * len(target)], cwd=root)
 
 
 def validate_symlink_graph(snapshot: Collection[Entry]) -> None:

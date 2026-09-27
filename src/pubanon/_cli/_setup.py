@@ -12,7 +12,7 @@ from pubanon import (
     _filesystem,
     _run,
 )
-from pubanon._errors import OperationCancelled, PubanonError
+from pubanon._errors import OperationCanceled, PubanonError
 from pubanon._gate import RuleClass, gate_unit
 from pubanon._remote import _host
 from pubanon._terminal import (
@@ -20,6 +20,7 @@ from pubanon._terminal import (
     confirm,
     diagnostic,
     escape,
+    fields,
     heading,
     next_step,
     output,
@@ -91,7 +92,7 @@ def _setup_account() -> str:
     while True:
         try:
             return _host.authenticated_account()
-        except OperationCancelled:
+        except OperationCanceled:
             raise
         except PubanonError as error:
             if not sys.stdin.isatty():
@@ -101,15 +102,15 @@ def _setup_account() -> str:
         if decision == 'retry':
             continue
         if decision == 'cancel':
-            raise OperationCancelled('setup cancelled', recovery='rerun pubanon setup')
+            raise OperationCanceled('Canceled.', recovery='rerun pubanon setup')
         output(
             'Handing this terminal to gh auth login. Completed authentication stays in effect '
-            'if setup is cancelled later.',
+            'if setup is canceled later.',
             kind='warning',
         )
         try:
             _host.login()
-        except OperationCancelled:
+        except OperationCanceled:
             raise
         except PubanonError:
             raise PubanonError(
@@ -135,7 +136,7 @@ def _setup_expected_account(
     if actual == expected:
         return config
     if not confirm('Use this GitHub account?', default=True):
-        raise PubanonError('setup cancelled', recovery='rerun pubanon setup')
+        raise OperationCanceled('Canceled. Nothing was saved.', recovery='rerun pubanon setup')
     return replace(config, accounts={'github': actual})
 
 
@@ -169,27 +170,104 @@ def _setup_review(
         print('Existing publication commits keep the old identity. Their identity audit will')
         print('fail until you restore the matching identity. No history will be rewritten.')
     heading('Configuration to save', separate=identity_changed)
-    print(
-        f'{style("Publication identity:")} {escape(config.anon_name)} '
-        f'<{escape(config.anon_email)}>'
+    fields(
+        [
+            ('Identity', f'{escape(config.anon_name)} <{escape(config.anon_email)}>'),
+            ('GitHub account', escape(config.accounts['github'])),
+            ('Default route', f'{escape(config.default_publication_route)} (new projects only)'),
+            (
+                'Excluded directories',
+                ', '.join(f'{escape(directory)}/' for directory in config.ignored_directories)
+                or 'none',
+            ),
+            ('Excluded files', ', '.join(escape(file) for file in config.ignored_files) or 'none'),
+            ('Sensitive terms', str(len(config.sensitive_terms))),
+        ]
     )
-    print(f'{style("GitHub account:")} {escape(config.accounts["github"])}')
-    print(style('Sensitive terms:'))
     for entry_id, term in enumerate(config.sensitive_terms, start=1):
         print(f'  {entry_id}. {escape(term)}')
 
 
-def _setup_term_id(terms: dict[int, str]) -> int:
-    """Read one stable sensitive-term entry number."""
+def _setup_route(default: str) -> str:
+    """Read the default route for future projects."""
+    print('Staged: try snapshots privately before final publication.')
+    print('Direct: upload straight to the final repository.')
     while True:
-        raw = ask('Term number')
+        route = ask('Default publication route (staged/direct)', default=default).casefold()
+        if route in _config.PUBLICATION_ROUTES:
+            return route
+        output('Choose staged or direct.', kind='warning')
+
+
+def _setup_term_id(terms: dict[int, str], *, prompt: str = 'Term number') -> int:
+    """Read one listed entry number."""
+    while True:
+        raw = ask(prompt)
         try:
             entry_id = int(raw)
         except ValueError:
             entry_id = 0
         if entry_id in terms:
             return entry_id
-        output('Choose one listed term number.', kind='warning')
+        output('Choose one listed number.', kind='warning')
+
+
+def _setup_edit_directories(config: _config.GlobalConfig) -> _config.GlobalConfig:
+    """Edit literal directory exclusions shared by existing and future projects."""
+    directories = list(config.ignored_directories)
+    print('Enter directories relative to each source root, such as docs/private.')
+    print('These exclusions override project includes; text references are still checked.')
+    while True:
+        heading('Excluded directories (all projects):')
+        for entry_id, directory in enumerate(directories, 1):
+            print(f'  {entry_id}. {escape(directory)}/')
+        if not directories:
+            print('  None.')
+        action = ask('Directories:', choices=['add', 'remove', 'done'])
+        if action == 'done':
+            return replace(config, ignored_directories=tuple(directories))
+        if action == 'remove':
+            if directories:
+                entry_id = _setup_term_id(
+                    dict(enumerate(directories, 1)), prompt='Directory number'
+                )
+                directories.pop(entry_id - 1)
+            continue
+        try:
+            directory = _config.validate_ignored_directory(ask('Directory'))
+        except PubanonError as error:
+            print(diagnostic(error))
+            continue
+        if directory not in directories:
+            directories.append(directory)
+
+
+def _setup_edit_files(config: _config.GlobalConfig) -> _config.GlobalConfig:
+    """Edit literal file exclusions shared by existing and future projects."""
+    files = list(config.ignored_files)
+    print('Enter files as a basename at any depth, or a path relative to the source root.')
+    print('These exclusions override project includes; text references are still checked.')
+    while True:
+        heading('Excluded files (all projects):')
+        for entry_id, file in enumerate(files, 1):
+            print(f'  {entry_id}. {escape(file)}')
+        if not files:
+            print('  None.')
+        action = ask('Files:', choices=['add', 'remove', 'done'])
+        if action == 'done':
+            return replace(config, ignored_files=tuple(files))
+        if action == 'remove':
+            if files:
+                entry_id = _setup_term_id(dict(enumerate(files, 1)), prompt='File number')
+                files.pop(entry_id - 1)
+            continue
+        try:
+            file = _config.validate_ignored_file(ask('File'))
+        except PubanonError as error:
+            print(diagnostic(error))
+            continue
+        if file not in files:
+            files.append(file)
 
 
 def _setup_terms_from_scratch() -> tuple[str, ...]:
@@ -212,7 +290,10 @@ def _setup_validate(config: _config.GlobalConfig) -> _config.GlobalConfig:
             'anon_name': config.anon_name,
             'anon_email': config.anon_email,
             'sensitive_terms': list(config.sensitive_terms),
+            'ignored_directories': list(config.ignored_directories),
+            'ignored_files': list(config.ignored_files),
             'accounts': dict(config.accounts),
+            'default_publication_route': config.default_publication_route,
         }
     )
 
@@ -308,7 +389,15 @@ def _setup_edit_terms(config: _config.GlobalConfig) -> _config.GlobalConfig:
 
 def _setup_edit(config: _config.GlobalConfig) -> _config.GlobalConfig:
     """Edit one selected setup section while preserving the other values."""
-    action = ask('Edit:', choices=['identity', 'terms', 'account', 'back'])
+    action = ask(
+        'Edit:', choices=['identity', 'terms', 'account', 'route', 'directories', 'files', 'back']
+    )
+    if action in {'files', 'directories'}:
+        editor = {'files': _setup_edit_files, 'directories': _setup_edit_directories}[action]
+        updated = editor(config)
+        if updated != config:
+            output(f'Changing ignored {action} invalidates retained snapshots.', kind='warning')
+        return updated
     if action == 'identity':
         return _setup_identity(config, ('anon_name', 'anon_email'), preserve_blank=True)
     if action == 'terms':
@@ -323,6 +412,10 @@ def _setup_edit(config: _config.GlobalConfig) -> _config.GlobalConfig:
             output('Changing the expected account invalidates retained snapshots.', kind='warning')
             print('Authentication and destination checks will run again.')
         return updated
+    if action == 'route':
+        return replace(
+            config, default_publication_route=_setup_route(config.default_publication_route)
+        )
     return config
 
 
@@ -331,13 +424,13 @@ def _setup_verify_saved(paths: _config.Paths, config: _config.GlobalConfig) -> N
     try:
         _check_global_identity(paths, config)
         _check_setup_account(config.accounts['github'], _host.authenticated_account())
-    except OperationCancelled as error:
+    except OperationCanceled as error:
         saved = 'configuration was saved; the saved configuration was retained'
         error.fact = f'{error.fact}; {saved}' if error.fact else saved
         raise
     except KeyboardInterrupt:
-        raise OperationCancelled(
-            'setup cancelled',
+        raise OperationCanceled(
+            'Canceled.',
             fact='configuration was saved; the saved configuration was retained',
             recovery='rerun pubanon setup',
         ) from None
@@ -377,9 +470,7 @@ def _setup_save_loop(
         _setup_review(config, saved_original)
         action = ask('Save this configuration?', choices=['save', 'edit', 'cancel'])
         if action == 'cancel':
-            raise OperationCancelled(
-                'setup cancelled', fact='nothing was saved', recovery='rerun pubanon setup'
-            )
+            raise OperationCanceled('Canceled. Nothing was saved.', recovery='rerun pubanon setup')
         if action == 'edit':
             config = _setup_edit(config)
             continue
@@ -394,7 +485,7 @@ def _setup_save_loop(
             account_verified = True
         _config.save_global(paths, config, original)
         _setup_verify_saved(paths, config)
-        output('Saved.', kind='success')
+        output('Saved your configuration.', kind='success')
         return
 
 
@@ -403,7 +494,7 @@ def _setup_locked(paths: _config.Paths, *, edit: bool = False) -> None:
     config, original = _read_setup(paths)
     if config is not None:
         _filesystem.chmod(paths.global_config, 0o600)
-        if not edit:
+        if not edit and config.accounts['github']:
             _check_global_identity(paths, config)
             _setup_expected_account(config)
             print(
@@ -429,7 +520,8 @@ def _setup_locked(paths: _config.Paths, *, edit: bool = False) -> None:
             'then leave blank to finish:'
         )
         terms = _setup_terms_from_scratch()
-        config = _config.GlobalConfig(name, email, {'github': ''}, terms)
+        route = _setup_route('staged')
+        config = _config.GlobalConfig(name, email, {'github': ''}, terms, route)
     initial = config
     _setup_save_loop(paths, initial, config, original)
 
@@ -438,10 +530,7 @@ def doctor() -> None:
     """Validate configuration, publication identity, and authenticated account."""
     paths = _config.derive_paths(os.environ)
     _check_global_readiness(paths, _config.load_global(paths))
-    output(
-        'Pubanon configuration and GitHub authentication are ready.',
-        kind='success',
-    )
+    output('Your configuration and GitHub login are ready.', kind='success')
 
 
 def setup(*, edit: bool = False) -> None:
@@ -454,35 +543,30 @@ def setup(*, edit: bool = False) -> None:
                 _setup_locked(paths, edit=True)
             else:
                 _setup_locked(paths)
-    except OperationCancelled as error:
+    except OperationCanceled as error:
         if error.recovery is None or error.recovery == 'rerun pubanon setup':
             error.recovery = (
                 'rerun pubanon setup; any completed GitHub authentication remains in effect'
             )
         raise
     except PubanonError as error:
-        if str(error) == 'setup cancelled':
+        if str(error) == 'setup canceled':
             error.recovery = (
                 'rerun pubanon setup; any completed GitHub authentication remains in effect'
             )
         raise
     except KeyboardInterrupt:
-        raise OperationCancelled(
-            'setup cancelled',
+        raise OperationCanceled(
+            'Canceled.',
             recovery='rerun pubanon setup; any completed GitHub authentication remains in effect',
         ) from None
     except EOFError:
         raise PubanonError(
-            'setup cancelled',
+            'setup canceled',
             recovery='rerun pubanon setup; any completed GitHub authentication remains in effect',
         ) from None
     except (OSError, RuntimeError):
         raise PubanonError(
             'cannot complete global setup', recovery='rerun pubanon setup'
         ) from None
-    output(
-        'Global configuration, runtime requirements, and GitHub account are ready.',
-        kind='success',
-    )
-    output('Run initialization from your source repository.')
-    next_step('pubanon init')
+    next_step('run pubanon init in your source repository')

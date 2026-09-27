@@ -13,7 +13,8 @@ import pytest
 
 from pubanon import _config, _filesystem, _locking
 from pubanon._errors import PubanonError
-from pubanon._gate import GateHit, RuleClass
+from pubanon._gate import GateHit, RuleClass, gate_unit
+from pubanon._policy import evaluate_membership
 from pubanon._terminal import escape
 from pubanon._toml import toml_string
 from tests._permissions import assert_private_mode
@@ -83,6 +84,8 @@ def _project_config(
             issues=True,
             wiki=False,
             projects=True,
+            pull_requests=False,
+            discussions=False,
         ),
     )
 
@@ -102,9 +105,11 @@ def _project_toml(source_path: Path, *, settings: bool = True) -> str:
         'hygiene_terms = ["internal-marker"]\n'
         'self_publication = false\n'
         'required_checks = ["test"]\n'
+        'publication_route = "staged"\n'
         + (
             'settings = { description = "Published project", default_branch = "main", '
-            'issues = true, wiki = false, projects = true }\n'
+            'issues = true, wiki = false, projects = true, '
+            'pull_requests = false, discussions = false }\n'
             if settings
             else ''
         )
@@ -126,6 +131,7 @@ def _write_global_config(
         f'anon_name = {toml_string(anon_name)}\n'
         f'anon_email = {toml_string(anon_email)}\n'
         f'sensitive_terms = [{rendered_terms}]\n'
+        'default_publication_route = "staged"\n'
         '[accounts]\n'
         'github = "anonymous-account"\n'
     )
@@ -229,6 +235,7 @@ def test_configuration_loads_use_explicit_utf8(
         'anon_name = "Public Name"\n'
         'anon_email = "public@example.invalid"\n'
         'sensitive_terms = ["Jos\u00e9"]\n'
+        'default_publication_route = "staged"\n'
         '[accounts]\n'
         'github = "anonymous-account"\n',
         encoding='utf-8',
@@ -453,6 +460,8 @@ def test_fingerprint_excludes_new_non_governing_project_fields(tmp_path: Path) -
             issues=True,
             wiki=False,
             projects=True,
+            pull_requests=False,
+            discussions=False,
         ),
         acknowledged_exposure='a' * 64,
         package=_config.PackageObservation(
@@ -461,7 +470,7 @@ def test_fingerprint_excludes_new_non_governing_project_fields(tmp_path: Path) -
             release_checks=('test',),
         ),
         workflows={
-            'release': ('prepare', 'inspect', 'publish', 'watch package'),
+            'release': ('prepare', 'inspect', 'publish', 'package watch'),
         },
     )
 
@@ -495,11 +504,20 @@ def test_fingerprint_matches_exact_projection_serialization(tmp_path: Path) -> N
 
     # The serialized source path uses each platform's native separators.
     expected = (
-        '2d37aeee070634a71cd340e093450b4b6b8e152d367926def6bf37d696fdf861'
+        '3eaaa4c286171c205f262d4cebb888da6647c21a5d9c536bc060962f2d7dbf4c'
         if os.name == 'nt'
-        else 'e49eedd085a79528a4a32943fd046beea3979ace0abcfb48adbfa7b56ae0bfa3'
+        else '40fa4558c1b43ebc4ddc10cd3930b4eea516f952d57592f87f87408216975806'
     )
     assert _config.fingerprint(_global_config(), project) == expected
+
+    assert (
+        _config.fingerprint(replace(_global_config(), default_publication_route='direct'), project)
+        == expected
+    )
+    assert (
+        _config.fingerprint(_global_config(), replace(project, publication_route='direct'))
+        == expected
+    )
 
 
 def test_gate_host_coordinates_reports_current_derived_terms(
@@ -525,7 +543,9 @@ def test_gate_host_coordinates_reports_current_derived_terms(
 
     monkeypatch.setattr(_config, 'derived_private_terms', _derived_terms)
 
-    with pytest.raises(PubanonError, match='repository repo failed content gates') as exc_info:
+    with pytest.raises(
+        PubanonError, match='repository name did not pass content checks'
+    ) as exc_info:
         _config.gate_host_coordinates(
             paths, global_config, project, coordinates=(project.owner, project.repo)
         )
@@ -533,16 +553,75 @@ def test_gate_host_coordinates_reports_current_derived_terms(
     assert term in exc_info.value.render()
 
 
+def test_global_directory_names_are_literal_and_root_relative() -> None:
+    config = replace(_global_config(), ignored_directories=('docs/private[1]',))
+    paths = [
+        'DOCS/Private[1]',
+        'Docs/PRIVATE[1]/nested/file',
+        'docs/private1/file',
+        'nested/docs/private[1]/file',
+    ]
+    membership = evaluate_membership(paths, ('**',), (), global_deny=_config.global_deny(config))
+    assert membership.denied == paths[:2]
+    assert membership.allowed == paths[2:]
+
+
 def test_global_from_mapping_refuses_unknown_account_adapter() -> None:
     data: dict[str, object] = {
         'anon_name': 'Public Name',
         'anon_email': 'public@example.invalid',
         'sensitive_terms': ['private-term'],
+        'default_publication_route': 'staged',
         'accounts': {'github': 'public-account', 'other': 'private-account'},
     }
 
     with pytest.raises(PubanonError, match='unknown account adapter key: other'):
         _config.global_from_mapping(data)
+
+
+def test_global_ignored_directories_round_trip_and_invalidate_snapshots(tmp_path: Path) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    original = _global_config()
+    updated = replace(original, ignored_directories=('docs/private', 'notes/confidential'))
+    _config.save_global(paths, updated, None)
+    assert _config.load_global(paths) == updated
+    project = _project_config(tmp_path)
+    assert _config.fingerprint(original, project) != _config.fingerprint(updated, project)
+
+
+def test_global_ignored_files_match_names_and_exact_paths(tmp_path: Path) -> None:
+    original = _global_config()
+    config = replace(
+        original, ignored_files=('local.MD', 'notes/private[1].txt', 'Stra\u00dfe.md')
+    )
+    paths = [
+        'LOCAL.md',
+        'nested/Local.md',
+        'NOTES/Private[1].TXT',
+        'nested/STRASSE.MD',
+        'nested/notes/private[1].txt',
+        'notes/private1.txt',
+        'LOCAL.md.bak',
+    ]
+    membership = evaluate_membership(paths, ('**',), (), global_deny=_config.global_deny(config))
+    assert membership.denied == paths[:4]
+    assert membership.allowed == paths[4:]
+    storage = _config.derive_paths({'HOME': str(tmp_path)})
+    _config.save_global(storage, config, None)
+    assert _config.load_global(storage) == config
+    project = _project_config(tmp_path)
+    assert _config.fingerprint(original, project) != _config.fingerprint(config, project)
+
+
+@pytest.mark.parametrize('route', ['direct', 'staged'])
+def test_global_publication_route_round_trips(tmp_path: Path, route: str) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    config = replace(_global_config(), default_publication_route=route)
+
+    _config.save_global(paths, config, None)
+
+    assert _config.load_global(paths) == config
+    assert f'default_publication_route = "{route}"\n' in paths.global_config.read_text()
 
 
 def test_held_project_lock_does_not_render_sensitive_project_name(tmp_path: Path) -> None:
@@ -602,32 +681,6 @@ def test_identity_refusal_names_sources_and_joined_recovery() -> None:
         'remove the value from sensitive_terms or choose another publication identity; '
         'choose a publication identity that does not contain a private path'
     )
-
-
-@pytest.mark.parametrize(
-    ('hits', 'expected'),
-    [
-        ([_identity_hit('global-term')], ('sensitive_terms',)),
-        ([_identity_hit('project-term')], ('extra_terms',)),
-        ([_identity_hit('/home/private')], ('private path',)),
-        ([_identity_hit('draft', RuleClass.HYGIENE)], ('hygiene term',)),
-        (
-            [
-                _identity_hit('draft', RuleClass.HYGIENE),
-                _identity_hit('/home/private'),
-                _identity_hit('global-term'),
-                _identity_hit('global-term'),
-            ],
-            ('sensitive_terms', 'private path', 'hygiene term'),
-        ),
-        ([_identity_hit('shared-term')], ('sensitive_terms', 'extra_terms')),
-    ],
-)
-def test_identity_rule_sources_names_each_source_once_in_order(
-    hits: list[GateHit], expected: tuple[str, ...]
-) -> None:
-    g, p = _identity_configs()
-    assert _config.identity_rule_sources(hits, g, p, ('/home/private',)) == expected
 
 
 def test_identity_rule_sources_without_project_uses_global_and_derived_terms() -> None:
@@ -730,6 +783,7 @@ def test_load_global_reads_exact_schema(tmp_path: Path) -> None:
         'anon_name = "Public Name"\n'
         'anon_email = "public@example.invalid"\n'
         'sensitive_terms = ["Real Name", "real@example.test"]\n'
+        'default_publication_route = "staged"\n'
         '[accounts]\n'
         'github = "anonymous-account"\n'
     )
@@ -766,31 +820,6 @@ def test_load_global_refuses_invalid_utf8_with_usable_path(tmp_path: Path) -> No
     assert escape(str(paths.global_config)) in error.value.render()
 
 
-@pytest.mark.parametrize(
-    ('content', 'match'),
-    [
-        ('anon_name = [\n', 'invalid'),
-        (
-            (
-                'anon_name = "Public Name"\nanon_email = "public@example.invalid"\n'
-                'sensitive_terms = []\n[accounts]\n'
-            ),
-            'github',
-        ),
-    ],
-)
-def test_load_global_refuses_malformed_or_incomplete_schema(
-    tmp_path: Path, content: str, match: str
-) -> None:
-
-    paths = _config.derive_paths({'HOME': str(tmp_path)})
-    paths.config_dir.mkdir(parents=True)
-    paths.global_config.write_text(content)
-
-    with pytest.raises(PubanonError, match=match):
-        _config.load_global(paths)
-
-
 def test_load_global_refuses_unknown_adapter(tmp_path: Path) -> None:
 
     paths = _config.derive_paths({'HOME': str(tmp_path)})
@@ -799,6 +828,7 @@ def test_load_global_refuses_unknown_adapter(tmp_path: Path) -> None:
         'anon_name = "Public Name"\n'
         'anon_email = "public@example.invalid"\n'
         'sensitive_terms = []\n'
+        'default_publication_route = "staged"\n'
         '[accounts]\n'
         'github = "anonymous-account"\n'
         'gitlab = "wrong-adapter"\n'
@@ -816,6 +846,7 @@ def test_load_global_refuses_unknown_key_and_names_it(tmp_path: Path) -> None:
         'anon_name = "Public Name"\n'
         'anon_email = "public@example.invalid"\n'
         'sensitive_terms = []\n'
+        'default_publication_route = "staged"\n'
         'unexpected = true\n'
         '[accounts]\n'
         'github = "anonymous-account"\n'
@@ -823,18 +854,6 @@ def test_load_global_refuses_unknown_key_and_names_it(tmp_path: Path) -> None:
 
     with pytest.raises(PubanonError, match='unexpected'):
         _config.load_global(paths)
-
-
-@pytest.mark.parametrize(
-    'value',
-    ['', ' name', 'name ', 'a<b', 'a>b', 'line\rbreak', 'tab\there', '\u00a0lead'],
-)
-def test_load_global_refuses_unstable_identity(tmp_path: Path, value: str) -> None:
-    paths = _write_global_config(tmp_path, anon_name=value)
-    with pytest.raises(PubanonError) as excinfo:
-        _config.load_global(paths)
-    message = str(excinfo.value).removeprefix('anon_name ')
-    assert not value or value not in message
 
 
 def test_load_global_refuses_wrong_value_type(tmp_path: Path) -> None:
@@ -845,12 +864,45 @@ def test_load_global_refuses_wrong_value_type(tmp_path: Path) -> None:
         'anon_name = 3\n'
         'anon_email = "public@example.invalid"\n'
         'sensitive_terms = []\n'
+        'default_publication_route = "staged"\n'
         '[accounts]\n'
         'github = "anonymous-account"\n'
     )
 
     with pytest.raises(PubanonError, match='anon_name'):
         _config.load_global(paths)
+
+
+@pytest.mark.parametrize('value', ['"other"', '3', 'true'])
+def test_load_global_rejects_invalid_publication_route(tmp_path: Path, value: str) -> None:
+    paths = _write_global_config(tmp_path)
+    content = paths.global_config.read_text().replace(
+        'default_publication_route = "staged"', f'default_publication_route = {value}'
+    )
+    paths.global_config.write_text(content)
+
+    with pytest.raises(PubanonError, match='default_publication_route'):
+        _config.load_global(paths)
+
+
+def test_load_global_requires_publication_route(tmp_path: Path) -> None:
+    paths = _write_global_config(tmp_path)
+    content = paths.global_config.read_text().replace('default_publication_route = "staged"\n', '')
+    paths.global_config.write_text(content)
+
+    with pytest.raises(
+        PubanonError, match='missing global configuration key: default_publication_route'
+    ):
+        _config.load_global(paths)
+
+
+def test_load_project_defaults_missing_source_tags_to_false(tmp_path: Path) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    project_file = paths.config_dir / 'projects' / 'demo.toml'
+    project_file.parent.mkdir(parents=True)
+    project_file.write_text(_project_toml(tmp_path / 'source'))
+
+    assert _config.load_project(paths, 'demo').source_tags is False
 
 
 def test_load_project_defaults_other_optional_fields(tmp_path: Path) -> None:
@@ -887,8 +939,10 @@ def test_load_project_reads_exact_schema(tmp_path: Path) -> None:
         'hygiene_terms = ["internal-marker"]\n'
         'self_publication = false\n'
         'required_checks = ["test"]\n'
+        'publication_route = "staged"\n'
         'settings = { description = "Published project", default_branch = "main", '
-        'issues = true, wiki = false, projects = true }\n'
+        'issues = true, wiki = false, projects = true, '
+        'pull_requests = false, discussions = false }\n'
     )
 
     assert _config.load_project(paths, 'demo') == _config.ProjectConfig(
@@ -911,6 +965,8 @@ def test_load_project_reads_exact_schema(tmp_path: Path) -> None:
             issues=True,
             wiki=False,
             projects=True,
+            pull_requests=False,
+            discussions=False,
         ),
     )
 
@@ -979,28 +1035,6 @@ def test_load_project_refuses_empty_workflow_name(tmp_path: Path) -> None:
         _config.load_project(paths, 'demo')
 
 
-@pytest.mark.parametrize(
-    ('stages', 'problem'),
-    [
-        ('["prepare", "future"]', 'future'),
-        ('["prepare", "prepare"]', 'prepare'),
-        ('["inspect", "prepare"]', 'prepare'),
-    ],
-)
-def test_load_project_refuses_invalid_workflow_stage_and_names_entry(
-    tmp_path: Path, stages: str, problem: str
-) -> None:
-    paths = _config.derive_paths({'HOME': str(tmp_path)})
-    project_file = paths.config_dir / 'projects' / 'demo.toml'
-    project_file.parent.mkdir(parents=True)
-    project_file.write_text(
-        _project_toml(tmp_path / 'source') + f'[workflow.release]\nstages = {stages}\n'
-    )
-
-    with pytest.raises(PubanonError, match=rf'workflow release.*{problem}'):
-        _config.load_project(paths, 'demo')
-
-
 def test_load_project_refuses_missing_settings_key(tmp_path: Path) -> None:
     paths = _config.derive_paths({'HOME': str(tmp_path)})
     project_file = paths.config_dir / 'projects' / 'demo.toml'
@@ -1011,6 +1045,8 @@ def test_load_project_refuses_missing_settings_key(tmp_path: Path) -> None:
         'default_branch = "main"\n'
         'issues = true\n'
         'wiki = false\n'
+        'pull_requests = false\n'
+        'discussions = false\n'
     )
 
     with pytest.raises(PubanonError, match='missing settings key: projects'):
@@ -1036,8 +1072,10 @@ def test_load_project_refuses_relative_source_path(tmp_path: Path) -> None:
         'owner = "account"\nrepo = "repo"\nvisibility = "public"\n'
         'allow = []\ndeny = []\nsecret_exceptions = []\nextra_terms = []\n'
         'hygiene_terms = []\nself_publication = false\nrequired_checks = []\n'
+        'publication_route = "staged"\n'
         'settings = { description = "Published project", default_branch = "main", '
-        'issues = true, wiki = false, projects = true }\n'
+        'issues = true, wiki = false, projects = true, '
+        'pull_requests = false, discussions = false }\n'
     )
 
     with pytest.raises(PubanonError, match='source_path'):
@@ -1050,7 +1088,7 @@ def test_load_project_refuses_stage_repo_containing_slash(tmp_path: Path) -> Non
     project_file.parent.mkdir(parents=True)
     project_file.write_text(_project_toml(tmp_path / 'source') + 'stage_repo = "nested/stage"\n')
 
-    with pytest.raises(PubanonError, match=r'stage_repo.*host coordinate segment'):
+    with pytest.raises(PubanonError, match='invalid staging repository name'):
         _config.load_project(paths, 'demo')
 
 
@@ -1086,6 +1124,7 @@ def test_load_project_refuses_unknown_key_and_names_it(tmp_path: Path) -> None:
         'host = "github"\nowner = "account"\nrepo = "repo"\nvisibility = "public"\n'
         'allow = []\ndeny = []\nsecret_exceptions = []\nextra_terms = []\n'
         'hygiene_terms = []\nself_publication = false\nrequired_checks = []\n'
+        'publication_route = "staged"\n'
         'surprise = "no"\n'
     )
 
@@ -1104,10 +1143,257 @@ def test_load_project_refuses_unknown_settings_key_and_names_it(tmp_path: Path) 
         'issues = true\n'
         'wiki = false\n'
         'projects = true\n'
+        'pull_requests = false\n'
+        'discussions = false\n'
         'surprise = true\n'
     )
 
     with pytest.raises(PubanonError, match='unknown settings key: surprise'):
+        _config.load_project(paths, 'demo')
+
+
+def test_load_project_refuses_unsupported_package_index(tmp_path: Path) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    project_file = paths.config_dir / 'projects' / 'demo.toml'
+    project_file.parent.mkdir(parents=True)
+    project_file.write_text(
+        _project_toml(tmp_path / 'source') + '[package]\n'
+        'index = "other"\n'
+        'name = "public-package"\n'
+        'release_checks = ["test"]\n'
+    )
+
+    with pytest.raises(PubanonError, match=r'index.*pypi'):
+        _config.load_project(paths, 'demo')
+
+
+def test_load_project_rejects_non_boolean_source_tags(tmp_path: Path) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    project_file = paths.config_dir / 'projects' / 'demo.toml'
+    project_file.parent.mkdir(parents=True)
+    project_file.write_text(_project_toml(tmp_path / 'source') + 'source_tags = "yes"\n')
+
+    with pytest.raises(PubanonError, match='source_tags'):
+        _config.load_project(paths, 'demo')
+
+
+@pytest.mark.parametrize('missing', ['pull_requests', 'discussions'])
+def test_load_project_requires_new_settings_keys(tmp_path: Path, missing: str) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    project_file = paths.config_dir / 'projects' / 'demo.toml'
+    project_file.parent.mkdir(parents=True)
+    settings = {'pull_requests': 'false', 'discussions': 'false'}
+    del settings[missing]
+    project_file.write_text(
+        _project_toml(tmp_path / 'source', settings=False)
+        + '[settings]\n'
+        + 'description = "Published project"\n'
+        + 'default_branch = "main"\n'
+        + 'issues = true\nwiki = false\nprojects = true\n'
+        + ''.join(f'{key} = {value}\n' for key, value in settings.items())
+    )
+
+    with pytest.raises(PubanonError, match=f'missing settings key: {missing}'):
+        _config.load_project(paths, 'demo')
+
+
+def test_load_project_requires_publication_route(tmp_path: Path) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    project_file = paths.config_dir / 'projects' / 'demo.toml'
+    project_file.parent.mkdir(parents=True)
+    project_file.write_text(
+        _project_toml(tmp_path / 'source').replace('publication_route = "staged"\n', '')
+    )
+
+    with pytest.raises(PubanonError, match='missing project configuration key: publication_route'):
+        _config.load_project(paths, 'demo')
+
+
+def test_project_dirs_are_owner_only_under_permissive_umask(tmp_path: Path) -> None:
+    previous = os.umask(0o022)
+    try:
+        paths = _config.derive_paths({'HOME': str(tmp_path / 'fresh')})
+        with _config.project_lock(paths, 'proj'):
+            pass
+        for level in (
+            paths.data_dir,
+            paths.data_dir / 'projects',
+            paths.data_dir / 'projects' / 'proj',
+        ):
+            assert_private_mode(level, 0o700)
+    finally:
+        os.umask(previous)
+
+
+def test_project_lock_emits_no_encoding_warning(tmp_path: Path) -> None:
+    env = dict(os.environ)
+    env['PYTHONPATH'] = str(Path(__file__).parents[1] / 'src')
+    script = (
+        'from pubanon import _config, _filesystem, _locking\n'
+        f'paths = _config.derive_paths({{"HOME": {str(tmp_path)!r}}})\n'
+        'with _config.project_lock(paths, "proj"):\n'
+        '    pass\n'
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            '-X',
+            'warn_default_encoding',
+            '-W',
+            'error::EncodingWarning',
+            '-c',
+            script,
+        ],
+        capture_output=True,
+        check=False,
+        env=env,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize('route', ['direct', 'staged'])
+def test_project_publication_route_round_trips(tmp_path: Path, route: str) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    project = replace(_project_config(tmp_path), publication_route=route)
+
+    _config.save_project(paths, project)
+
+    assert _config.load_project(paths, project.name) == project
+    assert (
+        f'publication_route = "{route}"\n'
+        in (paths.config_dir / 'projects' / 'demo.toml').read_text()
+    )
+
+
+def test_project_settings_round_trip_pull_requests_and_discussions(tmp_path: Path) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    original = _project_config(tmp_path)
+    assert original.settings is not None
+    project = replace(
+        original,
+        settings=replace(original.settings, pull_requests=True, discussions=False),
+    )
+
+    _config.save_project(paths, project)
+
+    assert _config.load_project(paths, project.name) == project
+    text = (paths.config_dir / 'projects' / 'demo.toml').read_text()
+    assert 'projects = true\npull_requests = true\ndiscussions = false\n' in text
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_project_source_tags_round_trip(tmp_path: Path, enabled: bool) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    project = replace(_project_config(tmp_path), source_tags=enabled)
+
+    _config.save_project(paths, project)
+
+    assert _config.load_project(paths, project.name) == project
+    assert (
+        f'source_tags = {str(enabled).lower()}\n'
+        in (paths.config_dir / 'projects' / 'demo.toml').read_text()
+    )
+
+
+@pytest.mark.parametrize('value', ['"other"', '3', 'true'])
+def test_load_project_rejects_invalid_publication_route(tmp_path: Path, value: str) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    project_file = paths.config_dir / 'projects' / 'demo.toml'
+    project_file.parent.mkdir(parents=True)
+    project_file.write_text(
+        _project_toml(tmp_path / 'source').replace(
+            'publication_route = "staged"', f'publication_route = {value}'
+        )
+    )
+
+    with pytest.raises(PubanonError, match='publication_route'):
+        _config.load_project(paths, 'demo')
+
+
+@pytest.mark.parametrize(
+    ('hits', 'expected'),
+    [
+        ([_identity_hit('global-term')], ('sensitive_terms',)),
+        ([_identity_hit('project-term')], ('extra_terms',)),
+        ([_identity_hit('/home/private')], ('private path',)),
+        ([_identity_hit('draft', RuleClass.HYGIENE)], ('hygiene term',)),
+        (
+            [
+                _identity_hit('draft', RuleClass.HYGIENE),
+                _identity_hit('/home/private'),
+                _identity_hit('global-term'),
+                _identity_hit('global-term'),
+            ],
+            ('sensitive_terms', 'private path', 'hygiene term'),
+        ),
+        ([_identity_hit('shared-term')], ('sensitive_terms', 'extra_terms')),
+    ],
+)
+def test_identity_rule_sources_names_each_source_once_in_order(
+    hits: list[GateHit], expected: tuple[str, ...]
+) -> None:
+    g, p = _identity_configs()
+    assert _config.identity_rule_sources(hits, g, p, ('/home/private',)) == expected
+
+
+@pytest.mark.parametrize(
+    ('content', 'match'),
+    [
+        ('anon_name = [\n', 'invalid'),
+        (
+            (
+                'anon_name = "Public Name"\nanon_email = "public@example.invalid"\n'
+                'sensitive_terms = []\ndefault_publication_route = "staged"\n[accounts]\n'
+            ),
+            'github',
+        ),
+    ],
+)
+def test_load_global_refuses_malformed_or_incomplete_schema(
+    tmp_path: Path, content: str, match: str
+) -> None:
+
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    paths.config_dir.mkdir(parents=True)
+    paths.global_config.write_text(content)
+
+    with pytest.raises(PubanonError, match=match):
+        _config.load_global(paths)
+
+
+@pytest.mark.parametrize(
+    'value',
+    ['', ' name', 'name ', 'a<b', 'a>b', 'line\rbreak', 'tab\there', '\u00a0lead'],
+)
+def test_load_global_refuses_unstable_identity(tmp_path: Path, value: str) -> None:
+    paths = _write_global_config(tmp_path, anon_name=value)
+    with pytest.raises(PubanonError) as excinfo:
+        _config.load_global(paths)
+    message = str(excinfo.value).removeprefix('anon_name ')
+    assert not value or value not in message
+
+
+@pytest.mark.parametrize(
+    ('stages', 'problem'),
+    [
+        ('["prepare", "future"]', 'future'),
+        ('["prepare", "prepare"]', 'prepare'),
+        ('["inspect", "prepare"]', 'prepare'),
+    ],
+)
+def test_load_project_refuses_invalid_workflow_stage_and_names_entry(
+    tmp_path: Path, stages: str, problem: str
+) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    project_file = paths.config_dir / 'projects' / 'demo.toml'
+    project_file.parent.mkdir(parents=True)
+    project_file.write_text(
+        _project_toml(tmp_path / 'source') + f'[workflow.release]\nstages = {stages}\n'
+    )
+
+    with pytest.raises(PubanonError, match=rf'workflow release.*{problem}'):
         _config.load_project(paths, 'demo')
 
 
@@ -1140,7 +1426,14 @@ def test_load_project_refuses_unsafe_host_segments(
         error = 'invalid project configuration'
     else:
         rendered_value = toml_string(value)
-        error = f'{field}.*host coordinate segment'
+        error = (
+            'invalid '
+            + {
+                'owner': 'GitHub owner',
+                'repo': 'repository name',
+                'stage_repo': 'staging repository name',
+            }[field]
+        )
     if field == 'stage_repo':
         text += f'stage_repo = {rendered_value}\n'
     else:
@@ -1179,43 +1472,14 @@ def test_load_project_refuses_unsupported_enum_value(
         ''.join(f'{key} = {toml_string(item)}\n' for key, item in project.items())
         + 'allow = []\ndeny = []\nsecret_exceptions = []\nextra_terms = []\n'
         'hygiene_terms = []\nself_publication = false\nrequired_checks = []\n'
+        'publication_route = "staged"\n'
         'settings = { description = "Published project", default_branch = "main", '
-        'issues = true, wiki = false, projects = true }\n'
+        'issues = true, wiki = false, projects = true, '
+        'pull_requests = false, discussions = false }\n'
     )
 
     with pytest.raises(PubanonError, match=field):
         _config.load_project(paths, 'demo')
-
-
-def test_load_project_refuses_unsupported_package_index(tmp_path: Path) -> None:
-    paths = _config.derive_paths({'HOME': str(tmp_path)})
-    project_file = paths.config_dir / 'projects' / 'demo.toml'
-    project_file.parent.mkdir(parents=True)
-    project_file.write_text(
-        _project_toml(tmp_path / 'source') + '[package]\n'
-        'index = "other"\n'
-        'name = "public-package"\n'
-        'release_checks = ["test"]\n'
-    )
-
-    with pytest.raises(PubanonError, match=r'index.*pypi'):
-        _config.load_project(paths, 'demo')
-
-
-def test_project_dirs_are_owner_only_under_permissive_umask(tmp_path: Path) -> None:
-    previous = os.umask(0o022)
-    try:
-        paths = _config.derive_paths({'HOME': str(tmp_path / 'fresh')})
-        with _config.project_lock(paths, 'proj'):
-            pass
-        for level in (
-            paths.data_dir,
-            paths.data_dir / 'projects',
-            paths.data_dir / 'projects' / 'proj',
-        ):
-            assert_private_mode(level, 0o700)
-    finally:
-        os.umask(previous)
 
 
 @pytest.mark.parametrize('field', ['owner', 'repo', 'stage_repo'])
@@ -1227,34 +1491,6 @@ def test_project_host_segments_round_trip(field: str, tmp_path: Path) -> None:
     _config.save_project(paths, project)
 
     assert _config.load_project(paths, project.name) == project
-
-
-def test_project_lock_emits_no_encoding_warning(tmp_path: Path) -> None:
-    env = dict(os.environ)
-    env['PYTHONPATH'] = str(Path(__file__).parents[1] / 'src')
-    script = (
-        'from pubanon import _config, _filesystem, _locking\n'
-        f'paths = _config.derive_paths({{"HOME": {str(tmp_path)!r}}})\n'
-        'with _config.project_lock(paths, "proj"):\n'
-        '    pass\n'
-    )
-    completed = subprocess.run(
-        [
-            sys.executable,
-            '-X',
-            'warn_default_encoding',
-            '-W',
-            'error::EncodingWarning',
-            '-c',
-            script,
-        ],
-        capture_output=True,
-        check=False,
-        env=env,
-        text=True,
-    )
-
-    assert completed.returncode == 0, completed.stderr
 
 
 @pytest.mark.parametrize('name', ['publications', 'source-worktrees', 'rewrite', 'rewrite.toml'])
@@ -1488,6 +1724,19 @@ def test_registry_lookup_without_state_is_read_only(tmp_path: Path) -> None:
     assert not paths.data_dir.exists()
     assert not paths.registry.exists()
     assert not lock_path.exists()
+
+
+def test_registry_remove_keeps_other_projects_and_removes_all_matching_sources(
+    tmp_path: Path,
+) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    _config.create_data_dirs(paths, None)
+    paths.registry.write_text(json.dumps({'/first': 'demo', '/second': 'demo', '/other': 'other'}))
+    assert _config.registry_source(paths, 'demo') == '/first'
+    assert _config.registry_remove(paths, 'demo')
+    assert json.loads(paths.registry.read_text()) == {'/other': 'other'}
+    assert _config.registry_source(paths, 'demo') is None
+    assert not _config.registry_remove(paths, 'demo')
 
 
 def test_registry_save_syncs_file_replaces_and_syncs_directory(
@@ -1754,7 +2003,7 @@ def test_save_global_directory_fsync_failure_reports_possible_save(
         _config.save_global(paths, updated, original)
 
     assert exc_info.value.render() == (
-        'error: global configuration may have been saved\nrecovery: rerun pubanon setup'
+        'error: global configuration may have been saved\n\nNext: rerun pubanon setup'
     )
     assert fsync_calls == 2
     assert _config.load_global(paths) == updated
@@ -1813,7 +2062,7 @@ def test_save_global_keyboard_interrupt_after_replace_reports_possible_save(
         _save_after_replace()
 
     assert exc_info.value.render() == (
-        'error: global configuration may have been saved\nrecovery: rerun pubanon setup'
+        'error: global configuration may have been saved\n\nNext: rerun pubanon setup'
     )
     assert _config.load_global(paths) == updated
     assert list(paths.config_dir.glob('.global-*.tmp')) == []
@@ -1893,6 +2142,16 @@ def test_save_global_refuses_invalid_config_before_filesystem_change(tmp_path: P
 
     with pytest.raises(PubanonError, match='sensitive_terms'):
         _config.save_global(paths, invalid, None)
+
+    assert not paths.config_dir.exists()
+
+
+def test_save_global_rejects_invalid_publication_route(tmp_path: Path) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    config = replace(_global_config(), default_publication_route='other')
+
+    with pytest.raises(PubanonError, match='default_publication_route'):
+        _config.save_global(paths, config, None)
 
     assert not paths.config_dir.exists()
 
@@ -2079,6 +2338,7 @@ def test_save_project_refuses_blank_terms_without_changing_file(
         ('host', 'gitlab'),
         ('allow', cast('tuple[str, ...]', ['src/**'])),
         ('self_publication', cast('bool', 1)),
+        ('source_tags', cast('bool', 'yes')),
     ],
 )
 def test_save_project_refuses_invalid_schema(tmp_path: Path, field: str, value: object) -> None:
@@ -2158,10 +2418,25 @@ def test_save_project_refuses_unsafe_host_segments(
     python_field = '_stage_repo' if field == 'stage_repo' else field
     project = replace(_project_config(tmp_path), **{python_field: value})
 
-    with pytest.raises(PubanonError, match=f'{field}.*host coordinate segment'):
+    label = {
+        'owner': 'GitHub owner',
+        'repo': 'repository name',
+        'stage_repo': 'staging repository name',
+    }[field]
+    with pytest.raises(PubanonError, match=f'invalid {label}'):
         _config.save_project(paths, project)
 
     assert not (paths.config_dir / 'projects' / 'demo.toml').exists()
+
+
+def test_save_project_rejects_invalid_publication_route(tmp_path: Path) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    project = replace(_project_config(tmp_path), publication_route='other')
+
+    with pytest.raises(PubanonError, match='publication_route'):
+        _config.save_project(paths, project)
+
+    assert not paths.config_dir.exists()
 
 
 def test_save_project_replace_failure_preserves_prior_bytes(
@@ -2196,6 +2471,8 @@ def test_save_project_round_trips_new_optional_fields(tmp_path: Path) -> None:
             issues=True,
             wiki=False,
             projects=True,
+            pull_requests=False,
+            discussions=False,
         ),
         acknowledged_exposure='b' * 64,
         package=_config.PackageObservation(
@@ -2204,8 +2481,8 @@ def test_save_project_round_trips_new_optional_fields(tmp_path: Path) -> None:
             release_checks=('test', 'build'),
         ),
         workflows={
-            'staged': ('prepare', 'stage push', 'watch ci --staged'),
-            'release': ('inspect', 'publish', 'repo reveal', 'watch package'),
+            'staged': ('prepare', 'stage push', 'stage watch'),
+            'release': ('inspect', 'publish', 'repo reveal', 'package watch'),
         },
     )
 
@@ -2221,8 +2498,8 @@ def test_save_project_round_trips_new_optional_fields(tmp_path: Path) -> None:
         'release_checks': ['test', 'build'],
     }
     assert saved['workflow'] == {
-        'staged': {'stages': ['prepare', 'stage push', 'watch ci --staged']},
-        'release': {'stages': ['inspect', 'publish', 'repo reveal', 'watch package']},
+        'staged': {'stages': ['prepare', 'stage push', 'stage watch']},
+        'release': {'stages': ['inspect', 'publish', 'repo reveal', 'package watch']},
     }
 
 
@@ -2277,6 +2554,8 @@ def test_save_project_round_trips_with_owner_only_permissions(tmp_path: Path) ->
             issues=True,
             wiki=False,
             projects=True,
+            pull_requests=False,
+            discussions=False,
         ),
     )
 
@@ -2390,6 +2669,8 @@ def test_settings_load_refuses_non_main_default_branch(tmp_path: Path) -> None:
         'issues = true\n'
         'wiki = false\n'
         'projects = true\n'
+        'pull_requests = false\n'
+        'discussions = false\n'
     )
 
     with pytest.raises(
@@ -2438,6 +2719,7 @@ def test_validate_host_segment_accepts_valid_single_segments(value: str) -> None
 @pytest.mark.parametrize(
     'value',
     [
+        pytest.param(None, id='not-text'),
         pytest.param('', id='empty'),
         pytest.param('two/segments', id='slash'),
         pytest.param('repo?query', id='query'),
@@ -2449,9 +2731,19 @@ def test_validate_host_segment_accepts_valid_single_segments(value: str) -> None
         pytest.param('trailing ', id='trailing-whitespace'),
     ],
 )
-def test_validate_host_segment_refuses_unsafe_values(value: str) -> None:
-    with pytest.raises(PubanonError, match='host coordinate segment'):
-        _config.validate_host_segment('repo', value)
+@pytest.mark.parametrize(
+    ('field', 'label'),
+    [
+        ('owner', 'GitHub owner'),
+        ('repo', 'repository name'),
+        ('stage_repo', 'staging repository name'),
+    ],
+)
+def test_validate_host_segment_refuses_unsafe_values(
+    value: object, field: str, label: str
+) -> None:
+    with pytest.raises(PubanonError, match=f'invalid {label}'):
+        _config.validate_host_segment(field, value)
 
 
 @pytest.mark.parametrize('value', ['', ' Alias', 'A<lias', 'Ali\x00as'])
@@ -2478,3 +2770,45 @@ def test_windows_project_name_accepts_non_alias(name: str) -> None:
 def test_windows_project_name_refuses_terminal_alias(name: str) -> None:
     with pytest.raises(PubanonError, match='invalid project name'):
         _config._validate_windows_project_name(name)
+
+
+@pytest.mark.parametrize('self_publication', [False, True])
+@pytest.mark.parametrize('term', ['private-marker', 'docs/private', 'notes/confidential'])
+def test_internal_text_is_blocked_even_when_directories_are_excluded(
+    tmp_path: Path, self_publication: bool, term: str
+) -> None:
+    project = _project_config(tmp_path, self_publication=self_publication)
+    global_config = replace(
+        _global_config(),
+        sensitive_terms=(term,),
+        ignored_directories=('docs/private', 'notes/confidential'),
+    )
+    rules = _config.assemble_rules(global_config, project, ())
+    hits = gate_unit('Makefile', f"--exclude '{term.upper()}/**'".encode(), rules)
+    hit = GateHit('Makefile', RuleClass.IDENTITY_CRITICAL, term)
+    assert hit in hits
+    assert _config.rule_labels(hit, global_config, project, ()) == (
+        'global sensitive_terms entry 1',
+    )
+
+
+@pytest.mark.parametrize(
+    'directory',
+    ['', '/', '../private', 'docs/../private', './docs', 'C:/private', 'docs\\private'],
+)
+def test_global_ignored_directories_refuse_nonrelative_paths(
+    tmp_path: Path, directory: str
+) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    config = replace(_global_config(), ignored_directories=(directory,))
+    with pytest.raises(PubanonError, match='ignored_directories'):
+        _config.save_global(paths, config, None)
+
+
+@pytest.mark.parametrize(
+    'value', ['', '/file', '../file', 'a//b', 'a/./b', 'file/', 'C:file', 'a\\b']
+)
+def test_global_ignored_files_reject_invalid_paths(tmp_path: Path, value: str) -> None:
+    config = replace(_global_config(), ignored_files=(value,))
+    with pytest.raises(PubanonError, match='ignored_files'):
+        _config.save_global(_config.derive_paths({'HOME': str(tmp_path)}), config, None)

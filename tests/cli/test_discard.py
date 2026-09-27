@@ -3,19 +3,39 @@ import shlex
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from pubanon import (
     _cli,
+    _filesystem,
 )
 from pubanon._cli import _arguments
 from pubanon._snapshots import _candidate, _records, _source
 from pubanon._terminal import escape
 from tests._cli import prepare
-from tests._permissions import assert_private_mode
 from tests._setup import configure
 from tests.cli.test_prepare import replacement_context
+
+
+def test_discard_copy_failure_keeps_record_for_retry(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paths, project, record = prepare(tmp_path, make_repo(), monkeypatch)
+    inspection = _candidate.materialize_inspect(paths, project.name, record)
+    with patch.object(_filesystem, 'remove_tree', side_effect=PermissionError('injected')):
+        assert _cli.main(['discard', '--project', project.name]) == 1
+    assert 'cannot clean review copy' in capsys.readouterr().err
+    assert inspection.exists()
+    assert _candidate.load_candidate(paths, project.name) == record
+
+    assert _cli.main(['discard', '--project', project.name]) == 0
+    assert not inspection.exists()
+    assert _candidate.load_candidate(paths, project.name) is None
 
 
 @pytest.mark.skipif(os.name != 'nt', reason='requires native Windows path aliases')
@@ -59,7 +79,7 @@ def test_discard_recovery_command_selects_project(
     command = output.split('Next: ', 1)[1].strip()
     argv = shlex.split(command)
     assert _arguments.build_parser().parse_args(argv[1:]).project == name
-    assert argv == ['pubanon', 'inspect', f'--project={name}', '--clean']
+    assert argv == ['pubanon', 'clean', f'--project={name}']
 
 
 @pytest.mark.skipif(os.name == 'nt', reason='Windows filenames cannot contain newlines')
@@ -77,11 +97,11 @@ def test_discard_recovery_shows_unrenderable_project(
     assert _cli.main(['discard', f'--project={name}']) == 0
     output = capsys.readouterr().out
     assert 'Choose project line\\x0abreak' in output
-    assert 'rerun inspect --clean' in output
+    assert 'rerun clean' in output
     assert '--project=line' not in output
 
 
-def test_discard_reports_preserved_inspection_copies(
+def test_discard_removes_prepared_review_copies(
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
@@ -90,27 +110,19 @@ def test_discard_reports_preserved_inspection_copies(
     source = make_repo(files={'README.md': 'public\n'})
     paths, project, record = prepare(tmp_path, source, monkeypatch)
     inspection = _candidate.materialize_inspect(paths, project.name, record)
-    reviewed = (inspection / 'README.md').read_bytes()
     capsys.readouterr()
     assert _cli.main(['discard', '--project', project.name]) == 0
     output = capsys.readouterr().out
-    assert 'Discarded the prepared snapshot.\n\nPreserved snapshot directories\n' in output
-    assert escape(str(inspection)) in output
-    assert 'pubanon inspect --project=demo --clean' in output
-    assert (inspection / 'README.md').read_bytes() == reviewed
-    assert_private_mode(inspection, 0o500)
-    assert_private_mode(inspection / 'README.md', 0o400)
+    assert 'Discarded the prepared snapshot.' in output
+    assert not inspection.exists()
     assert _cli.main(['status', '--project', project.name]) == 0
     status = capsys.readouterr().out
-    assert 'Prepared snapshot: none' in status
-    assert (
-        'Snapshot directories: 1\nView directories: pubanon inspect --project=demo --verbose\n'
-        in status
-    )
+    assert any(line.split() == ['Prepared:', 'none'] for line in status.splitlines())
+    assert 'Snapshot directories:' not in status
     assert escape(str(inspection)) not in status
-    assert '--clean' not in status
 
 
+@pytest.mark.slow
 def test_discard_reports_removed_provisional_source_bookmark(
     tmp_path: Path,
     make_repo: Callable[..., Path],
@@ -145,7 +157,8 @@ def test_discard_reports_when_candidate_and_inspection_directory_are_already_abs
     assert capsys.readouterr().out == 'No prepared snapshot was found.\n'
 
 
-def test_discard_rewrite_removes_private_progress_and_preserves_inspection(
+@pytest.mark.slow
+def test_discard_rewrite_removes_private_progress_and_keeps_publication_copy(
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
@@ -161,7 +174,6 @@ def test_discard_rewrite_removes_private_progress_and_preserves_inspection(
             _candidate.candidate_store_path(paths, project.name), original.commit
         ),
     )
-    reviewed = (inspection / 'README.md').read_bytes()
     assert _cli.main(['prepare', '--project', project.name, '--replace', 'v1.0.0', '--yes']) == 0
     assert _records.rewrite_path(paths, project.name).exists()
     assert _records.rewrite_directory(paths, project.name).is_dir()
@@ -169,8 +181,24 @@ def test_discard_rewrite_removes_private_progress_and_preserves_inspection(
     assert _cli.main(['discard', '--project', project.name]) == 0
     output = capsys.readouterr().out
     assert 'Discarded the prepared snapshot.' in output
-    assert 'pubanon inspect --project=demo --clean' in output
     assert _candidate.load_candidate(paths, project.name) is None
     assert not _records.rewrite_path(paths, project.name).exists()
     assert not _records.rewrite_directory(paths, project.name).exists()
-    assert (inspection / 'README.md').read_bytes() == reviewed
+    assert inspection.exists()
+
+
+def test_discard_unknown_outcome_keeps_record_and_review_copy(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paths, project, record = prepare(tmp_path, make_repo(), monkeypatch)
+    inspection = _candidate.materialize_inspect(paths, project.name, record)
+    pending = replace(record, state=_candidate.STATE_UNKNOWN_OUTCOME)
+    _candidate.save_candidate(paths, project.name, pending)
+
+    assert _cli.main(['discard', '--project', project.name]) == 1
+    assert 'pubanon publish --project=demo --resolve' in capsys.readouterr().err
+    assert inspection.exists()
+    assert _candidate.load_candidate(paths, project.name) == pending

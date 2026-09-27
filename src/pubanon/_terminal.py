@@ -1,16 +1,24 @@
 """Read operator answers and escape text for display."""
 
+from __future__ import annotations
+
 import os
 import re
 import shlex
 import sys
 import unicodedata
-from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import TextIO
+from pathlib import Path
+from typing import TYPE_CHECKING, TextIO
 
-from pubanon._errors import OperationCancelled, PubanonError, PublicationCancelled
+from pubanon import _errors
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Generator, Iterable, Sequence
+    from datetime import datetime
+
+    from pubanon._remote._host import CheckVerdict
 
 if os.name == 'nt':
     import msvcrt
@@ -43,6 +51,7 @@ _STYLES = {
     'warning': '33',
     'error': '1;31',
 }
+_VERBOSE: ContextVar[bool] = ContextVar('verbose', default=False)
 _YES = frozenset({'y', 'yes'})
 
 
@@ -82,6 +91,28 @@ def color_context(mode: str) -> Generator[None]:
         yield
     finally:
         _COLOR_MODE.reset(token)
+
+
+def color_enabled(*, stream: TextIO | None = None) -> bool:
+    """Return whether the scoped color mode enables styling for the destination."""
+    target = sys.stdout if stream is None else stream
+    mode = _COLOR_MODE.get()
+    return mode == 'always' or (
+        mode == 'auto' and 'NO_COLOR' not in os.environ and target.isatty()
+    )
+
+
+def display_duration(seconds: int) -> str:
+    """Render whole minutes when possible, otherwise seconds."""
+    if seconds % 60 == 0:
+        minutes = seconds // 60
+        return f'{minutes} minute' + ('' if minutes == 1 else 's')
+    return f'{seconds} seconds'
+
+
+def display_time(value: datetime) -> str:
+    """Render a timestamp in local time with seconds and its zone abbreviation."""
+    return value.astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')
 
 
 def escape(text: str) -> str:
@@ -163,8 +194,8 @@ def _read_key(prompt: str) -> str:
 def _read(prompt: str, *, key: bool = False) -> str:
     """Read a line or menu key, converting terminal failures to Pubanon errors."""
     if not sys.stdin.isatty():
-        raise PubanonError(
-            'interactive input is required',
+        raise _errors.PubanonError(
+            'this step needs an interactive terminal',
             recovery='rerun in an interactive terminal',
         )
     try:
@@ -177,12 +208,40 @@ def _read(prompt: str, *, key: bool = False) -> str:
             prompt = re.sub(r'\x1b\[[0-9;]*m', '\x01\\g<0>\x02', prompt)
         return input(prompt)
     except KeyboardInterrupt:
-        raise OperationCancelled('operation cancelled') from None
+        raise _errors.OperationCanceled('Canceled.') from None
     except _TERMINAL_ERRORS as exc:
-        raise PubanonError(
-            'interactive input is required',
+        raise _errors.PubanonError(
+            'this step needs an interactive terminal',
             recovery='rerun in an interactive terminal',
         ) from exc
+
+
+def display_check_result(verdict: CheckVerdict) -> str:
+    """Render an aggregated check verdict without changing its acceptance rules."""
+    if verdict.state != 'unacceptable':
+        return {
+            'missing': 'not found',
+            'ambiguous': 'could not be determined',
+            'pending': 'pending',
+            'success': 'passed',
+        }[verdict.state]
+    words = {'cancelled': 'canceled', 'timed_out': 'timed out', 'action_required': 'needs action'}
+    details = [
+        words.get(conclusion, conclusion)
+        for conclusion in verdict.detail.split(', ')
+        if conclusion and conclusion != 'failure'
+    ]
+    return 'failed' + (f' ({escape(", ".join(details))})' if details else '')
+
+
+def display_path(path: Path) -> str:
+    """Escape an absolute display path, abbreviating the home directory as `~`."""
+    absolute = path.absolute()
+    try:
+        relative = absolute.relative_to(Path.home())
+    except ValueError:
+        return escape(str(absolute))
+    return escape('~' if relative == Path() else '~' + os.sep + str(relative))
 
 
 @contextmanager
@@ -273,13 +332,26 @@ def guidance(text: str) -> str:
         return f'{command} {option}{rest}'
 
     return re.sub(
-        r'(?P<command>(?<![\w/\\])pubanon (?:repo (?:create|verify|reveal)|'
-        r'stage (?:push|status|clean)|watch (?:ci|package)|list|show|delete|init|status|prepare|'
-        r'inspect|discard|publish|release|run)(?![\w/-]))'
+        r'(?P<command>(?<![\w/\\])pubanon (?:repo (?:create|verify|reveal|restore)|'
+        r'stage (?:push|status|repair|forget|delete|watch)|package watch|'
+        r'release (?:create|edit|list|show)|'
+        r'repo watch|'
+        r'list|show|delete|clean|forget|init|status|audit|prepare|'
+        r'inspect|discard|publish|run)(?![\w/-]))'
         r'(?P<rest>(?:(?![`;\n,]| then | or | && ).)*)',
         _qualify,
         text,
     )
+
+
+@contextmanager
+def verbose_context(enabled: bool) -> Generator[None]:
+    """Scope diagnostic output, restoring the previous setting on every exit."""
+    token = _VERBOSE.set(enabled)
+    try:
+        yield
+    finally:
+        _VERBOSE.reset(token)
 
 
 def style(text: str, kind: str = 'label', *, stream: TextIO | None = None) -> str:
@@ -294,17 +366,13 @@ def style(text: str, kind: str = 'label', *, stream: TextIO | None = None) -> st
     Returns:
         Styled text when enabled, otherwise plain text.
     """
-    target = sys.stdout if stream is None else stream
     code = _STYLES[kind]
-    mode = _COLOR_MODE.get()
-    if not text or not code or mode == 'never':
-        return text
-    if mode == 'auto' and ('NO_COLOR' in os.environ or not target.isatty()):
+    if not text or not code or not color_enabled(stream=stream):
         return text
     return f'\x1b[{code}m{text}\x1b[0m'
 
 
-def diagnostic(error: PubanonError, *, stream: TextIO | None = None) -> str:
+def diagnostic(error: _errors.PubanonError, *, stream: TextIO | None = None) -> str:
     """Format an error or cancellation for terminal display.
 
     Args:
@@ -312,30 +380,30 @@ def diagnostic(error: PubanonError, *, stream: TextIO | None = None) -> str:
         stream: Destination used for terminal detection; defaults to stdout.
 
     Returns:
-        A colored headline and indented, labeled recovery details.
+        A colored headline, indented facts, and a separate next step.
     """
-    if isinstance(error, PublicationCancelled):
-        return '\n'.join(
-            (
-                style(str(error), 'warning', stream=stream),
-                error.fact or '',
-                '',
-                f'{style("Next:", stream=stream)} {guidance(error.recovery or "pubanon publish")}',
-            )
-        )
-    cancelled = isinstance(error, OperationCancelled)
-    label = 'cancelled' if cancelled else 'error'
-    kind = 'warning' if cancelled else 'error'
-    lines = [style(f'{label}: {error}', kind, stream=stream)]
+    kind = error.diagnostic_kind if isinstance(error, _errors.OperationCanceled) else 'error'
+    headline = f'error: {error}' if kind == 'error' else str(error)
+    lines = [style(headline, kind, stream=stream)]
+    if error.fact is not None:
+        lines.extend('  ' + line for line in error.fact.split('\n'))
     for name, value in (
-        ('fact', error.fact),
-        ('expected', error.expected),
-        ('actual', error.actual),
-        ('recovery', error.recovery),
+        ('Expected', error.expected),
+        ('Found', error.actual),
     ):
         if value is not None:
-            rendered = guidance(value) if name == 'recovery' else value
-            lines.append(f'  {style(name + ":", stream=stream)} {rendered}')
+            first, *rest = value.split('\n')
+            lines.append(f'  {style(name + ":", stream=stream)} {first}')
+            lines.extend(' ' * (len(name) + 4) + line for line in rest)
+    recovery = error.recovery
+    if isinstance(error, _errors.PublicationCanceled):
+        recovery = recovery or 'pubanon publish'
+    if recovery is not None:
+        first, *rest = guidance(recovery).split('\n')
+        lines.extend(
+            ('', f'{style("Next:", stream=stream)} {style(first, "choice", stream=stream)}')
+        )
+        lines.extend('      ' + style(line, 'choice', stream=stream) for line in rest)
     return '\n'.join(lines)
 
 
@@ -351,6 +419,54 @@ def field(label: str, value: str, *, kind: str = 'plain') -> str:
     return f'{style(label + ":")} {style(value, kind)}'
 
 
+def next_step(text: str) -> None:
+    """Print the next command unless an enclosing workflow owns the next step."""
+    if not text or _GUIDANCE_WORKFLOW.get():
+        return
+    print(f'{style("Next:")} {style(guidance(text), "choice")}')
+
+
+def render_fields(rows: Sequence[tuple[str, str]], *, indent: int = 0) -> str:
+    """Render already escaped field rows with bold labels and aligned values.
+
+    Args:
+        rows: Pairs of field labels without colons and field values.
+        indent: Number of spaces before each label.
+    """
+    width = max((len(label) for label, _value in rows), default=0)
+    return '\n'.join(
+        ' ' * indent + style(label + ':') + ' ' * (width - len(label) + 1) + value
+        for label, value in rows
+    )
+
+
+def fields(rows: Sequence[tuple[str, str]], *, indent: int = 0) -> None:
+    """Print already escaped field rows with bold labels and aligned values.
+
+    Args:
+        rows: Pairs of field labels without colons and field values.
+        indent: Number of spaces before each label.
+    """
+    if rows:
+        print(render_fields(rows, indent=indent))
+
+
+def verbose_enabled() -> bool:
+    """Return whether diagnostic output is enabled for the current command."""
+    return _VERBOSE.get()
+
+
+def detail_fields(rows: Sequence[tuple[str, str]], *, indent: int = 0) -> None:
+    """Print already escaped aligned field rows only in verbose mode.
+
+    Args:
+        rows: Pairs of field labels without colons and field values.
+        indent: Number of spaces before each label.
+    """
+    if verbose_enabled():
+        fields(rows, indent=indent)
+
+
 def heading(text: str, *, separate: bool = False) -> None:
     """Print a bold title, optionally separated from preceding content.
 
@@ -361,13 +477,6 @@ def heading(text: str, *, separate: bool = False) -> None:
     print(('\n' if separate else '') + style(text.removesuffix(':'), 'heading'))
 
 
-def next_step(text: str) -> None:
-    """Print the next command unless an enclosing workflow owns the next step."""
-    if not text or _GUIDANCE_WORKFLOW.get():
-        return
-    print(f'{style("Next:")} {style(guidance(text), "choice")}')
-
-
 def output(text: str = '', *, kind: str = 'plain') -> None:
     """Print one terminal message using its presentation role.
 
@@ -376,6 +485,12 @@ def output(text: str = '', *, kind: str = 'plain') -> None:
         kind: Presentation role accepted by `style`.
     """
     print(style(text, kind))
+
+
+def detail(text: str = '') -> None:
+    """Print already escaped diagnostic text as a note only in verbose mode."""
+    if verbose_enabled():
+        output(text, kind='note')
 
 
 def ask(
@@ -401,8 +516,8 @@ def ask(
 
     Raises:
         ValueError: Two choices use the same abbreviation.
-        OperationCancelled: The operator pressed Ctrl-C.
-        PubanonError: Input ended or the terminal is unusable.
+        _errors.OperationCanceled: The operator pressed Ctrl-C.
+        _errors.PubanonError: Input ended or the terminal is unusable.
     """
     if choices is None:
         suffix = f' [{escape(default)}]' if default else ''
@@ -448,8 +563,8 @@ def confirm(question: str, *, default: bool | None = None) -> bool:
         needed.
 
     Raises:
-        OperationCancelled: The operator pressed Ctrl-C.
-        PubanonError: Input ended or the terminal is unusable.
+        _errors.OperationCanceled: The operator pressed Ctrl-C.
+        _errors.PubanonError: Input ended or the terminal is unusable.
     """
     hint = {None: '[y/n]', True: '[Y/n]', False: '[y/N]'}[default]
     prompt = f'{style(question)} {style(hint, "choice")} '

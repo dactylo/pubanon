@@ -8,8 +8,10 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Literal, NamedTuple
 
-from pubanon._errors import ObservationTimeoutError, OperationCancelled, PubanonError
+from pubanon._errors import ObservationTimeoutError, PubanonError
 from pubanon._terminal import escape
+
+OID_HEX = '[0-9a-f]{40}|[0-9a-f]{64}'
 
 _GIT = 'git'
 _GIT_FLOOR = (2, 41, 0)
@@ -19,7 +21,6 @@ _GIT_ISOLATION: dict[str, str] = {
     'GIT_CONFIG_NOSYSTEM': '1',
     'GIT_TERMINAL_PROMPT': '0',
 }
-OID_HEX = '[0-9a-f]{40}|[0-9a-f]{64}'
 _PYTHON_FLOOR = (3, 13)
 
 
@@ -144,16 +145,8 @@ def run_credential_child(
         )
     except ObservationTimeoutError:
         pass
-    except OperationCancelled:
-        raise
     except PubanonError as exc:
-        raise type(exc)(
-            f'Git {operation} could not start',
-            fact=exc.fact,
-            expected=exc.expected,
-            actual=exc.actual,
-            recovery=exc.recovery,
-        ) from exc
+        raise PubanonError(f'Git {operation} could not start') from exc
     else:
         if result.returncode != 0:
             raise PubanonError(
@@ -192,8 +185,8 @@ def run_git(  # noqa: PLR0913
     Raises:
         PubanonError: Git cannot start, or Git exits unsuccessfully while
             `check` is true.
-        ObservationTimeoutError: The supplied child timeout expires. Only
-            escaped display detail is preserved; raw captured streams are not.
+        ObservationTimeoutError: The supplied child timeout expires. Captured
+            streams and the originating exception context are discarded.
     """
     try:
         result = _run_git(
@@ -203,11 +196,8 @@ def run_git(  # noqa: PLR0913
             env_extra=env_extra,
             timeout=timeout,
         )
-    except ObservationTimeoutError as exc:
-        output = exc.stdout.decode(errors='surrogateescape') + exc.stderr.decode(
-            errors='surrogateescape'
-        )
-        detail = escape(output).strip() or None
+    except ObservationTimeoutError:
+        pass
     else:
         if check and result.returncode != 0:
             output = result.stdout.decode(errors='surrogateescape') + result.stderr.decode(
@@ -217,4 +207,4 @@ def run_git(  # noqa: PLR0913
                 escape(output).strip() or 'Git failed', fact=git_failure_fact(result)
             )
         return result
-    raise ObservationTimeoutError(detail=detail)
+    raise ObservationTimeoutError

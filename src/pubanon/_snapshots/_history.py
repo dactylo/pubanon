@@ -3,13 +3,14 @@
 import heapq
 import os
 import re
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 from pubanon import _filesystem
 from pubanon._config import Paths, ProjectConfig
-from pubanon._errors import OperationCancelled, PubanonError
+from pubanon._errors import OperationCanceled, PubanonError
 from pubanon._run import OID_HEX, git_failure_fact, run_git
 from pubanon._snapshots import _candidate, _records, _source
 from pubanon._snapshots._records import CandidateRecord, PublicationRecord
@@ -19,7 +20,7 @@ from pubanon._terminal import field as display_field
 _OID_PREFIX = re.compile(r'[0-9a-fA-F]+')
 _PUBLICATION_REPAIR = (
     'Restore the local publication store from a backup, or use '
-    '`pubanon repo verify --repair-store` if the host still contains this published snapshot.'
+    '`pubanon repo restore --to local` if the host still contains this published snapshot.'
 )
 _VERSION_TAG = re.compile(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)')
 
@@ -111,60 +112,6 @@ def _catalog_ancestors(
     return ancestors
 
 
-def _ordered_entries(
-    entries: dict[str, PublicationEntry], graph: dict[str, tuple[int, tuple[str, ...]]]
-) -> tuple[PublicationEntry, ...]:
-    """Order known publications after descendants, using dates across tips."""
-    ancestors = _catalog_ancestors(entries, graph)
-    incoming = dict.fromkeys(entries, 0)
-    for predecessors in ancestors.values():
-        for parent in predecessors:
-            incoming[parent] += 1
-
-    def _priority(oid: str) -> tuple[int, str]:
-        entry = entries[oid]
-        when = entry.record.confirmed_at if entry.record is not None else entry.commit_time
-        return (-int(when.timestamp()) if when is not None else 0, oid)
-
-    ready = [_priority(oid) for oid, count in incoming.items() if count == 0]
-    heapq.heapify(ready)
-    ordered: list[PublicationEntry] = []
-    while ready:
-        _, oid = heapq.heappop(ready)
-        ordered.append(entries[oid])
-        for parent in ancestors[oid]:
-            incoming[parent] -= 1
-            if incoming[parent] == 0:
-                heapq.heappush(ready, _priority(parent))
-    return tuple(ordered)
-
-
-def _parse_worktree_registration(block: bytes) -> tuple[Path, str | None, bool]:
-    """Decode one NUL-separated porcelain registration."""
-    location: Path | None = None
-    head: str | None = None
-    detached = False
-    for field in block.strip(b'\0').split(b'\0'):
-        if field.startswith(b'worktree '):
-            location = Path(os.fsdecode(field[9:]))
-        elif field.startswith(b'HEAD '):
-            raw_head = field[5:]
-            if re.fullmatch(OID_HEX.encode(), raw_head) is not None:
-                head = raw_head.decode('ascii')
-        elif field == b'detached':
-            detached = True
-    if location is None or not location.is_absolute():
-        raise PubanonError('Git returned malformed worktree registrations')
-    return location, head, detached
-
-
-def _publication_source(record: PublicationRecord) -> str | None:
-    """Return the exact pinned source or a derived publication's source input."""
-    if record.pinned is not None:
-        return record.pinned.commit
-    return record.derivation.original_source if record.derivation is not None else None
-
-
 def _delete_source(
     project: ProjectConfig, record: PublicationRecord
 ) -> _source.SourceBookmark | None:
@@ -172,7 +119,7 @@ def _delete_source(
     bookmark = record.source_bookmark
     if bookmark is None:
         return None
-    source_commit = _publication_source(record)
+    source_commit = _records.publication_source(record)
     if source_commit is None:
         raise PubanonError('source bookmark has no recorded source commit')
     common = bookmark.git_common_dir
@@ -218,6 +165,53 @@ def _delete_source(
                 fact=escape(str(bookmark.git_common_dir)),
             )
     return bookmark
+
+
+def _ordered_entries(
+    entries: dict[str, PublicationEntry], graph: dict[str, tuple[int, tuple[str, ...]]]
+) -> tuple[PublicationEntry, ...]:
+    """Order known publications after descendants, using dates across tips."""
+    ancestors = _catalog_ancestors(entries, graph)
+    incoming = dict.fromkeys(entries, 0)
+    for predecessors in ancestors.values():
+        for parent in predecessors:
+            incoming[parent] += 1
+
+    def _priority(oid: str) -> tuple[int, str]:
+        entry = entries[oid]
+        when = entry.record.confirmed_at if entry.record is not None else entry.commit_time
+        return (-int(when.timestamp()) if when is not None else 0, oid)
+
+    ready = [_priority(oid) for oid, count in incoming.items() if count == 0]
+    heapq.heapify(ready)
+    ordered: list[PublicationEntry] = []
+    while ready:
+        _, oid = heapq.heappop(ready)
+        ordered.append(entries[oid])
+        for parent in ancestors[oid]:
+            incoming[parent] -= 1
+            if incoming[parent] == 0:
+                heapq.heappush(ready, _priority(parent))
+    return tuple(ordered)
+
+
+def _parse_worktree_registration(block: bytes) -> tuple[Path, str | None, bool]:
+    """Decode one NUL-separated porcelain registration."""
+    location: Path | None = None
+    head: str | None = None
+    detached = False
+    for field in block.strip(b'\0').split(b'\0'):
+        if field.startswith(b'worktree '):
+            location = Path(os.fsdecode(field[9:]))
+        elif field.startswith(b'HEAD '):
+            raw_head = field[5:]
+            if re.fullmatch(OID_HEX.encode(), raw_head) is not None:
+                head = raw_head.decode('ascii')
+        elif field == b'detached':
+            detached = True
+    if location is None or not location.is_absolute():
+        raise PubanonError('Git returned malformed worktree registrations')
+    return location, head, detached
 
 
 def _registered_worktrees(source: Path) -> dict[Path, tuple[str | None, bool]]:
@@ -439,7 +433,7 @@ def delete_guidance(
     return (
         display_field('Snapshot', entry.commit[:12]),
         display_field('Version', escape(', '.join(entry.tags) or 'untagged')),
-        'Delete this local snapshot entry, review directory, and source recovery information.',
+        'Delete this local snapshot entry, review copy, and source recovery information.',
         'GitHub and source working directories are unchanged.',
     )
 
@@ -468,8 +462,8 @@ def delete_publication(paths: Paths, project: ProjectConfig, entry: PublicationE
             _release_archive(paths, project.name, entry.commit)
         except (PubanonError, OSError, KeyboardInterrupt) as exc:
             error_type = (
-                OperationCancelled
-                if isinstance(exc, (KeyboardInterrupt, OperationCancelled))
+                OperationCanceled
+                if isinstance(exc, (KeyboardInterrupt, OperationCanceled))
                 else PubanonError
             )
             retry = shell_command('pubanon', 'delete', entry.commit, f'--project={project.name}')
@@ -485,7 +479,7 @@ def delete_publication(paths: Paths, project: ProjectConfig, entry: PublicationE
         return
     if bookmark is not None and bookmark != record.source_bookmark:
         record = _records.relocate_publication_source(paths, project.name, record, bookmark)
-    source_commit = _publication_source(record)
+    source_commit = _records.publication_source(record)
     if bookmark is not None and source_commit is None:
         raise PubanonError('source bookmark has no recorded source commit')
     completed = []
@@ -507,8 +501,8 @@ def delete_publication(paths: Paths, project: ProjectConfig, entry: PublicationE
         completed.append('private recovery record removed')
     except (PubanonError, OSError, KeyboardInterrupt) as exc:
         error_type = (
-            OperationCancelled
-            if isinstance(exc, (KeyboardInterrupt, OperationCancelled))
+            OperationCanceled
+            if isinstance(exc, (KeyboardInterrupt, OperationCanceled))
             else PubanonError
         )
         if not path.exists():
@@ -541,14 +535,23 @@ def inspect_publication(
 
     A private record, when present, supplies the exact expected tree and
     content digest. Recordless publications can be inspected from their Git
-    commit. Ordinary reuse verifies the commit-keyed copy and refuses local
-    edits; `refresh` replaces the selected copy. Missing or conflicting saved
-    objects are refused before replacement.
+    commit. Missing or conflicting saved objects are refused before
+    replacement.
 
     The caller must hold the project lock for the complete operation.
 
+    Args:
+        paths: Paths derived for this command.
+        project: Registered project name.
+        entry: Publication whose saved commit is inspected.
+        refresh: Replace the selected copy instead of refusing local edits.
+
     Returns:
         Path to the selected commit's read-only review directory.
+
+    Raises:
+        PubanonError: The saved commit or objects are missing or inconsistent,
+            or the existing review copy has local edits without `refresh`.
     """
     if re.fullmatch(OID_HEX, entry.commit) is None:
         raise PubanonError('invalid published snapshot commit')
@@ -623,13 +626,16 @@ def publications(
     available_records = {
         oid
         for oid in records
-        if store.exists()
-        and run_git(
-            ['--git-dir', str(store.absolute()), 'cat-file', '-e', f'{oid}^{{commit}}'],
-            cwd=store,
-            check=False,
-        ).returncode
-        == 0
+        if oid in reachable
+        or (
+            store.exists()
+            and run_git(
+                ['--git-dir', str(store.absolute()), 'cat-file', '-e', f'{oid}^{{commit}}'],
+                cwd=store,
+                check=False,
+            ).returncode
+            == 0
+        )
     }
     graph = _publication_graph(store, ref_roots | available_records)
     deleted: set[str] = set() if include_deleted else _records.deleted_publications(paths, project)
@@ -667,6 +673,10 @@ def record_publication(
     Returns:
         The record for `candidate.commit`, which can differ from the replayed
         transaction tip whose proof is saved first.
+
+    Raises:
+        PubanonError: A retained publication record conflicts with the
+            candidate's provenance.
     """
     _candidate.verify_publication_objects(paths, project.name, candidate)
     commits = (candidate.commit, *(entry.new for entry in candidate.replayed))
@@ -697,18 +707,32 @@ def record_publication(
 
 
 def select_publication(
-    paths: Paths, project: str, selector: str, *, include_deleted: bool = False
+    paths: Paths,
+    project: str,
+    selector: str,
+    *,
+    include_deleted: bool = False,
+    entries: Collection[PublicationEntry] | None = None,
 ) -> PublicationEntry:
     """Resolve only known publication tags, IDs, or recorded main.
 
-    `latest` selects recorded current main. Other selectors are supported
-    release labels or hexadecimal commit prefixes. An operational tag target
-    takes precedence over unrelated retained records carrying the same label.
+    An operational tag target takes precedence over unrelated retained records
+    carrying the same label.
+
+    Args:
+        paths: Paths derived for this command.
+        project: Registered project name.
+        selector: `latest` for recorded current main, or a supported release
+            label or hexadecimal commit prefix.
+        include_deleted: Include locally deleted publication records in lookup.
+        entries: Reuse a catalog from `publications` with the same
+            `include_deleted` setting, read under the same project lock.
 
     Raises:
         PubanonError: The selector is absent or ambiguous in local history.
     """
-    entries = publications(paths, project, include_deleted=include_deleted)
+    if entries is None:
+        entries = publications(paths, project, include_deleted=include_deleted)
     if selector == 'latest':
         main, _ = _candidate.published_refs(paths, project)
         if main is None:
@@ -754,7 +778,7 @@ def source_cleanup_guidance(project: ProjectConfig, entry: PublicationEntry) -> 
     record = entry.record
     if record is None or record.source_bookmark is None:
         return ()
-    source_commit = _publication_source(record)
+    source_commit = _records.publication_source(record)
     if source_commit is None:
         return ()
     recovery = _source.source_recovery(
@@ -797,7 +821,7 @@ def source_guidance(
             display_field('Source input', derivation.original_source or 'unknown'),
             'The published files may differ from this source input after replaying changes.',
         )
-    source_commit = _publication_source(record)
+    source_commit = _records.publication_source(record)
     if source_commit is None:
         return (
             *lines,
@@ -820,3 +844,79 @@ def source_guidance(
         *lines,
         *_worktree_guidance(paths, project, record, recovery, source_commit),
     )
+
+
+def source_matches(
+    project: ProjectConfig, entries: tuple[PublicationEntry, ...]
+) -> dict[str, _source.SourceMatches]:
+    """Find current source-history matches keyed by published snapshot ID.
+
+    Derived publications match their original source input, as recorded in
+    their provenance.
+
+    Returns:
+        Matches keyed by published snapshot ID, omitting missing source
+        commits.
+
+    Raises:
+        PubanonError: The registered source history cannot be read.
+    """
+    sources = {
+        entry.commit: source
+        for entry in entries
+        if entry.record is not None
+        and (source := _records.publication_source(entry.record)) is not None
+    }
+    matches = _source.matching_commits(project.source_path, tuple(sources.values()))
+    return {commit: matches[source] for commit, source in sources.items() if source in matches}
+
+
+def refresh_source_tags(
+    project: ProjectConfig,
+    entries: tuple[PublicationEntry, ...],
+    *,
+    matches: Mapping[str, _source.SourceMatches] | None = None,
+) -> tuple[str, ...]:
+    """Refresh opted-in local source tags and return any actionable warnings.
+
+    Current publications take precedence over superseded records for the same
+    version. Retained original commits remain the targets until they leave
+    current history; then the latest exact content match is used.
+    If no match exists, the original source remains the target.
+
+    Args:
+        project: Project whose opted-in source tags are refreshed.
+        entries: Publication entries from which tag targets are chosen.
+        matches: Precomputed matches keyed by published snapshot ID, or `None`
+            to compute them from `entries`.
+
+    Raises:
+        PubanonError: The source history cannot be read for matching.
+    """
+    if not project.source_tags:
+        return ()
+    if matches is None:
+        matches = source_matches(project, entries)
+    selected: dict[str, tuple[PublicationEntry, str]] = {}
+    known: dict[str, list[str]] = {}
+    for entry in sorted(entries, key=lambda entry: entry.replaced):
+        if entry.record is None or (source := _records.publication_source(entry.record)) is None:
+            continue
+        for label in entry.tags or (entry.commit,):
+            selected.setdefault(label, (entry, source))
+            known.setdefault(label, []).append(source)
+    warnings: list[str] = []
+    for label, (entry, source) in selected.items():
+        match = matches.get(entry.commit)
+        target = (
+            match.latest
+            if match is not None and not match.original_reachable and match.latest is not None
+            else source
+        )
+        try:
+            _source.update_source_tag(project.source_path, label, target, known[label])
+        except OperationCanceled:
+            raise
+        except (OSError, PubanonError) as exc:
+            warnings.append(f'Could not update local source tag pubanon/{label}: {exc}')
+    return tuple(warnings)

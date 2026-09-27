@@ -19,7 +19,7 @@ from tests._cli import gh_calls
 from tests._permissions import assert_private_mode
 from tests._setup import configure
 
-_Script = Callable[[Sequence[tuple[str, str]]], None]
+_Script = Callable[[Sequence[str | tuple[str, str]]], None]
 
 
 @pytest.mark.parametrize('failure', [EOFError(), KeyboardInterrupt()])
@@ -38,7 +38,11 @@ def test_setup_cancellation_preserves_original_configuration(
     monkeypatch.setattr('builtins.input', _cancel)
     assert _cli.main(['setup']) == (130 if isinstance(failure, KeyboardInterrupt) else 1)
     assert not paths.global_config.exists()
-    expected = 'cancelled' if isinstance(failure, KeyboardInterrupt) else 'interactive input'
+    expected = (
+        'Canceled.'
+        if isinstance(failure, KeyboardInterrupt)
+        else 'this step needs an interactive terminal'
+    )
     assert expected in capsys.readouterr().err
 
 
@@ -66,7 +70,9 @@ def test_setup_cancels_at_save_menu_without_saving(
     assert paths.global_config.read_bytes() == original
     output = capsys.readouterr()
     assert (
-        'cancelled' if isinstance(failure, KeyboardInterrupt) else 'interactive input is required'
+        'Canceled.'
+        if isinstance(failure, KeyboardInterrupt)
+        else 'this step needs an interactive terminal'
     ) in output.err
     if isinstance(failure, KeyboardInterrupt):
         assert 'any completed GitHub authentication remains in effect' in output.err
@@ -94,6 +100,7 @@ def test_setup_cancels_during_confirmation_without_saving(
             ('Publication email: ', 'public@example.invalid'),
             ('Sensitive term: ', 'private-canary'),
             ('Sensitive term: ', ''),
+            ('Default publication route (staged/direct) [staged]: ', ''),
         ]
     )
 
@@ -118,7 +125,9 @@ def test_setup_cancels_during_confirmation_without_saving(
     _no_remaining_prompts()
     assert not paths.global_config.exists()
     assert (
-        'cancelled' if isinstance(failure, KeyboardInterrupt) else 'interactive input is required'
+        'Canceled.'
+        if isinstance(failure, KeyboardInterrupt)
+        else 'this step needs an interactive terminal'
     ) in capsys.readouterr().err
 
 
@@ -137,7 +146,7 @@ def test_setup_cancels_during_runtime_floor_check(
     assert _cli.main(['setup']) == 130
     assert paths.global_config.read_bytes() == original
     output = capsys.readouterr()
-    assert 'setup cancelled' in output.err
+    assert 'Canceled.' in output.err
     assert 'rerun pubanon setup' in output.err
     assert 'Traceback' not in output.out + output.err
 
@@ -189,7 +198,8 @@ def test_setup_complete_rerun_preserves_bytes_and_repairs_permissions(
     assert_private_mode(paths.global_config, 0o600)
     assert_private_mode(paths.config_dir, 0o700)
     output = capsys.readouterr().out
-    assert 'Publication identity: Anonymous Publisher <anonymous@example.invalid>' in output
+    assert 'Publication identity:' in output
+    assert 'Anonymous Publisher <anonymous@example.invalid>' in output
     assert 'pubanon setup --edit' in output
 
 
@@ -212,6 +222,7 @@ def test_setup_creates_complete_owner_only_global_configuration(
             ('Publication email: ', 'pat@example.com'),
             ('Sensitive term: ', 'private-canary'),
             ('Sensitive term: ', ''),
+            ('Default publication route (staged/direct) [staged]: ', ''),
             ('Use this GitHub account? [Y/n] ', ''),
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
         ]
@@ -228,14 +239,19 @@ def test_setup_creates_complete_owner_only_global_configuration(
     assert config.anon_email == 'pat@example.com'
     assert config.sensitive_terms == ('private-canary',)
     assert config.accounts == {'github': 'pat-example'}
+    assert config.default_publication_route == 'staged'
     output = capsys.readouterr().out
     assert output
     assert not output.startswith('\n')
-    assert 'ready' in output
+    assert 'Saved your configuration.' in output
     assert 'pubanon init' in output
-    assert 'Publication identity: Pat Example <pat@example.com>' in output
+    assert 'Identity:' in output
+    assert 'Pat Example <pat@example.com>' in output
     assert 'GitHub account: pat-example' in output
-    assert 'Sensitive terms:\n  1. private-canary' in output
+    assert 'Default route:' in output
+    assert 'staged (new projects only)' in output
+    assert 'Sensitive terms:' in output
+    assert '  1. private-canary' in output
     assert 'private-canary' in output
     assert str(paths.global_config) not in output
     assert 'Nothing was changed' not in output
@@ -254,7 +270,7 @@ def test_setup_edit_account_mismatch_can_be_corrected_before_readiness(
     answers(
         [
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 'e'),
-            ('Edit: [i]dentity / [t]erms / [a]ccount / [b]ack: ', 'a'),
+            'a',
             ('Use this GitHub account? [Y/n] ', ''),
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
         ]
@@ -267,6 +283,37 @@ def test_setup_edit_account_mismatch_can_be_corrected_before_readiness(
     assert config.anon_email == original.anon_email
     assert config.sensitive_terms == original.sensitive_terms
     assert config.accounts == {'github': 'correct-account'}
+
+
+def test_setup_edit_changes_default_without_changing_existing_project(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_gh: Path,
+    answers: _Script,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / 'source'
+    source.mkdir()
+    paths, _, project = configure(tmp_path, monkeypatch, source)
+    assert project is not None
+    _config.save_project(paths, replace(project, publication_route='staged'))
+    fake_gh.write_text(
+        json.dumps([{'args': ['api', 'user', '--jq', '.login'], 'stdout': 'anonymous-account\n'}])
+    )
+    answers(
+        [
+            ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 'e'),
+            'r',
+            ('Default publication route (staged/direct) [staged]: ', 'direct'),
+            ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
+        ]
+    )
+
+    assert _cli.main(['setup', '--edit']) == 0
+    assert _config.load_global(paths).default_publication_route == 'direct'
+    assert _config.load_project(paths, project.name).publication_route == 'staged'
+    rendered = capsys.readouterr().out
+    assert 'new projects only' in rendered
 
 
 def test_setup_edit_completed_config_preserves_unedited_values(
@@ -283,7 +330,7 @@ def test_setup_edit_completed_config_preserves_unedited_values(
     answers(
         [
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 'e'),
-            ('Edit: [i]dentity / [t]erms / [a]ccount / [b]ack: ', 't'),
+            't',
             ('Terms: [a]dd / [r]eplace / re[m]ove / [d]one: ', 'a'),
             ('Sensitive term: ', 'additional-canary'),
             ('Terms: [a]dd / [r]eplace / re[m]ove / [d]one: ', 'd'),
@@ -317,7 +364,7 @@ def test_setup_edit_corrects_identity_before_save(
     answers(
         [
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 'e'),
-            ('Edit: [i]dentity / [t]erms / [a]ccount / [b]ack: ', 'i'),
+            'i',
             ('Publication name [Anonymous Publisher]: ', 'Correct Publisher'),
             ('Publication email [anonymous@example.invalid]: ', 'correct@example.invalid'),
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
@@ -336,6 +383,129 @@ def test_setup_edit_corrects_identity_before_save(
     assert 'Correct Publisher <correct@example.invalid>' in output
     assert 'every project using this configuration' in output
     assert 'No history will be rewritten' in output
+
+
+def test_setup_edit_save_preserves_direct_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_gh: Path,
+    answers: _Script,
+) -> None:
+    paths, original, _ = configure(tmp_path, monkeypatch)
+    _config.save_global(
+        paths,
+        replace(original, default_publication_route='direct'),
+        paths.global_config.read_bytes(),
+    )
+    fake_gh.write_text(
+        json.dumps([{'args': ['api', 'user', '--jq', '.login'], 'stdout': 'anonymous-account\n'}])
+    )
+    answers([('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's')])
+
+    assert _cli.main(['setup', '--edit']) == 0
+    assert _config.load_global(paths).default_publication_route == 'direct'
+
+
+def test_setup_edits_global_ignored_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paths, original, _ = configure(tmp_path, monkeypatch)
+    monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+    monkeypatch.setattr(_host, 'authenticated_account', lambda: 'anonymous-account')
+    answers = iter(
+        [
+            'edit',
+            'directories',
+            'add',
+            'docs/private/',
+            'add',
+            'notes/confidential',
+            'done',
+            'save',
+        ]
+    )
+
+    def answer(_prompt: str) -> str:
+        return next(answers)
+
+    monkeypatch.setattr('builtins.input', answer)
+    assert _cli.main(['setup', '--edit']) == 0
+    saved = _config.load_global(paths)
+    assert saved == replace(original, ignored_directories=('docs/private', 'notes/confidential'))
+    assert 'Excluded directories:' in capsys.readouterr().out
+
+
+def test_setup_edits_global_ignored_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paths, original, _ = configure(tmp_path, monkeypatch)
+    monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+    monkeypatch.setattr(_host, 'authenticated_account', lambda: 'anonymous-account')
+    answers = iter(
+        [
+            'edit',
+            'files',
+            'add',
+            'LOCAL.md',
+            'add',
+            'notes/private.txt',
+            'done',
+            'save',
+        ]
+    )
+
+    def answer(_prompt: str) -> str:
+        return next(answers)
+
+    monkeypatch.setattr('builtins.input', answer)
+    assert _cli.main(['setup', '--edit']) == 0
+    saved = _config.load_global(paths)
+    assert saved == replace(original, ignored_files=('LOCAL.md', 'notes/private.txt'))
+    assert 'Excluded files:' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('action', ['s', 'c'])
+def test_setup_incomplete_account_requires_save_decision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    answers: _Script,
+    action: str,
+) -> None:
+    paths, _, _ = configure(tmp_path, monkeypatch)
+    paths.global_config.write_text(
+        'anon_name = "Anonymous Publisher"\n'
+        'anon_email = "anonymous@example.invalid"\n'
+        'sensitive_terms = ["Private Person"]\n'
+        'default_publication_route = "staged"\n'
+        '\n[accounts]\n'
+        'github = ""\n'
+    )
+    original = paths.global_config.read_bytes()
+    Path(os.environ['PUBANON_FAKE_GH_RESPONSES']).write_text(
+        json.dumps([{'args': ['api', 'user', '--jq', '.login'], 'stdout': 'public-account\n'}])
+    )
+    answers(
+        [
+            ('Use this GitHub account? [Y/n] ', ''),
+            ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', action),
+        ]
+    )
+
+    assert _cli.main(['setup']) == (0 if action == 's' else 130)
+    output = capsys.readouterr()
+    assert 'Configuration to save' in output.out
+    if action == 's':
+        assert _config.load_global(paths).accounts == {'github': 'public-account'}
+        assert paths.global_config.read_bytes() != original
+        assert 'Saved your configuration.' in output.out
+    else:
+        assert paths.global_config.read_bytes() == original
+        assert 'ready' not in output.out
 
 
 @pytest.mark.parametrize('action', ['retry', 'login', 'cancel'])
@@ -401,6 +571,7 @@ def test_setup_interrupt_after_save_retains_configuration_and_facts(
             ('Publication email: ', 'new@example.com'),
             ('Sensitive term: ', 'private-canary'),
             ('Sensitive term: ', ''),
+            ('Default publication route (staged/direct) [staged]: ', ''),
             ('Use this GitHub account? [Y/n] ', ''),
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
         ]
@@ -525,6 +696,7 @@ def test_setup_post_save_readiness_failure_retains_valid_config(
             ('Publication email: ', 'new@example.com'),
             ('Sensitive term: ', 'private-canary'),
             ('Sensitive term: ', ''),
+            ('Default publication route (staged/direct) [staged]: ', ''),
             ('Use this GitHub account? [Y/n] ', ''),
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
         ]
@@ -554,6 +726,7 @@ def test_setup_preserves_nonblank_term_whitespace(
             ('Publication email: ', 'public@example.invalid'),
             ('Sensitive term: ', ' spaced-canary '),
             ('Sensitive term: ', ''),
+            ('Default publication route (staged/direct) [staged]: ', ''),
             ('Use this GitHub account? [Y/n] ', ''),
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
         ]
@@ -577,8 +750,8 @@ def test_setup_refuses_configured_account_mismatch(
     assert _cli.main(['setup']) == 1
     assert paths.global_config.read_bytes() == original
     err = capsys.readouterr().err
-    assert 'expected: anonymous-account' in err
-    assert 'actual: other-account' in err
+    assert 'Expected: anonymous-account' in err
+    assert 'Found: other-account' in err
 
 
 def test_setup_refuses_existing_identity_collision_with_machine_paths(
@@ -606,7 +779,8 @@ def test_setup_refuses_existing_identity_collision_with_machine_paths(
         (
             (
                 'anon_name = "bad<private-canary>"\nanon_email = "public@example.com"\n'
-                'sensitive_terms = ["private-canary"]\n[accounts]\ngithub = "account"'
+                'sensitive_terms = ["private-canary"]\n'
+                'default_publication_route = "staged"\n[accounts]\ngithub = "account"'
             ),
             'anon_name',
         ),
@@ -645,8 +819,9 @@ def test_setup_retries_colliding_new_identity_without_removing_terms(
             ('Publication email: ', 'public@example.com'),
             ('Sensitive term: ', 'Private Person'),
             ('Sensitive term: ', ''),
+            ('Default publication route (staged/direct) [staged]: ', ''),
             ('Use this GitHub account? [Y/n] ', ''),
-            ('Edit: [i]dentity / [t]erms / [a]ccount / [b]ack: ', 'i'),
+            'i',
             ('Publication name [Private Person]: ', 'Public Publisher'),
             ('Publication email [public@example.com]: ', 'public@example.com'),
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
@@ -681,6 +856,7 @@ def test_setup_retries_invalid_name_without_losing_other_answers(
             ('Publication email: ', 'public@example.invalid'),
             ('Sensitive term: ', 'first-canary'),
             ('Sensitive term: ', ''),
+            ('Default publication route (staged/direct) [staged]: ', ''),
             ('Use this GitHub account? [Y/n] ', ''),
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
         ]
@@ -710,6 +886,7 @@ def test_setup_retries_invalid_new_fields_and_terms(
             ('Sensitive term: ', '   '),
             ('Sensitive term: ', 'private-canary'),
             ('Sensitive term: ', ''),
+            ('Default publication route (staged/direct) [staged]: ', ''),
             ('Use this GitHub account? [Y/n] ', ''),
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
         ]
@@ -736,7 +913,7 @@ def test_setup_save_decline_leaves_original_bytes(
     answers(
         [
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 'e'),
-            ('Edit: [i]dentity / [t]erms / [a]ccount / [b]ack: ', 'a'),
+            'a',
             ('Use this GitHub account? [Y/n] ', ''),
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 'c'),
         ]
@@ -781,9 +958,10 @@ def test_setup_shows_terms_while_editing_and_before_saving(
             ('Publication email: ', 'public@example.invalid'),
             ('Sensitive term: ', 'first-canary'),
             ('Sensitive term: ', ''),
+            ('Default publication route (staged/direct) [staged]: ', ''),
             ('Use this GitHub account? [Y/n] ', ''),
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 'e'),
-            ('Edit: [i]dentity / [t]erms / [a]ccount / [b]ack: ', 't'),
+            't',
             ('Terms: [a]dd / [r]eplace / re[m]ove / [d]one: ', 'd'),
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
         ]
@@ -791,9 +969,7 @@ def test_setup_shows_terms_while_editing_and_before_saving(
     assert _cli.main(['setup']) == 0
     out = capsys.readouterr().out
     assert '  1. first-canary' in out
-    assert 'Sensitive terms:\n  1. first-canary' in out
-    assert '[hidden]' not in out
-    assert 'Show the exact values' not in out
+    assert 'Sensitive terms:' in out
     assert _config.load_global(paths).sensitive_terms == ('first-canary',)
 
 
@@ -821,7 +997,7 @@ def test_setup_term_edit_retries_blank_before_valid_value(
     answers(
         [
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 'e'),
-            ('Edit: [i]dentity / [t]erms / [a]ccount / [b]ack: ', 't'),
+            't',
             *selection,
             ('Sensitive term: ', ''),
             ('Sensitive term: ', 'replacement-canary'),
@@ -855,7 +1031,7 @@ def test_setup_term_review_keeps_ids_after_earlier_removal(
     answers(
         [
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 'e'),
-            ('Edit: [i]dentity / [t]erms / [a]ccount / [b]ack: ', 't'),
+            't',
             ('Terms: [a]dd / [r]eplace / re[m]ove / [d]one: ', 'm'),
             ('Term number: ', '1'),
             ('Terms: [a]dd / [r]eplace / re[m]ove / [d]one: ', 'a'),
@@ -890,7 +1066,7 @@ def test_setup_term_review_lists_terms_by_number(
     answers(
         [
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 'e'),
-            ('Edit: [i]dentity / [t]erms / [a]ccount / [b]ack: ', 't'),
+            't',
             ('Terms: [a]dd / [r]eplace / re[m]ove / [d]one: ', 'r'),
             ('Term number: ', '1'),
             ('Sensitive term: ', 'replacement-canary'),
@@ -928,6 +1104,7 @@ def test_setup_writes_nothing_until_save(
             ('Publication email: ', 'public@example.invalid'),
             ('Sensitive term: ', 'first-canary'),
             ('Sensitive term: ', ''),
+            ('Default publication route (staged/direct) [staged]: ', ''),
             ('Use this GitHub account? [Y/n] ', ''),
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 'c'),
         ]

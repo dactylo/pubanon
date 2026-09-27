@@ -115,13 +115,19 @@ def test_gate_unit_computes_views_once(monkeypatch: pytest.MonkeyPatch) -> None:
         return original(data)
 
     monkeypatch.setattr(_gate, '_views', _counting)
+    data = b'has secret and marker'
+    assert _gate.gate_unit('unit', data, {}) == []
+    assert calls == []
+
     rules = {
         _gate.RuleClass.IDENTITY_CRITICAL: ('secret',),
         _gate.RuleClass.HYGIENE: ('marker',),
     }
-    hits = _gate.gate_unit('unit', b'has secret and marker', rules)
-    assert {hit.term for hit in hits} == {'secret', 'marker'}
-    assert len(calls) == 1
+    assert _gate.gate_unit('unit', data, rules) == [
+        GateHit('unit', RuleClass.IDENTITY_CRITICAL, 'secret'),
+        GateHit('unit', RuleClass.HYGIENE, 'marker'),
+    ]
+    assert calls == [data]
 
 
 @pytest.mark.parametrize(

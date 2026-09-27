@@ -2,15 +2,17 @@
 
 For installation and your first publication, start with the
 [README walkthrough](../README.md#your-first-release). Use this guide for later releases, project
-settings, and optional workflows. Commands select the project registered to your current source
+settings, and named workflows. Commands select the project registered to your current source
 directory; use `--project NAME` when working elsewhere.
 
 | If you want to...                            | Start here                                                    |
 | -------------------------------------------- | ------------------------------------------------------------- |
 | Publish committed changes                    | [Quick path](#quick-path)                                     |
+| Add a page to a published tag                | [GitHub release pages](#github-release-pages)                 |
 | Review each publication step                 | [Step-by-step publication](#step-by-step-publication)         |
 | Choose or update a version tag               | [Version tags](#version-tags)                                 |
 | Set up another project                       | [Initialize a project](#initialize-a-project)                 |
+| Remove a project from this machine           | [`pubanon forget`](operations.md#cleanup)                     |
 | Change files, CI checks, or project settings | [Edit an existing project](#edit-an-existing-project)         |
 | Understand snapshots and content checks      | [How a release works](#how-a-release-works)                   |
 | Publish directly to a public repository      | [Direct publication](#direct-publication)                     |
@@ -24,45 +26,77 @@ For interruptions, cleanup, backups, or damaged local history, use the
 
 ## Quick path
 
-After the first release, commit the changes you want to publish, then run:
+For a staged release with configured checks, commit the changes you want to publish, then run:
 
 ```sh
 pubanon prepare
 pubanon inspect
+pubanon stage push
+pubanon stage watch
+pubanon repo create
 pubanon publish
+pubanon repo watch
+pubanon repo reveal
 ```
 
-`prepare` saves a local snapshot of the selected committed files. `inspect` shows the release
-details and a directory of read-only files for review. `publish` asks for confirmation before
-sending that saved snapshot to GitHub. Your source branches, ordinary tags, checkout, and files
-stay unchanged.
+`prepare` saves a local snapshot of the selected committed files, and `inspect` shows its details
+and a read-only copy of the files to review. `stage push` sends that exact snapshot to a private
+staging repository, and `stage watch` waits for its configured checks. `repo create` creates the
+final repository. `publish` asks for confirmation, then sends the snapshot there. `repo watch`
+waits for the final repository's checks, and `repo reveal` makes the repository public after a
+review.
 
-If your project has a committed package version, update it before preparing the next release.
-Pubanon uses that version automatically. See [version tags](#version-tags) for details and for
-projects without a package version.
+Leave out the commands that don't apply:
 
-For a versioned release, `pubanon release VERSION` combines preparation, an inspection summary, and
-publication with confirmation. For example, after committing package version `0.2.0`:
+- Skip `stage watch` when no checks are configured, and review the staging repository yourself.
+  Skip `repo watch` in the same way.
+- Skip `repo create` when the final repository already exists, and `repo reveal` when it is already
+  public or should stay private.
+- On the `direct` route, skip both `stage` commands and go from inspection to publication.
+
+Publication leaves your source branches, checkout, and files unchanged. Optional
+[local source tags](operations.md#local-source-tags) mark releases in your Git history.
+
+Interactive `prepare` shows the included and excluded files and asks whether to continue, review,
+or quit. Review walks through the file groups again with include, exclude, customize, and back
+choices. A revised selection is saved to the project configuration only when you continue; quit
+leaves it unchanged. Global exclusions always apply. `--yes` skips this review but cannot answer
+unresolved file choices or approve files that are new since the last release.
+
+If your project has a committed package version, update and commit it before preparing; Pubanon
+reads it automatically. Otherwise, choose a version tag with `pubanon prepare --version 0.2.0`. See
+[version tags](#version-tags) for the rules. For a repeatable sequence, declare a named
+[workflow](#reusable-workflows).
+
+## GitHub release pages
+
+After publishing a tagged snapshot, you can add a GitHub release page to that existing tag:
 
 ```sh
-pubanon release 0.2.0
+pubanon release create v0.2.0 --notes-file notes.md
+pubanon release show v0.2.0
+pubanon release edit v0.2.0 --title "Version 0.2.0" --notes-file revised-notes.md
 ```
 
-The shortcut does not pause for file review. Use the separate commands above when you want to
-inspect files or run tests. Rerunning the shortcut resumes the retained snapshot only when its
-version and current checks still match. If new files need your decision, it asks about the complete
-list. `--yes` cannot answer that question; see
-[unattended releases](operations.md#unattended-releases).
+The page belongs to the configured final repository, and its title defaults to the tag. `create`
+requires a UTF-8 notes file, which may be empty; `-` does not mean standard input. `edit` accepts a
+new title, a notes file, or both, and keeps whatever you omit; an empty notes file clears the
+notes.
+
+Before a change, Pubanon checks that the tag belongs to your published history and points to the
+same commit on GitHub. It checks the tag, title, and notes against your content rules, previews
+them, and asks for confirmation. `--yes` skips the confirmation but not the checks. If Pubanon
+cannot tell whether a change succeeded, look at the page with `pubanon release show v0.2.0` before
+trying again. `pubanon release list` shows up to 30 pages; `--limit` changes the count.
+
+Release pages are separate from publication: publishing a snapshot does not create a page, and page
+commands do not publish snapshots, upload packages, or run as `pubanon run` stages.
 
 ## Step-by-step publication
 
 For a new project, complete [setup](#setup-and-configuration) and
-[initialization](#initialize-a-project), choosing `private` visibility. Create the destination
-once:
-
-```sh
-pubanon repo create
-```
+[initialization](#initialize-a-project), choosing `private` visibility. Create the final
+destination before publication if it does not already exist.
 
 ### Prepare committed changes
 
@@ -89,17 +123,28 @@ expected visibility. It summarizes changes from the last publication, lists up t
 and links to a complete local file report. Use `--verbose` for full source and publication commit
 IDs and tree details.
 
-Review the directory printed by `inspect`. Its files are read-only and contain no Git metadata.
-Builds or tests that write files need a separate writable copy. Changes in either copy do not alter
-the saved snapshot. To correct the release, edit and commit in the source, then discard and prepare
-again. See [inspection](operations.md#inspection) for refreshing or removing review directories.
+Review the copy printed by `inspect`. Its files are read-only and contain no Git metadata. Builds
+or tests that write files need a separate writable copy. Changes in either copy do not alter the
+saved snapshot. To correct the release, edit and commit in the source, then discard and prepare
+again. `discard` removes that preparation's review copies; see
+[inspection](operations.md#inspection) for refreshing copies kept with other snapshots.
 
 Inspection rechecks saved Git objects. It reports the content checks performed during preparation
 and any changed configuration; it does not check current GitHub state.
 
-### Publish
+### Test privately and publish
+
+On a staged project, run `pubanon stage push`, then `pubanon stage watch` if checks are configured.
+If staging reveals a problem, commit the fix in the source, run `pubanon discard`, prepare and
+inspect again, and push the new candidate. The staging repository is reused for later candidates.
+See [private-first CI](#private-first-ci).
+
+Before the first final upload, consider that GitHub may retain commits, activity, Actions logs, and
+artifacts after refs are replaced. Staging lets you check the exact snapshot before the final
+repository receives it. Create the final repository if absent, then publish:
 
 ```sh
+pubanon repo create
 pubanon publish
 ```
 
@@ -114,29 +159,28 @@ retrieval, retention, and cleanup.
 
 ### Check CI and make the repository public
 
-If you configured `required_checks`, wait for them on the latest published snapshot:
+If you configured `required_checks`, wait for them:
 
 ```sh
-pubanon watch ci
+pubanon repo watch
 ```
 
-Use `--version 0.1.0` to select that published version instead. When a branch and tag trigger
-separate runs of the same check, all matching runs must succeed. For CI before publication, insert
-the [private staging steps](#private-first-ci) between inspection and publication.
+By default, `repo watch` checks the latest published commit; `--version 0.1.0` selects that
+release's tag instead. If a branch push and a tag push both run the same check, every run must
+pass.
 
-When ready to make a private destination public, run:
+When ready to make a private repository public, run:
 
 ```sh
 pubanon repo reveal
 ```
 
-Reveal checks published Git history, repository settings, required CI, and any configured
-[package observation](#package-observation). It lists Actions runs and artifacts and supplies links
-for your review. Pubanon does not scan logs or artifact contents. After your separate disclosure
-acknowledgment and confirmation, it changes visibility and checks the resulting repository again.
-
-Already public repositories need no reveal step for later releases. See
-[post-publication verification](operations.md#post-publication-verification) for additional checks.
+Reveal checks the published history, repository settings, required CI, and any configured
+[package observation](#package-observation). It lists Actions runs and artifacts, with links to the
+Activity and Actions pages, for you to review: Pubanon does not scan logs or artifact contents.
+After you acknowledge that and confirm, it makes the repository public and checks it again. A
+repository that is already public needs no reveal for later releases. See
+[post-publication verification](operations.md#post-publication-verification) for more checks.
 
 ## Version tags
 
@@ -166,10 +210,11 @@ source commit using your allow and deny rules, checks their contents, and create
 under your publication identity. "Sanitized" means selected and checked; Pubanon does not rewrite
 secrets out of included files.
 
-Content checks read selected file bytes as UTF-8 with surrogate escapes and as Latin-1. Pubanon
-normalizes both text views and configured terms to NFC, then casefolds them for matching. UTF-16/32
-text and compatibility-character substitutions, such as U+FF21 in place of ASCII `A`, are not
-guaranteed matches. Review the selected files with these limits in mind.
+Content checks look for your configured terms in every selected file, ignoring case and treating
+equivalent Unicode spellings of a character as the same. They read each file as UTF-8 and as
+Latin-1 text. A term may be missed in a UTF-16 or UTF-32 file, or when it is written with
+look-alike characters such as full-width letters. Review the selected files with these limits in
+mind.
 
 The same snapshot has a state throughout its lifecycle:
 
@@ -181,26 +226,14 @@ The same snapshot has a state throughout its lifecycle:
 | `published`  | Part of the current published history                             |
 | `superseded` | Previously published, then replaced by a history correction       |
 
-For `incomplete` or `unresolved` snapshots, the explanation and recovery command appear below the
-table. Follow that command to continue preparation or resolve publication. Opening an inspection
-directory does not approve publication.
-
-A review directory contains read-only files matching the saved snapshot. Pubanon verifies existing
-directories before reusing them. To change the snapshot, edit and commit in your source repository,
-then discard and prepare again. `discard` removes the prepared snapshot; `inspect --clean` removes
-snapshot directories. Published and superseded snapshots remain in `list` while their saved history
-is available.
+For `incomplete` or `unresolved` snapshots, Pubanon explains the problem and gives the recovery
+command. Opening a review copy does not approve publication.
 
 `pubanon status` shows the current project, its prepared snapshot, and its last published snapshot.
-`pubanon list` lists known snapshots in a table with their versions, states, and publication times.
-Use `--verbose` for additional identifiers and provenance.
-
-After replacing publications, `pubanon clean` previews the superseded local snapshots and asks once
-before removing them, their review directories, and their source recovery information. It keeps
-current published snapshots and prepared work. Use `pubanon delete ID` when you want to remove a
-particular local snapshot instead. Neither command changes GitHub. See
-[cleanup](operations.md#cleanup) for the distinction between deleting a snapshot, discarding
-prepared work, and removing review copies.
+`pubanon list` shows known snapshots with their versions, states, and publication times; add
+`--verbose` for identifiers and provenance. Published and superseded snapshots stay in `list` while
+their saved history is available. To remove snapshots or review copies, see
+[cleanup](operations.md#cleanup).
 
 ```text
 private source repository
@@ -212,13 +245,10 @@ prepared snapshot
 private or public GitHub repository
 ```
 
-`prepare` changes neither the source nor GitHub. You can stop to inspect the snapshot before
-publishing it. If the destination is private, `pubanon repo reveal` checks it and asks for separate
-confirmation before making it public.
-
-Pubanon retains one prepared snapshot per project at a time. It checks content before and after
-creating the commit, verifies the saved Git objects, and pushes the branch and any version tag
-together in one atomic update.
+`prepare` changes neither the source nor GitHub, so you can inspect the snapshot before publishing
+it. Each project has at most one prepared snapshot at a time. Pubanon checks content before and
+after creating the commit, verifies the saved Git objects, and pushes the branch and any version
+tag together, so either both arrive or neither does.
 
 ## Setup and configuration
 
@@ -228,20 +258,29 @@ Run guided setup before initializing your first project:
 pubanon setup
 ```
 
-Setup asks for the publication name and email, then sensitive terms one per line until you enter a
-blank line. It verifies the current GitHub CLI account and shows it before saving. If
-authentication cannot be verified, choose retry, login, or cancel. Login hands the terminal and
-browser authorization to `gh`.
+Setup asks for the publication name and email, sensitive terms one per line until you enter a blank
+line, and the default publication route for new projects. The built-in route is `staged`; choose
+`direct` to publish without private staging. It verifies the current GitHub CLI account and shows
+it before saving. If authentication cannot be verified, choose retry, login, or cancel. Login hands
+the terminal and browser authorization to `gh`.
 
 Review the identity, account, and every term, then choose save, edit, or cancel. Editing preserves
 your other answers and lets you replace or remove terms by number. It asks you to confirm
 surrounding whitespace in an edited term. Nothing is written until you save.
 
 To change saved answers, use `pubanon setup --edit`. To check readiness without editing, use
-`pubanon doctor`. Rerunning ordinary setup preserves your answers and checks readiness; on POSIX,
-it also restores owner-only configuration-file permissions. GitHub authentication completed by `gh`
-remains in effect if setup later stops. See
+`pubanon doctor`. Rerunning ordinary setup preserves your answers and checks readiness; on Linux
+and macOS, it also restores owner-only permissions on the configuration files. GitHub
+authentication completed by `gh` remains in effect if setup later stops. See
 [login recovery](operations.md#github-login-during-setup).
+
+When Pubanon saves a configuration file, it rewrites the whole file, so hand-written comments and
+layout may be lost. The global `config.toml` is saved by guided setup and `setup --edit`. A
+project's file is saved when `init` creates the project, changes its route or source-tag setting,
+or relocates its source; when you accept a revised file selection in `prepare`; when you
+acknowledge a historical exposure during publication; and when `repo reveal` records that the
+repository is public. `doctor` never writes configuration, and neither do setup or `init` when
+nothing changes.
 
 Identity changes affect every project using this configuration. Existing publication commits keep
 their identity unless you [replace their history](#publication-identity). Changes to sensitive
@@ -255,9 +294,44 @@ Configuration and publication data live outside the source repository:
 | `~/.config/pubanon/projects/NAME.toml` | Settings for the named project                                          |
 | `~/.local/share/pubanon/`              | Project registry, snapshots, publication records, and local Git history |
 
-Pubanon honors `XDG_CONFIG_HOME` and `XDG_DATA_HOME`. See [platforms](platforms.md) for filesystem
-permissions and Windows behavior. To write the global TOML yourself, set `anon_name`, `anon_email`,
-and `sensitive_terms`, plus `github` under `[accounts]`. Run `setup` or `doctor` to validate it.
+`XDG_CONFIG_HOME` and `XDG_DATA_HOME` change these roots. The local Git store at
+`~/.local/share/pubanon/projects/NAME/store.git` holds the exact published snapshots and history;
+it is separate from your private source repository. See [platforms](platforms.md) for file
+permissions and Windows behavior.
+
+To write the global configuration yourself, use this form. `sensitive_terms` needs at least one
+term, and `default_publication_route` is `staged` or `direct`. Run `pubanon doctor` afterwards to
+validate it.
+
+```toml
+anon_name = "Example Author"
+anon_email = "author@example.com"
+sensitive_terms = ["private-name"]
+default_publication_route = "staged"
+
+[accounts]
+github = "example-account"
+```
+
+### Global exclusions
+
+To keep files or directories out of every project, run `pubanon setup --edit` and choose **Files**
+or **Directories**. You can also add the optional top-level fields to the global configuration,
+above `[accounts]`:
+
+```toml
+ignored_files = ["LOCAL.md", "notes/private.txt"]
+ignored_directories = ["docs/private", "notes/confidential"]
+```
+
+Entries are literal paths, not glob patterns, and ignore case. A bare filename matches at any
+depth; a path containing `/` matches that exact path from the source root. A directory entry covers
+everything beneath it, with or without a trailing slash. Exclusions override project includes,
+apply to existing and new projects, and leave your source files untouched. Changing either list
+requires prepared snapshots to be prepared again; published history is unchanged.
+
+Exclusions don't stop content checks on the files that remain. To block references to private names
+or paths in published text, including build configuration, add them to `sensitive_terms`.
 
 ### Initialize a project
 
@@ -267,34 +341,48 @@ From a private source repository with no Git remote, run:
 pubanon init
 ```
 
-Choose which files to publish, the GitHub destination, expected visibility, and repository
-settings. The publication branch is always `main`; your private source branch can have any name.
+Choose which files to publish, the GitHub destination, expected visibility, publication route, and
+repository settings. The route starts from your global default and is saved for this project; later
+changes to that default affect only new projects. The final review also shows the derived private
+staging destination. Both publication and staging use `main`; your private source branch can have
+any name.
 
 Initialization first asks about paths whose names suggest credential files. A name match is a
 warning, not proof of a secret; you choose whether to include each file. Included files still pass
 the content checks. The preview groups included files by directory and shows exclusions with their
-reasons. Exclusions take precedence over includes. Files named `.pubanon.toml` are always excluded
-because that name is reserved for Pubanon configuration.
+reasons; exclusions take precedence over includes. Subdirectories of `docs/` and the `.agents/`
+directory appear as separate groups. Files named `.pubanon.toml` are always excluded because that
+name is reserved for Pubanon configuration.
 
-Choose continue to accept the selection or review to adjust it. Back undoes the preceding
-include/exclude choice, including a credential-like filename decision. The updated preview also
-offers Back. `--verbose` adds include/exclude patterns and the first two matches per include
-pattern. You can save the complete filename list at the displayed local path; it contains names,
-not file contents.
+Choose continue to accept the selection or review to adjust it. Back undoes the preceding choice,
+including a credential-like filename decision. `--verbose` adds the include and exclude patterns
+and the first two matches for each include pattern. The complete list of filenames, without their
+contents, is saved at the local path shown.
 
-Initialization discovers CI check names from the committed workflows selected for publication.
-Choose All listed or Select to choose by number. This controls which results Pubanon waits for; the
-workflow still controls which jobs GitHub runs. Static matrix jobs expand to individual names.
-Unsupported expressions and reusable workflows are marked unresolved so you can enter their names
-yourself. Separate manual names with commas and quote a name containing a comma, such as
-`quality, "tests (ubuntu-24.04, 3.13)"`. An empty list makes CI waiting optional.
+Initialization finds CI check names in the committed workflows selected for publication, expanding
+static matrix jobs into individual names. The checks you choose are the results Pubanon waits for;
+your workflows still decide which jobs GitHub runs. Pubanon flags checks that might not run on an
+ordinary push: those from workflows without a branch-push trigger, with branch or path filters, or
+with a job condition. Review flagged checks before selecting them; a manual release job, for
+example, usually doesn't belong. When anything is flagged or unresolved, choose checks by number
+instead of selecting all.
 
-Set the repository description and whether issues, the wiki, and projects are enabled. These
-settings are saved under `[settings]` and checked before reveal. The final review lets you save,
-edit, or cancel. Invalid answers return to the affected field without losing earlier choices.
-Directories such as `docs/internal/`, `docs/superpowers/`, and `.agents/` appear as separate
-selection groups when present. For Pubanon's own source, pass `--self-publication` so its name is
-not treated as a hygiene term.
+Discovery can't evaluate every GitHub expression. Checks from unsupported expressions and reusable
+workflows are marked unresolved, so enter their names yourself: separate names with commas and
+quote a name that contains one, such as `quality, "tests (ubuntu-24.04, 3.13)"`. An empty list
+means there are no checks to wait for; on the staged route, review the staging repository yourself.
+
+Initialization also offers local source tags, off by default. Enable them to see a marker such as
+`pubanon/v0.1.0` beside the source commit in your usual Git viewer. The choice is saved per
+project.
+
+Set the repository description and whether issues, the wiki, projects, pull requests, and
+discussions are enabled. Pull requests and discussions default to off. Pubanon publishes from the
+private source and does not merge on GitHub. These settings are saved under `[settings]` and
+checked before reveal. The final review lets you save, edit, or cancel. An invalid answer returns
+you to that field without losing earlier choices. When publishing Pubanon's own source, pass
+`--self-publication` so its name is not treated as a hygiene term; your configured terms and
+exclusions still apply.
 
 Each accepted answer is saved in a setup draft. After quitting or pressing Ctrl-C, rerun the
 displayed command and choose Resume. Start over discards the draft; quitting the resume menu keeps
@@ -303,37 +391,74 @@ review. The project configuration is written only when you choose Save at the fi
 
 ### Edit an existing project
 
+To change which files are included, run `pubanon prepare` and choose **Review** at the selection
+prompt. If a snapshot is already prepared, discard it first with `pubanon discard`. After accepting
+the new selection, preparation checks and saves the snapshot for inspection.
+
 Open `~/.config/pubanon/projects/NAME.toml` in your editor, using the configured XDG location if
 different. To find the exact path, run `pubanon init` from the registered source directory. For an
 existing project, this prints the path and refreshes registration; it does not reopen the setup
 questions.
+
+To change only the route on an existing project, run `pubanon init --publication-route staged` or
+`pubanon init --publication-route direct` from the registered source. This preserves prepared
+snapshots, staging tracking, and publication history. Rerunning `pubanon init` without the flag
+keeps the project's route.
+
+Use `pubanon init --source-tags` to enable local source tags, or `pubanon init --no-source-tags` to
+stop creating and updating them. Existing tags remain when disabled. Run `pubanon list` after
+enabling the option to mark already published sources. These changes preserve prepared snapshots.
 
 Update the existing fields for the change you want. For example, these are top-level fields, above
 the first table heading such as `[settings]`:
 
 ```toml
 allow = ["src/*", "pyproject.toml", "README.md", "LICENSE"]
-deny = ["docs/internal/*"]
+deny = ["docs/private/*"]
 required_checks = ["quality"]
+publication_route = "staged"
+source_tags = false
 ```
 
-Keep the other saved fields. `allow` and `deny` use case-sensitive patterns against the whole
-relative path, with forward slashes on every platform. `*` can match across directory separators:
-`src/*` includes files in nested source directories. Deny patterns take precedence. Pubanon's
-reserved `.pubanon.toml` filename stays excluded.
+Keep the other saved fields. `publication_route` is required and accepts `staged` or `direct`.
+Changing it does not rebuild or change a prepared snapshot. `allow` and `deny` use case-sensitive
+patterns against the whole relative path, with forward slashes on every platform. `*` can match
+across directory separators: `src/*` includes files in nested source directories. Deny patterns
+take precedence. Pubanon's reserved `.pubanon.toml` filename stays excluded.
 
-Private staging defaults to a repository named after the destination with `-stage` appended. To
-choose another name, set the optional top-level `stage_repo` value. Add
-[named workflows](#reusable-workflows) and [package observation](#package-observation) as their own
-TOML tables. Edit the existing `[settings]` table for repository features and description;
-`default_branch` must remain `"main"`. Pubanon checks declared settings against GitHub before
-reveal; editing this file does not update GitHub settings.
+The staging repository is named after the destination with `-stage` appended; set the optional
+top-level `stage_repo` to choose another name. Add [named workflows](#reusable-workflows) and
+[package observation](#package-observation) as their own TOML tables. Edit the existing
+`[settings]` table for repository features and description; `default_branch` must remain `"main"`.
+For example:
+
+```toml
+[settings]
+description = "Public project"
+default_branch = "main"
+issues = true
+wiki = false
+projects = false
+pull_requests = false
+discussions = false
+```
+
+Both `pull_requests` and `discussions` are required in existing project configurations. Set each to
+`true` or `false` when updating a configuration that does not yet have them.
+
+Pubanon checks these settings against the final repository before reveal. A new staging repository
+starts with the same settings, but later edits are not copied to it.
+
+CI runs separately in the staging and final repositories. Staging receives `main` without tags, so
+tag-only workflows don't run there. Keep deployment and package-upload triggers limited to the
+repository that should run them.
 
 After saving, run `pubanon status` to check the project and any retained snapshot. Changes to file
 selection, publication identity, destination, or required checks require a fresh snapshot. When
 instructed, discard the old snapshot and prepare again, then inspect the selected files. See
 [when to prepare again](operations.md#when-a-snapshot-must-be-prepared-again) for the complete
-rules. Use `pubanon setup --edit` for global identity, sensitive terms, and account changes.
+rules. Use `pubanon setup --edit` for global identity, sensitive terms, exclusions, and account
+changes.
 
 ## Publication identity
 
@@ -347,8 +472,8 @@ The identity must not appear in `sensitive_terms` or in a project's `extra_terms
 refusal names every matched rule source without printing the matched term.
 
 Every published commit is audited against the configured identity. A changed name or email blocks
-ordinary publication, synchronization, store repair, and reveal. Restore the original identity, or
-follow [correcting published history](#correcting-published-history) and use
+ordinary publication, `repo restore` in either direction, and reveal. Restore the original
+identity, or follow [correcting published history](#correcting-published-history) and use
 `pubanon prepare --replace all` to make an explicit full replacement under the changed identity.
 The replacement does not erase old content from existing clones or caches. Choose an email you can
 keep, such as a host no-reply address.
@@ -361,100 +486,109 @@ XDG_CONFIG_HOME=~/.config/pubanon-public XDG_DATA_HOME=~/.local/share/pubanon-pu
 ```
 
 Each root keeps its own global configuration, project registry, and published-history store. Under
-a real name, the residual risks in the operations guide still apply to every configured sensitive
-term; they no longer apply to the identity itself.
+a real name, the [residual risks](operations.md#residual-risks) still apply to every configured
+sensitive term; they no longer apply to the identity itself.
 
 ## Direct publication
 
-Private staging is optional. If local evidence is sufficient, create the final repository as public
-and publish directly. During `init`, choose `public` when asked for expected visibility;
-`repo create --public` must match that saved choice.
+Select the `direct` route to publish without private staging. The route is separate from the final
+repository's visibility: for this example, choose `direct` and `public` visibility during `init`.
+`repo create` uses the saved visibility.
 
 ```sh
-pubanon init
-pubanon repo create --public
+pubanon init --publication-route direct
+pubanon repo create
 pubanon prepare
 pubanon inspect
 pubanon publish
 ```
 
-For a versioned release, you may replace the last three commands with `pubanon release VERSION`. It
-requires a version matching any committed package version. `publish` and `release` use the existing
-final repository; they do not create it, change visibility, or add staging.
+`publish` needs an existing final repository; it neither creates one nor changes its visibility.
+The same `init` command switches an existing project to `direct`; leftover staging tracking does
+not then require staging.
 
 ## Private-first CI
 
-Use a separate private staging repository to run CI before publishing to the final destination. Set
-`required_checks` and, if needed, `stage_repo` in your
+Select the `staged` route to test the exact candidate in a separate private repository before the
+final upload. Set `required_checks` and, if needed, `stage_repo` in your
 [project configuration](#edit-an-existing-project). Then run:
 
 ```sh
 pubanon prepare
 pubanon inspect
 pubanon stage push
-pubanon watch ci --staged
+pubanon stage watch
 pubanon publish
 ```
 
-On first use, `stage push` asks before it creates the private staging repository; `--yes` cannot
-make that creation decision. Later pushes may replace only the staging branch and never send tags.
-`stage status` checks the staged snapshot and reports its current CI results without waiting.
-`watch ci --staged` waits for the configured checks on that snapshot. The final repository still
-needs its own checks because staging results belong to the separate staging repository. Pubanon
-proves that the released tree matches the staged snapshot.
+The first `stage push` asks before creating the private staging repository, and `--yes` cannot
+approve that. Later pushes update its `main` branch and never send tags. `stage status` reports the
+staged snapshot's current check results without waiting; `stage watch` waits for them. `publish`
+reads the results once for the exact staged commit, and pending or failed checks stop it. With an
+empty `required_checks` list, skip the watch and review staging yourself: Pubanon still verifies
+the staged commit but does not report CI success. The final repository needs its own checks,
+because staging results stay in the staging repository.
 
-Checks may take time to appear. The watches report progress and wait within a shared timeout;
-Ctrl-C stops the wait without changing the snapshot or GitHub. Rerun the same watch to continue.
-See [watch recovery](operations.md#retrying-an-interrupted-command) for missing, ambiguous, or
-failed checks and timeout options.
+Checks may take time to appear. The watches report progress until a timeout; Ctrl-C stops waiting
+without changing the snapshot or GitHub, and rerunning the same watch continues. See
+[watch recovery](operations.md#retrying-an-interrupted-command) for missing, ambiguous, or failed
+checks and timeout options.
 
-Delete the staging repository when it is no longer useful:
-
-```sh
-pubanon stage clean
-```
-
-The command previews the selected repository and asks before deleting it. See
-[cleanup](operations.md#cleanup) if the configuration changed or GitHub cannot confirm whether the
-repository still exists.
+Keep the staging repository for later releases. `stage repair` reconnects local tracking when it
+recognizes the repository's `main` branch; a repository that still has an old `stage` branch must
+be corrected on GitHub first. `stage forget` removes local tracking but keeps the repository and
+the route, so a staged project must push or repair staging again before publishing. To stop
+staging, switch to `direct` with `pubanon init --publication-route direct`. `stage delete` deletes
+the staging repository. See [cleanup](operations.md#cleanup) for details.
 
 ## Reusable workflows
 
-Add a named sequence to your [project configuration](#edit-an-existing-project). Set
-`required_checks` before including `watch ci`:
+Named workflows let you test privately, review the results, and then publish the tested snapshot.
+Add them to your [project configuration](#edit-an-existing-project), with `required_checks` set for
+the CI waits:
 
 ```toml
+[workflow.stage]
+stages = ["prepare", "inspect", "stage push", "stage watch"]
+
 [workflow.ship]
-stages = ["prepare", "inspect", "publish", "watch ci"]
+stages = ["publish", "repo watch"]
 ```
 
-Run it with an explicit publication version matching any committed package version:
+A workflow uses each stage at most once, in this order: `prepare`, `inspect`, `stage push`,
+`stage watch`, `publish`, `repo watch`, `repo reveal`, and `package watch`. The names `stage` and
+`ship` are your choice, and you can define several workflows.
+
+First, prepare the candidate, send it to staging, and wait for CI. Preparation reads the version
+from your committed `pyproject.toml` when there is one:
 
 ```sh
-pubanon run ship --version 0.1.0
+pubanon run stage
 ```
 
-A declared workflow prints its stage outline first. It prepares and verifies the retained snapshot
-before asking for publication approval. The final preview shows its full commit IDs, actual author
-and committer, complete message, file summary, verified destination and visibility, and exact refs.
-A public destination means the snapshot becomes publicly accessible. Declining retains the snapshot
-and snapshot directory; run `pubanon inspect` for hands-on review, then publish when ready. Staging
-creation, staging push, publication, and reveal each keep their own concrete approval.
+After staging CI succeeds and you have reviewed the result, publish that candidate and wait for the
+final repository's CI:
 
-With `--yes`, selected stages continue automatically after their previews. The inspection stage
-creates or preserves the snapshot-specific copy but does not pause for editing or testing. For
-hands-on review in that mode, end the workflow at `inspect` or run `prepare`, `inspect`, and
-`publish` separately. First-use staging creation, source drift, historical-exposure acknowledgment,
-and reveal disclosure are not covered by `--yes`.
+```sh
+pubanon run ship
+```
 
-Review directories remain available after publication or cancellation. See
-[inspection](operations.md#inspection) for checking, refreshing, or cleaning them.
+`ship` publishes the same snapshot you tested, with the candidate's version, or without a tag if it
+has none. For a project without a committed package version, pass `--version` to `run stage` to get
+a tag. A workflow containing `publish` needs a prepared snapshot or an explicit `--version`: after
+publication, `pubanon run ship --version 0.1.0` resumes the remaining checks for that release.
 
-A workflow may contain each of these stages at most once and in this order: `prepare`, `inspect`,
-`stage push`, `watch ci --staged`, `publish`, `watch ci`, `repo reveal`, and `watch package`. `run`
-prints the resolved stages and every possible change to GitHub before it starts. `--yes` can
-confirm only that declared sequence. It cannot answer policy, new-path, source-drift, first-use
-staging, or reveal-disclosure decisions.
+`run` first prints its stages and every change it could make on GitHub. Creating the staging
+repository, pushing to it, publishing, and revealing each keep their own approval. Before
+publication, the preview shows the full commit IDs, author and committer, message, file summary,
+destination, visibility, and refs. Declining keeps the snapshot and its review copy; run
+`pubanon inspect` to review it by hand, then follow its next step.
+
+With `--yes`, stages continue after their previews without asking, and the inspection stage does
+not pause for you to review files. For a hands-on review, end the workflow at `inspect` or run the
+commands separately. `--yes` confirms only the declared stages. It cannot answer policy or new-path
+decisions, accept a changed source branch or tag, approve creating the staging repository,
+acknowledge a historical exposure, or accept the reveal disclosure.
 
 ## Non-package workflows
 
@@ -462,29 +596,29 @@ Pubanon can publish any supported Git source snapshot. A project without a packa
 `[package]` table and still publish Git history, wait for CI, and reveal a repository.
 
 Use plain `pubanon prepare` for an untagged snapshot or [choose a version tag](#version-tags)
-explicitly. Configure `required_checks` to use `pubanon watch ci`. A
+explicitly. Configure `required_checks` to use `pubanon repo watch`. A
 [named workflow](#reusable-workflows) can end after CI; package observation is optional.
 
 ## Package observation
 
-Use package observation when your release workflow uploads to PyPI and you want to check that the
-files arrived. Pubanon observes the upload; it never uploads a package itself. Add this table to
-your [project configuration](#edit-an-existing-project):
+Use package observation when your release workflow uploads to PyPI and you want to confirm that the
+files arrived. Pubanon only observes; it never uploads packages. Add this table to your
+[project configuration](#edit-an-existing-project):
 
 ```toml
 [package]
 index = "pypi"
 name = "public-package"
-release_checks = ["Publish package"]
+release_checks = ["Publish to PyPI"]
 ```
 
-Use the exact PyPI distribution name for `name`. `release_checks` must contain at least one exact
-host check name that gates the project's package release. `pubanon watch package` observes PyPI
-only after every configured release check succeeds. Without `--version`, it selects the numerically
-greatest strict `X.Y.Z` release tag, regardless of commit recency or the published `main` tip. With
-`--version`, it selects that exact release tag and commit. Version metadata without distribution
-files remains incomplete: the watch continues, and `repo reveal` refuses to change visibility until
-files appear. A successful observation lists the actual files. Pubanon never uploads a package.
+Set `name` to the exact PyPI distribution name. `release_checks` lists at least one check that
+gates the package upload, by its job or check name rather than the workflow title.
+`pubanon package watch` looks at PyPI only after every release check succeeds. Without `--version`,
+it selects the highest `X.Y.Z` release tag, even if a newer commit has a lower version; `--version`
+selects that exact release. A version with no uploaded files is incomplete: the watch keeps
+waiting, and `repo reveal` refuses to make the repository public until files appear. When the files
+arrive, the watch lists them.
 
 ## Correcting published history
 
@@ -499,9 +633,11 @@ situation:
 | Correct an older release and rebuild subsequent publications | `pubanon prepare --replace v0.1.0` |
 | Start the published history over entirely                    | `pubanon prepare --replace all`    |
 
-After preparation, run `pubanon inspect`, then `pubanon publish`. Preparation uses your current
-committed source by default and does not change GitHub. The summary explains which history will be
-replaced. These commands have the same meaning for private and public destinations.
+After preparation, run `pubanon inspect` and follow its route-aware next step. A staged project
+must stage the resulting tip and satisfy configured checks before `pubanon publish`; a direct
+project can publish after inspection. Preparation uses your current committed source by default and
+does not change GitHub. The summary explains which history will be replaced. These commands have
+the same meaning for private and public destinations.
 
 For a versioned package, commit a new version before preparing an ordinary new release. If its tag
 already exists, plain `prepare` stops and explains how to select a replacement instead.
@@ -511,19 +647,23 @@ While iterating privately toward an initial release, commit each correction and 
 ```sh
 pubanon prepare --replace all --message "Initial release."
 pubanon inspect
+pubanon stage push
+pubanon stage watch
 pubanon publish
 ```
+
+Adjust the staging commands for your route and checks as in the [quick path](#quick-path).
 
 Each successful publication starts the published history over with one commit and the intended
 version tag, if any. You can keep the same package version while correcting that initial release.
 Your private development history stays intact.
 
 Once others use a public repository, usually publish a new release instead of replacing history.
-Ordinary publication and `publish --sync` do not rewrite published history. Replacement can be used
-for private or public repositories, but may disrupt existing clones and consumers. Existing clones,
-caches, and host-retained objects may still contain the old content. Moved Git tags do not replace
-GitHub Release assets, Actions logs or artifacts, or packages already uploaded by your release
-workflow.
+Ordinary publication and `repo restore --to remote` do not rewrite published history. Replacement
+can be used for private or public repositories, but may disrupt existing clones and consumers.
+Existing clones, caches, and host-retained objects may still contain the old content. Moved Git
+tags do not replace GitHub Release assets, Actions logs or artifacts, or packages already uploaded
+by your release workflow.
 
 First commit the intended correction in your private source. Select that committed revision when
 preparing:
@@ -595,59 +735,53 @@ pubanon inspect --rewritten v0.2.0
 ```
 
 The report lists old-to-new commits, per-release changes, moved tags, and recorded resolutions; its
-complete files report contains changes omitted from a bounded terminal preview. Inspection copies
-are read-only and match the selected saved snapshot. If you use staging, `pubanon stage push` sends
-the resulting tip only, and publication requires staging evidence for that same tip.
+complete files report contains changes omitted from a bounded terminal preview. Review copies are
+read-only and match the selected saved snapshot. On the staged route, `pubanon stage push` sends
+the resulting tip only, and publication requires private staging and configured checks for that
+same tip. Follow inspection's next step before the publication commands below.
 
 ```sh
 pubanon publish
-pubanon watch ci --version 0.3.0
+pubanon repo watch --version 0.3.0
 ```
 
-The CI example selects the final replayed release's version; use your actual moved tag. Publication
-reviews the destination, correction and replay mapping, ref changes, and public-history warning
-before one confirmation. It sends the frozen result with exact old-ref checks in one atomic push.
-GitHub rules may refuse the rewrite; Pubanon does not promise to detect host policy in advance.
-Local publication success does not imply CI success. Observe the exact published version next. If
-the push outcome is unknown, run `pubanon publish --resolve`; it checks the saved destination
-without pushing again. `release` and `run` refuse retained replacements so that you finish through
-the explicit inspection and publication steps.
+In the example, `0.3.0` stands for the last replayed release; use your actual moved tag.
+Publication shows the destination, which releases are corrected and replayed, the ref changes, and
+a warning about public history, then asks once. It pushes the result in a single update that fails
+if GitHub no longer matches the saved published state. GitHub branch rules may still refuse the
+rewrite, and Pubanon cannot detect them in advance. A successful publication says nothing about CI,
+so watch the published version next. If the push outcome is unknown, run
+`pubanon publish --resolve`, which checks GitHub without pushing again. `run` refuses a prepared
+replacement, so finish it with the individual commands.
 
 `list` shows superseded snapshots with state `superseded`. They remain locally inspectable by
 commit prefix while preserved. A derived release's original source revision is an input to replay,
 not an exact private-source copy of its resulting published tree. See the operations guide for
 [source recovery](operations.md#published-history-and-source-recovery) and
-[separate cleanup choices](operations.md#cleanup).
+[cleanup](operations.md#cleanup).
 
 ## Existing destinations and restored history
 
-For a first publication, the configured host repository may already exist when it is empty. Prepare
-and publish normally:
-
-```sh
-pubanon prepare
-pubanon inspect
-pubanon publish
-```
-
-The `publish` preflight verifies that the repository is empty before sending the first release. It
-refuses a nonempty repository with unrelated commits, branches, or tags rather than importing,
-replacing, or force-updating that history.
+The final repository may already exist before your first publication, as long as it is empty.
+Follow the [quick path](#quick-path) without `repo create`. Before the first release, `publish`
+checks that the repository is empty. It refuses a repository with existing commits, branches, or
+tags rather than importing, replacing, or overwriting them.
 
 For a recreated or restored repository, retained local published history may be sent to a host that
 is empty or an exact prefix of that history:
 
 ```sh
-pubanon publish --sync
+pubanon repo restore --to remote
 ```
 
-`publish --sync` verifies that the host is empty or strictly behind, then sends the verified
-retained public history. It consumes no prepared snapshot.
+It checks that GitHub is empty or strictly behind, then sends the saved published history. It does
+not use or change a prepared snapshot.
 
-Historical auditing uses current terms, including for the publication author and committer name and
-email. If an alias becomes sensitive after publication, `status --audit` reports the exposure,
-`repo reveal` refuses it, and synchronization requires explicit historical-exposure acknowledgment.
-`--yes` alone cannot supply that acknowledgment.
+Run `pubanon audit` to check your saved published history, including the author and committer names
+and emails, against your current terms. `pubanon audit --remote` first checks that history against
+GitHub. If a name becomes sensitive after publication, `audit` reports the exposure, `repo reveal`
+refuses it, and `publish` and `repo restore --to remote` require you to acknowledge it; `--yes`
+alone cannot.
 
 Findings identify the matched term and its location so you can correct it. Accepting a historical
 exposure does not remove published content or allow those terms in new snapshots. See
@@ -663,13 +797,14 @@ If the local published-history copy is missing or damaged and the host still has
 rebuild the local copy from the verified host:
 
 ```sh
-pubanon repo verify --repair-store
+pubanon repo restore --to local
 ```
 
-Use repair only when GitHub has the history you want to keep locally. It previews the local changes
-and asks before replacing them. Matching history structure and identity cannot prove that Pubanon
-originally created it. See [history repair](operations.md#repairing-the-local-history-copy) for
-verification, partial-success recovery, and limits.
+Here, `local` means saved publication history, not the source checkout. Use restoration only when
+GitHub has the history you want to keep locally. It previews the local changes and asks before
+replacing them. Matching history structure and identity cannot prove that Pubanon originally
+created it. See [history repair](operations.md#repairing-the-local-history-copy) for verification,
+partial-success recovery, and limits.
 
 ## Accepting an outside fix
 
@@ -722,31 +857,44 @@ A `CONTRIBUTING.md` stating that policy is ordinary project content.
 ### If the host changed outside Pubanon
 
 When `publish` reports that the remote state differs from what the snapshot expects, or
-`status --audit --remote` reports that host refs do not match local published state, Pubanon shows
-the expected and observed references. It does not know why they differ. Possible causes include a
-pull request merged on the host, a push from another machine or configuration root, or a change
-made in the host's web interface.
+`audit --remote` reports that host refs do not match local published state, Pubanon shows the
+expected and observed references. It does not know why they differ. Possible causes include a pull
+request merged on the host, a push from another machine or configuration root, or a change made in
+the host's web interface.
 
 Ordinary publication does not remove commits from host history. Explicit
 [publication replacement](#correcting-published-history) can rewrite the expected published refs,
 but does not bypass a mismatch caused by outside changes. If you want the public branch back at the
 last published state, restore it outside Pubanon, using the last published commit reported by
-`pubanon status`. After that, `pubanon status --remote` reports a match and publication resumes. If
-the local published-history store is what is wrong, `pubanon repo verify --repair-store` rebuilds
-it from a host that passes verification. Repair checks history structure and identity, but cannot
-prove that Pubanon originally created the commits.
+`pubanon status --verbose`. After that, `pubanon status --remote` reports a match and publication
+resumes. If the local published-history store is what is wrong, `pubanon repo restore --to local`
+rebuilds it from a host that passes verification. Repair checks history structure and identity, but
+cannot prove that Pubanon originally created the commits.
 
 ## Reading the terminal interface
 
-Sections are separated by blank lines and bold cyan headings. Questions are bold, choices are cyan,
-successful results are green, warnings and cancellations are yellow, and errors are red. Labels and
-messages also explain their meaning without color. `--color auto` (the default) enables styling on
-terminals and respects `NO_COLOR`; redirected output stays plain. `--color always` forces styling,
-including in pipes, and overrides `NO_COLOR`. `--color never` disables color and bolding.
+Output gives the context, the facts needed to judge the result, one result line, and a `Next:`
+command when there is another step. Short results need no heading. Previews show what you are about
+to change; warnings explain consequences such as replaced history or checks not performed.
 
-Use `-v` or `--verbose` for additional snapshot IDs, source revisions, and local paths. Normal
-output still includes the state, relevant warnings, and next action. Presentation options work
-before or after the command. Publication timestamps use local time with seconds and a timezone.
+Headings are bold cyan, field labels are bold, successful results are green, warnings and
+cancellations are yellow, and errors are bold red. Questions are bold and choices and commands are
+cyan. Secondary notes are dim. Messages use words rather than status symbols and remain clear
+without color. `--color auto` (the default) enables styling on terminals and respects `NO_COLOR`;
+redirected output stays plain. `--color always` forces styling, including in pipes, and overrides
+`NO_COLOR`. `--color never` disables color and bolding.
+
+Use `-v` or `--verbose` for diagnostic detail: full commit IDs, Git references, internal paths, and
+comparisons of saved and observed state. It adds to the normal output; warnings, unknown outcomes,
+and recovery commands remain visible without it. Presentation options work before or after the
+command. Commit IDs normally use 12 characters. Publication timestamps use local time with seconds
+and a timezone abbreviation. Displayed paths under your home directory start with `~`; paths in
+commands to copy and run stay absolute.
+
+Declining a confirmation reports `Canceled.` and returns status 130, as do quitting a menu and
+pressing Ctrl-C before a change starts. If a change may already have happened, Pubanon reports the
+known outcome and the recovery step. See
+[input and cancellation](operations.md#input-and-cancellation).
 
 Inside a registered source repository or its subdirectories, commands select that project
 automatically. Use `-p NAME` (or `--project NAME`) before or after a command when working elsewhere

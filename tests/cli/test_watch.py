@@ -62,9 +62,44 @@ def test_watch_defaults_reach_observation_functions(
     monkeypatch.setattr(_watch, 'watch_ci', _WatchModule._watch_ci)
     monkeypatch.setattr(_watch, 'watch_package', _WatchModule._watch_package)
 
-    assert _cli.main(['watch', 'ci', '--project', project.name]) == 0
-    assert _cli.main(['watch', 'package', '--project', project.name]) == 0
+    assert _cli.main(['stage', 'watch', '--project', project.name]) == 0
+    assert _cli.main(['stage', 'watch', '--project', project.name, '--timeout', '45']) == 0
+    assert _cli.main(['repo', 'watch', '--project', project.name]) == 0
+    assert (
+        _cli.main(
+            ['repo', 'watch', '--project', project.name, '--version', '1.2.3', '--timeout', '30']
+        )
+        == 0
+    )
+    assert _cli.main(['package', 'watch', '--project', project.name]) == 0
+    assert (
+        _cli.main(
+            [
+                'package',
+                'watch',
+                '--project',
+                project.name,
+                '--version',
+                '2.0.0',
+                '--timeout',
+                '60',
+            ]
+        )
+        == 0
+    )
     assert received == [
+        (
+            paths,
+            global_config,
+            project,
+            {'staged': True, 'version': None, 'timeout': _watch.DEFAULT_TIMEOUT},
+        ),
+        (
+            paths,
+            global_config,
+            project,
+            {'staged': True, 'version': None, 'timeout': 45},
+        ),
         (
             paths,
             global_config,
@@ -75,7 +110,19 @@ def test_watch_defaults_reach_observation_functions(
             paths,
             global_config,
             project,
+            {'staged': False, 'version': '1.2.3', 'timeout': 30},
+        ),
+        (
+            paths,
+            global_config,
+            project,
             {'version': None, 'timeout': _watch.DEFAULT_TIMEOUT},
+        ),
+        (
+            paths,
+            global_config,
+            project,
+            {'version': '2.0.0', 'timeout': 60},
         ),
     ]
 
@@ -101,9 +148,9 @@ def test_watch_gates_current_coordinates_before_host_access(
     )
     capsys.readouterr()
 
-    assert _cli.main(['watch', 'ci', '--project', project.name, '--timeout', '1']) == 1
+    assert _cli.main(['repo', 'watch', '--project', project.name, '--timeout', '1']) == 1
 
     rendered = capsys.readouterr().err
-    assert 'repository repo failed content gates' in rendered
+    assert 'repository name did not pass content checks' in rendered
     assert term in rendered
     assert not (tmp_path / 'fake-gh-calls.jsonl').exists()

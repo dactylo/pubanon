@@ -1,7 +1,5 @@
 """Persist private candidate and confirmed published snapshot records."""
 
-# pyright: reportPrivateUsage=false
-
 import os
 import re
 import tomllib
@@ -24,6 +22,9 @@ from pubanon._snapshots._source import (
 )
 from pubanon._terminal import escape
 from pubanon._toml import toml_string
+
+STATE_RETAINED = 'retained'
+STATE_UNKNOWN_OUTCOME = 'unknown-outcome'
 
 _BOOKMARK_KEYS = frozenset({'source_path', 'git_common_dir', 'refname'})
 _CANDIDATE_KEYS = frozenset(
@@ -89,13 +90,11 @@ _REWRITE_KEYS = frozenset(
     {'correction', 'replaces', 'prestate_main', 'descendants', 'phase', 'replayed', 'pause'}
 )
 _VALID_MODES = frozenset({0o100644, 0o100755, 0o120000})
+_VALID_STATES = frozenset({STATE_RETAINED, STATE_UNKNOWN_OUTCOME})
 _VERSION_PATTERN = re.compile(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)')
 type _TOML_VALUE = (
     str | int | datetime | tuple[str, ...] | dict[str, _TOML_VALUE] | list[dict[str, _TOML_VALUE]]
 )
-STATE_RETAINED = 'retained'
-STATE_UNKNOWN_OUTCOME = 'unknown-outcome'
-_VALID_STATES = frozenset({STATE_RETAINED, STATE_UNKNOWN_OUTCOME})
 
 
 @dataclass(frozen=True)
@@ -204,7 +203,6 @@ class PublicationRecord:
     destination: RecordedDestination
     confirmed_at: datetime
     source_bookmark: SourceBookmark | None
-    _schema_version: int = 1
     replaces: str | None = None
     replace_scope: Literal['one', 'all'] | None = None
     derivation: Derivation | None = None
@@ -449,7 +447,13 @@ def _shared_data(record: CandidateRecord | PublicationRecord) -> dict[str, _TOML
         if record.pinned.selector_oid is not None:
             pinned['selector_oid'] = record.pinned.selector_oid
         data['pinned'] = pinned
-    data['destination'] = dict(record.destination.__dict__)
+    data['destination'] = {
+        'adapter': record.destination.adapter,
+        'owner': record.destination.owner,
+        'repo': record.destination.repo,
+        'visibility': record.destination.visibility,
+        'account': record.destination.account,
+    }
     if record.source_bookmark is not None:
         data['source_bookmark'] = _bookmark_data(record.source_bookmark)
     return data
@@ -867,11 +871,9 @@ def _validate_resolutions(resolutions: tuple[Resolution, ...], error: str) -> No
 
 
 def _validate_publication(record: PublicationRecord, project: str) -> None:
-    """Validate a confirmed record's schema, provenance form, and UTC timestamp."""
+    """Validate a confirmed record's provenance form and UTC timestamp."""
     error = 'invalid published snapshot record'
     _validate_common(record, project, error)
-    if type(record._schema_version) is not int or record._schema_version != 1:
-        raise PubanonError('unsupported published snapshot record schema version')
     if record.confirmed_at.tzinfo is None or record.confirmed_at.utcoffset() != timedelta(0):
         raise PubanonError(error)
     if (record.pinned is None) == (record.derivation is None):
@@ -1211,6 +1213,17 @@ def publication_ref(commit: str) -> str:
     if _OID_PATTERN.fullmatch(commit) is None:
         raise PubanonError('invalid published snapshot commit ID')
     return f'refs/pubanon/published/{commit}'
+
+
+def publication_source(record: PublicationRecord) -> str | None:
+    """Return pinned source provenance or the original input of a derivation.
+
+    Returns:
+        The recorded source commit, or `None` when no source input is known.
+    """
+    if record.pinned is not None:
+        return record.pinned.commit
+    return record.derivation.original_source if record.derivation is not None else None
 
 
 def relocate_publication_source(

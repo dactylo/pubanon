@@ -1,3 +1,5 @@
+import pytest
+
 from pubanon._remote import _workflow_checks
 from pubanon._snapshots._source import Entry
 
@@ -86,6 +88,56 @@ jobs:
     assert 'duplicate discovered check name' in result.notes[0]
 
 
+@pytest.mark.parametrize(
+    ('trigger', 'reason'),
+    [
+        ('on: workflow_dispatch', 'manually'),
+        ('on: [release, workflow_dispatch]', 'branch pushes'),
+        ('on:\n  push:\n    tags: ["v*"]', 'tags'),
+        ('on:\n  push:\n    branches: [release]', 'branches'),
+        ('on:\n  push:\n    paths: ["src/**"]', 'paths'),
+        ('on:\n  push:\n    paths-ignore: ["docs/**"]', 'paths'),
+        ('on:\n  push:\n    branches-ignore: [main]', 'branches'),
+        ('', 'trigger'),
+    ],
+)
+def test_discover_explains_when_a_workflow_may_not_run_on_a_branch_push(
+    trigger: str,
+    reason: str,
+) -> None:
+    result = _workflow_checks.discover(
+        (_workflow(f'{trigger}\njobs:\n  verify:\n    runs-on: linux\n'),)
+    )
+
+    assert result.names == ('verify',)
+    (caution,) = result.cautions
+    assert caution.name == 'verify'
+    assert caution.path == '.github/workflows/checks.yml'
+    assert any(reason in message for message in caution.reasons)
+
+
+def test_discover_identifies_conditions_on_each_matrix_check() -> None:
+    result = _workflow_checks.discover(
+        (
+            _workflow("""\
+on: push
+jobs:
+  tests:
+    if: inputs.run_tests
+    strategy:
+      matrix:
+        os: [linux, windows]
+"""),
+        )
+    )
+
+    assert result.names == ('tests (linux)', 'tests (windows)')
+    assert tuple(caution.name for caution in result.cautions) == result.names
+    assert all(
+        any('condition' in message for message in caution.reasons) for caution in result.cautions
+    )
+
+
 def test_discover_ignores_other_paths_and_non_blob_entries() -> None:
     workflow = b'jobs:\n  build:\n    runs-on: ubuntu-latest\n'
     result = _workflow_checks.discover(
@@ -128,6 +180,18 @@ jobs:
         'tests (macos-15, 3.13)',
     )
     assert result.notes == ()
+
+
+@pytest.mark.parametrize(
+    'trigger', ['on: push', 'on: [push, workflow_dispatch]', 'on:\n  push:\n    branches: ["**"]']
+)
+def test_discover_recognizes_unfiltered_branch_pushes(trigger: str) -> None:
+    result = _workflow_checks.discover(
+        (_workflow(f'{trigger}\njobs:\n  quality:\n    runs-on: linux\n'),)
+    )
+
+    assert result.names == ('quality',)
+    assert result.cautions == ()
 
 
 def test_discover_rejects_expressions_inside_literal_matrix_values() -> None:

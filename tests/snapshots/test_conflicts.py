@@ -356,8 +356,9 @@ def test_names_modes_and_repository_manifest_are_literal(tmp_path: Path) -> None
     }
 
 
-@pytest.mark.skipif(os.name == 'nt', reason='POSIX directory traversal')
 def test_open_directory_closes_descriptors_on_descent_failure(tmp_path: Path) -> None:
+    if os.name == 'nt':
+        pytest.skip('POSIX directory traversal')
     child = tmp_path / 'child'
     child.mkdir()
     descriptors = [os.open(path, os.O_RDONLY | os.O_DIRECTORY) for path in (tmp_path, child)]
@@ -551,6 +552,7 @@ def test_symlink_versions_and_resolution_preserve_target_bytes(tmp_path: Path) -
         read_resolutions(store, directory, pause)
 
 
+@pytest.mark.slow
 def test_text_resolution_is_explicit_and_preserves_literal_bytes(tmp_path: Path) -> None:
     store, pause = _merge(
         tmp_path,
