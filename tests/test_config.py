@@ -391,6 +391,14 @@ def test_derived_private_terms_resolution_failure_is_path_free(
     assert escape(str(private_source)) not in exc_info.value.render()
 
 
+def test_fingerprint_changes_with_ci_workflow(tmp_path: Path) -> None:
+    project = _project_config(tmp_path)
+
+    assert _config.fingerprint(_global_config(), project) != _config.fingerprint(
+        _global_config(), replace(project, ci_workflow='ci.yml')
+    )
+
+
 @pytest.mark.parametrize(
     ('field', 'value'),
     [
@@ -1177,6 +1185,62 @@ def test_load_project_rejects_non_boolean_source_tags(tmp_path: Path) -> None:
         _config.load_project(paths, 'demo')
 
 
+def test_load_project_requires_publication_route(tmp_path: Path) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    project_file = paths.config_dir / 'projects' / 'demo.toml'
+    project_file.parent.mkdir(parents=True)
+    project_file.write_text(
+        _project_toml(tmp_path / 'source').replace('publication_route = "staged"\n', '')
+    )
+
+    with pytest.raises(PubanonError, match='missing project configuration key: publication_route'):
+        _config.load_project(paths, 'demo')
+
+
+@pytest.mark.parametrize('name', ['ci.yml', 'build.yaml', 'my_ci-2.yml'])
+def test_project_config_accepts_ci_workflow_file_name(tmp_path: Path, name: str) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    project_file = paths.config_dir / 'projects' / 'demo.toml'
+    project_file.parent.mkdir(parents=True)
+    project_file.write_text(_project_toml(tmp_path / 'source') + f'ci_workflow = "{name}"\n')
+
+    assert _config.load_project(paths, 'demo').ci_workflow == name
+
+
+@pytest.mark.parametrize(
+    ('value', 'rendered'),
+    [
+        ('', '""'),
+        ('ci', '"ci"'),
+        ('ci.json', '"ci.json"'),
+        ('.yml', '".yml"'),
+        ('../ci.yml', '"../ci.yml"'),
+        ('dir/ci.yml', '"dir/ci.yml"'),
+        ('ci.yml?x', '"ci.yml?x"'),
+        ('ci.yml#x', '"ci.yml#x"'),
+        (' ci.yml', '" ci.yml"'),
+        (5, '5'),
+        (True, 'true'),
+    ],
+)
+def test_project_config_rejects_invalid_ci_workflow(
+    tmp_path: Path, value: object, rendered: str
+) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    project_file = paths.config_dir / 'projects' / 'demo.toml'
+    project_file.parent.mkdir(parents=True)
+    project_file.write_text(_project_toml(tmp_path / 'source') + f'ci_workflow = {rendered}\n')
+
+    with pytest.raises(
+        PubanonError, match=r'^ci_workflow must be a workflow file name such as ci\.yml$'
+    ):
+        _config.load_project(paths, 'demo')
+    with pytest.raises(
+        PubanonError, match=r'^ci_workflow must be a workflow file name such as ci\.yml$'
+    ):
+        _config.save_project(paths, replace(_project_config(tmp_path), ci_workflow=value))
+
+
 @pytest.mark.parametrize('missing', ['pull_requests', 'discussions'])
 def test_load_project_requires_new_settings_keys(tmp_path: Path, missing: str) -> None:
     paths = _config.derive_paths({'HOME': str(tmp_path)})
@@ -1194,18 +1258,6 @@ def test_load_project_requires_new_settings_keys(tmp_path: Path, missing: str) -
     )
 
     with pytest.raises(PubanonError, match=f'missing settings key: {missing}'):
-        _config.load_project(paths, 'demo')
-
-
-def test_load_project_requires_publication_route(tmp_path: Path) -> None:
-    paths = _config.derive_paths({'HOME': str(tmp_path)})
-    project_file = paths.config_dir / 'projects' / 'demo.toml'
-    project_file.parent.mkdir(parents=True)
-    project_file.write_text(
-        _project_toml(tmp_path / 'source').replace('publication_route = "staged"\n', '')
-    )
-
-    with pytest.raises(PubanonError, match='missing project configuration key: publication_route'):
         _config.load_project(paths, 'demo')
 
 
@@ -2458,6 +2510,22 @@ def test_save_project_replace_failure_preserves_prior_bytes(
 
     assert project_file.read_bytes() == original
     assert not project_file.with_suffix('.toml.tmp').exists()
+
+
+def test_save_project_round_trips_ci_workflow(tmp_path: Path) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    project = replace(_project_config(tmp_path), _stage_repo='custom-stage', ci_workflow='ci.yml')
+    project_file = paths.config_dir / 'projects' / 'demo.toml'
+
+    _config.save_project(paths, project)
+
+    assert _config.load_project(paths, project.name) == project
+    assert 'stage_repo = "custom-stage"\nci_workflow = "ci.yml"\n' in project_file.read_text()
+
+    _config.save_project(paths, replace(project, ci_workflow=None))
+
+    assert 'ci_workflow' not in project_file.read_text()
+    assert _config.load_project(paths, project.name).ci_workflow is None
 
 
 def test_save_project_round_trips_new_optional_fields(tmp_path: Path) -> None:

@@ -78,8 +78,10 @@ source, then run `pubanon discard` and `pubanon prepare` again.
 
 `stage push` sends that exact snapshot to a separate private GitHub repository, asking before it
 creates the repository the first time. Staging never changes your source branches, and the same
-staging repository is reused for later releases. `stage watch` waits for its configured checks; if
-you haven't configured any, skip it and review the staging repository yourself.
+staging repository is reused for later releases. For projects with `ci_workflow`, use
+`stage push --full-tests` for a full test run or `stage push --hosted` for a hosted run.
+`stage watch` waits for its configured checks; if you have neither `ci_workflow` nor configured
+checks, skip it and review the staging repository yourself.
 
 ### Publish and make it public
 
@@ -99,10 +101,10 @@ the final repository.
 
 `publish` asks for confirmation, then sends the snapshot to the final repository. On the `staged`
 route, it first checks that the staged snapshot passed its configured checks. `repo watch` waits
-for the final repository's own checks; skip it if none are configured. `repo reveal` checks the
-published history and settings, links the repository's Activity and Actions pages for you to
-review, and asks before making the repository public. Pubanon does not scan logs or artifact
-contents.
+for the final repository's own CI; skip it if neither `ci_workflow` nor checks are configured.
+`repo reveal` checks the published history and settings, links the repository's Activity and
+Actions pages for you to review, and asks before making the repository public. Pubanon does not
+scan logs or artifact contents.
 
 For the next release, commit your changes, updating the package version if you have one, and repeat
 these steps without `repo create` and `repo reveal`.

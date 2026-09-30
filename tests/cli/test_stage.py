@@ -51,7 +51,12 @@ def test_stage_operation_uses_concrete_operation_and_holds_project_lock(
     assert received == [(paths, global_config, project, yes)]
 
 
-def test_stage_push_uses_concrete_operation_and_holds_project_lock(
+@pytest.mark.parametrize(
+    ('full_tests', 'hosted'), [(False, False), (True, False), (False, True), (True, True)]
+)
+def test_stage_push_forwards_ci_options(
+    full_tests: bool,
+    hosted: bool,
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
@@ -69,18 +74,32 @@ def test_stage_push_uses_concrete_operation_and_holds_project_lock(
             actual_project: _config.ProjectConfig,
             *,
             yes: bool,
+            ci: _stage.StageCiOptions,
         ) -> None:
             with (
                 pytest.raises(PubanonError, match='another Pubanon command is running'),
                 _config.project_lock(paths, project.name),
             ):
                 pytest.fail('stage push did not hold its project lock')
-            received.append((actual_paths, actual_global, actual_project, yes))
+            received.append((actual_paths, actual_global, actual_project, yes, ci))
 
     monkeypatch.setattr(_stage, 'stage_push', _StageModule._stage_push)
 
-    assert _cli.main(['stage', 'push', '--project', project.name, '--yes']) == 0
-    assert received == [(paths, global_config, project, True)]
+    argv = ['stage', 'push', '--project', project.name, '--yes']
+    if full_tests:
+        argv.append('--full-tests')
+    if hosted:
+        argv.append('--hosted')
+    assert _cli.main(argv) == 0
+    assert received == [
+        (
+            paths,
+            global_config,
+            project,
+            True,
+            _stage.StageCiOptions(full_tests=full_tests, hosted=hosted),
+        )
+    ]
 
 
 def test_stage_status_uses_concrete_operation_and_holds_project_lock(

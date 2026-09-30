@@ -384,3 +384,22 @@ def discover(snapshot: _source.Snapshot) -> Discovery:
         _discover_workflow(entry, names, notes, seen, cautions)
 
     return Discovery(tuple(names), tuple(notes), tuple(cautions))
+
+
+def dispatch_contract_problem(data: bytes) -> str | None:
+    """Describe a missing boolean input in a workflow's dispatch declaration."""
+    workflow, problem = _load_workflow(data)
+    if workflow is None:
+        return problem
+
+    triggers = _as_mapping(workflow.get('on'))
+    dispatch = _as_mapping(triggers.get('workflow_dispatch')) if triggers is not None else None
+    inputs = _as_mapping(dispatch.get('inputs')) if dispatch is not None else None
+    if inputs is None:
+        return 'does not declare workflow_dispatch inputs'
+
+    for name in ('hosted', 'full_tests'):
+        input_definition = _as_mapping(inputs.get(name))
+        if input_definition is None or input_definition.get('type') != 'boolean':
+            return f'does not declare the boolean input {name}'
+    return None

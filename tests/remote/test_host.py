@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -145,6 +146,23 @@ def _disclosure_responses(
     return responses
 
 
+def _dispatch_args() -> list[str]:
+    return [
+        'api',
+        '--method',
+        'POST',
+        '--header',
+        'X-GitHub-Api-Version: 2026-03-10',
+        'repos/owner/repo/actions/workflows/ci.yml/dispatches',
+        '-f',
+        'ref=main',
+        '-F',
+        'inputs[hosted]=true',
+        '-F',
+        'inputs[full_tests]=false',
+    ]
+
+
 def _exception_graph(error: BaseException) -> tuple[BaseException, ...]:
     graph: list[BaseException] = []
     pending = [error]
@@ -181,6 +199,16 @@ def _release(tag: str, *, title: str = 'Page', notes: str = 'Notes\n') -> dict[s
         'html_url': f'https://github.com/publication-owner/public-repo/releases/tag/{tag}',
         'draft': False,
         'prerelease': False,
+    }
+
+
+def _workflow_job() -> dict[str, object]:
+    return {
+        'name': 'quality',
+        'status': 'completed',
+        'conclusion': 'success',
+        'run_id': 1,
+        'run_attempt': 2,
     }
 
 
@@ -516,6 +544,22 @@ def test_create_repository_refuses_nonorganization_owner_before_post(
     assert _gh_calls(tmp_path) == [{'args': owner_args, 'stdin': ''}]
 
 
+def test_create_repository_variable_posts_name_and_value(fake_gh: Path, tmp_path: Path) -> None:
+    args = [
+        'api',
+        '--method',
+        'POST',
+        'repos/owner/repo/actions/variables',
+        '-f',
+        'name=CI_RUN_ON_PUSH',
+        '-f',
+        'value=false',
+    ]
+    _write_responses(fake_gh, [{'args': args}])
+    _host.create_repository_variable(('owner', 'repo'), 'CI_RUN_ON_PUSH', 'false')
+    assert _gh_calls(tmp_path) == [{'args': args, 'stdin': ''}]
+
+
 def test_delete_repository_accepts_success(fake_gh: Path, tmp_path: Path) -> None:
     args = ['api', '-X', 'DELETE', 'repos/publication-owner/public-repo']
     _write_responses(fake_gh, [{'args': args}])
@@ -716,6 +760,32 @@ def test_disclosure_refuses_short_page_before_total(fake_gh: Path) -> None:
     assert 'workflow runs for publication-owner/public-repo' in str(error.value)
     assert error.value.fact == 'The GitHub Actions inventory is unknown.'
     assert error.value.recovery is not None
+
+
+def test_dispatch_workflow_rejects_unlaunchable_cli(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_host, '_GH', str(tmp_path / 'missing-gh'))
+    with pytest.raises(_host.DispatchRejectedError, match='cannot run GitHub CLI'):
+        _host.dispatch_workflow(
+            ('owner', 'repo'), 'ci.yml', ref='main', inputs={'hosted': True, 'full_tests': False}
+        )
+    assert not (tmp_path / 'fake-gh-calls.jsonl').exists()
+
+
+def test_dispatch_workflow_sends_both_inputs_and_version_header(
+    fake_gh: Path,
+    tmp_path: Path,
+) -> None:
+    _write_responses(fake_gh, [{'args': _dispatch_args(), 'stdout': '{"workflow_run_id":42}'}])
+    assert (
+        _host.dispatch_workflow(
+            ('owner', 'repo'), 'ci.yml', ref='main', inputs={'hosted': True, 'full_tests': False}
+        )
+        == 42
+    )
+    assert _gh_calls(tmp_path) == [{'args': _dispatch_args(), 'stdin': ''}]
 
 
 def test_fake_gh_autouse_records_and_refuses_unexpected_call(tmp_path: Path) -> None:
@@ -2977,6 +3047,360 @@ def test_verify_recorded_destination_reports_repository_coordinate_mismatch(
     assert actual in rendered
 
 
+def _workflow_run(identifier: int = 1) -> dict[str, object]:
+    return {
+        'id': identifier,
+        'run_number': identifier + 10,
+        'run_attempt': 2,
+        'path': '.github/workflows/ci.yml',
+        'event': 'workflow_dispatch',
+        'head_branch': 'main',
+        'head_sha': 'a' * 40,
+        'status': 'completed',
+        'conclusion': 'success',
+        'display_title': 'CI / local',
+        'html_url': 'https://example.invalid/display-only',
+    }
+
+
+def _workflow_runs_args(page: int | None = 1) -> list[str]:
+    query = 'event=workflow_dispatch&branch=main&per_page=100'
+    if page is not None:
+        query = f'head_sha={"a" * 40}&{query}&page={page}'
+    return ['api', f'repos/owner/repo/actions/workflows/ci.yml/runs?{query}']
+
+
+def _workflow_jobs_args(page: int = 1) -> list[str]:
+    return ['api', f'repos/owner/repo/actions/runs/1/attempts/2/jobs?per_page=100&page={page}']
+
+
+def test_list_run_jobs_reads_current_attempt(fake_gh: Path) -> None:
+    _write_responses(
+        fake_gh,
+        [
+            {
+                'args': _workflow_jobs_args(),
+                'stdout': json.dumps({'total_count': 1, 'jobs': [_workflow_job()]}),
+            }
+        ],
+    )
+    assert _host.list_run_jobs(('owner', 'repo'), 1, 2) == (
+        _host.WorkflowJob('quality', 'completed', 'success'),
+    )
+
+
+def test_list_workflow_runs_reads_every_page(fake_gh: Path, tmp_path: Path) -> None:
+    _write_responses(
+        fake_gh,
+        [
+            {
+                'args': _workflow_runs_args(page),
+                'stdout': json.dumps(
+                    {'total_count': 101, 'workflow_runs': [_workflow_run(i) for i in ids]}
+                ),
+            }
+            for page, ids in ((1, range(1, 101)), (2, range(101, 102)))
+        ],
+    )
+    runs = _host.list_workflow_runs(
+        ('owner', 'repo'), 'ci.yml', 'a' * 40, event='workflow_dispatch'
+    )
+    assert [run.identifier for run in runs] == list(range(1, 102))
+    assert runs[0] == _host.WorkflowRun(
+        1,
+        11,
+        2,
+        '.github/workflows/ci.yml',
+        'workflow_dispatch',
+        'main',
+        'a' * 40,
+        'completed',
+        'success',
+        'CI / local',
+        'https://example.invalid/display-only',
+    )
+    assert [call['args'] for call in _gh_calls(tmp_path)] == [
+        _workflow_runs_args(1),
+        _workflow_runs_args(2),
+    ]
+
+
+@pytest.mark.parametrize('jobs', [False, True])
+@pytest.mark.parametrize('expire', [False, True])
+def test_listings_spend_one_budget_across_pages(
+    fake_gh: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    jobs: bool,
+    expire: bool,
+) -> None:
+    responses: list[dict[str, object]] = []
+    for page, ids in ((1, range(1, 101)), (2, range(101, 102))):
+        entries = [_workflow_job() if jobs else _workflow_run(i) for i in ids]
+        responses.append(
+            {
+                'args': _workflow_jobs_args(page) if jobs else _workflow_runs_args(page),
+                'stdout': json.dumps(
+                    {'total_count': 101, 'jobs' if jobs else 'workflow_runs': entries}
+                ),
+            }
+        )
+    _write_responses(fake_gh, responses)
+    budgets: list[float] = []
+    timeouts: list[object] = []
+    original_run = cast('Callable[..., subprocess.CompletedProcess[bytes]]', subprocess.run)
+
+    def _capture(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        timeouts.append(kwargs.get('timeout'))
+        return original_run(*args, **kwargs)
+
+    def _remaining() -> float:
+        budgets.append(3.0 - len(budgets))
+        if expire and len(budgets) == 2:
+            raise ObservationTimeoutError
+        return budgets[-1]
+
+    def _read() -> None:
+        if jobs:
+            assert len(_host.list_run_jobs(('owner', 'repo'), 1, 2, remaining=_remaining)) == 101
+        else:
+            assert (
+                len(
+                    _host.list_workflow_runs(
+                        ('owner', 'repo'),
+                        'ci.yml',
+                        'a' * 40,
+                        event='workflow_dispatch',
+                        remaining=_remaining,
+                    )
+                )
+                == 101
+            )
+
+    monkeypatch.setattr(_host.subprocess, 'run', _capture)
+    if expire:
+        with pytest.raises(ObservationTimeoutError):
+            _read()
+    else:
+        _read()
+    assert budgets == [3.0, 2.0]
+    assert timeouts == ([3.0] if expire else [3.0, 2.0])
+    assert len(_gh_calls(tmp_path)) == (1 if expire else 2)
+
+
+@pytest.mark.parametrize('change', ['total', 'duplicate', 'short', 'excess'])
+def test_list_workflow_runs_reports_listing_changes(fake_gh: Path, change: str) -> None:
+    first = [_workflow_run(i) for i in range(1, 101)]
+    second = [_workflow_run(101)]
+    total = 101
+    if change == 'total':
+        total = 102
+    elif change == 'duplicate':
+        second = [_workflow_run(1)]
+    elif change == 'short':
+        first.pop()
+    else:
+        second.append(_workflow_run(102))
+    _write_responses(
+        fake_gh,
+        [
+            {
+                'args': _workflow_runs_args(),
+                'stdout': json.dumps({'total_count': 101, 'workflow_runs': first}),
+            },
+            {
+                'args': _workflow_runs_args(2),
+                'stdout': json.dumps({'total_count': total, 'workflow_runs': second}),
+            },
+        ],
+    )
+    with pytest.raises(_host.RunListingChangedError):
+        _host.list_workflow_runs(('owner', 'repo'), 'ci.yml', 'a' * 40, event='workflow_dispatch')
+
+
+@pytest.mark.parametrize('field', ['head_sha', 'event', 'head_branch', 'path'])
+def test_list_workflow_runs_rejects_mismatched_run(fake_gh: Path, field: str) -> None:
+    run = _workflow_run() | {field: 'different'}
+    _write_responses(
+        fake_gh,
+        [
+            {
+                'args': _workflow_runs_args(),
+                'stdout': json.dumps({'total_count': 1, 'workflow_runs': [run]}),
+            }
+        ],
+    )
+    with pytest.raises(PubanonError, match='invalid workflow run response'):
+        _host.list_workflow_runs(('owner', 'repo'), 'ci.yml', 'a' * 40, event='workflow_dispatch')
+
+
+@pytest.mark.parametrize('recent', [False, True])
+def test_list_workflow_runs_treats_unregistered_workflow_as_empty(
+    fake_gh: Path,
+    recent: bool,
+) -> None:
+    _write_responses(
+        fake_gh,
+        [
+            {
+                'args': _workflow_runs_args(None if recent else 1),
+                'returncode': 1,
+                'stderr': 'gh: Not Found (HTTP 404)',
+            }
+        ],
+    )
+    if recent:
+        assert (
+            _host.recent_workflow_runs(('owner', 'repo'), 'ci.yml', event='workflow_dispatch')
+            == ()
+        )
+    else:
+        assert (
+            _host.list_workflow_runs(
+                ('owner', 'repo'), 'ci.yml', 'a' * 40, event='workflow_dispatch'
+            )
+            == ()
+        )
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [
+        ('run_id', 3),
+        ('run_attempt', 1),
+        ('run_id', True),
+        ('run_attempt', False),
+        ('name', None),
+        ('status', 1),
+        ('conclusion', 0),
+    ],
+)
+def test_list_run_jobs_rejects_invalid_job(fake_gh: Path, field: str, value: object) -> None:
+    _write_responses(
+        fake_gh,
+        [
+            {
+                'args': _workflow_jobs_args(),
+                'stdout': json.dumps(
+                    {'total_count': 1, 'jobs': [_workflow_job() | {field: value}]}
+                ),
+            }
+        ],
+    )
+    with pytest.raises(PubanonError, match='invalid workflow job response'):
+        _host.list_run_jobs(('owner', 'repo'), 1, 2)
+
+
+@pytest.mark.parametrize('change', ['total', 'short', 'excess'])
+def test_list_run_jobs_rejects_inconsistent_pages(fake_gh: Path, change: str) -> None:
+    first_count = 99 if change == 'short' else 100
+    second_count = 2 if change == 'excess' else 1
+    _write_responses(
+        fake_gh,
+        [
+            {
+                'args': _workflow_jobs_args(),
+                'stdout': json.dumps(
+                    {'total_count': 101, 'jobs': [_workflow_job()] * first_count}
+                ),
+            },
+            {
+                'args': _workflow_jobs_args(2),
+                'stdout': json.dumps(
+                    {
+                        'total_count': 102 if change == 'total' else 101,
+                        'jobs': [_workflow_job()] * second_count,
+                    }
+                ),
+            },
+        ],
+    )
+    with pytest.raises(PubanonError, match='invalid workflow job response') as raised:
+        _host.list_run_jobs(('owner', 'repo'), 1, 2)
+    assert not isinstance(raised.value, _host.RunListingChangedError)
+
+
+@pytest.mark.parametrize('identifier', [1, 2])
+def test_read_workflow_run_validates_identity(fake_gh: Path, identifier: int) -> None:
+    _write_responses(
+        fake_gh,
+        [
+            {
+                'args': ['api', 'repos/owner/repo/actions/runs/1'],
+                'stdout': json.dumps(_workflow_run(identifier)),
+            }
+        ],
+    )
+    if identifier == 1:
+        assert _host.read_workflow_run(('owner', 'repo'), 1).identifier == 1
+    else:
+        with pytest.raises(PubanonError, match='invalid workflow run response'):
+            _host.read_workflow_run(('owner', 'repo'), 1)
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [
+        ('id', True),
+        ('run_number', 0),
+        ('run_attempt', -1),
+        ('path', None),
+        ('event', 1),
+        ('head_branch', None),
+        ('head_sha', 1),
+        ('status', False),
+        ('display_title', None),
+        ('html_url', []),
+        ('conclusion', 1),
+    ],
+)
+def test_read_workflow_run_rejects_invalid_fields(
+    fake_gh: Path, field: str, value: object
+) -> None:
+    _write_responses(
+        fake_gh,
+        [
+            {
+                'args': ['api', 'repos/owner/repo/actions/runs/1'],
+                'stdout': json.dumps(_workflow_run() | {field: value}),
+            }
+        ],
+    )
+    with pytest.raises(PubanonError, match='invalid workflow run response'):
+        _host.read_workflow_run(('owner', 'repo'), 1)
+
+
+@pytest.mark.parametrize('body', ['{}', '[]', '{"id":1,"id":2}', 'not json'])
+def test_read_workflow_run_rejects_malformed_response(fake_gh: Path, body: str) -> None:
+    _write_responses(
+        fake_gh, [{'args': ['api', 'repos/owner/repo/actions/runs/1'], 'stdout': body}]
+    )
+    with pytest.raises(PubanonError, match='invalid workflow run response'):
+        _host.read_workflow_run(('owner', 'repo'), 1)
+
+
+def test_recent_workflow_runs_reads_only_one_page(fake_gh: Path, tmp_path: Path) -> None:
+    _write_responses(
+        fake_gh,
+        [
+            {
+                'args': _workflow_runs_args(None),
+                'stdout': json.dumps(
+                    {
+                        'total_count': 101,
+                        'workflow_runs': [_workflow_run(i) for i in range(1, 101)],
+                    }
+                ),
+            }
+        ],
+    )
+    assert (
+        len(_host.recent_workflow_runs(('owner', 'repo'), 'ci.yml', event='workflow_dispatch'))
+        == 100
+    )
+    assert len(_gh_calls(tmp_path)) == 1
+
+
 def test_verify_recorded_destination_reports_repository_lookup_failure(
     fake_gh: Path,
 ) -> None:
@@ -3051,3 +3475,148 @@ def test_verify_recorded_destination_uses_recorded_facts(
     verified = _host.verify_recorded_destination(destination)
 
     assert verified == destination
+
+
+@pytest.mark.parametrize('state', ['absent', 'active', 'disabled_manually', 'wrong_path'])
+def test_workflow_registered_distinguishes_absent_active_and_disabled(
+    fake_gh: Path,
+    state: str,
+) -> None:
+    response: dict[str, object] = {'args': ['api', 'repos/owner/repo/actions/workflows/ci.yml']}
+    if state == 'absent':
+        response |= {'returncode': 1, 'stdout': '{"status":"404"}'}
+    else:
+        response['stdout'] = json.dumps(
+            {
+                'state': state,
+                'path': 'other.yml' if state == 'wrong_path' else '.github/workflows/ci.yml',
+            }
+        )
+    _write_responses(fake_gh, [response])
+    if state in {'absent', 'active'}:
+        assert _host.workflow_registered(('owner', 'repo'), 'ci.yml') is (state == 'active')
+    else:
+        message = 'invalid workflow response' if state == 'wrong_path' else 'workflow is disabled'
+        with pytest.raises(PubanonError, match=message):
+            _host.workflow_registered(('owner', 'repo'), 'ci.yml')
+
+
+@pytest.mark.parametrize(
+    'failure',
+    [
+        '422',
+        '502',
+        '429',
+        '408',
+        'unknown',
+        'malformed',
+        'bool_id',
+        'zero_id',
+        'duplicate_id',
+        'timeout',
+    ],
+)
+def test_dispatch_workflow_classifies_failures(
+    fake_gh: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    response: dict[str, object] = {'args': _dispatch_args()}
+    if failure.isdigit():
+        response |= {'returncode': 1, 'stderr': f'gh: refused\x1b[31m (HTTP {failure})'}
+    elif failure == 'unknown':
+        response |= {'returncode': 1, 'stderr': 'connection lost'}
+    else:
+        response['stdout'] = {
+            'bool_id': '{"workflow_run_id":true}',
+            'zero_id': '{"workflow_run_id":0}',
+            'duplicate_id': '{"workflow_run_id":1,"workflow_run_id":2}',
+        }.get(failure, 'bad')
+    _write_responses(fake_gh, [response])
+    original_run = cast('Callable[..., subprocess.CompletedProcess[bytes]]', subprocess.run)
+    timeouts: list[object] = []
+
+    def _capture(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        timeouts.append(kwargs.get('timeout'))
+        completed = original_run(*args, **kwargs)
+        if failure == 'timeout':
+            raise subprocess.TimeoutExpired('gh', 60)
+        return completed
+
+    monkeypatch.setattr(_host.subprocess, 'run', _capture)
+    expected = _host.DispatchRejectedError if failure == '422' else _host.DispatchUncertainError
+    with pytest.raises(expected) as raised:
+        _host.dispatch_workflow(
+            ('owner', 'repo'), 'ci.yml', ref='main', inputs={'hosted': True, 'full_tests': False}
+        )
+    assert timeouts == [60]
+    assert _gh_calls(tmp_path) == [{'args': _dispatch_args(), 'stdin': ''}]
+    assert '\x1b' not in raised.value.render()
+    if failure == '422':
+        assert r'\x1b[31m' in raised.value.render()
+
+
+@pytest.mark.parametrize('state', ['present', 'absent', 'denied', 'mismatch', 'malformed'])
+def test_repository_variable_reads_absent_and_denied(fake_gh: Path, state: str) -> None:
+    response: dict[str, object] = {
+        'args': ['api', 'repos/owner/repo/actions/variables/CI_RUN_ON_PUSH']
+    }
+    if state in {'absent', 'denied'}:
+        response |= {
+            'returncode': 1,
+            'stdout': json.dumps({'status': 404 if state == 'absent' else 403}),
+        }
+    else:
+        response['stdout'] = json.dumps(
+            {
+                'name': 'other' if state == 'mismatch' else 'CI_RUN_ON_PUSH',
+                'value': 1 if state == 'malformed' else 'false',
+            }
+        )
+    _write_responses(fake_gh, [response])
+    if state in {'present', 'absent'}:
+        assert _host.repository_variable(('owner', 'repo'), 'CI_RUN_ON_PUSH') == (
+            'false' if state == 'present' else None
+        )
+    else:
+        message = (
+            'GitHub denied access' if state == 'denied' else 'invalid repository variable response'
+        )
+        with pytest.raises(PubanonError, match=message):
+            _host.repository_variable(('owner', 'repo'), 'CI_RUN_ON_PUSH')
+
+
+@pytest.mark.parametrize(
+    'body',
+    [
+        '{"total_count":true,"workflow_runs":[]}',
+        '{"total_count":-1,"workflow_runs":[]}',
+        '{"total_count":0,"workflow_runs":{}}',
+        '{"total_count":0,"total_count":0,"workflow_runs":[]}',
+        '{"total_count":0}',
+    ],
+)
+def test_list_workflow_runs_rejects_malformed_listing(fake_gh: Path, body: str) -> None:
+    _write_responses(fake_gh, [{'args': _workflow_runs_args(), 'stdout': body}])
+    with pytest.raises(PubanonError, match='invalid workflow run response'):
+        _host.list_workflow_runs(('owner', 'repo'), 'ci.yml', 'a' * 40, event='workflow_dispatch')
+
+
+@pytest.mark.parametrize(
+    ('stdout', 'stderr', 'expected'),
+    [
+        (b'{"status":"422"}', b'HTTP 502', 422),
+        (b'{"status":404}', b'', 404),
+        (b'not json', b'gh: Forbidden (HTTP 403)', 403),
+        (b'{"status":true}', b'', None),
+        (b'{"status":422,"status":400}', b'', None),
+        (b'{"status":"invalid"}', b'connection failed', None),
+    ],
+)
+def test_http_status_reads_body_before_stderr(
+    stdout: bytes,
+    stderr: bytes,
+    expected: int | None,
+) -> None:
+    assert _host._http_status(stdout, stderr) == expected

@@ -48,8 +48,8 @@ review.
 
 Leave out the commands that don't apply:
 
-- Skip `stage watch` when no checks are configured, and review the staging repository yourself.
-  Skip `repo watch` in the same way.
+- Skip `stage watch` when neither `ci_workflow` nor checks are configured, and review the staging
+  repository yourself. Skip `repo watch` in the same way.
 - Skip `repo create` when the final repository already exists, and `repo reveal` when it is already
   public or should stay private.
 - On the `direct` route, skip both `stage` commands and go from inspection to publication.
@@ -159,15 +159,16 @@ retrieval, retention, and cleanup.
 
 ### Check CI and make the repository public
 
-If you configured `required_checks`, wait for them:
+If you configured `ci_workflow` or `required_checks`, wait for CI:
 
 ```sh
 pubanon repo watch
 ```
 
 By default, `repo watch` checks the latest published commit; `--version 0.1.0` selects that
-release's tag instead. If a branch push and a tag push both run the same check, every run must
-pass.
+release's commit by tag. Without `ci_workflow`, if a branch push and a tag push both run the same
+required check, every check run must pass. With `ci_workflow`, Pubanon judges the latest matching
+push run for the exact selected commit on `main`.
 
 When ready to make a private repository public, run:
 
@@ -369,8 +370,8 @@ instead of selecting all.
 
 Discovery can't evaluate every GitHub expression. Checks from unsupported expressions and reusable
 workflows are marked unresolved, so enter their names yourself: separate names with commas and
-quote a name that contains one, such as `quality, "tests (ubuntu-24.04, 3.13)"`. An empty list
-means there are no checks to wait for; on the staged route, review the staging repository yourself.
+quote a name that contains one, such as `quality, "test (ubuntu-24.04, 3.13)"`. An empty list means
+there are no checks to wait for; on the staged route, review the staging repository yourself.
 
 Initialization also offers local source tags, off by default. Enable them to see a marker such as
 `pubanon/v0.1.0` beside the source commit in your usual Git viewer. The choice is saved per
@@ -415,7 +416,8 @@ the first table heading such as `[settings]`:
 ```toml
 allow = ["src/*", "pyproject.toml", "README.md", "LICENSE"]
 deny = ["docs/private/*"]
-required_checks = ["quality"]
+required_checks = ["quality", "hosted-validation"]
+ci_workflow = "ci.yml"
 publication_route = "staged"
 source_tags = false
 ```
@@ -425,6 +427,12 @@ Changing it does not rebuild or change a prepared snapshot. `allow` and `deny` u
 patterns against the whole relative path, with forward slashes on every platform. `*` can match
 across directory separators: `src/*` includes files in nested source directories. Deny patterns
 take precedence. Pubanon's reserved `.pubanon.toml` filename stays excluded.
+
+The optional `ci_workflow` names one `.yml` or `.yaml` file under `.github/workflows/`, such as
+`ci.yml`. The filename must start with an ASCII letter, digit, underscore, or hyphen; later
+characters may also be periods. When set, Pubanon reads the workflow's requested runs and uses
+`required_checks` as exact job names; changing `ci_workflow` requires a fresh `prepare`. Without
+it, the existing check-run behavior applies.
 
 The staging repository is named after the destination with `-stage` appended; set the optional
 top-level `stage_repo` to choose another name. Add [named workflows](#reusable-workflows) and
@@ -454,11 +462,11 @@ tag-only workflows don't run there. Keep deployment and package-upload triggers 
 repository that should run them.
 
 After saving, run `pubanon status` to check the project and any retained snapshot. Changes to file
-selection, publication identity, destination, or required checks require a fresh snapshot. When
-instructed, discard the old snapshot and prepare again, then inspect the selected files. See
-[when to prepare again](operations.md#when-a-snapshot-must-be-prepared-again) for the complete
-rules. Use `pubanon setup --edit` for global identity, sensitive terms, exclusions, and account
-changes.
+selection, publication identity, destination, required checks, or `ci_workflow` require a fresh
+snapshot. When instructed, discard the old snapshot and prepare again, then inspect the selected
+files. See [when to prepare again](operations.md#when-a-snapshot-must-be-prepared-again) for the
+complete rules. Use `pubanon setup --edit` for global identity, sensitive terms, exclusions, and
+account changes.
 
 ## Publication identity
 
@@ -524,10 +532,35 @@ pubanon publish
 The first `stage push` asks before creating the private staging repository, and `--yes` cannot
 approve that. Later pushes update its `main` branch and never send tags. `stage status` reports the
 staged snapshot's current check results without waiting; `stage watch` waits for them. `publish`
-reads the results once for the exact staged commit, and pending or failed checks stop it. With an
-empty `required_checks` list, skip the watch and review staging yourself: Pubanon still verifies
-the staged commit but does not report CI success. The final repository needs its own checks,
-because staging results stay in the staging repository.
+reads the results once for the exact staged commit, and pending or failed checks stop it. Without
+`ci_workflow`, an empty `required_checks` list means you can skip the watch and review staging
+yourself: Pubanon still verifies the staged commit but does not report CI success. The final
+repository needs its own checks, because staging results stay in the staging repository.
+
+### Request CI from stage push
+
+Set `ci_workflow` to request a run after staging. A plain `pubanon stage push` requests a quick run
+on configured local runners, with slow tests omitted where the workflow defines that mode. Use
+`pubanon stage push --full-tests` to request every test on configured local runners, or
+`pubanon stage push --hosted` to request a complete run on GitHub-hosted runners. The options can
+be combined; the workflow receives both `full_tests=true` and `hosted=true` and decides how to
+route that run. Without a configured local runner, the workflow may use a hosted runner. The
+options require `ci_workflow`.
+
+For an integrated project, Pubanon creates `CI_RUN_ON_PUSH=false` in the staging repository when
+needed, pushes the exact prepared commit, and requests one run of the configured workflow. The
+workflow must declare boolean `workflow_dispatch` inputs named `full_tests` and `hosted`. It must
+skip push CI when `CI_RUN_ON_PUSH` is `false`, so a stage push does not start a second run.
+Pubanon's own [CI workflow](../.github/workflows/ci.yml) shows this contract. Other projects can
+opt in by adding those inputs and the push condition to their workflow, then setting `ci_workflow`
+and the required job names in their project configuration.
+
+`stage status`, `stage watch`, and `publish` use the requested runs for the staged commit. Pubanon
+publishes only when the most recent requested run for that exact commit passed the required jobs. A
+newer run replaces an older pass as evidence. For example, a quick local run after a hosted pass
+blocks publication if `hosted-validation` is required, because the quick run skips that job.
+Request `pubanon stage push --hosted` again and wait for it to pass. `repo watch` applies the same
+latest-run rule to push CI in the final repository.
 
 Checks may take time to appear. The watches report progress until a timeout; Ctrl-C stops waiting
 without changing the snapshot or GitHub, and rerunning the same watch continues. See

@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, NamedTuple
 
+from pubanon import _history_output
 from pubanon._config import (
     GlobalConfig,
     Paths,
@@ -19,6 +20,13 @@ from pubanon._config import (
 )
 from pubanon._errors import OperationCanceled, PubanonError, PublicationCanceled
 from pubanon._remote import _host, _stage, _watch
+from pubanon._remote._ci import (
+    RUN_ON_PUSH_VARIABLE,
+    RunQuery,
+    evidence_facts,
+    evidence_recovery,
+    run_evidence,
+)
 from pubanon._remote._host import (
     Destination,
     RemoteRefs,
@@ -123,11 +131,12 @@ def _acknowledge_exposure(
     paths: Paths,
     configs: tuple[GlobalConfig, ProjectConfig],
     audit: _audit.HistoryAudit,
+    history: tuple[tuple[str, ...], dict[str, str]],
     *,
     unattended: bool,
 ) -> ProjectConfig:
     """Record an informed decision for current historical exposures."""
-    g, p = configs
+    _g, p = configs
     digest = _audit.exposure_digest(audit.findings)
     if not digest or digest == p.acknowledged_exposure:
         return p
@@ -137,16 +146,17 @@ def _acknowledge_exposure(
             recovery=('run pubanon audit to review the findings, then rerun without --yes'),
         )
 
-    details = _audit.history_details(
+    commits, tags = history
+    lines = _history_output.finding_groups(
         audit,
-        g,
-        p,
+        configs,
         derived_private_terms(paths, p, os.environ),
-        short_commits=not verbose_enabled(),
+        commits,
+        tags,
     )
     heading('Historical exposure review', separate=True)
-    for label, value in details.items():
-        output(f'{style(escape(label) + ":")} {escape(value)}')
+    for line in lines:
+        output(line)
     output('Locations show the first match for each finding; more matches may exist.')
     output(
         'Acknowledgment accepts these existing identity-critical historical findings. '
@@ -206,7 +216,11 @@ def _audit_sync(
         if label.startswith('policy mismatch'):
             output(f'policy mismatch: {escape(finding)}', kind='warning')
     _acknowledge_exposure(
-        ctx._paths, (ctx._global_config, ctx._project), full_audit, unattended=ctx._unattended
+        ctx._paths,
+        (ctx._global_config, ctx._project),
+        full_audit,
+        (full_commits, local_tags),
+        unattended=ctx._unattended,
     )
 
 
@@ -695,6 +709,46 @@ def _publication_review_question(ctx: PublishContext, verified: _Verified) -> st
     return question
 
 
+def _require_final_push_ci(destination: Destination) -> None:
+    """Refuse a final repository that disables push-triggered CI."""
+    value = _host.repository_variable((destination.owner, destination.repo), RUN_ON_PUSH_VARIABLE)
+    if value is not None and value.casefold() == 'false':
+        raise PubanonError(
+            'the final repository turns off push CI',
+            fact='CI_RUN_ON_PUSH is false in the final repository.',
+            recovery='delete CI_RUN_ON_PUSH from the final repository on GitHub, '
+            'then rerun pubanon publish',
+        )
+
+
+def _require_stage_ci(ctx: PublishContext, tip: str) -> None:
+    """Require fresh successful workflow evidence for the verified staging tip."""
+    destination, stage = _stage.verify_staged_target(ctx._paths, ctx._global_config, ctx._project)
+    if stage.commit != tip:
+        raise PubanonError(
+            'staging evidence does not cover the retained snapshot',
+            expected=escape(tip),
+            actual=escape(stage.commit),
+            recovery='pubanon stage push',
+        )
+    workflow = ctx._project.ci_workflow
+    if workflow is None:
+        return
+    evidence = run_evidence(
+        (destination.owner, destination.repo),
+        RunQuery(workflow, tip, 'workflow_dispatch'),
+        required=ctx._project.required_checks,
+    )
+    if evidence.state != 'success':
+        raise PubanonError(
+            'the latest staging CI run is not acceptable',
+            fact=evidence_facts(evidence),
+            recovery=evidence_recovery(evidence, staged=True, retry='pubanon stage watch'),
+        )
+    detail(field('Verified staged commit', escape(stage.commit)))
+    detail(field('Accepted CI run', evidence_facts(evidence)))
+
+
 def _review_publication(ctx: PublishContext, verified: _Verified) -> None:
     """Verify and review one candidate before attempting a push."""
     main, tags = published_refs(ctx._paths, ctx._project.name)
@@ -717,7 +771,11 @@ def _review_publication(ctx: PublishContext, verified: _Verified) -> None:
                 recovery='pubanon audit',
             )
         _acknowledge_exposure(
-            ctx._paths, (ctx._global_config, ctx._project), audit, unattended=ctx._unattended
+            ctx._paths,
+            (ctx._global_config, ctx._project),
+            audit,
+            (commits, tags),
+            unattended=ctx._unattended,
         )
     question = _publication_review_question(ctx, verified)
     inspection = _candidate.materialize_inspect(ctx._paths, ctx._project.name, ctx._record)
@@ -985,6 +1043,9 @@ def _verify_publication_route(ctx: PublishContext) -> None:
             actual=escape(stage.commit),
             recovery='pubanon stage push',
         )
+    if ctx._project.ci_workflow:
+        _require_stage_ci(ctx, tip)
+        return
     destination, stage = _stage.verify_staged_target(ctx._paths, ctx._global_config, ctx._project)
     verdicts = _watch.ci_verdicts(destination, tip, ctx._project.required_checks)
     unresolved = [verdict for verdict in verdicts if verdict.state != 'success']
@@ -1075,6 +1136,8 @@ def _verify_for_publish(ctx: PublishContext) -> _Verified:
     )
     _verify_source(ctx)
     destination = verify_destination(ctx._paths, ctx._global_config, ctx._project)
+    if ctx._project.ci_workflow:
+        _require_final_push_ci(destination)
     recorded = _destination_from_record(ctx._record)
     if destination != recorded:
         raise PubanonError('verified destination does not match the snapshot record')
@@ -1174,7 +1237,7 @@ def publication_next_action(project: ProjectConfig, record: CandidateRecord | No
     A replacement record must contain its completed poststate. Return an empty
     string when no configured next step exists.
     """
-    if project.required_checks:
+    if project.required_checks or project.ci_workflow:
         return 'pubanon repo watch'
     version = ''
     if record is not None and record.replaces is not None:
@@ -1402,6 +1465,8 @@ def publish(ctx: PublishContext) -> None:
         ctx = _preserve_replayed_sources(ctx)
         _history.preserve_previous_tip(ctx._paths, ctx._project.name, ctx._record)
         _review_publication(ctx, verified)
+        if ctx._project.ci_workflow and ctx._project.publication_route != 'direct':
+            _require_stage_ci(ctx, _records.candidate_tip(ctx._record))
     except (OperationCanceled, KeyboardInterrupt) as error:
         raise PublicationCanceled(
             'Canceled. Nothing was published.',

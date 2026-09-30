@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import tomllib
 from collections.abc import Callable, Sequence
 from contextlib import redirect_stdout
 from dataclasses import replace
@@ -38,6 +39,16 @@ from tests._permissions import assert_private_mode
 from tests._setup import configure
 from tests.snapshots.test_candidate import _complete_replacement
 
+_CI_WORKFLOW = """on:
+  workflow_dispatch:
+    inputs:
+      hosted:
+        type: boolean
+      full_tests:
+        type: boolean
+jobs: {}
+"""
+
 
 def _build_candidate(
     paths: Paths,
@@ -56,6 +67,29 @@ def _build_candidate(
             None,
         ),
     )
+
+
+def _ci_jobs(
+    coordinates: tuple[str, str], number: int, *checks: tuple[str, str]
+) -> dict[str, object]:
+    owner, repo = coordinates
+    jobs = [
+        {
+            'run_id': number,
+            'run_attempt': 1,
+            'name': name,
+            'status': 'completed',
+            'conclusion': conclusion,
+        }
+        for name, conclusion in checks
+    ]
+    return {
+        'args': [
+            'api',
+            f'repos/{owner}/{repo}/actions/runs/{number}/attempts/1/jobs?per_page=100&page=1',
+        ],
+        'stdout': json.dumps({'total_count': len(jobs), 'jobs': jobs}),
+    }
 
 
 def _configs(source: Path) -> tuple[GlobalConfig, ProjectConfig]:
@@ -406,7 +440,7 @@ def _host_responses(
     *,
     absent: bool = False,
     actual: tuple[str, str, str] | None = None,
-) -> None:
+) -> list[dict[str, object]]:
     stage_repo = project._stage_repo
     assert stage_repo is not None
     facts = actual or (project.owner, stage_repo, 'private')
@@ -516,6 +550,7 @@ def _host_responses(
             }
         )
     fake_gh.write_text(json.dumps(responses) + '\n')
+    return responses
 
 
 def _prepare_stage(
@@ -2023,6 +2058,16 @@ def test_stage_push_routes_account_requirement_after_retained_proof(
 
     assert events == ['proof', 'account']
     assert requirements == [('stage-owner', 'staging configuration')]
+
+
+def test_stage_push_without_ci_workflow_is_unchanged(
+    tmp_path: Path,
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _prepare_stage(tmp_path, fake_gh, make_repo, monkeypatch)
+    assert not any('/actions/' in arg for call in _calls(tmp_path) for arg in call)
 
 
 def test_stage_record_failure_names_repair_and_preserves_records(
@@ -3609,6 +3654,460 @@ def test_verify_staged_target_refuses_drifted_remote_tip_with_push_recovery(
     assert exc_info.value.expected == record.commit
     assert exc_info.value.actual == remote_tip
     assert exc_info.value.recovery == 'pubanon stage repair or pubanon stage push'
+
+
+def _ci_candidate(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    workflow: str = _CI_WORKFLOW,
+) -> tuple[Path, Paths, GlobalConfig, ProjectConfig, _candidate.CandidateRecord]:
+    source = make_repo(files={'.github/workflows/ci.yml': workflow})
+    host = _new_host(tmp_path)
+    paths = _paths(tmp_path)
+    global_config, project = _configs(source)
+    project = replace(project, ci_workflow='ci.yml')
+    record = _build_candidate(paths, global_config, project)
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', host.as_uri())
+    return host, paths, global_config, project, record
+
+
+def _ci_run(commit: str, number: int = 9) -> dict[str, object]:
+    return {
+        'id': number,
+        'run_number': number,
+        'run_attempt': 1,
+        'path': '.github/workflows/ci.yml',
+        'event': 'workflow_dispatch',
+        'head_branch': 'main',
+        'head_sha': commit,
+        'status': 'completed',
+        'conclusion': 'success',
+        'display_title': 'CI / local',
+        'html_url': f'https://example.invalid/runs/{number}',
+    }
+
+
+def _ci_responses(
+    commit: str, *, variable: str | None = None, hosted: bool = False, full_tests: bool = False
+) -> list[dict[str, object]]:
+    root = 'repos/stage-owner/staging-repo/actions'
+    read_variable = ['api', f'{root}/variables/CI_RUN_ON_PUSH']
+    return [
+        {
+            'args': read_variable,
+            'stdout': json.dumps({'status': '404'})
+            if variable is None
+            else json.dumps({'name': 'CI_RUN_ON_PUSH', 'value': variable}),
+            'returncode': 1 if variable is None else 0,
+            'once': True,
+        },
+        {
+            'args': [
+                'api',
+                f'{root}/workflows/ci.yml/runs?event=workflow_dispatch&branch=main&per_page=100',
+            ],
+            'stdout': json.dumps({'total_count': 0, 'workflow_runs': []}),
+        },
+        {
+            'args': [
+                'api',
+                '--method',
+                'POST',
+                f'{root}/variables',
+                '-f',
+                'name=CI_RUN_ON_PUSH',
+                '-f',
+                'value=false',
+            ]
+        },
+        {
+            'args': read_variable,
+            'stdout': json.dumps({'name': 'CI_RUN_ON_PUSH', 'value': 'false'}),
+        },
+        {
+            'args': ['api', f'{root}/workflows/ci.yml'],
+            'stdout': json.dumps({'path': '.github/workflows/ci.yml', 'state': 'active'}),
+        },
+        {
+            'args': [
+                'api',
+                '--method',
+                'POST',
+                '--header',
+                'X-GitHub-Api-Version: 2026-03-10',
+                f'{root}/workflows/ci.yml/dispatches',
+                '-f',
+                'ref=main',
+                '-F',
+                f'inputs[hosted]={str(hosted).lower()}',
+                '-F',
+                f'inputs[full_tests]={str(full_tests).lower()}',
+            ],
+            'stdout': json.dumps({'workflow_run_id': 9}),
+        },
+        {'args': ['api', f'{root}/runs/9'], 'stdout': json.dumps(_ci_run(commit))},
+    ]
+
+
+def _integrated_status(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    checks: tuple[str, ...],
+) -> tuple[Paths, GlobalConfig, ProjectConfig, _candidate.CandidateRecord]:
+    _host_path, paths, g, p, candidate = _ci_candidate(tmp_path, make_repo, monkeypatch)
+    p = replace(p, publication_route='staged', required_checks=checks)
+    candidate = replace(candidate, fingerprint=fingerprint(g, p))
+    _save_stage(paths, p.name, _stage.StageRecord(candidate.commit, p.owner, stage_repository(p)))
+
+    def _read_candidate(_paths: Paths, _project: str) -> _candidate.CandidateRecord:
+        return candidate
+
+    def _refs(_dest: _host.Destination) -> _host.RemoteRefs:
+        return _host.RemoteRefs(candidate.commit, {})
+
+    monkeypatch.setattr(_stage, 'load_candidate', _read_candidate)
+    monkeypatch.setattr(_stage, 'read_remote_refs', _refs)
+    return paths, g, p, candidate
+
+
+def test_candidate_next_action_watches_integrated_project_without_required_checks(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, g, p, candidate = _integrated_status(tmp_path, make_repo, monkeypatch, ())
+    assert _stage.candidate_next_action(paths, g, p, candidate) == 'pubanon stage watch'
+    assert (
+        _stage.candidate_next_action(paths, g, p, candidate, checked_commit=candidate.commit)
+        == 'pubanon publish'
+    )
+
+
+@pytest.mark.parametrize(('full_tests', 'hosted'), [(True, False), (False, True), (True, True)])
+def test_stage_push_ci_options_require_ci_workflow_before_host_access(
+    tmp_path: Path,
+    fake_gh: Path,
+    full_tests: bool,
+    hosted: bool,
+) -> None:
+    del fake_gh
+    g, p = _configs(tmp_path)
+    with pytest.raises(PubanonError, match='--full-tests and --hosted require ci_workflow'):
+        _stage.stage_push(
+            _paths(tmp_path),
+            g,
+            p,
+            yes=True,
+            ci=_stage.StageCiOptions(full_tests=full_tests, hosted=hosted),
+        )
+    assert _calls(tmp_path) == []
+
+
+@pytest.mark.parametrize('new_repository', [False, True])
+def test_stage_push_creates_variable_pushes_then_requests_ci(
+    tmp_path: Path,
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    new_repository: bool,
+) -> None:
+    host, paths, g, p, record = _ci_candidate(tmp_path, make_repo, monkeypatch)
+    responses = _host_responses(fake_gh, p, absent=new_repository)
+    actions = _ci_responses(record.commit, hosted=new_repository, full_tests=new_repository)
+    action_args = [cast('list[str]', action['args']) for action in actions]
+    run = _ci_run(record.commit)
+    run.update(display_title='CI\x1b[31m', html_url='https://example.invalid/\nrun')
+    actions[6]['stdout'] = json.dumps(run)
+    fake_gh.write_text(json.dumps(responses + actions))
+    before = set(paths.data_dir.rglob('*'))
+    calls_at_push: list[list[str]] = []
+    original_push = _stage.push
+
+    def _push(dest: _host.Destination, store: Path, args: Sequence[str]) -> GitResult:
+        calls_at_push.extend(_calls(tmp_path))
+        return original_push(dest, store, args)
+
+    monkeypatch.setattr(_stage, 'push', _push)
+
+    def _confirm(_question: str) -> bool:
+        return True
+
+    monkeypatch.setattr(_stage, 'confirm', _confirm)
+    stream = StringIO()
+    with redirect_stdout(stream):
+        _stage.stage_push(
+            paths,
+            g,
+            p,
+            yes=True,
+            ci=_stage.StageCiOptions(full_tests=new_repository, hosted=new_repository),
+        )
+    output = stream.getvalue()
+    assert 'CI run: #9 CI\\x1b[31m' in output
+    assert 'https://example.invalid/\\x0arun' in output
+    assert output.rstrip().endswith('Next: pubanon stage watch')
+    assert _git(host, 'rev-parse', 'main').decode().strip() == record.commit
+    calls = _calls(tmp_path)
+    variable_read = action_args[0]
+    variable_create = action_args[2]
+    assert calls_at_push.count(variable_read) == 2
+    assert calls_at_push.index(variable_read) < calls_at_push.index(variable_create)
+    assert calls_at_push[-1] == variable_read
+    assert action_args[4] not in calls_at_push
+    assert calls.index(action_args[4]) < calls.index(action_args[5]) < calls.index(action_args[6])
+    stage_path = _stage._stage_path(paths, p.name)
+    assert tomllib.loads(stage_path.read_text()) == {
+        'commit': record.commit,
+        'owner': p.owner,
+        'repo': 'staging-repo',
+    }
+    assert set(paths.data_dir.rglob('*')) - before == {stage_path}
+
+
+def test_stage_push_preview_names_cancelled_run_and_replaced_evidence(
+    tmp_path: Path,
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    host, paths, g, p, record = _ci_candidate(tmp_path, make_repo, monkeypatch)
+    responses = _host_responses(fake_gh, p)
+    actions = _ci_responses(record.commit)
+    passed = _ci_run(record.commit)
+    passed['display_title'] = 'passed\nforged'
+    pending = _ci_run('a' * 40, 10)
+    pending.update(status='in_progress', conclusion=None, display_title='pending\x1b[31m')
+    actions[1]['stdout'] = json.dumps({'total_count': 2, 'workflow_runs': [passed, pending]})
+    fake_gh.write_text(json.dumps(responses + actions))
+
+    def _confirm(_question: str) -> bool:
+        return False
+
+    monkeypatch.setattr(_stage, 'confirm', _confirm)
+    with pytest.raises(OperationCanceled):
+        _stage.stage_push(
+            paths, g, p, yes=False, ci=_stage.StageCiOptions(full_tests=True, hosted=True)
+        )
+    output = capsys.readouterr().out
+    assert 'CI workflow: ci.yml' in output
+    assert 'CI inputs:   hosted=true, full_tests=true' in output
+    assert 'Creates variable: CI_RUN_ON_PUSH=false' in output
+    assert 'Cancels: #10 pending\\x1b[31m' in output
+    assert 'Replaces evidence: #9 passed\\x0aforged (passed)' in output
+    assert _git(host, 'for-each-ref') == b''
+    assert actions[2]['args'] not in _calls(tmp_path)
+    assert actions[5]['args'] not in _calls(tmp_path)
+
+
+@pytest.mark.parametrize('variable', ['true', 'unreadable'])
+def test_stage_push_refuses_conflicting_variable_before_push(
+    tmp_path: Path,
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    variable: str,
+) -> None:
+    host, paths, g, p, record = _ci_candidate(tmp_path, make_repo, monkeypatch)
+    responses = _host_responses(fake_gh, p)
+    actions = _ci_responses(record.commit, variable=variable)
+    if variable == 'unreadable':
+        actions[0].update(stdout=json.dumps({'status': '403'}), returncode=1)
+    fake_gh.write_text(json.dumps(responses + actions))
+    with pytest.raises(PubanonError):
+        _stage.stage_push(paths, g, p, yes=True)
+    assert _git(host, 'for-each-ref') == b''
+    assert _stage.load_stage(paths, p.name) is None
+    assert not any('POST' in call for call in _calls(tmp_path))
+
+
+@pytest.mark.parametrize('boundary', ['push', '_finish_stage_push', '_save_stage'])
+def test_stage_push_never_requests_ci_before_verified_stage_record(
+    tmp_path: Path,
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    _, paths, g, p, record = _ci_candidate(tmp_path, make_repo, monkeypatch)
+    responses = _host_responses(fake_gh, p)
+    actions = _ci_responses(record.commit)
+    fake_gh.write_text(json.dumps(responses + actions))
+
+    def _fail(*_args: object, **_kwargs: object) -> Never:
+        raise PubanonError('injected boundary failure')
+
+    monkeypatch.setattr(_stage, boundary, _fail)
+    with pytest.raises(PubanonError):
+        _stage.stage_push(paths, g, p, yes=True)
+    assert _stage.load_stage(paths, p.name) is None
+    assert actions[4]['args'] not in _calls(tmp_path)
+    assert actions[5]['args'] not in _calls(tmp_path)
+
+
+def _ci_listing(
+    coordinates: tuple[str, str],
+    commit: str,
+    runs: list[dict[str, object]],
+    *,
+    event: str = 'workflow_dispatch',
+    total: int | None = None,
+) -> dict[str, object]:
+    owner, repo = coordinates
+    return {
+        'args': [
+            'api',
+            (
+                f'repos/{owner}/{repo}/actions/workflows/ci.yml/runs?head_sha={commit}'
+                f'&event={event}&branch=main&per_page=100&page=1'
+            ),
+        ],
+        'stdout': json.dumps(
+            {'total_count': len(runs) if total is None else total, 'workflow_runs': runs}
+        ),
+        'once': True,
+    }
+
+
+def test_stage_push_refuses_snapshot_without_dispatch_inputs_before_host_access(
+    tmp_path: Path,
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del fake_gh
+    _, paths, g, p, _ = _ci_candidate(
+        tmp_path, make_repo, monkeypatch, workflow='on: push\njobs: {}\n'
+    )
+    with pytest.raises(PubanonError, match=r'ci\.yml cannot receive Pubanon CI requests'):
+        _stage.stage_push(paths, g, p, yes=True)
+    assert _calls(tmp_path) == []
+
+
+def test_stage_push_reports_staged_snapshot_when_ci_request_fails(
+    tmp_path: Path,
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    host, paths, g, p, record = _ci_candidate(tmp_path, make_repo, monkeypatch)
+    responses = _host_responses(fake_gh, p)
+    actions = _ci_responses(record.commit)
+    actions[5].update(stdout=json.dumps({'status': '403'}), returncode=1)
+    fake_gh.write_text(json.dumps(responses + actions))
+    with pytest.raises(PubanonError, match='GitHub refused the CI request'):
+        _stage.stage_push(paths, g, p, yes=True)
+    assert f'Staged snapshot ({record.commit[:12]})' in capsys.readouterr().out
+    assert _git(host, 'rev-parse', 'main').decode().strip() == record.commit
+    assert _stage.load_stage(paths, p.name) == _stage.StageRecord(
+        record.commit, p.owner, 'staging-repo'
+    )
+    assert _calls(tmp_path).count(cast('list[str]', actions[5]['args'])) == 1
+
+
+def test_stage_push_same_commit_requests_another_run(
+    tmp_path: Path,
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host, paths, g, p, record = _ci_candidate(tmp_path, make_repo, monkeypatch)
+    responses = _host_responses(fake_gh, p)
+    actions = _ci_responses(record.commit, variable='FALSE')
+    fake_gh.write_text(json.dumps(responses + actions))
+    _stage.stage_push(paths, g, p, yes=True)
+    _stage.stage_push(paths, g, p, yes=True)
+    assert _calls(tmp_path).count(cast('list[str]', actions[5]['args'])) == 2
+    assert actions[2]['args'] not in _calls(tmp_path)
+    assert _git(host, 'rev-parse', 'main').decode().strip() == record.commit
+
+
+@pytest.mark.parametrize('checks', [('quality',), ()])
+def test_stage_status_reports_latest_requested_run(
+    tmp_path: Path,
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    checks: tuple[str, ...],
+) -> None:
+    paths, g, p, candidate = _integrated_status(tmp_path, make_repo, monkeypatch, checks)
+    _status_responses(fake_gh, p, candidate.commit, {})
+    coordinates = (p.owner, stage_repository(p))
+    run = _ci_run(candidate.commit) | {
+        'display_title': 'CI\x1b / hosted',
+        'html_url': 'https://example.invalid/\nrun',
+    }
+    listing = _ci_listing(coordinates, candidate.commit, [run])
+    fake_gh.write_text(
+        json.dumps(
+            [
+                *json.loads(fake_gh.read_text()),
+                listing,
+                _ci_jobs(coordinates, 9, *((name, 'success') for name in checks)),
+                listing,
+            ]
+        )
+    )
+    capture = StringIO()
+    with redirect_stdout(capture):
+        _stage.stage_status(paths, g, p)
+    rendered = capture.getvalue()
+    assert 'CI run: #9 CI\\x1b / hosted' in rendered
+    assert 'https://example.invalid/\\x0arun' in rendered
+    assert 'CI verdict: passed' in rendered
+    if checks:
+        assert 'quality: passed' in rendered
+    assert rendered.rstrip().endswith('Next: pubanon publish')
+    assert not any('check-runs' in call[-1] for call in _calls(tmp_path))
+
+
+@pytest.mark.parametrize('state', ['missing', 'pending', 'failure', 'ambiguous'])
+def test_stage_status_fails_without_suggesting_publish_when_latest_run_is_not_acceptable(
+    tmp_path: Path,
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    paths, g, p, candidate = _integrated_status(tmp_path, make_repo, monkeypatch, ('quality',))
+    _status_responses(fake_gh, p, candidate.commit, {})
+    coordinates = (p.owner, stage_repository(p))
+    run = _ci_run(candidate.commit) | {'conclusion': 'failure'}
+    if state == 'pending':
+        run |= {'status': 'in_progress', 'conclusion': None}
+    runs = [] if state == 'missing' else [run]
+    if state == 'ambiguous':
+        runs.append(run | {'id': 10})
+    listing = _ci_listing(coordinates, candidate.commit, runs)
+    fake_gh.write_text(
+        json.dumps(
+            [
+                *json.loads(fake_gh.read_text()),
+                listing,
+                _ci_jobs(coordinates, 9, ('quality', 'failure')),
+                listing,
+            ]
+        )
+    )
+    capture = StringIO()
+    with (
+        redirect_stdout(capture),
+        pytest.raises(PubanonError, match='latest CI run is not acceptable') as raised,
+    ):
+        _stage.stage_status(paths, g, p)
+    rendered = capture.getvalue()
+    assert 'Next: pubanon publish' not in rendered
+    assert 'CI verdict:' in rendered
+    assert 'quality:' in rendered
+    assert 'rerun `pubanon stage status`' in (raised.value.recovery or '')
+    if state == 'missing':
+        assert 'No requested CI run for the staged snapshot' in rendered
+    elif state == 'failure':
+        assert 'quality: failed' in rendered
 
 
 def test_verify_staged_target_refuses_malformed_record_before_host_access(

@@ -17,7 +17,7 @@ from pubanon._config import (
     ProjectConfig,
     stage_repository,
 )
-from pubanon._errors import ObservationTimeoutError, PubanonError
+from pubanon._errors import ObservationTimeoutError, OperationCanceled, PubanonError
 from pubanon._remote import _host, _stage, _watch
 from pubanon._remote._host import CheckVerdict, Destination, RemoteRefs
 from pubanon._remote._package import PackageRelease
@@ -25,7 +25,13 @@ from pubanon._remote._stage import _save_stage
 from pubanon._snapshots import _candidate
 from pubanon._terminal import verbose_context
 from tests._cli import gh_calls, prepare
-from tests.remote.test_stage import _prepare_stage, _status_responses
+from tests.remote.test_stage import (
+    _ci_jobs,
+    _ci_listing,
+    _ci_run,
+    _prepare_stage,
+    _status_responses,
+)
 
 
 class _Clock:
@@ -44,6 +50,145 @@ class _Clock:
 class _FailIfTouched:
     def __getattribute__(self, name: str) -> object:
         pytest.fail(f'configuration was touched: {name}')
+
+
+def _integrated_watch_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    checks: tuple[str, ...] = ('quality',),
+) -> tuple[Paths, GlobalConfig, ProjectConfig]:
+    paths, g, p = _configs(tmp_path, required_checks=checks)
+    p = replace(p, ci_workflow='ci.yml')
+    _record_stage(paths, p.name, _stage.StageRecord('a' * 40, p.owner, stage_repository(p)))
+    _stub_staged_destination(monkeypatch, _verify_selected)
+
+    def _refs(_dest: Destination, *, timeout: float | None = None) -> RemoteRefs:
+        assert timeout is not None
+        assert timeout > 0
+        return RemoteRefs('a' * 40, {})
+
+    monkeypatch.setattr(_stage, 'read_remote_refs', _refs)
+    return paths, g, p
+
+
+@pytest.mark.parametrize('conclusion', ['cancelled', 'failure'])
+def test_integrated_stage_watch_refuses_cancelled_latest_run_with_recovery(
+    tmp_path: Path,
+    fake_gh: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    conclusion: str,
+) -> None:
+    paths, g, p = _integrated_watch_target(tmp_path, monkeypatch)
+    clock = _patch_clock(monkeypatch)
+    coordinates = (p.owner, stage_repository(p))
+    commit = 'a' * 40
+    run = _ci_run(commit) | {'conclusion': conclusion}
+    fake_gh.write_text(
+        json.dumps(
+            [
+                _ci_listing(coordinates, commit, [run]),
+                _ci_jobs(coordinates, 9, ('quality', conclusion)),
+                _ci_listing(coordinates, commit, [run]),
+            ]
+        )
+    )
+    with pytest.raises(PubanonError, match='latest CI run is not acceptable') as raised:
+        _watch.watch_ci(paths, g, p, staged=True, version=None, timeout=60)
+    assert '#9' in (raised.value.fact or '')
+    assert 'rerun `pubanon stage watch`' in (raised.value.recovery or '')
+    if conclusion == 'cancelled':
+        assert 'request a new run with pubanon stage push' in (raised.value.recovery or '')
+    assert clock._sleeps == []
+
+
+@pytest.mark.parametrize('checks', [('quality',), ()])
+def test_integrated_repo_watch_reads_push_runs(
+    tmp_path: Path,
+    fake_gh: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    checks: tuple[str, ...],
+) -> None:
+    paths, g, p = _configs(tmp_path, required_checks=checks)
+    p = replace(p, ci_workflow='ci.yml')
+    commit = 'a' * 40
+    _published_refs(monkeypatch, commit, {})
+    clock = _patch_clock(monkeypatch)
+    coordinates = (p.owner, p.repo)
+    run = _ci_run(commit) | {'event': 'push'}
+    pending = run | {'status': 'queued', 'conclusion': None}
+    _host_responses(
+        fake_gh,
+        _ci_listing(coordinates, commit, [], event='push'),
+        _ci_listing(coordinates, commit, [pending], event='push'),
+        _ci_listing(coordinates, commit, [run], event='push'),
+        _ci_jobs(coordinates, 9, *((name, 'success') for name in checks)),
+        _ci_listing(coordinates, commit, [run], event='push'),
+    )
+    _watch.watch_ci(paths, g, p, staged=False, version=None, timeout=60)
+    queries = [call[-1] for call in gh_calls(tmp_path) if '/workflows/ci.yml/runs?' in call[-1]]
+    assert len(queries) == 4
+    assert clock._sleeps == [15, 15]
+    assert all('&event=push&branch=main&' in query for query in queries)
+    if not checks:
+        assert 'Checks: latest run of ci.yml' in re.sub(r': +', ': ', capsys.readouterr().out)
+
+
+@pytest.mark.parametrize('state', ['missing', 'pending', 'ambiguous'])
+def test_integrated_watch_stops_on_deadline_or_ambiguous_evidence(
+    tmp_path: Path,
+    fake_gh: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    paths, g, p = _integrated_watch_target(tmp_path, monkeypatch)
+    clock = _patch_clock(monkeypatch)
+    commit = 'a' * 40
+    coordinates = (p.owner, stage_repository(p))
+    pending = _ci_run(commit) | {'status': 'queued', 'conclusion': None}
+    runs = [] if state == 'missing' else [pending]
+    if state == 'ambiguous':
+        runs.append(pending | {'id': 10})
+    fake_gh.write_text(json.dumps([_ci_listing(coordinates, commit, runs)]))
+    message = (
+        'latest CI run is not acceptable' if state == 'ambiguous' else 'observation timed out'
+    )
+    with pytest.raises(PubanonError, match=message) as raised:
+        _watch.watch_ci(paths, g, p, staged=True, version=None, timeout=10)
+    assert clock._sleeps == ([] if state == 'ambiguous' else [10])
+    assert len(gh_calls(tmp_path)) == 1
+    if state == 'ambiguous':
+        assert 'resolve the duplicate runs or job names' in (raised.value.recovery or '')
+    else:
+        assert raised.value.fact == 'CI run: pending'
+
+
+@pytest.mark.parametrize(
+    'failure', [ObservationTimeoutError(), OperationCanceled('Canceled.'), KeyboardInterrupt()]
+)
+def test_integrated_watch_preserves_observation_failure_semantics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    paths, g, p = _integrated_watch_target(tmp_path, monkeypatch)
+    clock = _patch_clock(monkeypatch)
+
+    def _fail(*_args: object, **_kwargs: object) -> Never:
+        raise failure
+
+    monkeypatch.setattr(_watch, 'run_evidence', _fail)
+    if isinstance(failure, ObservationTimeoutError):
+        with pytest.raises(PubanonError, match='observation timed out') as raised:
+            _watch.watch_ci(paths, g, p, staged=True, version=None, timeout=60)
+        assert raised.value.fact == 'CI run: pending'
+        assert raised.value.recovery == 'rerun `pubanon stage watch`'
+    else:
+        with pytest.raises(type(failure)) as propagated:
+            _watch.watch_ci(paths, g, p, staged=True, version=None, timeout=60)
+        assert propagated.value is failure
+    assert clock._sleeps == []
 
 
 def _absent_release(
@@ -89,6 +234,13 @@ def _check_response(
     if once:
         response['once'] = True
     return response
+
+
+def _patch_clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
+    clock = _Clock()
+    monkeypatch.setattr(_watch, '_monotonic', clock._monotonic)
+    monkeypatch.setattr(_watch, '_sleep', clock._sleep)
+    return clock
 
 
 def _configs(
@@ -141,89 +293,6 @@ def _destination(
         account='anonymous-account',
         visibility=visibility,
     )
-
-
-def _failed_check(
-    _coordinates: tuple[str, str],
-    _commit: str,
-    name: str,
-    *,
-    timeout: float | None = None,
-) -> CheckVerdict:
-    del timeout
-    return CheckVerdict(name, 'unacceptable', 'failure')
-
-
-def _host_responses(
-    fake_gh: Path,
-    *checks: dict[str, object],
-    repo: str = 'public-repo',
-    visibility: str = 'private',
-) -> None:
-    fake_gh.write_text(
-        json.dumps(
-            [
-                {
-                    'args': ['api', 'user', '--jq', '.login'],
-                    'stdout': 'anonymous-account\n',
-                },
-                {
-                    'args': [
-                        'api',
-                        f'repos/publication-owner/{repo}',
-                        '--jq',
-                        _host._REPOSITORY_QUERY,
-                    ],
-                    'stdout': json.dumps(
-                        {
-                            'owner': 'publication-owner',
-                            'repo': repo,
-                            'visibility': visibility,
-                        }
-                    )
-                    + '\n',
-                },
-                *checks,
-            ]
-        )
-        + '\n'
-    )
-
-
-def _missing_check_response(commit: str, name: str, *, once: bool = False) -> dict[str, object]:
-    query = f'check_name={name}&filter=latest&per_page=100'
-    response: dict[str, object] = {
-        'args': [
-            'api',
-            f'repos/publication-owner/public-repo/commits/{commit}/check-runs?{query}',
-        ],
-        'stdout': json.dumps({'total_count': 0, 'check_runs': []}) + '\n',
-    }
-    if once:
-        response['once'] = True
-    return response
-
-
-def _patch_clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
-    clock = _Clock()
-    monkeypatch.setattr(_watch, '_monotonic', clock._monotonic)
-    monkeypatch.setattr(_watch, '_sleep', clock._sleep)
-    return clock
-
-
-def _pending_check(
-    _coordinates: tuple[str, str],
-    _commit: str,
-    name: str,
-    *,
-    timeout: float | None = None,
-) -> CheckVerdict:
-    del timeout
-    return CheckVerdict(name, 'pending', 'queued')
-
-
-def _raise_observation_timeout(*, stage: str | None = None) -> Never:
-    raise ObservationTimeoutError(stage=stage)
 
 
 def _record_stage(paths: Paths, project: str, record: _stage.StageRecord) -> None:
@@ -318,7 +387,7 @@ def _stub_staged_destination(
     monkeypatch.setattr(_stage, '_verify_stage_facts', _verify_facts)
 
 
-def _successful_check(
+def _failed_check(
     _coordinates: tuple[str, str],
     _commit: str,
     name: str,
@@ -326,68 +395,68 @@ def _successful_check(
     timeout: float | None = None,
 ) -> CheckVerdict:
     del timeout
-    return CheckVerdict(name, 'success', 'success')
+    return CheckVerdict(name, 'unacceptable', 'failure')
 
 
-def _verify_selected(
-    _paths: Paths,
-    _g: GlobalConfig,
-    selected: ProjectConfig,
-    *,
-    timeout: float | None = None,
-) -> Destination:
-    del timeout
-    return _destination(
-        owner=selected.owner,
-        repo=selected.repo,
-        visibility=selected.visibility,
+def _host_responses(
+    fake_gh: Path,
+    *checks: dict[str, object],
+    repo: str = 'public-repo',
+    visibility: str = 'private',
+) -> None:
+    fake_gh.write_text(
+        json.dumps(
+            [
+                {
+                    'args': ['api', 'user', '--jq', '.login'],
+                    'stdout': 'anonymous-account\n',
+                },
+                {
+                    'args': [
+                        'api',
+                        f'repos/publication-owner/{repo}',
+                        '--jq',
+                        _host._REPOSITORY_QUERY,
+                    ],
+                    'stdout': json.dumps(
+                        {
+                            'owner': 'publication-owner',
+                            'repo': repo,
+                            'visibility': visibility,
+                        }
+                    )
+                    + '\n',
+                },
+                *checks,
+            ]
+        )
+        + '\n'
     )
 
 
-@pytest.mark.parametrize(
-    ('verdict', 'recovery'),
-    [
-        pytest.param(
-            CheckVerdict('CI', 'pending', 'in_progress'),
-            'wait for the check, then rerun the watch',
-            id='pending',
-        ),
-        pytest.param(
-            CheckVerdict('CI', 'missing', ''),
-            'check the configured name and workflow trigger, then rerun the watch',
-            id='missing',
-        ),
-        pytest.param(
-            CheckVerdict('CI', 'ambiguous', '2 check runs'),
-            'resolve the multiple matching check runs, then rerun the watch',
-            id='ambiguous',
-        ),
-        pytest.param(
-            CheckVerdict('CI', 'unacceptable', 'failure'),
-            'inspect the failed check and fix or rerun its workflow, then rerun the watch',
-            id='failed',
-        ),
-    ],
-)
-def test_check_recovery_matches_observed_state(
-    verdict: CheckVerdict,
-    recovery: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    clock = _patch_clock(monkeypatch)
+def _missing_check_response(commit: str, name: str, *, once: bool = False) -> dict[str, object]:
+    query = f'check_name={name}&filter=latest&per_page=100'
+    response: dict[str, object] = {
+        'args': [
+            'api',
+            f'repos/publication-owner/public-repo/commits/{commit}/check-runs?{query}',
+        ],
+        'stdout': json.dumps({'total_count': 0, 'check_runs': []}) + '\n',
+    }
+    if once:
+        response['once'] = True
+    return response
 
-    def _check(*_args: object, timeout: float | None = None) -> CheckVerdict:
-        assert timeout is not None
-        assert timeout > 0
-        return verdict
 
-    monkeypatch.setattr(_watch, 'check_result', _check)
-
-    with pytest.raises(PubanonError) as raised:
-        _watch._wait_for_checks(_destination(), 'a' * 40, ('CI',), 1)
-
-    assert raised.value.recovery == recovery
-    assert clock._sleeps == ([] if verdict.state in {'ambiguous', 'unacceptable'} else [1])
+def _pending_check(
+    _coordinates: tuple[str, str],
+    _commit: str,
+    name: str,
+    *,
+    timeout: float | None = None,
+) -> CheckVerdict:
+    del timeout
+    return CheckVerdict(name, 'pending', 'queued')
 
 
 def test_ci_verdicts_reads_each_configured_check_once_in_order(
@@ -471,6 +540,207 @@ def test_explicit_selectors_carry_the_selected_tags_exact_commit(
         '0.2.0',
         'b' * 40,
     )
+
+
+def _raise_observation_timeout(*, stage: str | None = None) -> Never:
+    raise ObservationTimeoutError(stage=stage)
+
+
+def test_integrated_stage_watch_follows_newer_run(
+    tmp_path: Path,
+    fake_gh: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paths, g, p = _integrated_watch_target(tmp_path, monkeypatch)
+    clock = _patch_clock(monkeypatch)
+    coordinates = (p.owner, stage_repository(p))
+    commit = 'a' * 40
+    older = _ci_run(commit, 8) | {'status': 'in_progress', 'conclusion': None}
+    newer = _ci_run(commit, 9) | {'status': 'in_progress', 'conclusion': None}
+    success = newer | {'status': 'completed', 'conclusion': 'success'}
+    fake_gh.write_text(
+        json.dumps(
+            [
+                _ci_listing(coordinates, commit, [older]),
+                _ci_listing(coordinates, commit, [older, newer]),
+                _ci_listing(coordinates, commit, [older, success]),
+                _ci_jobs(coordinates, 9, ('quality', 'success')),
+                _ci_listing(coordinates, commit, [older, success]),
+            ]
+        )
+    )
+    _watch.watch_ci(paths, g, p, staged=True, version=None, timeout=60)
+    rendered = capsys.readouterr().out
+    assert '#8' in rendered
+    assert '#9' in rendered
+    assert rendered.count('https://example.invalid/runs/9') == 1
+    assert clock._sleeps == [15, 15]
+    assert not any('/runs/8/attempts/' in call[-1] for call in gh_calls(tmp_path))
+
+
+def _successful_check(
+    _coordinates: tuple[str, str],
+    _commit: str,
+    name: str,
+    *,
+    timeout: float | None = None,
+) -> CheckVerdict:
+    del timeout
+    return CheckVerdict(name, 'success', 'success')
+
+
+def test_integrated_stage_watch_waits_through_missing_and_pending(
+    tmp_path: Path,
+    fake_gh: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paths, g, p = _integrated_watch_target(tmp_path, monkeypatch)
+    clock = _patch_clock(monkeypatch)
+    coordinates = (p.owner, stage_repository(p))
+    commit = 'a' * 40
+    pending = _ci_run(commit) | {
+        'status': 'in_progress',
+        'conclusion': None,
+        'display_title': 'CI\x1b / hosted',
+        'html_url': 'https://example.invalid/\nrun',
+    }
+    success = pending | {'status': 'completed', 'conclusion': 'success'}
+    fake_gh.write_text(
+        json.dumps(
+            [
+                _ci_listing(coordinates, commit, []),
+                _ci_listing(coordinates, commit, [pending]),
+                _ci_listing(coordinates, commit, [success]),
+                _ci_jobs(coordinates, 9, ('quality', 'success')),
+                _ci_listing(coordinates, commit, [success]),
+            ]
+        )
+    )
+    _watch.watch_ci(paths, g, p, staged=True, version=None, timeout=60)
+    rendered = capsys.readouterr().out
+    assert clock._sleeps == [15, 15]
+    assert 'not found' in rendered
+    assert 'pending' in rendered
+    assert 'passed' in rendered
+    assert rendered.count('CI\\x1b / hosted') == 1
+    assert rendered.count('https://example.invalid/\\x0arun') == 1
+    assert not any('check-runs' in call[-1] for call in gh_calls(tmp_path))
+
+
+def test_integrated_watch_allows_empty_required_checks(
+    tmp_path: Path,
+    fake_gh: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paths, g, p = _integrated_watch_target(tmp_path, monkeypatch, checks=())
+    _patch_clock(monkeypatch)
+    coordinates = (p.owner, stage_repository(p))
+    commit = 'a' * 40
+    listing = _ci_listing(coordinates, commit, [_ci_run(commit)])
+    fake_gh.write_text(json.dumps([listing, _ci_jobs(coordinates, 9), listing]))
+    _watch.watch_ci(paths, g, p, staged=True, version=None, timeout=60)
+    assert 'Checks: latest run of ci.yml' in re.sub(r': +', ': ', capsys.readouterr().out)
+
+
+def _verify_selected(
+    _paths: Paths,
+    _g: GlobalConfig,
+    selected: ProjectConfig,
+    *,
+    timeout: float | None = None,
+) -> Destination:
+    del timeout
+    return _destination(
+        owner=selected.owner,
+        repo=selected.repo,
+        visibility=selected.visibility,
+    )
+
+
+@pytest.mark.parametrize(
+    ('verdict', 'recovery'),
+    [
+        pytest.param(
+            CheckVerdict('CI', 'pending', 'in_progress'),
+            'wait for the check, then rerun the watch',
+            id='pending',
+        ),
+        pytest.param(
+            CheckVerdict('CI', 'missing', ''),
+            'check the configured name and workflow trigger, then rerun the watch',
+            id='missing',
+        ),
+        pytest.param(
+            CheckVerdict('CI', 'ambiguous', '2 check runs'),
+            'resolve the multiple matching check runs, then rerun the watch',
+            id='ambiguous',
+        ),
+        pytest.param(
+            CheckVerdict('CI', 'unacceptable', 'failure'),
+            'inspect the failed check and fix or rerun its workflow, then rerun the watch',
+            id='failed',
+        ),
+    ],
+)
+def test_check_recovery_matches_observed_state(
+    verdict: CheckVerdict,
+    recovery: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _patch_clock(monkeypatch)
+
+    def _check(*_args: object, timeout: float | None = None) -> CheckVerdict:
+        assert timeout is not None
+        assert timeout > 0
+        return verdict
+
+    monkeypatch.setattr(_watch, 'check_result', _check)
+
+    with pytest.raises(PubanonError) as raised:
+        _watch._wait_for_checks(_destination(), 'a' * 40, ('CI',), 1)
+
+    assert raised.value.recovery == recovery
+    assert clock._sleeps == ([] if verdict.state in {'ambiguous', 'unacceptable'} else [1])
+
+
+def test_integrated_watch_stops_reading_when_budget_is_spent(
+    tmp_path: Path,
+    fake_gh: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, g, p = _integrated_watch_target(tmp_path, monkeypatch)
+    clock = _patch_clock(monkeypatch)
+    coordinates = (p.owner, stage_repository(p))
+    commit = 'a' * 40
+    fake_gh.write_text(
+        json.dumps(
+            [
+                _ci_listing(
+                    coordinates,
+                    commit,
+                    [_ci_run(commit, number) for number in range(1, 101)],
+                    total=101,
+                ),
+            ]
+        )
+    )
+
+    def _advancing_clock() -> float:
+        clock._now += 1
+        return clock._now
+
+    monkeypatch.setattr(_watch, '_monotonic', _advancing_clock)
+    with pytest.raises(PubanonError, match='observation timed out') as raised:
+        _watch.watch_ci(paths, g, p, staged=True, version=None, timeout=4)
+    assert raised.value.fact == 'CI run: pending'
+    assert raised.value.recovery == 'rerun `pubanon stage watch`'
+    calls = gh_calls(tmp_path)
+    assert len(calls) == 1
+    assert '/runs?' in calls[0][-1]
+    assert 'page=1' in calls[0][-1]
 
 
 def test_package_watch_passes_decreasing_positive_remaining_time(

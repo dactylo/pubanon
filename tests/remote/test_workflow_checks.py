@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from pubanon._remote import _workflow_checks
@@ -88,34 +90,6 @@ jobs:
     assert 'duplicate discovered check name' in result.notes[0]
 
 
-@pytest.mark.parametrize(
-    ('trigger', 'reason'),
-    [
-        ('on: workflow_dispatch', 'manually'),
-        ('on: [release, workflow_dispatch]', 'branch pushes'),
-        ('on:\n  push:\n    tags: ["v*"]', 'tags'),
-        ('on:\n  push:\n    branches: [release]', 'branches'),
-        ('on:\n  push:\n    paths: ["src/**"]', 'paths'),
-        ('on:\n  push:\n    paths-ignore: ["docs/**"]', 'paths'),
-        ('on:\n  push:\n    branches-ignore: [main]', 'branches'),
-        ('', 'trigger'),
-    ],
-)
-def test_discover_explains_when_a_workflow_may_not_run_on_a_branch_push(
-    trigger: str,
-    reason: str,
-) -> None:
-    result = _workflow_checks.discover(
-        (_workflow(f'{trigger}\njobs:\n  verify:\n    runs-on: linux\n'),)
-    )
-
-    assert result.names == ('verify',)
-    (caution,) = result.cautions
-    assert caution.name == 'verify'
-    assert caution.path == '.github/workflows/checks.yml'
-    assert any(reason in message for message in caution.reasons)
-
-
 def test_discover_identifies_conditions_on_each_matrix_check() -> None:
     result = _workflow_checks.discover(
         (
@@ -180,18 +154,6 @@ jobs:
         'tests (macos-15, 3.13)',
     )
     assert result.notes == ()
-
-
-@pytest.mark.parametrize(
-    'trigger', ['on: push', 'on: [push, workflow_dispatch]', 'on:\n  push:\n    branches: ["**"]']
-)
-def test_discover_recognizes_unfiltered_branch_pushes(trigger: str) -> None:
-    result = _workflow_checks.discover(
-        (_workflow(f'{trigger}\njobs:\n  quality:\n    runs-on: linux\n'),)
-    )
-
-    assert result.names == ('quality',)
-    assert result.cautions == ()
 
 
 def test_discover_rejects_expressions_inside_literal_matrix_values() -> None:
@@ -284,3 +246,78 @@ jobs:
         'Test 3.14 on ubuntu-latest',
     )
     assert result.notes == ()
+
+
+def test_dispatch_contract_accepts_pubanon_workflow() -> None:
+    workflow = Path(__file__).parents[2] / '.github/workflows/ci.yml'
+
+    assert _workflow_checks.dispatch_contract_problem(workflow.read_bytes()) is None
+
+
+@pytest.mark.parametrize(
+    ('data', 'problem'),
+    [
+        ('jobs: {}', 'does not declare workflow_dispatch inputs'),
+        ('on: [push, workflow_dispatch]', 'does not declare workflow_dispatch inputs'),
+        ('on:\n  workflow_dispatch:', 'does not declare workflow_dispatch inputs'),
+        (
+            'on:\n  workflow_dispatch:\n    inputs:\n      hosted:\n        type: boolean',
+            'does not declare the boolean input full_tests',
+        ),
+        (
+            """\
+on:
+  workflow_dispatch:
+    inputs:
+      hosted:
+        type: string
+      full_tests:
+        type: boolean""",
+            'does not declare the boolean input hosted',
+        ),
+        ('on: [', 'could not be parsed as YAML 1.2'),
+        ('- push', 'does not contain a workflow mapping'),
+    ],
+)
+def test_dispatch_contract_reports_missing_declarations(data: str, problem: str) -> None:
+    assert _workflow_checks.dispatch_contract_problem(data.encode()) == problem
+
+
+@pytest.mark.parametrize(
+    ('trigger', 'reason'),
+    [
+        ('on: workflow_dispatch', 'manually'),
+        ('on: [release, workflow_dispatch]', 'branch pushes'),
+        ('on:\n  push:\n    tags: ["v*"]', 'tags'),
+        ('on:\n  push:\n    branches: [release]', 'branches'),
+        ('on:\n  push:\n    paths: ["src/**"]', 'paths'),
+        ('on:\n  push:\n    paths-ignore: ["docs/**"]', 'paths'),
+        ('on:\n  push:\n    branches-ignore: [main]', 'branches'),
+        ('', 'trigger'),
+    ],
+)
+def test_discover_explains_when_a_workflow_may_not_run_on_a_branch_push(
+    trigger: str,
+    reason: str,
+) -> None:
+    result = _workflow_checks.discover(
+        (_workflow(f'{trigger}\njobs:\n  verify:\n    runs-on: linux\n'),)
+    )
+
+    assert result.names == ('verify',)
+    (caution,) = result.cautions
+    assert caution.name == 'verify'
+    assert caution.path == '.github/workflows/checks.yml'
+    assert any(reason in message for message in caution.reasons)
+
+
+@pytest.mark.parametrize(
+    'trigger', ['on: push', 'on: [push, workflow_dispatch]', 'on:\n  push:\n    branches: ["**"]']
+)
+def test_discover_recognizes_unfiltered_branch_pushes(trigger: str) -> None:
+    result = _workflow_checks.discover(
+        (_workflow(f'{trigger}\njobs:\n  quality:\n    runs-on: linux\n'),)
+    )
+
+    assert result.names == ('quality',)
+    assert result.cautions == ()

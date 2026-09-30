@@ -9,12 +9,9 @@ from pathlib import Path
 import pytest
 
 from pubanon import _cli, _config
-from pubanon._cli import _audit as audit_cli
 from pubanon._cli._context import load_context
-from pubanon._gate import RuleClass
 from pubanon._remote import _host
 from pubanon._snapshots import _audit, _candidate
-from pubanon._terminal import color_context
 from tests._cli import prepare, record_published_main, stub_remote
 from tests._git import git_env
 from tests._setup import configure
@@ -107,117 +104,6 @@ def test_audit_discloses_invalid_tree_header_result(
     assert f'identity problem: {problem}' in output
     assert 'Content auditing could not be completed reliably.' in output
     assert 'No configured sensitive terms were found in the checked history.' not in output
-
-
-def test_audit_groups_findings_by_snapshot_with_release_tags(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    paths, _global, project = configure(tmp_path, monkeypatch, tmp_path)
-    assert project is not None
-    ctx = load_context(paths, project.name)
-    older, newer = 'a' * 40, 'b' * 40
-    evidence = tuple(
-        _audit.HistoryEvidence(
-            _audit.AuditFinding(unit, RuleClass.IDENTITY_CRITICAL, 'Private Person'),
-            commit,
-            'blob bytes 0:14',
-            label,
-            'Private Person',
-        )
-        for unit, commit, label in (
-            ('path:a.txt', older, 'a.txt:1'),
-            ('path:b.txt', newer, 'b.txt:1'),
-            ('path:c.txt', older, 'c.txt:1'),
-            ('tag:unresolved', None, 'tag name'),
-        )
-    )
-    result = _audit.HistoryAudit(tuple(item.finding for item in evidence), (), evidence)
-
-    with color_context('never'):
-        output = '\n'.join(
-            audit_cli._finding_groups(result, ctx, (), [newer, older], {'v1.0.0': older})
-        )
-
-    newest_heading = f'Published snapshot: {newer[:12]}'
-    older_heading = f'Published snapshot: v1.0.0 ({older[:12]})'
-    unknown_heading = 'Published snapshot: unknown'
-    assert output.count('Warning: historical exposure') == 1
-    for heading in (newest_heading, older_heading, unknown_heading):
-        assert output.count(heading) == 1
-    newest, older_group, unknown = (
-        output.index(heading) for heading in (newest_heading, older_heading, unknown_heading)
-    )
-    assert newest < output.index('  b.txt:1') < older_group
-    assert older_group < output.index('  a.txt:1') < output.index('  c.txt:1') < unknown
-    assert unknown < output.index('  tag unresolved')
-    assert 'Commit:' not in output
-
-
-@pytest.mark.parametrize(
-    ('text', 'term', 'highlighted'),
-    [
-        ('before SECRET after', 'secret', 'before \x1b[33mSECRET\x1b[0m after'),
-        ('before cafe\u0301 after', 'caf\u00e9', 'before \x1b[33mcafe\u0301\x1b[0m after'),
-        (
-            'x' * 80 + '...target',
-            '...',
-            '...' + 'x' * 60 + '\x1b[33m...\x1b[0mtarget',
-        ),
-        (
-            '\x1b[31msecret\\suffix',
-            'secret',
-            r'\x1b[31m' + '\x1b[33msecret\x1b[0m' + r'\\suffix',
-        ),
-        ('\u00e9', '\u00c3', None),
-    ],
-)
-def test_audit_highlights_source_match_without_changing_excerpt(
-    text: str, term: str, highlighted: str | None
-) -> None:
-    findings: dict[_audit.AuditFinding, _audit.HistoryEvidence] = {}
-    _audit._add_findings(
-        findings,
-        'path:notes.txt',
-        text.encode(),
-        {RuleClass.IDENTITY_CRITICAL: (term,)},
-        ('a' * 40, 'blob'),
-    )
-
-    with color_context('always'):
-        lines = audit_cli._finding_lines(
-            next(iter(findings.values())), ('global sensitive_terms entry 1',)
-        )
-
-    assert lines[1] == '    Rule: global sensitive_terms, item 1'
-    if highlighted is None:
-        assert lines[2] == f'    Matched: \x1b[33m{term}\x1b[0m'
-        assert lines[3] == f'    Text: {text}'
-    else:
-        assert lines[2] == f'    Text: {highlighted}'
-        assert not any('Matched:' in line for line in lines)
-
-
-def test_audit_keeps_full_tag_name_when_source_excerpt_is_shortened() -> None:
-    name = 'v1.0.0-' + 'x' * 100 + '-blocked'
-    findings: dict[_audit.AuditFinding, _audit.HistoryEvidence] = {}
-    _audit._add_findings(
-        findings,
-        f'tag:{name}',
-        name.encode(),
-        {RuleClass.IDENTITY_CRITICAL: ('blocked',)},
-        (None, 'tag name'),
-    )
-
-    with color_context('never'):
-        lines = audit_cli._finding_lines(
-            next(iter(findings.values())), ('global sensitive_terms entry 1',)
-        )
-
-    assert lines[0] == f'  tag {name}'
-    assert lines[1] == '    Rule: global sensitive_terms, item 1'
-    assert lines[2] == '    Matched: blocked'
-    assert lines[3].startswith('    Text: ...')
-    assert not any('Commit:' in line for line in lines)
 
 
 def test_audit_remote_labels_verified_history(
@@ -519,7 +405,6 @@ def test_audit_reports_findings_and_public_history_guidance(
         )
         == 2
     )
-    assert 'Commit:' not in output
     if not verbose:
         assert record.commit not in output
     assert f'  {published_path} (filename)\n    Rule:' in output
@@ -635,7 +520,6 @@ def test_audit_reports_matching_nonempty_exposure_acknowledgment(
 
     output = capsys.readouterr().out
     assert 'Historical exposure acknowledged.' in output
-    assert 'exposure unacknowledged:' not in output
 
 
 @pytest.mark.parametrize('exposure', ['Anonymous Publisher', 'anonymous@example.invalid'])

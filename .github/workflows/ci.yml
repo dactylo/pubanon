@@ -1,8 +1,9 @@
 name: CI
 run-name: >-
-  ${{ (!github.event.repository.private || github.event_name == 'pull_request' ||
+  ${{ github.event_name == 'push' && vars.CI_RUN_ON_PUSH == 'false' && 'CI / push skipped' ||
+      (!github.event.repository.private || github.event_name != 'workflow_dispatch' ||
        inputs.hosted || !(vars.CI_LINUX_RUNNER || vars.CI_MACOS_RUNNER || vars.CI_WINDOWS_RUNNER)) &&
-      'CI / hosted' || inputs.full_tests && 'CI / development (full)' || 'CI / development' }}
+      'CI / hosted' || inputs.full_tests && 'CI / local (full)' || 'CI / local' }}
 
 on:
   pull_request:
@@ -21,12 +22,21 @@ on:
         type: boolean
         default: false
 
+# A newer requested run on a branch supersedes the older one. Each push run
+# has its own group: the release workflow needs the tagged commit's push run.
+concurrency:
+  group: >-
+    ${{ github.event_name == 'workflow_dispatch'
+        && format('ci-dispatch-{0}', github.ref)
+        || format('ci-run-{0}', github.run_id) }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 env:
   CI_HOSTED: >-
-    ${{ !github.event.repository.private || github.event_name == 'pull_request' ||
+    ${{ !github.event.repository.private || github.event_name != 'workflow_dispatch' ||
         inputs.hosted || !(vars.CI_LINUX_RUNNER || vars.CI_MACOS_RUNNER || vars.CI_WINDOWS_RUNNER) }}
   CI_IMPORT: pubanon
   UV_PYTHON_DOWNLOADS: never
@@ -39,8 +49,9 @@ defaults:
 
 jobs:
   quality:
+    if: github.event_name != 'push' || vars.CI_RUN_ON_PUSH != 'false'
     runs-on: >-
-      ${{ github.event.repository.private && github.event_name != 'pull_request' &&
+      ${{ github.event.repository.private && github.event_name == 'workflow_dispatch' &&
           !inputs.hosted && vars.CI_LINUX_RUNNER || 'ubuntu-24.04' }}
     steps:
       - name: Verify execution environment
@@ -109,16 +120,9 @@ jobs:
       - name: Check worktree
         run: git diff --exit-code
 
-  tests:
+  test:
     needs: quality
-    timeout-minutes: >-
-      ${{ github.event.repository.private && github.event_name != 'pull_request' &&
-          !inputs.hosted &&
-          (matrix.os == 'windows-2022' && vars.CI_WINDOWS_RUNNER &&
-           (inputs.full_tests && 60 || 20) ||
-           matrix.os == 'macos-15' && vars.CI_MACOS_RUNNER &&
-           (inputs.full_tests && 35 || 20)) ||
-          (matrix.os == 'windows-2022' && 45 || 30) }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -134,7 +138,7 @@ jobs:
           - os: windows-2022
             python-version: "3.13"
     runs-on: >-
-      ${{ github.event.repository.private && github.event_name != 'pull_request' &&
+      ${{ github.event.repository.private && github.event_name == 'workflow_dispatch' &&
           !inputs.hosted &&
           (matrix.os == 'ubuntu-24.04' && vars.CI_LINUX_RUNNER ||
            matrix.os == 'macos-15' && vars.CI_MACOS_RUNNER ||
@@ -201,9 +205,9 @@ jobs:
           python -m pytest -q -n auto --dist worksteal --durations=15 "${selection[@]}"
 
   package:
-    needs: [quality, tests]
+    needs: [quality, test]
     runs-on: >-
-      ${{ github.event.repository.private && github.event_name != 'pull_request' &&
+      ${{ github.event.repository.private && github.event_name == 'workflow_dispatch' &&
           !inputs.hosted && vars.CI_LINUX_RUNNER || 'ubuntu-24.04' }}
     env:
       UV_SYSTEM_PYTHON: "0"
@@ -293,7 +297,7 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ${{ env.CI_HOSTED == 'true' && 'python-distributions' || 'development-distributions' }}
+          name: ${{ env.CI_HOSTED == 'true' && 'python-distributions' || 'local-distributions' }}
           path: dist/
           if-no-files-found: error
           overwrite: true
@@ -301,19 +305,20 @@ jobs:
   hosted-validation:
     if: >-
       ${{ always() &&
-          (!github.event.repository.private || github.event_name == 'pull_request' ||
+          (github.event_name != 'push' || vars.CI_RUN_ON_PUSH != 'false') &&
+          (!github.event.repository.private || github.event_name != 'workflow_dispatch' ||
            inputs.hosted || !(vars.CI_LINUX_RUNNER || vars.CI_MACOS_RUNNER || vars.CI_WINDOWS_RUNNER)) }}
-    needs: [quality, tests, package]
+    needs: [quality, test, package]
     runs-on: ubuntu-24.04
     steps:
       - name: Require complete hosted CI
         env:
           CI_RUNNER_ENVIRONMENT: ${{ runner.environment }}
           QUALITY_RESULT: ${{ needs.quality.result }}
-          TESTS_RESULT: ${{ needs.tests.result }}
+          TEST_RESULT: ${{ needs.test.result }}
           PACKAGE_RESULT: ${{ needs.package.result }}
         run: |
           test "$CI_RUNNER_ENVIRONMENT" = github-hosted
           test "$QUALITY_RESULT" = success
-          test "$TESTS_RESULT" = success
+          test "$TEST_RESULT" = success
           test "$PACKAGE_RESULT" = success

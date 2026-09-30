@@ -193,7 +193,7 @@ def _init_source(paths: _config.Paths) -> tuple[Path, str | None]:
 
 def _manual_required_checks(default: tuple[str, ...]) -> tuple[str, ...]:
     """Read check names with CSV quoting so commas inside names are preserved."""
-    output('Quote names containing commas, for example "tests (linux, 3.13)".', kind='note')
+    output('Quote names containing commas, for example "test (linux, 3.13)".', kind='note')
     while True:
         raw_checks = ask(
             'Required CI checks (comma separated, blank for none)',

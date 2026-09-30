@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.1 (2026-09-29)
+
+### Added
+
+- Optional `ci_workflow` project setting. When set, `stage push` requests a run of that workflow
+  after pushing; see the guide for the workflow inputs it requires.
+- `stage push --full-tests` and `--hosted` to request complete or hosted CI.
+- With `ci_workflow`, `stage status`, `stage watch`, and `publish` judge only the latest requested
+  run for the exact staged commit, which must pass the required jobs. `repo watch` applies the same
+  rule to the final repository's CI.
+
+### Changed
+
+- `publish` and `repo restore --to remote` show previously published exposures grouped as in
+  `audit`, with rule labels and highlighted matches.
+
 ## 0.2.0 (2026-09-25)
 
 ### Breaking changes

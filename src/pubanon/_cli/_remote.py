@@ -272,7 +272,13 @@ def stage_push(args: argparse.Namespace) -> None:
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
         ctx = _context.load_context(paths, name)
-        _stage.stage_push(paths, ctx.global_config, ctx.project, yes=args.yes)
+        _stage.stage_push(
+            paths,
+            ctx.global_config,
+            ctx.project,
+            yes=args.yes,
+            ci=_stage.StageCiOptions(full_tests=args.full_tests, hosted=args.hosted),
+        )
 
 
 def stage_repair(args: argparse.Namespace) -> None:

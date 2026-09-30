@@ -24,6 +24,17 @@ from pubanon._config import (
 )
 from pubanon._errors import ObservationTimeoutError, OperationCanceled, PubanonError
 from pubanon._remote import _host
+from pubanon._remote._ci import (
+    RunQuery,
+    StageCiPlan,
+    ensure_run_on_push_variable,
+    evidence_facts,
+    evidence_recovery,
+    plan_stage_ci,
+    require_ci_contract,
+    run_evidence,
+    start_stage_ci,
+)
 from pubanon._remote._host import (
     CheckVerdict,
     Destination,
@@ -69,6 +80,20 @@ _OID_PATTERN = re.compile(OID_HEX)
 _STAGE_RECORD_KEYS = frozenset({'commit', 'owner', 'repo'})
 _STAGE_REF = 'refs/heads/main'
 _monotonic = time.monotonic
+
+
+@dataclass(frozen=True)
+class StageCiOptions:
+    """Select the workflow inputs for a staging CI request.
+
+    Attributes:
+        full_tests: Request all local tests; defaults to the quick selection.
+        hosted: Request GitHub-hosted runners; defaults to local runners.
+            Both inputs may be true; the workflow interprets their combination.
+    """
+
+    full_tests: bool = False
+    hosted: bool = False
 
 
 @dataclass(frozen=True)
@@ -121,6 +146,26 @@ def _backup_stage(path: Path, content: bytes) -> None:
         if backup is not None and not complete:
             with suppress(OSError):
                 backup.unlink(missing_ok=True)
+
+
+def _preview_stage_ci(plan: StageCiPlan) -> None:
+    """Show requested inputs and escaped advisory effects on existing runs."""
+    fields(
+        [
+            ('CI workflow', escape(plan.workflow)),
+            (
+                'CI inputs',
+                f'hosted={str(plan.hosted).lower()}, full_tests={str(plan.full_tests).lower()}',
+            ),
+        ],
+        indent=2,
+    )
+    if plan.create_variable:
+        output('  ' + field('Creates variable', 'CI_RUN_ON_PUSH=false'))
+    for run in plan.cancels:
+        output('  ' + field('Cancels', f'#{run.number} {escape(run.title)}'))
+    if (run := plan.replaces) is not None:
+        output('  ' + field('Replaces evidence', f'#{run.number} {escape(run.title)} (passed)'))
 
 
 def _preview_stage_push(
@@ -308,6 +353,38 @@ def _clear_stage(paths: Paths, project: str) -> None:
 
 def _status_checks(dest: Destination, stage: StageRecord, p: ProjectConfig) -> None:
     """Report ordered CI verdicts for one identified exact staging commit."""
+    if p.ci_workflow:
+        evidence = run_evidence(
+            (dest.owner, dest.repo),
+            RunQuery(p.ci_workflow, stage.commit, 'workflow_dispatch'),
+            required=p.required_checks,
+        )
+        if evidence.run is None:
+            output(field('CI run', 'No requested CI run for the staged snapshot'))
+        else:
+            run = evidence.run
+            output(field('CI run', f'#{run.number} {escape(run.title)}'))
+            output(field('Run URL', escape(run.url)))
+        output(
+            field(
+                'CI verdict',
+                display_check_result(CheckVerdict('CI run', evidence.state, evidence.detail)),
+            )
+        )
+        checks = evidence.checks or tuple(
+            CheckVerdict(name, evidence.state, evidence.detail) for name in p.required_checks
+        )
+        for check in checks:
+            output(field(escape(check.name), display_check_result(check)))
+        if evidence.state != 'success':
+            raise PubanonError(
+                'the latest CI run is not acceptable for the staged commit',
+                fact=evidence_facts(evidence),
+                recovery=evidence_recovery(
+                    evidence, staged=True, retry='rerun `pubanon stage status`'
+                ),
+            )
+        return
     if not p.required_checks:
         output('No required checks are configured for the staged snapshot.', kind='warning')
         return
@@ -549,6 +626,24 @@ def _recognized_stage_record(
     return None
 
 
+def _stage_push_candidate(
+    paths: Paths, g: GlobalConfig, p: ProjectConfig, ci: StageCiOptions
+) -> tuple[CandidateRecord, str]:
+    """Prove local snapshot and requested CI contracts before any host access."""
+    if (ci.full_tests or ci.hosted) and p.ci_workflow is None:
+        raise PubanonError(
+            '--full-tests and --hosted require ci_workflow',
+            recovery='set ci_workflow in the project configuration, then prepare a new snapshot',
+        )
+    record = load_candidate(paths, p.name)
+    if record is None:
+        raise PubanonError('no prepared snapshot is retained', recovery='pubanon prepare')
+    tip = _verified_stage_tip(paths, g, p, record)
+    if p.ci_workflow is not None:
+        require_ci_contract(store_path(paths, p.name), tip, p.ci_workflow)
+    return record, tip
+
+
 def _verify_stage_default(default_branch: str) -> None:
     """Require main as the default for an existing staged branch."""
     if default_branch != 'main':
@@ -594,25 +689,6 @@ def _verify_stage_refs(refs: RemoteRefs) -> None:
         )
 
 
-def _finish_stage_push(
-    dest: Destination, tip: str, refs: RemoteRefs, settings: SettingsFacts
-) -> None:
-    """Verify the pushed refs and select the first main as default when needed."""
-    readback = read_remote_refs(dest)
-    _verify_stage_refs(readback)
-    if readback.main != tip:
-        raise PubanonError(
-            'staging read-back does not match the prepared snapshot commit',
-            expected=escape(tip),
-            actual=escape(readback.main or 'absent'),
-        )
-
-    if refs.main is None and settings.default_branch != 'main':
-        set_default_branch(dest.owner, dest.repo, 'main')
-    _verify_stage_facts(dest, recovery='pubanon stage repair')
-    _verify_stage_default(repository_settings(dest.owner, dest.repo).default_branch)
-
-
 def _observe_stage_repair(dest: Destination) -> _StageObservation:
     """Read current private facts and supported staging refs without mutation."""
     _verify_stage_facts(dest, recovery='inspect GitHub access, then rerun pubanon stage repair')
@@ -641,6 +717,42 @@ def _repair_stage_default(dest: Destination, tip: str) -> None:
             'cannot verify staging default repair; prior tracking was retained',
             fact=exc.render(),
             recovery=recovery,
+        ) from exc
+
+
+def _verify_pushed_stage(
+    dest: Destination, tip: str, refs: RemoteRefs, settings: SettingsFacts
+) -> None:
+    """Verify pushed refs and make the first main the default when needed."""
+    readback = read_remote_refs(dest)
+    _verify_stage_refs(readback)
+    if readback.main != tip:
+        raise PubanonError(
+            'staging read-back does not match the prepared snapshot commit',
+            expected=escape(tip),
+            actual=escape(readback.main or 'absent'),
+        )
+
+    if refs.main is None and settings.default_branch != 'main':
+        set_default_branch(dest.owner, dest.repo, 'main')
+    _verify_stage_facts(dest, recovery='pubanon stage repair')
+    _verify_stage_default(repository_settings(dest.owner, dest.repo).default_branch)
+
+
+def _finish_stage_push(
+    dest: Destination, tip: str, refs: RemoteRefs, settings: SettingsFacts
+) -> None:
+    """Keep failed read-back distinct from the successful remote update."""
+    try:
+        _verify_pushed_stage(dest, tip, refs, settings)
+    except OperationCanceled:
+        raise
+    except PubanonError as exc:
+        raise PubanonError(
+            'cannot verify staging push read-back; '
+            'remote update succeeded but tracking was not saved',
+            fact=exc.render(),
+            recovery='pubanon stage repair',
         ) from exc
 
 
@@ -810,7 +922,7 @@ def candidate_next_action(
         action = 'pubanon stage repair'
     elif stage.commit != candidate_tip(record):
         action = 'pubanon stage push'
-    elif p.required_checks and checked_commit != stage.commit:
+    elif (p.required_checks or p.ci_workflow) and checked_commit != stage.commit:
         action = 'pubanon stage watch'
     else:
         action = 'pubanon publish'
@@ -928,12 +1040,15 @@ def stage_push(
     p: ProjectConfig,
     *,
     yes: bool,
+    ci: StageCiOptions | None = None,
 ) -> None:
     """Push one retained candidate to the private staging branch.
 
     Create a missing private staging repository after first-use confirmation.
     Replace only the staging branch and record local staging evidence after
-    verifying the pushed commit.
+    verifying the pushed commit. Integrated projects then request CI exactly
+    once;
+    a CI-start failure leaves the verified staging record intact.
 
     The caller must hold the project lock for the complete operation.
 
@@ -944,16 +1059,16 @@ def stage_push(
 
         yes: Whether to skip the replacement-push confirmation. This does not
             confirm first-use repository creation.
+        ci: Workflow input selection; `None` selects quick local CI.
+            Non-default options require `ci_workflow`.
 
     Raises:
         PubanonError: Local state, host facts, creation, refs, push, read-back,
-            or evidence persistence fails. The staging repository may have
-            changed before a later failure.
+            evidence persistence, or the CI request fails. The staging
+            repository may have changed before a later failure.
     """
-    record = load_candidate(paths, p.name)
-    if record is None:
-        raise PubanonError('no prepared snapshot is retained', recovery='pubanon prepare')
-    tip = _verified_stage_tip(paths, g, p, record)
+    ci = ci or StageCiOptions()
+    record, tip = _stage_push_candidate(paths, g, p, ci)
     try:
         stage = load_stage(paths, p.name)
     except _InvalidStageRecordError:
@@ -990,10 +1105,19 @@ def stage_push(
         _verify_stage_default(settings.default_branch)
     expected_old = refs.main
     _report_stage_default_change(refs, settings, yes=yes)
+    plan = (
+        plan_stage_ci(
+            (dest.owner, dest.repo), p.ci_workflow, tip, hosted=ci.hosted, full_tests=ci.full_tests
+        )
+        if p.ci_workflow is not None
+        else None
+    )
 
     if not yes:
         heading('Stage prepared snapshot', separate=creating_repository)
         _preview_stage_push(dest, record, stage, refs, settings)
+        if plan is not None:
+            _preview_stage_ci(plan)
     if not yes and not confirm(f'Push {tip[:12]} to the staging repository?'):
         raise OperationCanceled(
             'Canceled. Nothing was pushed.',
@@ -1002,19 +1126,11 @@ def stage_push(
             else None,
             recovery='pubanon stage push',
         )
+    if plan is not None:
+        ensure_run_on_push_variable((dest.owner, dest.repo), plan)
     _push_stage_main(dest, store_path(paths, p.name), tip, expected_old)
 
-    try:
-        _finish_stage_push(dest, tip, refs, settings)
-    except OperationCanceled:
-        raise
-    except PubanonError as exc:
-        raise PubanonError(
-            'cannot verify staging push read-back; '
-            'remote update succeeded but tracking was not saved',
-            fact=exc.render(),
-            recovery='pubanon stage repair',
-        ) from exc
+    _finish_stage_push(dest, tip, refs, settings)
     _record_stage_push(paths, p.name, StageRecord(tip, dest.owner, dest.repo))
     label = escape(record.tag_intent) if record.tag_intent else 'snapshot'
     output(
@@ -1022,7 +1138,19 @@ def stage_push(
         f'{escape(dest.owner)}/{escape(dest.repo)}.',
         kind='success',
     )
-    next_step(candidate_next_action(paths, g, p, record))
+    if plan is not None:
+        run = start_stage_ci(
+            (dest.owner, dest.repo),
+            plan.workflow,
+            tip,
+            hosted=plan.hosted,
+            full_tests=plan.full_tests,
+        )
+        output(field('CI run', f'#{run.number} {escape(run.title)}'))
+        output(escape(run.url))
+        next_step('pubanon stage watch')
+    else:
+        next_step(candidate_next_action(paths, g, p, record))
 
 
 def stage_repair(paths: Paths, g: GlobalConfig, p: ProjectConfig, *, yes: bool) -> None:
@@ -1102,7 +1230,7 @@ def stage_status(paths: Paths, g: GlobalConfig, p: ProjectConfig) -> None:
             g,
             p,
             load_candidate(paths, p.name),
-            checked_commit=stage.commit if p.required_checks else None,
+            checked_commit=stage.commit if (p.required_checks or p.ci_workflow) else None,
         )
     )
 

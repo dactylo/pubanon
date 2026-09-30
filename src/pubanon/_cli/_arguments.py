@@ -609,6 +609,16 @@ def build_parser() -> _RootParser:
         action='store_true',
         help='approve the staged push; cannot approve first-use repository creation',
     )
+    stage_push.add_argument(
+        '--full-tests',
+        action='store_true',
+        help='run all tests on local runners (workflow input full_tests)',
+    )
+    stage_push.add_argument(
+        '--hosted',
+        action='store_true',
+        help='run CI on GitHub-hosted runners (workflow input hosted)',
+    )
     _add_stage_observation_parsers(stage_commands)
     stage_repair = _add_command_parser(stage_commands, 'repair', 'repair staging tracking')
     stage_repair.add_argument('--yes', action='store_true', help='approve the previewed repair')

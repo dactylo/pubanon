@@ -10,7 +10,7 @@ requires = [ "editables>=0.3", "hatchling>=1.27" ]
 # ==========================================================
 [project]
 name = "pubanon"
-version = "0.2.0"
+version = "0.2.1"
 description = "Publish selected files to GitHub under a separate identity"
 readme = "README.md"
 keywords = [ "anonymization", "git", "privacy", "publishing", "security" ]

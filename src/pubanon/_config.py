@@ -26,6 +26,7 @@ PUBLICATION_ROUTES = frozenset({'direct', 'staged'})
 VISIBILITIES = frozenset({'private', 'public'})
 
 _ADAPTER_KEYS = frozenset({'github'})
+_CI_WORKFLOW_PATTERN = re.compile(r'[A-Za-z0-9_-][A-Za-z0-9._-]*\.ya?ml')
 _EXPOSURE_DIGEST_LENGTH = 64
 _GLOBAL_KEYS = frozenset(
     {'accounts', 'anon_email', 'anon_name', 'default_publication_route', 'sensitive_terms'}
@@ -66,7 +67,7 @@ _PROJECT_KEYS = frozenset(
     }
 )
 _PROJECT_OPTIONAL_KEYS = frozenset(
-    {'acknowledged_exposure', 'package', 'source_tags', 'stage_repo', 'workflow'}
+    {'acknowledged_exposure', 'ci_workflow', 'package', 'source_tags', 'stage_repo', 'workflow'}
 )
 _SETTINGS_KEYS = frozenset(
     {'default_branch', 'description', 'discussions', 'issues', 'projects', 'pull_requests', 'wiki'}
@@ -196,6 +197,8 @@ class ProjectConfig:
         publication_route: Chosen route to the final publication repository.
         source_tags: Whether to mark published versions in the source
             repository.
+        ci_workflow: Workflow filename under `.github/workflows/` that supplies
+            publication evidence when set.
     """
 
     name: str
@@ -218,6 +221,7 @@ class ProjectConfig:
     workflows: Mapping[str, tuple[str, ...]] = field(default_factory=dict[str, tuple[str, ...]])
     publication_route: str = 'staged'
     source_tags: bool = False
+    ci_workflow: str | None = None
 
 
 def _close_lock_quietly(lock_file: IO[bytes]) -> None:
@@ -516,6 +520,15 @@ def _validate_acknowledged_exposure(value: object) -> str:
         )
     ):
         raise PubanonError('acknowledged_exposure must be empty or 64 lowercase hex characters')
+    return value
+
+
+def _validate_ci_workflow(value: object) -> str | None:
+    """Validate one optional workflow filename."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or _CI_WORKFLOW_PATTERN.fullmatch(value) is None:
+        raise PubanonError('ci_workflow must be a workflow file name such as ci.yml')
     return value
 
 
@@ -824,6 +837,8 @@ def fingerprint(g: GlobalConfig, p: ProjectConfig) -> str:
         'source_path': str(p.source_path),
         'visibility': p.visibility,
     }
+    if p.ci_workflow is not None:
+        projection['ci_workflow'] = p.ci_workflow
     if g.ignored_directories or g.ignored_files:
         # Rebuild snapshots prepared with the previous case-sensitive exclusions.
         projection['global_deny_casefold'] = True
@@ -1515,6 +1530,7 @@ def _validate_project_config(cfg: ProjectConfig, expected_name: str) -> None:
     _require_boolean(data, 'self_publication')
     _require_boolean(data, 'source_tags')
     _validate_stage_repo(cfg._stage_repo, cfg.repo)
+    _validate_ci_workflow(cfg.ci_workflow)
     validate_settings(cfg.settings)
     _validate_acknowledged_exposure(cfg.acknowledged_exposure)
     _validate_package(cfg.package)
@@ -1643,6 +1659,7 @@ def load_project(paths: Paths, name: str) -> ProjectConfig:
         workflows=(
             _workflows_from_mapping(_require_table(data, 'workflow')) if 'workflow' in data else {}
         ),
+        ci_workflow=_validate_ci_workflow(data.get('ci_workflow')),
     )
     _validate_project_config(config, name)
     return config
@@ -1760,6 +1777,8 @@ def save_project(paths: Paths, cfg: ProjectConfig) -> None:
     )
     if cfg._stage_repo is not None:
         content += f'stage_repo = {_toml_string(cfg._stage_repo)}\n'
+    if cfg.ci_workflow is not None:
+        content += f'ci_workflow = {_toml_string(cfg.ci_workflow)}\n'
     if cfg.acknowledged_exposure:
         content += f'acknowledged_exposure = {_toml_string(cfg.acknowledged_exposure)}\n'
     content += (

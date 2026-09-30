@@ -16,7 +16,7 @@ CI_EXTRAS :=
 CI_BUILD_REQUIREMENTS = $(DEV_PYTHON) -c 'import tomllib; print("\n".join(tomllib.load(open("pyproject.toml", "rb"))["build-system"]["requires"]))'
 CI_COMPILE = uv pip compile pyproject.toml - $(CI_EXTRAS) --universal --python-version $(CI_PYTHON) --no-python-downloads --no-sources --no-build --generate-hashes --no-annotate --custom-compile-command 'make lock-update'
 
-.PHONY: all check env-check format format-check install lock lock-update quality reinstall setup test type uv-check venv-check whitespace
+.PHONY: all check env-check format format-check install lock-check lock-update quality reinstall setup test type-check uv-check venv-check whitespace-check
 
 uv-check:
 	@test "$$(uv --version | cut -d ' ' -f 2)" = "$(UV_VERSION)" || \
@@ -56,7 +56,7 @@ format-check: env-check
 	$(DEV_PYTHON) -m mdformat --check $(MDFORMAT_FILES)
 	$(VENV_BIN)/pyproject-fmt --check pyproject.toml
 
-lock: env-check uv-check
+lock-check: env-check uv-check
 	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
 	cp requirements-ci.txt "$$tmp/requirements-ci.txt" && \
 	$(CI_BUILD_REQUIREMENTS) | $(CI_COMPILE) --group dev --quiet --output-file "$$tmp/requirements-ci.txt" && \
@@ -68,7 +68,7 @@ lock-update: venv-check uv-check
 	$(CI_BUILD_REQUIREMENTS) | $(CI_COMPILE) --group dev --output-file requirements-ci.txt $(LOCK_FLAGS)
 	$(CI_BUILD_REQUIREMENTS) | $(CI_COMPILE) --group test --constraint requirements-ci.txt --output-file requirements-test.txt
 
-type: env-check
+type-check: env-check
 	$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonpath "$(DEV_PYTHON)" --pythonplatform Linux $(PYTHON_FILES)
 	$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonpath "$(DEV_PYTHON)" --pythonplatform Darwin $(PYTHON_FILES)
 	$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonpath "$(DEV_PYTHON)" --pythonplatform Windows $(PYTHON_FILES)
@@ -76,10 +76,10 @@ type: env-check
 test: env-check
 	$(DEV_PYTHON) -m pytest -q $(TEST_FLAGS)
 
-whitespace:
+whitespace-check:
 	git diff --check HEAD
 
-quality: format-check lock type whitespace
+quality: format-check lock-check type-check whitespace-check
 
 check: quality test
 

@@ -2,6 +2,7 @@
 
 import time
 from collections.abc import Iterable, Sequence
+from typing import NamedTuple
 
 from pubanon._config import (
     GlobalConfig,
@@ -11,6 +12,13 @@ from pubanon._config import (
     stage_repository,
 )
 from pubanon._errors import ObservationTimeoutError, PubanonError
+from pubanon._remote._ci import (
+    RunEvidence,
+    RunQuery,
+    evidence_facts,
+    evidence_recovery,
+    run_evidence,
+)
 from pubanon._remote._host import (
     CheckVerdict,
     Destination,
@@ -47,6 +55,14 @@ _POLL_SECONDS = 15
 _PROGRESS_SECONDS = 30
 _monotonic = time.monotonic
 _sleep = time.sleep
+
+
+class _RunObservation(NamedTuple):
+    """Carry one watch's shared deadline and recovery context."""
+
+    deadline: float
+    retry: str
+    staged: bool
 
 
 def _check_facts(verdicts: Sequence[CheckVerdict]) -> str:
@@ -108,7 +124,7 @@ def _report_ci_start(
     target: tuple[str, str],
     selection: str,
     commit: str | None,
-    checks: Sequence[str],
+    checks: str,
     timeout: int,
 ) -> None:
     """Report the complete selected CI observation before host reads."""
@@ -121,7 +137,7 @@ def _report_ci_start(
         detail_fields([('Selected commit', escape(commit))])
     fields(
         [
-            ('Checks', ', '.join(escape(name) for name in checks)),
+            ('Checks', checks),
             (
                 'Timeout',
                 (
@@ -318,6 +334,52 @@ def _wait_for_checks(
         )
 
 
+def _wait_for_run(
+    dest: Destination, query: RunQuery, checks: Sequence[str], observation: _RunObservation
+) -> RunEvidence:
+    """Follow the latest run until conclusive evidence or the shared deadline."""
+    deadline, retry, staged = observation
+    previous: tuple[int | None, str] | None = None
+    shown: set[int] = set()
+    started = _monotonic()
+    last_elapsed = started
+    while True:
+        try:
+            evidence = run_evidence(
+                (dest.owner, dest.repo),
+                query,
+                required=checks,
+                remaining=lambda: _remaining(deadline, 'CI run', retry=retry),
+            )
+        except ObservationTimeoutError as exc:
+            raise _timeout_error('CI run', retry=retry) from exc
+        _remaining(deadline, 'CI run', retry=retry)
+        run = evidence.run
+        current = (run.number if run is not None else None, evidence.state)
+        if run is not None and run.identifier not in shown:
+            output(field('CI run', f'#{run.number} {escape(run.title)}'))
+            output(field('Run URL', escape(run.url)))
+            shown.add(run.identifier)
+        if current != previous:
+            output(_check_status(CheckVerdict('CI verdict', evidence.state, evidence.detail)))
+            previous = current
+        if evidence.state == 'success':
+            return evidence
+        if evidence.state not in {'missing', 'pending'}:
+            raise PubanonError(
+                'the latest CI run is not acceptable',
+                fact=evidence_facts(evidence),
+                recovery=evidence_recovery(evidence, staged=staged, retry=retry),
+            )
+        now = _monotonic()
+        if now - last_elapsed >= _PROGRESS_SECONDS:
+            output(
+                f'Elapsed: {int(now - started)} seconds. Still waiting for CI run.', kind='warning'
+            )
+            last_elapsed = now
+        _pause_or_expire(deadline, _timeout_error('CI run', retry=retry))
+
+
 def ci_verdicts(
     dest: Destination,
     commit: str,
@@ -400,8 +462,8 @@ def watch_ci(  # noqa: PLR0913
     """Wait for required CI checks on one exact selected commit.
 
     Poll missing or pending checks within the shared timeout. Failed or
-    ambiguous checks refuse immediately. At least one required check must be
-    configured.
+    ambiguous checks refuse immediately. Integrated projects follow the latest
+    workflow run, including when no required check names are configured.
 
     Args:
         paths: Derived Pubanon configuration and data paths.
@@ -421,7 +483,7 @@ def watch_ci(  # noqa: PLR0913
     """
     if staged and version is not None:
         raise PubanonError('the staging repository holds prepared snapshots, not releases')
-    if not p.required_checks:
+    if not (p.required_checks or p.ci_workflow):
         raise PubanonError(
             'no required checks are configured',
             recovery='add required_checks to the project configuration',
@@ -434,6 +496,11 @@ def watch_ci(  # noqa: PLR0913
         else 'rerun the watch'
     )
     deadline = _monotonic() + timeout
+    checks = (
+        ', '.join(escape(name) for name in p.required_checks)
+        if p.required_checks
+        else f'latest run of {escape(p.ci_workflow or "")}'
+    )
     if staged:
         recorded = load_stage(paths, p.name)
         selected_commit = recorded.commit if recorded is not None else None
@@ -441,7 +508,7 @@ def watch_ci(  # noqa: PLR0913
             (p.owner, stage_repository(p)),
             'recorded staged snapshot',
             selected_commit,
-            p.required_checks,
+            checks,
             timeout,
         )
         detail(field('Phase', 'verifying the staged target'))
@@ -462,10 +529,18 @@ def watch_ci(  # noqa: PLR0913
         selection = (
             'recorded published main' if version is None else f'exact tag v{escape(version)}'
         )
-        _report_ci_start((p.owner, p.repo), selection, commit, p.required_checks, timeout)
+        _report_ci_start((p.owner, p.repo), selection, commit, checks, timeout)
         dest = _verified_published_destination(paths, g, p, deadline, retry=retry)
     detail(field('Phase', 'reading CI checks'))
-    _wait_for_checks(dest, commit, p.required_checks, deadline, retry=retry)
+    if p.ci_workflow:
+        _wait_for_run(
+            dest,
+            RunQuery(p.ci_workflow, commit, 'workflow_dispatch' if staged else 'push'),
+            p.required_checks,
+            _RunObservation(deadline, retry, staged),
+        )
+    else:
+        _wait_for_checks(dest, commit, p.required_checks, deadline, retry=retry)
     next_action = (
         candidate_next_action(paths, g, p, load_candidate(paths, p.name), checked_commit=commit)
         if staged

@@ -30,7 +30,7 @@ from pubanon._remote._stage import _save_stage
 from pubanon._run import GitResult
 from pubanon._snapshots import _audit, _candidate, _history, _records, _rewrite, _source
 from pubanon._snapshots._source import Snapshot, pin, read_snapshot
-from pubanon._terminal import escape
+from pubanon._terminal import color_context, escape, verbose_context
 from tests._cli import gh_calls
 from tests._git import git_env, remove_tree
 from tests._permissions import assert_private_mode
@@ -71,6 +71,109 @@ def _configs(source: Path) -> tuple[GlobalConfig, ProjectConfig]:
             ),
         ),
     )
+
+
+def _new_host(tmp_path: Path) -> Path:
+    host = tmp_path / 'host.git'
+    subprocess.run(['git', 'init', '--bare', '-q', host], check=True, env=git_env())
+    return host
+
+
+def _paths(tmp_path: Path) -> Paths:
+    config_dir = tmp_path / 'config' / 'pubanon'
+    data_dir = tmp_path / 'data' / 'pubanon'
+    return Paths(config_dir, data_dir, config_dir / 'config.toml', data_dir / 'registry.json')
+
+
+def _ci_context(
+    tmp_path: Path,
+    source: Path,
+    *,
+    required: tuple[str, ...] = ('hosted-validation',),
+    route: Literal['staged', 'direct'] = 'staged',
+    ci_workflow: str | None = 'ci.yml',
+) -> _publish.PublishContext:
+    paths = _paths(tmp_path)
+    global_config, project = _configs(source)
+    project = replace(
+        project, ci_workflow=ci_workflow, required_checks=required, publication_route=route
+    )
+    pinned = pin(source, 'HEAD')
+    record = _candidate.build_candidate(
+        paths,
+        global_config,
+        project,
+        _candidate.CandidateInputs(read_snapshot(source, pinned.commit), pinned, None, None),
+    )
+    return _publish.PublishContext(
+        paths, global_config, project, record, _yes=True, _unattended=True
+    )
+
+
+def _configure_ci_evidence(
+    ctx: _publish.PublishContext,
+    fake_gh: Path,
+    *,
+    state: str = 'success',
+    variable: str | None = 'true',
+) -> None:
+    prefix = f'repos/{ctx._project.owner}/{_config.stage_repository(ctx._project)}'
+    run = {
+        'id': 9,
+        'run_number': 9,
+        'run_attempt': 1,
+        'path': '.github/workflows/ci.yml',
+        'event': 'workflow_dispatch',
+        'head_branch': 'main',
+        'head_sha': _records.candidate_tip(ctx._record),
+        'status': 'in_progress' if state == 'pending' else 'completed',
+        'conclusion': 'failure' if state == 'failure' else 'success',
+        'display_title': 'CI / hosted\x1b[31m',
+        'html_url': 'https://example.invalid/runs/9\nend',
+    }
+    runs = [] if state == 'missing' else [run]
+    if state == 'success':
+        runs.append({**run, 'id': 8, 'run_number': 8, 'conclusion': 'failure'})
+    if state == 'ambiguous':
+        runs.append({**run, 'id': 10})
+    jobs = [
+        {
+            'run_id': 9,
+            'run_attempt': 1,
+            'name': name,
+            'status': 'completed',
+            'conclusion': 'skipped' if state == 'skipped' else 'success',
+        }
+        for name in ctx._project.required_checks
+    ]
+    variable_response: dict[str, object] = {
+        'args': ['api', 'repos/public-owner/public-repo/actions/variables/CI_RUN_ON_PUSH'],
+        'stdout': json.dumps({'name': 'CI_RUN_ON_PUSH', 'value': variable}),
+    }
+    if variable is None:
+        variable_response.update(stdout='', stderr='HTTP 404: Not Found', returncode=1)
+    responses = json.loads(fake_gh.read_text())
+    responses.extend(
+        [
+            variable_response,
+            {
+                'args': [
+                    'api',
+                    (
+                        f'{prefix}/actions/workflows/ci.yml/runs?'
+                        f'head_sha={_records.candidate_tip(ctx._record)}'
+                        '&event=workflow_dispatch&branch=main&per_page=100&page=1'
+                    ),
+                ],
+                'stdout': json.dumps({'total_count': len(runs), 'workflow_runs': runs}),
+            },
+            {
+                'args': ['api', f'{prefix}/actions/runs/9/attempts/1/jobs?per_page=100&page=1'],
+                'stdout': json.dumps({'total_count': len(jobs), 'jobs': jobs}),
+            },
+        ]
+    )
+    fake_gh.write_text(json.dumps(responses))
 
 
 @contextmanager
@@ -141,18 +244,6 @@ def _literal_history_commit(
         .decode()
         .strip()
     )
-
-
-def _new_host(tmp_path: Path) -> Path:
-    host = tmp_path / 'host.git'
-    subprocess.run(['git', 'init', '--bare', '-q', host], check=True, env=git_env())
-    return host
-
-
-def _paths(tmp_path: Path) -> Paths:
-    config_dir = tmp_path / 'config' / 'pubanon'
-    data_dir = tmp_path / 'data' / 'pubanon'
-    return Paths(config_dir, data_dir, config_dir / 'config.toml', data_dir / 'registry.json')
 
 
 def _context(
@@ -740,6 +831,7 @@ def test_acknowledged_digest_skips_matching_findings_and_changes_for_new_exposur
             (),
             tuple(_audit.HistoryEvidence(item, None, item.unit, item.unit) for item in findings),
         ),
+        ((), {}),
         unattended=False,
     )
 
@@ -760,6 +852,7 @@ def test_acknowledged_digest_skips_matching_findings_and_changes_for_new_exposur
                     _audit.HistoryEvidence(item, None, item.unit, item.unit) for item in findings
                 ),
             ),
+            ((), {}),
             unattended=False,
         )
         == acknowledged
@@ -788,6 +881,7 @@ def test_acknowledged_digest_skips_matching_findings_and_changes_for_new_exposur
                     _audit.HistoryEvidence(item, None, item.unit, item.unit) for item in changed
                 ),
             ),
+            ((), {}),
             unattended=False,
         )
 
@@ -868,14 +962,15 @@ def test_clean_push_rejection_restores_retained_state(
     assert retained.state == _candidate.STATE_RETAINED
 
 
-@pytest.mark.parametrize('accept', [False, True])
+@pytest.mark.parametrize('presentation', [(False, 'never'), (True, 'always')])
 def test_exposure_review_shows_rule_and_location_before_acknowledgment(
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    accept: bool,
+    presentation: tuple[bool, str],
 ) -> None:
+    accept, color = presentation
     term = 'private-canary'
     source = make_repo(files={'README.md': 'public\n'})
     ctx = _context(tmp_path, source, extra_terms=(term,))
@@ -886,7 +981,12 @@ def test_exposure_review_shows_rule_and_location_before_acknowledgment(
         (),
         (
             _audit.HistoryEvidence(
-                finding, 'a' * 40, 'blob bytes 4:18', 'private-canary.txt:2', 'private-canary'
+                finding,
+                'a' * 40,
+                'blob bytes 4:18',
+                'private-canary.txt:2',
+                'before private-canary after',
+                (7, 21),
             ),
         ),
     )
@@ -895,29 +995,44 @@ def test_exposure_review_shows_rule_and_location_before_acknowledgment(
     def _answer(prompt: str) -> str:
         assert prompts, f'unexpected prompt: {prompt}'
         expected, response = prompts.pop(0)
-        assert expected == prompt
+        assert expected == re.sub(r'\x1b\[[0-9;]*m', '', prompt)
         output = capsys.readouterr().out
-        assert 'project extra_terms entry 1' in output
-        assert 'private-canary.txt:2; text private-canary' in output
-        assert 'commit ' + 'a' * 12 in output
+        plain = re.sub(r'\x1b\[[0-9;]*m', '', output)
+        assert plain.count('Warning: historical exposure') == 1
+        assert 'Published snapshot: v1.0.0 (' + 'a' * 12 + ')' in plain
+        assert '  private-canary.txt:2\n    Rule: project extra_terms, item 1\n' in plain
+        assert '    Text: before private-canary after\n' in plain
+        assert plain.index('Rule:') < plain.index('Text:')
+        if color == 'always':
+            assert 'Text: before \x1b[33mprivate-canary\x1b[0m after' in output
+        else:
+            assert '\x1b' not in output
+            assert '    Matched: private-canary\n' in output
         assert 'a' * 40 not in output
-        assert term in output
-        assert output.count('path:private-canary.txt') == 1
         assert 'does not remove published content' in output
         assert 'new snapshot content' in output
         return response
 
     monkeypatch.setattr('builtins.input', _answer)
-    if accept:
-        result = _acknowledge_exposure(
-            ctx._paths, (ctx._global_config, ctx._project), audit, unattended=False
-        )
-        assert result.acknowledged_exposure == _audit.exposure_digest(audit.findings)
-    else:
-        with pytest.raises(OperationCanceled, match=r'Canceled\. Nothing was published.'):
-            _acknowledge_exposure(
-                ctx._paths, (ctx._global_config, ctx._project), audit, unattended=False
+    with color_context(color):
+        if accept:
+            result = _acknowledge_exposure(
+                ctx._paths,
+                (ctx._global_config, ctx._project),
+                audit,
+                (('a' * 40,), {'v1.0.0': 'a' * 40}),
+                unattended=False,
             )
+            assert result.acknowledged_exposure == _audit.exposure_digest(audit.findings)
+        else:
+            with pytest.raises(OperationCanceled, match=r'Canceled\. Nothing was published.'):
+                _acknowledge_exposure(
+                    ctx._paths,
+                    (ctx._global_config, ctx._project),
+                    audit,
+                    (('a' * 40,), {'v1.0.0': 'a' * 40}),
+                    unattended=False,
+                )
     assert not prompts
     saved = _config.load_project(ctx._paths, ctx._project.name)
     assert bool(saved.acknowledged_exposure) is accept
@@ -1675,6 +1790,14 @@ def test_publication_interrupt_reports_outcome_and_working_recovery(
         assert restored.state == _candidate.STATE_RETAINED
 
 
+def test_publication_next_action_watches_integrated_project(tmp_path: Path) -> None:
+    _global_config, project = _configs(tmp_path)
+    assert (
+        _publish.publication_next_action(replace(project, ci_workflow='ci.yml'))
+        == 'pubanon repo watch'
+    )
+
+
 @pytest.mark.slow
 @pytest.mark.parametrize(
     'publication_cli',
@@ -1869,7 +1992,7 @@ def test_publish_acknowledges_visible_exposure_before_confirmation(
         if not prompts:
             ordinary = capsys.readouterr().out
             assert exposure in ordinary
-            assert 'entry 1' in ordinary
+            assert 'item 1' in ordinary
         prompts.append(prompt)
         assert answers, f'unexpected prompt: {prompt}'
         expected, response = answers.pop(0)
@@ -1952,7 +2075,7 @@ def test_publish_acknowledgment_displays_identity_and_hygiene_in_one_path(
             ordinary = capsys.readouterr().out
             assert identity in ordinary
             assert hygiene in ordinary
-            assert 'entry 1' in ordinary
+            assert 'item 1' in ordinary
         prompts.append(prompt)
         assert answers, f'unexpected prompt: {prompt}'
         expected, response = answers.pop(0)
@@ -2200,6 +2323,54 @@ def test_publish_proceeds_when_staging_evidence_covers_the_candidate(
     assert 'GitHub keeps a record of this upload' not in output.getvalue()
     assert _remote_ref(host, 'refs/heads/main') == ctx._record.commit
     assert _candidate.load_candidate(ctx._paths, ctx._project.name) is None
+
+
+def test_publish_rechecks_ci_after_confirmation(
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_repo(files={'README.md': 'first\n'})
+    host = _new_host(fake_gh.parent)
+    _configure_host(host, fake_gh, monkeypatch)
+    ctx = _publish_mode(_ci_context(fake_gh.parent, source), 'interactive')
+    _configure_staged_candidate(ctx, fake_gh, monkeypatch)
+    _configure_ci_evidence(ctx, fake_gh)
+    prompts: list[str] = []
+
+    def _confirm(prompt: str) -> str:
+        prompts.append(prompt)
+        responses = json.loads(fake_gh.read_text())
+        for response in responses:
+            if '/actions/workflows/ci.yml/runs?' in ' '.join(response['args']):
+                data = json.loads(response['stdout'])
+                run = data['workflow_runs'][0]
+                data['workflow_runs'].append(
+                    {
+                        **run,
+                        'id': 10,
+                        'run_number': 10,
+                        'status': 'in_progress',
+                        'conclusion': None,
+                    }
+                )
+                data['total_count'] = len(data['workflow_runs'])
+                response['stdout'] = json.dumps(data)
+        fake_gh.write_text(json.dumps(responses))
+        return 'yes'
+
+    monkeypatch.setattr('builtins.input', _confirm)
+    with pytest.raises(PubanonError, match='the latest staging CI run is not acceptable') as error:
+        _publish.publish(ctx)
+    assert len(prompts) == 1
+    assert '#10' in error.value.render()
+    assert 'Nothing was published. No push was attempted' in error.value.render()
+    assert error.value.recovery == 'wait for the run to complete, then pubanon stage watch'
+    assert _remote_ref(host, 'refs/heads/main') is None
+    saved = _candidate.load_candidate(ctx._paths, ctx._project.name)
+    assert saved is not None
+    assert saved.commit == ctx._record.commit
+    assert saved.state == _candidate.STATE_RETAINED
 
 
 def test_publish_refuses_existing_intended_tag(
@@ -2517,6 +2688,47 @@ def test_publish_verification_reads_snapshot_once(
     _verify_for_publish(ctx)
 
     assert len(reads) == 1
+
+
+def test_publish_without_ci_workflow_keeps_check_runs(
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_repo(files={'README.md': 'first\n'})
+    host = _new_host(fake_gh.parent)
+    _configure_host(host, fake_gh, monkeypatch)
+    ctx = _ci_context(fake_gh.parent, source, ci_workflow=None, required=('build',))
+    _configure_staged_candidate(ctx, fake_gh, monkeypatch)
+    prefix = f'repos/{ctx._project.owner}/{_config.stage_repository(ctx._project)}'
+    responses = json.loads(fake_gh.read_text())
+    responses.append(
+        {
+            'args': [
+                'api',
+                f'{prefix}/commits/{ctx._record.commit}/check-runs?check_name=build&filter=latest&per_page=100',
+            ],
+            'stdout': json.dumps(
+                {
+                    'total_count': 1,
+                    'check_runs': [
+                        {
+                            'name': 'build',
+                            'head_sha': ctx._record.commit,
+                            'status': 'completed',
+                            'conclusion': 'success',
+                        }
+                    ],
+                }
+            ),
+        }
+    )
+    fake_gh.write_text(json.dumps(responses))
+    _publish.publish(ctx)
+    assert _remote_ref(host, 'refs/heads/main') == ctx._record.commit
+    calls = gh_calls(fake_gh.parent)
+    assert any('/check-runs?' in ' '.join(call) for call in calls)
+    assert not any('/actions/' in ' '.join(call) for call in calls)
 
 
 @pytest.mark.slow
@@ -4567,7 +4779,7 @@ def test_sync_acknowledgment_displays_identity_and_hygiene_in_one_path(
             ordinary = capsys.readouterr().out
             assert identity in ordinary
             assert hygiene in ordinary
-            assert 'entry 1' in ordinary
+            assert 'item 1' in ordinary
         prompts.append(prompt)
         assert answers, f'unexpected prompt: {prompt}'
         expected, response = answers.pop(0)
@@ -4782,9 +4994,12 @@ def test_sync_newly_sensitive_anonymous_identity_requires_explicit_acknowledgmen
     assert _config.load_project(ctx._paths, project.name).acknowledged_exposure
     output = output_buffer.getvalue()
     assert 'Historical exposure review\n' in output
-    for commit in (first._record.commit, second._record.commit):
+    for version, record in (('v2.0.0', second._record), ('v1.0.0', first._record)):
+        heading = f'Published snapshot: {version} ({record.commit[:12]})'
+        assert output.count(heading) == 1
+        group = output.split(heading)[1].split('Published snapshot:')[0]
         for field in ('author', 'committer'):
-            assert output.count(f'{commit[:12]}:header:{field}') == 1
+            assert group.count(f'  header {field} value\n') == 1
     assert exposure in output
 
 
@@ -5409,6 +5624,90 @@ def test_verify_refuses_ref_drift_under_yes_without_prompt(
         _verify_for_publish(ctx)
 
     assert error.value.recovery == 'rerun pubanon publish in an interactive terminal without --yes'
+
+
+@pytest.mark.parametrize('state', ['missing', 'pending', 'failure', 'skipped', 'ambiguous'])
+def test_publish_refuses_when_latest_requested_run_is_not_acceptable(
+    state: str,
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_repo(files={'README.md': 'first\n'})
+    host = _new_host(fake_gh.parent)
+    _configure_host(host, fake_gh, monkeypatch)
+    ctx = _ci_context(fake_gh.parent, source)
+    _configure_staged_candidate(ctx, fake_gh, monkeypatch)
+    _configure_ci_evidence(ctx, fake_gh, state=state)
+    before = _record_path(ctx).read_bytes()
+    with pytest.raises(PubanonError, match='the latest staging CI run is not acceptable') as error:
+        _publish.publish(ctx)
+    assert _record_path(ctx).read_bytes() == before
+    assert _remote_ref(host, 'refs/heads/main') is None
+    assert 'No push was attempted' in error.value.render()
+    assert error.value.recovery is not None
+    assert (
+        'pubanon stage push --hosted' in error.value.recovery
+        if state == 'skipped'
+        else 'pubanon stage' in error.value.recovery
+    )
+    if state in {'failure', 'skipped', 'pending'}:
+        assert r'CI / hosted\x1b[31m' in error.value.render()
+        assert r'https://example.invalid/runs/9\x0aend' in error.value.render()
+
+
+@pytest.mark.parametrize('required', [(), ('hosted-validation',)])
+def test_publish_accepts_latest_hosted_pass(
+    required: tuple[str, ...],
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_repo(files={'README.md': 'first\n'})
+    host = _new_host(fake_gh.parent)
+    _configure_host(host, fake_gh, monkeypatch)
+    ctx = _ci_context(fake_gh.parent, source, required=required)
+    _configure_staged_candidate(ctx, fake_gh, monkeypatch)
+    _configure_ci_evidence(ctx, fake_gh)
+    rendered = StringIO()
+    with redirect_stdout(rendered), verbose_context(enabled=True):
+        _publish.publish(ctx)
+    assert 'Accepted CI run' in rendered.getvalue()
+    assert r'CI / hosted\x1b[31m' in rendered.getvalue()
+    assert r'https://example.invalid/runs/9\x0aend' in rendered.getvalue()
+    assert _remote_ref(host, 'refs/heads/main') == ctx._record.commit
+    assert _candidate.load_candidate(ctx._paths, ctx._project.name) is None
+    calls = gh_calls(fake_gh.parent)
+    assert sum('/actions/workflows/ci.yml/runs?' in ' '.join(call) for call in calls) == 4
+    assert not any('/check-runs?' in ' '.join(call) for call in calls)
+
+
+@pytest.mark.parametrize('variable', ['false', 'FALSE', 'true', None])
+def test_publish_refuses_final_repository_with_push_ci_turned_off(
+    variable: str | None,
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_repo(files={'README.md': 'first\n'})
+    host = _new_host(fake_gh.parent)
+    _configure_host(host, fake_gh, monkeypatch)
+    ctx = _ci_context(fake_gh.parent, source, route='direct')
+    _configure_ci_evidence(ctx, fake_gh, variable=variable)
+    before = _record_path(ctx).read_bytes()
+    if variable is not None and variable.casefold() == 'false':
+        with pytest.raises(PubanonError, match='the final repository turns off push CI') as error:
+            _publish.publish(ctx)
+        assert 'CI_RUN_ON_PUSH is false in the final repository.' in error.value.render()
+        assert error.value.recovery == (
+            'delete CI_RUN_ON_PUSH from the final repository on GitHub, then rerun pubanon publish'
+        )
+        assert _record_path(ctx).read_bytes() == before
+        assert _remote_ref(host, 'refs/heads/main') is None
+    else:
+        _publish.publish(ctx)
+        assert _remote_ref(host, 'refs/heads/main') == ctx._record.commit
+    assert not any('/actions/workflows/' in ' '.join(call) for call in gh_calls(fake_gh.parent))
 
 
 def test_verify_refuses_tampered_candidate_commit_author(

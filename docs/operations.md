@@ -32,20 +32,20 @@ attention. See the [operator guide](guide.md) for complete publication paths.
 The table lists changes to GitHub and the optional login session. Each command previews the target
 and change before it runs.
 
-| Command                                | External change                                                                                  | What stays unchanged                                                     |
-| -------------------------------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------ |
-| `pubanon setup` (selected login only)  | Starts the GitHub CLI browser login you select; `gh` may store credentials and select HTTPS.     | No repository creation, push, visibility change, or `gh auth setup-git`. |
-| `pubanon repo create`                  | Creates the configured empty repository with its saved visibility.                               | No push or visibility change.                                            |
-| `pubanon publish`                      | Atomically publishes the snapshot; an explicit replacement rewrites `main` and its planned tags. | No repository creation, visibility change, staging, or package upload.   |
-| `pubanon release create TAG`           | Creates a GitHub release page for a verified published tag after confirmation.                   | No snapshot push, tag creation, or package upload.                       |
-| `pubanon release edit TAG`             | Changes the selected page's title or notes after confirmation.                                   | Keeps the tag, status, assets, and other page settings.                  |
-| `pubanon repo restore --to remote`     | Pushes retained published history to an empty or exact-prefix repository.                        | No new snapshot, imported foreign history, or tag movement.              |
-| `pubanon run NAME [--version VERSION]` | Performs the GitHub changes named by the workflow stages.                                        | No undeclared or later stage; `--yes` cannot add one.                    |
-| `pubanon repo reveal`                  | Makes the configured private repository public after checks and acknowledgment.                  | No branch or tag push, and no package upload.                            |
-| `pubanon stage push`                   | Creates the private staging repository with separate approval, or updates its `main` branch.     | No final publication or tag push.                                        |
-| `pubanon stage repair`                 | May correct the private staging repository's default branch after approval.                      | No staging push or final publication.                                    |
-| `pubanon stage forget`                 | No external change; removes local staging tracking.                                              | Keeps the staging repository and publication route.                      |
-| `pubanon stage delete`                 | Deletes the selected private staging repository after its own preview and confirmation.          | Refuses the final repository; no change to local published history.      |
+| Command                                | External change                                                                                                                                                               | What stays unchanged                                                     |
+| -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `pubanon setup` (selected login only)  | Starts the GitHub CLI browser login you select; `gh` may store credentials and select HTTPS.                                                                                  | No repository creation, push, visibility change, or `gh auth setup-git`. |
+| `pubanon repo create`                  | Creates the configured empty repository with its saved visibility.                                                                                                            | No push or visibility change.                                            |
+| `pubanon publish`                      | Atomically publishes the snapshot; an explicit replacement rewrites `main` and its planned tags.                                                                              | No repository creation, visibility change, staging, or package upload.   |
+| `pubanon release create TAG`           | Creates a GitHub release page for a verified published tag after confirmation.                                                                                                | No snapshot push, tag creation, or package upload.                       |
+| `pubanon release edit TAG`             | Changes the selected page's title or notes after confirmation.                                                                                                                | Keeps the tag, status, assets, and other page settings.                  |
+| `pubanon repo restore --to remote`     | Pushes retained published history to an empty or exact-prefix repository.                                                                                                     | No new snapshot, imported foreign history, or tag movement.              |
+| `pubanon run NAME [--version VERSION]` | Performs the GitHub changes named by the workflow stages.                                                                                                                     | No undeclared or later stage; `--yes` cannot add one.                    |
+| `pubanon repo reveal`                  | Makes the configured private repository public after checks and acknowledgment.                                                                                               | No branch or tag push, and no package upload.                            |
+| `pubanon stage push`                   | Creates the private staging repository with separate approval, or updates its `main` branch. With `ci_workflow`, it may create `CI_RUN_ON_PUSH=false` and request one CI run. | No final publication or tag push.                                        |
+| `pubanon stage repair`                 | May correct the private staging repository's default branch after approval.                                                                                                   | No staging push or final publication.                                    |
+| `pubanon stage forget`                 | No external change; removes local staging tracking.                                                                                                                           | Keeps the staging repository and publication route.                      |
+| `pubanon stage delete`                 | Deletes the selected private staging repository after its own preview and confirmation.                                                                                       | Refuses the final repository; no change to local published history.      |
 
 Apart from the optional GitHub login, `setup`, `init`, `prepare`, `inspect`, and
 `repo restore --to local` change only Pubanon's own configuration and data. Before pushing,
@@ -287,6 +287,14 @@ replacement may move or remove tags only as already reviewed in that snapshot.
   publish without staging, run `pubanon init --publication-route direct` from the registered
   source. A repository that still has an old `stage` branch must be corrected on GitHub before
   repair.
+- With `ci_workflow`, `pubanon stage push` requests quick CI on configured local runners. Add
+  `--full-tests` for every test, `--hosted` for hosted CI, or both to pass both inputs. If a push
+  succeeds but workflow registration or dispatch fails, the snapshot remains staged. Correct the
+  reported cause and rerun `pubanon stage push` to request a new run. If a transport error or
+  malformed response leaves the request outcome uncertain, inspect `pubanon stage status` first;
+  rerunning requests another run and makes it the latest evidence. A failed or cancelled latest run
+  blocks publication. Inspect its jobs, then request a new run; use `--hosted` when a required
+  `hosted-validation` job was skipped by a local run.
 - If a watch reaches its time limit, follow its observed-state recovery and rerun the same watch.
   Pending checks need more time; missing checks need their configured name and workflow trigger
   checked; ambiguous checks need the multiple matches resolved; failed checks need inspection and a
@@ -464,7 +472,7 @@ first match is shown; there may be more. You see every finding before any acknow
 Acknowledging an exposure neither removes published content nor relaxes the checks on new
 snapshots; declining leaves the previous acknowledgment unchanged.
 
-If `required_checks` is configured, wait for CI on this release:
+If `ci_workflow` or `required_checks` is configured, wait for CI on this release:
 
 ```sh
 pubanon repo watch --version 0.1.0

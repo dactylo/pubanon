@@ -11,6 +11,10 @@ make setup
 make check
 ```
 
+Use `make install` to install the command-line tool with `uv tool`, or `make reinstall` to replace
+an existing installation. `make format-check`, `make lock-check`, `make type-check`, and
+`make whitespace-check` run the corresponding read-only checks; `make quality` combines them.
+
 `make setup` creates `.venv` with the available `python`, syncs the exact packages and hashes in
 `requirements-ci.txt`, and installs Pubanon in editable mode using the locked build backend. To
 choose an installed interpreter when creating the environment, use
@@ -29,43 +33,40 @@ temporary Git repositories and a fake GitHub CLI.
 
 ## Continuous integration
 
-The manual [Publish package workflow](../.github/workflows/release.yml) uploads this repository's
-package to PyPI after checking its tag and CI result. Its publishing job is named
-`Publish to PyPI`.
+The [CI workflow](../.github/workflows/ci.yml) runs `quality` first. The `test` jobs then run in
+parallel. `package` starts only after those jobs pass; `hosted-validation` reports the outcome of a
+hosted run, including failures.
 
-Quality checks run first, followed by the test matrix. Packaging starts only after every test job
-passes. A failure prevents later stages from starting, on both hosted and local runners.
+CI uses GitHub-hosted runners unless a run explicitly requests local runners. In a private
+repository, the Actions variables `CI_LINUX_RUNNER`, `CI_MACOS_RUNNER`, and `CI_WINDOWS_RUNNER`
+select local runners for runs started from Actions > CI > Run workflow with the hosted option
+disabled, including runs requested by `pubanon stage push`. If a variable is absent, that operating
+system uses a hosted runner. Pushes, pull requests, public repositories, and runs with the hosted
+option enabled use hosted runners for every job and run every test.
 
-The repository's CI uses GitHub-hosted runners by default. For a private repository, Actions
-variables `CI_LINUX_RUNNER`, `CI_MACOS_RUNNER`, and `CI_WINDOWS_RUNNER` can select local runners
-for ordinary branch pushes. If a variable is absent, that operating system uses a hosted runner.
-Public repositories, pull requests, and workflow dispatches with the hosted option enabled use
-hosted runners for every job. The conditional `hosted-validation` job summarizes a complete hosted
-run.
+A staging repository sets the Actions variable `CI_RUN_ON_PUSH` to `false`. Its pushes then appear
+as `CI / push skipped` and run no jobs; CI runs only on request. A newer requested run on a branch
+cancels an older one. Push runs are never cancelled, because the Release workflow needs the tagged
+commit's push run.
 
-CI runs tests in parallel using pytest-xdist. Hosted runners and local Linux runners run the full
-suite. By default, local macOS and Windows runners omit tests marked `slow` and have a 20-minute
-job limit. These expensive integration scenarios remain part of every hosted validation run.
+| Requested run                                                 | Pubanon                           | Actions > CI > Run workflow | Title               |
+| ------------------------------------------------------------- | --------------------------------- | --------------------------- | ------------------- |
+| Quick: local runners, slow tests omitted on macOS and Windows | `pubanon stage push`              | hosted off, slow tests off  | `CI / local`        |
+| Full: local runners, every test                               | `pubanon stage push --full-tests` | hosted off, slow tests on   | `CI / local (full)` |
+| Hosted: GitHub-hosted runners, every test                     | `pubanon stage push --hosted`     | hosted on                   | `CI / hosted`       |
 
-To run the full suite on local runners, open Actions > CI > Run workflow, disable the hosted
-option, and enable **Include slow tests on local runners** (`full_tests`). This requires no runner
-variable or required-check changes. The run appears as `CI / development (full)` and uses longer
-timeouts for Windows and macOS. Enabling the hosted option always runs every test, regardless of
-the slow-test checkbox.
+The `test` matrix covers Python 3.13 to 3.15 on Linux and Python 3.13 on macOS and Windows. All
+test jobs have a one-hour hang guard, on local and hosted runners, in quick and full runs.
 
-To run the full suite with the same scheduling in a terminal:
+CI runs tests in parallel with pytest-xdist. Set `PYTEST_XDIST_AUTO_NUM_WORKERS` when a runner's
+visible CPU count exceeds its CPU quota. For the same scheduling locally, run:
 
 ```sh
 make test TEST_FLAGS='-n auto --dist worksteal --durations=15'
 ```
 
-For the shorter local macOS/Windows selection, include `-m "not slow"` in `TEST_FLAGS`. The marker
-applies to expensive test functions, including all their parameter variations. Classification comes
-from measured test cost; adding a scenario does not automatically make it slow.
-
-Workers are selected from the available CPU count. Set `PYTEST_XDIST_AUTO_NUM_WORKERS` when a
-runner has a CPU quota that differs from its visible CPU count, such as a Docker container. Use
-`-n 0` for a serial run when debugging. Plain `make test` also remains serial.
+The manual [Release workflow](../.github/workflows/release.yml) publishes the package to PyPI after
+checking its version tag and a successful push CI run for the tagged commit.
 
 ## Dependency updates
 
@@ -91,8 +92,9 @@ make lock-update LOCK_FLAGS=--upgrade
 ```
 
 Review both generated files, run `make setup` and `make check`, then commit the locks with the
-dependency changes. `make lock` checks that they are current without rewriting them; `make check`
-includes that check. Lock generation and checking resolve dependencies but do not install them.
+dependency changes. `make lock-check` checks that they are current without rewriting them;
+`make check` includes that check. Lock generation and checking resolve dependencies but do not
+install them.
 
 CI verifies hashes when installing the pinned tools and build backend. The package check installs
 the built wheel in a clean environment, using the same version constraints for its runtime
@@ -104,3 +106,12 @@ SHA-256 checksums. The versions and checksums live in the workflow. uv excludes 
 Taplo Python dependency because that distribution lacks Linux and Windows ARM wheels; the native
 executable supplies the formatter instead. For local Markdown formatting, provide `taplo` and
 `shfmt` on `PATH`. Test jobs do not need them.
+
+## Test selection
+
+The `slow` marker covers expensive test functions and all their parameter variations. A new
+scenario is not automatically slow; classification comes from measured test cost. To run the
+shorter local macOS/Windows selection, include `-m "not slow"` in `TEST_FLAGS`. Workers use the
+available CPU count; a container's visible count can exceed its CPU quota. Use `-n 0` for a serial
+debugging run. Plain `make test` remains serial. The hosted option runs every test regardless of
+the slow-test checkbox. The release workflow's publishing job is named `Publish to PyPI`.
