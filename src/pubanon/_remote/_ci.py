@@ -6,21 +6,15 @@ from pathlib import Path
 from typing import NamedTuple
 
 from pubanon._errors import ObservationTimeoutError, OperationCanceled, PubanonError
+from pubanon._remote import _host
 from pubanon._remote._host import (
+    CheckState,
     CheckVerdict,
     DispatchRejectedError,
     DispatchUncertainError,
     RunListingChangedError,
     WorkflowJob,
     WorkflowRun,
-    create_repository_variable,
-    dispatch_workflow,
-    list_run_jobs,
-    list_workflow_runs,
-    read_workflow_run,
-    recent_workflow_runs,
-    repository_variable,
-    workflow_registered,
 )
 from pubanon._remote._workflow_checks import dispatch_contract_problem
 from pubanon._run import run_git
@@ -48,7 +42,7 @@ class RunEvidence(NamedTuple):
             Host-provided content must be escaped before display.
     """
 
-    state: str
+    state: CheckState
     run: WorkflowRun | None
     checks: tuple[CheckVerdict, ...]
     detail: str
@@ -143,7 +137,7 @@ def _wait_for_registration(coordinates: tuple[str, str], workflow: str) -> None:
     while (remaining := deadline - _monotonic()) > 0:
         try:
             if (
-                workflow_registered(coordinates, workflow, timeout=remaining)
+                _host.workflow_registered(coordinates, workflow, timeout=remaining)
                 and _monotonic() <= deadline
             ):
                 break
@@ -172,10 +166,10 @@ def ensure_run_on_push_variable(coordinates: tuple[str, str], plan: StageCiPlan)
     """
     if not plan.create_variable:
         return
-    create_repository_variable(coordinates, RUN_ON_PUSH_VARIABLE, 'false')
+    _host.create_repository_variable(coordinates, RUN_ON_PUSH_VARIABLE, 'false')
     recovery = 'verify CI_RUN_ON_PUSH and GitHub access, then rerun pubanon stage push'
     try:
-        value = repository_variable(coordinates, RUN_ON_PUSH_VARIABLE)
+        value = _host.repository_variable(coordinates, RUN_ON_PUSH_VARIABLE)
     except OperationCanceled as exc:
         raise OperationCanceled(
             'Canceled after creating CI_RUN_ON_PUSH.',
@@ -290,7 +284,7 @@ def plan_stage_ci(
     Raises:
         PubanonError: The push switch conflicts or host reads fail.
     """
-    value = repository_variable(coordinates, RUN_ON_PUSH_VARIABLE)
+    value = _host.repository_variable(coordinates, RUN_ON_PUSH_VARIABLE)
     if value is not None and value.casefold() != 'false':
         raise PubanonError(
             'the staging repository variable CI_RUN_ON_PUSH has an unexpected value',
@@ -299,7 +293,7 @@ def plan_stage_ci(
                 'set CI_RUN_ON_PUSH to false or delete it on GitHub, then rerun pubanon stage push'
             ),
         )
-    runs = recent_workflow_runs(coordinates, workflow, event='workflow_dispatch')
+    runs = _host.recent_workflow_runs(coordinates, workflow, event='workflow_dispatch')
     cancels = tuple(run for run in runs if run.status != 'completed')
     latest = max(
         (run for run in runs if run.commit == commit), key=lambda run: run.number, default=None
@@ -337,7 +331,7 @@ def require_ci_contract(store: Path, commit: str, workflow: str) -> None:
     problem = dispatch_contract_problem(result.stdout)
     if problem is not None:
         raise PubanonError(
-            f'{path} cannot receive Pubanon CI requests',
+            f'{path} cannot receive pubanon CI requests',
             fact=problem,
             recovery=(
                 'declare the boolean workflow_dispatch inputs hosted and full_tests, '
@@ -374,7 +368,7 @@ def run_evidence(
         ObservationTimeoutError: The shared budget or a host request expires.
     """
     try:
-        runs = list_workflow_runs(
+        runs = _host.list_workflow_runs(
             coordinates, query.workflow, query.commit, event=query.event, remaining=remaining
         )
     except RunListingChangedError:
@@ -387,10 +381,10 @@ def run_evidence(
     if latest.status != 'completed':
         checks = tuple(CheckVerdict(name, 'pending', latest.status) for name in required)
         return RunEvidence('pending', latest, checks, f'run {latest.status}')
-    jobs = list_run_jobs(coordinates, latest.identifier, latest.attempt, remaining=remaining)
+    jobs = _host.list_run_jobs(coordinates, latest.identifier, latest.attempt, remaining=remaining)
     try:
         confirmed = _latest(
-            list_workflow_runs(
+            _host.list_workflow_runs(
                 coordinates, query.workflow, query.commit, event=query.event, remaining=remaining
             )
         )
@@ -422,7 +416,7 @@ def start_stage_ci(
     """
     _wait_for_registration(coordinates, workflow)
     try:
-        run_id = dispatch_workflow(
+        run_id = _host.dispatch_workflow(
             coordinates, workflow, ref='main', inputs={'hosted': hosted, 'full_tests': full_tests}
         )
     except DispatchRejectedError as exc:
@@ -441,7 +435,7 @@ def start_stage_ci(
             ),
         ) from exc
     try:
-        run = read_workflow_run(coordinates, run_id)
+        run = _host.read_workflow_run(coordinates, run_id)
     except OperationCanceled:
         raise
     except (PubanonError, ObservationTimeoutError) as exc:

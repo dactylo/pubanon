@@ -12,8 +12,9 @@ from pubanon._errors import PubanonError
 from pubanon._gate import RuleClass, gate_unit
 from pubanon._run import GitResult, run_git
 from pubanon._snapshots import _audit, _source
-from pubanon._snapshots._candidate import store_path
 from pubanon._snapshots._source import Entry, Snapshot, read_snapshot
+from pubanon._snapshots._store import store_path
+from tests._git import oracle_tree
 
 _ANON_EMAIL = 'anonymous@example.invalid'
 _ANON_NAME = 'Anonymous Publisher'
@@ -44,6 +45,19 @@ class _SnapshotCommitOptions(TypedDict, total=False):
     parent: str | None
 
 
+def _audit_history(
+    paths: Paths,
+    commits: tuple[str, ...],
+    *,
+    tip: str,
+    tags: dict[str, str] | None = None,
+    rules: dict[RuleClass, tuple[str, ...]] | None = None,
+) -> _audit.HistoryAudit:
+    return _audit.audit_history(
+        paths, _PROJECT, commits, tags or {}, rules or {}, f'{_ANON_NAME} <{_ANON_EMAIL}>', tip=tip
+    )
+
+
 def _commit_object(paths: Paths, commit: str) -> tuple[bytes, bytes]:
     store = store_path(paths, _PROJECT)
     raw = run_git(['cat-file', 'commit', commit], cwd=store).stdout
@@ -61,60 +75,8 @@ def _global_config() -> GlobalConfig:
     )
 
 
-def _audit_history(
-    paths: Paths,
-    commits: tuple[str, ...],
-    *,
-    tip: str,
-    tags: dict[str, str] | None = None,
-    rules: dict[RuleClass, tuple[str, ...]] | None = None,
-) -> _audit.HistoryAudit:
-    return _audit.audit_history(
-        paths, _PROJECT, commits, tags or {}, rules or {}, _global_config(), tip=tip
-    )
-
-
 def _oid(output: bytes) -> str:
     return output.decode('ascii').strip()
-
-
-def _oracle_tree(store: Path, snapshot: Snapshot) -> str:
-    contents: dict[str, list[tuple[bytes, bytes]]] = {'': []}
-    for entry in sorted(snapshot, key=lambda item: item.path.encode('utf-8')):
-        parent = Path(entry.path).parent
-        while str(parent) != '.':
-            contents.setdefault(parent.as_posix(), [])
-            parent = parent.parent
-        oid = run_git(
-            ['hash-object', '-w', '--stdin'], cwd=store, input_bytes=entry.data
-        ).stdout.strip()
-        directory, _, name = entry.path.rpartition('/')
-        raw_name = name.encode()
-        contents[directory].append(
-            (raw_name, f'{entry.mode:o} blob '.encode() + oid + b'\t' + raw_name + b'\0')
-        )
-
-    root_oid: bytes | None = None
-    for directory in sorted(
-        contents,
-        key=lambda item: item.count('/') + bool(item),
-        reverse=True,
-    ):
-        tree_oid = run_git(
-            ['mktree', '-z'],
-            cwd=store,
-            input_bytes=b''.join(record for _name, record in sorted(contents[directory])),
-        ).stdout.strip()
-        if directory:
-            parent, _, name = directory.rpartition('/')
-            raw_name = name.encode()
-            contents[parent].append(
-                (raw_name, b'040000 tree ' + tree_oid + b'\t' + raw_name + b'\0')
-            )
-        else:
-            root_oid = tree_oid
-    assert root_oid is not None
-    return root_oid.decode('ascii')
 
 
 def _paths(tmp_path: Path) -> Paths:
@@ -242,7 +204,7 @@ def _with_gpgsig(paths: Paths, commit: str) -> str:
 
 def _write_merge_commit(paths: Paths, first_parent: str, second_parent: str) -> str:
     store = store_path(paths, _PROJECT)
-    tree = _oracle_tree(store, ())
+    tree = oracle_tree(store, ())
     return _oid(
         run_git(
             ['commit-tree', tree, '-p', first_parent, '-p', second_parent],
@@ -267,7 +229,7 @@ def _write_snapshot_commit(
     **options: Unpack[_SnapshotCommitOptions],
 ) -> str:
     store = store_path(paths, _PROJECT)
-    tree = _oracle_tree(store, snapshot)
+    tree = oracle_tree(store, snapshot)
     env = {
         'GIT_AUTHOR_NAME': options.get('author_name', _ANON_NAME),
         'GIT_AUTHOR_EMAIL': options.get('author_email', _ANON_EMAIL),
@@ -313,14 +275,11 @@ def test_clean_two_commit_history_has_no_audit_problems(tmp_path: Path) -> None:
     assert _summary(result) == ((), ())
 
 
-def test_commit_header_parser_classifies_each_structural_failure(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
-    commit = _write_snapshot_commit(paths, (), b'release\n')
-    headers, _message = _commit_object(paths, commit)
-    records = headers.split(b'\n')
-    tree = next(record for record in records if record.startswith(b'tree '))
-    author = next(record for record in records if record.startswith(b'author '))
-    committer = next(record for record in records if record.startswith(b'committer '))
+def test_commit_header_parser_classifies_each_structural_failure() -> None:
+    commit = 'a' * 40
+    tree = b'tree ' + b'b' * 40
+    author = b'author Anonymous Publisher <anonymous@example.invalid> 1700000000 +0000'
+    committer = b'committer Anonymous Publisher <anonymous@example.invalid> 1700000000 +0000'
     identity = re.escape(f'{_ANON_NAME} <{_ANON_EMAIL}>'.encode()) + rb' [0-9]+ \+0000'
     cases = (
         (
@@ -512,7 +471,7 @@ def test_history_audit_deduplicates_blob_findings_across_commits(tmp_path: Path)
         (second, third),
         {},
         rules,
-        _global_config(),
+        f'{_ANON_NAME} <{_ANON_EMAIL}>',
         tip=third,
     )
     expected = tuple(
@@ -589,7 +548,15 @@ def test_history_audit_gates_complete_non_structural_header_values(tmp_path: Pat
     }
 
     full, focused = _audit.audit_history_pair(
-        paths, _PROJECT, (commit, root), {}, (root,), {}, rules, _global_config(), tip=commit
+        paths,
+        _PROJECT,
+        (commit, root),
+        {},
+        (root,),
+        {},
+        rules,
+        f'{_ANON_NAME} <{_ANON_EMAIL}>',
+        tip=commit,
     )
 
     assert _summary(full) == (
@@ -795,7 +762,7 @@ def test_history_audit_reports_newly_sensitive_anonymous_identity(
         (first,),
         {},
         {rule_class: (term, term)},
-        _global_config(),
+        f'{_ANON_NAME} <{_ANON_EMAIL}>',
         tip=second,
     )
 
@@ -953,7 +920,7 @@ def test_history_batch_matches_oracle_for_unchanged_and_shared_blobs(tmp_path: P
         focused_commits,
         focused_tags,
         rules,
-        _global_config(),
+        f'{_ANON_NAME} <{_ANON_EMAIL}>',
         tip=unchanged,
     )
 
@@ -1010,7 +977,15 @@ def test_history_batch_process_count_does_not_scale_per_commit_or_blob(tmp_path:
         # Count the operation across module boundaries without fixing Git command syntax.
         with patch('subprocess.Popen', wraps=subprocess.Popen) as processes:
             full, focused = _audit.audit_history_pair(
-                paths, _PROJECT, commits, tags, (tip,), tags, rules, _global_config(), tip=tip
+                paths,
+                _PROJECT,
+                commits,
+                tags,
+                (tip,),
+                tags,
+                rules,
+                f'{_ANON_NAME} <{_ANON_EMAIL}>',
+                tip=tip,
             )
         counts.append(processes.call_count)
 
@@ -1358,7 +1333,7 @@ def test_history_evidence_identifies_filename_blob_message_header_and_tag_bytes(
         (commit,),
         {'tag-canary': commit},
         {RuleClass.IDENTITY_CRITICAL: terms},
-        _global_config(),
+        f'{_ANON_NAME} <{_ANON_EMAIL}>',
         tip=commit,
     )
     assert full == focused
@@ -1390,6 +1365,97 @@ def test_history_evidence_identifies_filename_blob_message_header_and_tag_bytes(
         assert data[start:end] == item.finding.term.encode()
         if item.finding.term == 'shared-canary':
             assert unit == 'filename'
+
+
+def test_identity_only_audit_reads_only_required_object_bodies(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    store = store_path(paths, _PROJECT)
+    snapshot = (
+        Entry('file.txt', 0o100644, 'blob', b'ordinary content'),
+        Entry('executable', 0o100755, 'blob', b'executable content'),
+        Entry('shared.txt', 0o100644, 'blob', b'file.txt'),
+        Entry('link', 0o120000, 'symlink', b'file.txt'),
+    )
+    commit = _write_snapshot_commit(paths, snapshot, b'commit\n')
+    tag = _oid(
+        run_git(
+            ['hash-object', '-w', '-t', 'tag', '--stdin'],
+            cwd=store,
+            input_bytes=(
+                f'object {commit}\ntype commit\ntag v1\n'
+                f'tagger {_ANON_NAME} <{_ANON_EMAIL}> 1700000000 +0000\n\nannotation\n'
+            ).encode(),
+        ).stdout
+    )
+    blobs = tuple(
+        run_git(['hash-object', '--stdin'], cwd=store, input_bytes=entry.data).stdout.strip()
+        for entry in snapshot
+    )
+    with (
+        patch.object(_audit, 'read_objects', wraps=_audit.read_objects) as reads,
+        patch.object(_audit, 'run_git', wraps=_audit.run_git) as commands,
+    ):
+        result = _audit_history(paths, (commit,), tip=commit, tags={'v1': tag})
+    requested = [oid for call in reads.call_args_list for oid in call.args[1]]
+    checked = [
+        call.kwargs['input_bytes'].splitlines()
+        for call in commands.call_args_list
+        if call.args[0][2:] == ['cat-file', '--batch-check']
+    ]
+
+    assert result.findings == ()
+    assert result.identity_problems == ('tag:v1: tag does not point directly to a commit',)
+    assert requested == [commit.encode(), tag.encode(), blobs[-1]]
+    assert blobs[0] not in requested
+    assert blobs[1] not in requested
+    assert len(checked) == 1
+    assert set(checked[0]) == set(blobs[:2])
+    assert len(checked[0]) == 2
+
+
+@pytest.mark.parametrize(
+    ('mutation', 'error'),
+    [
+        ('missing-object', 'published blob object could not be read'),
+        ('wrong-type', 'published blob object could not be read'),
+        ('bad-header', 'malformed published object header'),
+        ('bad-oid', 'mismatched published object'),
+        ('bad-type', 'unsupported published object type'),
+        ('bad-size', 'malformed published object size'),
+        ('unterminated', 'unterminated published object header'),
+        ('trailing', 'trailing published object data'),
+        ('nonzero', 'published object read failed'),
+    ],
+)
+def test_identity_only_audit_validates_blob_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str, error: str
+) -> None:
+    paths = _paths(tmp_path)
+    commit = _write_commit(paths, data=b'ordinary content', message=b'commit\n')
+    real_run_git = _audit.run_git
+
+    def _malformed_run_git(args: Sequence[str], **kwargs: Unpack[_RunGitOptions]) -> GitResult:
+        result = real_run_git(args, **kwargs)
+        if args[2:] != ['cat-file', '--batch-check']:
+            return result
+        oid, object_type, size = result.stdout.rstrip(b'\n').split(b' ')
+        if mutation == 'nonzero':
+            return GitResult(1, b'', b'object read failed')
+        output = {
+            'missing-object': oid + b' missing\n',
+            'wrong-type': b' '.join((oid, b'tree', size)) + b'\n',
+            'bad-header': oid + b'\n',
+            'bad-oid': b'x' + result.stdout[1:],
+            'bad-type': b' '.join((oid, b'unknown', size)) + b'\n',
+            'bad-size': b' '.join((oid, object_type, b'-1')) + b'\n',
+            'unterminated': result.stdout[:-1],
+            'trailing': result.stdout + b'extra\n',
+        }[mutation]
+        return GitResult(0, output, b'')
+
+    monkeypatch.setattr(_audit, 'run_git', _malformed_run_git)
+    with pytest.raises(PubanonError, match=error):
+        _audit_history(paths, (commit,), tip=commit)
 
 
 def test_published_commits_with_old_returns_only_newer_commits(tmp_path: Path) -> None:

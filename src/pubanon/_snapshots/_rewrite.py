@@ -1,17 +1,25 @@
 """Resume frozen publication-history replay without changing published refs."""
 
 import re
-import shutil
 import time
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Literal
 
+from pubanon import _filesystem
 from pubanon._config import GlobalConfig, Paths, ProjectConfig, fingerprint
 from pubanon._errors import PubanonError
 from pubanon._run import OID_HEX, run_git
-from pubanon._snapshots import _candidate, _conflicts, _history, _records
+from pubanon._snapshots import (
+    _candidate,
+    _conflicts,
+    _history,
+    _records,
+    _reports,
+    _store,
+    _verification,
+)
 from pubanon._snapshots._records import (
     CandidateRecord,
     ReplayEntry,
@@ -19,6 +27,29 @@ from pubanon._snapshots._records import (
     RewritePause,
     RewriteRecord,
 )
+
+
+def _clear_pause(paths: Paths, project: str, store: Path) -> None:
+    """Remove completed pause artifacts while keeping replay evidence for retry."""
+    directory = _records.rewrite_directory(paths, project)
+    try:
+        _filesystem.remove_tree(directory)
+    except OSError as exc:
+        raise PubanonError('cannot clean completed rewrite export') from exc
+    old = _candidate.read_ref(store, _candidate.REWRITE_MERGED_REF)
+    if old is not None:
+        run_git(
+            [
+                '--git-dir',
+                str(store.absolute()),
+                'update-ref',
+                '--no-deref',
+                '-d',
+                _candidate.REWRITE_MERGED_REF,
+                old,
+            ],
+            cwd=store,
+        )
 
 
 def _commit_replay(store: Path, g: GlobalConfig, old: str, base: str, tree: str) -> str:
@@ -51,15 +82,10 @@ def _commit_replay(store: Path, g: GlobalConfig, old: str, base: str, tree: str)
 
 def _complete(record: CandidateRecord, progress: RewriteRecord) -> CandidateRecord:
     """Derive the final candidate only from frozen tags and the exact saved mapping."""
-    mapping = {progress.replaces: progress.correction}
-    mapping.update((entry.old, entry.new) for entry in progress.replayed)
-    tags = {tag: mapping.get(oid, oid) for tag, oid in record.prestate_tags.items()}
-    if record.tag_intent is not None and progress.replaces not in record.prestate_tags.values():
-        tags[record.tag_intent] = record.commit
     return replace(
         record,
         tip=progress.replayed[-1].new if progress.replayed else record.commit,
-        poststate_tags=tags,
+        poststate_tags=_records.replacement_poststate_tags(record, progress.replayed),
         replayed=progress.replayed,
     )
 
@@ -88,41 +114,6 @@ def _merge(store: Path, progress: RewriteRecord) -> _conflicts.MergeResult:
             check=False,
         )
     )
-
-
-def _read_ref(store: Path, ref: str) -> str | None:
-    """Read one optional direct retention ref."""
-    result = run_git(
-        ['--git-dir', str(store.absolute()), 'for-each-ref', '--format=%(objectname)', ref],
-        cwd=store,
-    )
-    return result.stdout.strip().decode('ascii') or None
-
-
-def _clear_pause(paths: Paths, project: str, store: Path) -> None:
-    """Remove completed pause artifacts while keeping replay evidence for retry."""
-    directory = _records.rewrite_directory(paths, project)
-    try:
-        if directory.is_symlink() or directory.is_junction():
-            raise PubanonError('cannot clean rewrite directory through a symlink')
-        if directory.exists():
-            shutil.rmtree(directory)
-    except OSError as exc:
-        raise PubanonError('cannot clean completed rewrite export') from exc
-    old = _read_ref(store, _candidate.REWRITE_MERGED_REF)
-    if old is not None:
-        run_git(
-            [
-                '--git-dir',
-                str(store.absolute()),
-                'update-ref',
-                '--no-deref',
-                '-d',
-                _candidate.REWRITE_MERGED_REF,
-                old,
-            ],
-            cwd=store,
-        )
 
 
 def _remove_completed_rewrite_record(paths: Paths, project: str) -> None:
@@ -170,7 +161,7 @@ def _retain_pause(store: Path, progress: RewriteRecord) -> None:
     pause = progress.pause
     if pause is None:
         raise PubanonError('rewrite pause is missing')
-    current = _read_ref(store, _candidate.REWRITE_MERGED_REF)
+    current = _candidate.read_ref(store, _candidate.REWRITE_MERGED_REF)
     if current is not None and current != pause.tree:
         raise PubanonError('rewrite merged-tree ref conflicts with saved pause')
     if current is None:
@@ -199,7 +190,7 @@ def _replay_loop(
     paths: Paths, g: GlobalConfig, p: ProjectConfig, progress: RewriteRecord
 ) -> RewriteRecord:
     """Append durable completed steps until the chain finishes or exports a pause."""
-    store = _candidate.candidate_store_path(paths, p.name)
+    store = _store.candidate_store_path(paths, p.name)
     while len(progress.replayed) < len(progress.descendants):
         resolutions: tuple[Resolution, ...] = ()
         tree: str | None = None
@@ -254,12 +245,13 @@ def continue_rewrite(
     progress = _records.load_rewrite(paths, p.name)
     if record is None or record.replaces is None:
         raise PubanonError('no rewrite is in progress')
+    recovery = _reports.reprepare_advice(record, project=p.name)
     if fingerprint(g, p) != record.fingerprint:
         raise PubanonError(
             'the configuration changed after the snapshot was prepared',
-            recovery='pubanon discard, then pubanon prepare',
+            recovery=recovery,
         )
-    store = _candidate.candidate_store_path(paths, p.name)
+    store = _store.candidate_store_path(paths, p.name)
     if record.tip is not None:
         if progress is None:
             raise PubanonError('no rewrite is in progress')
@@ -271,7 +263,7 @@ def continue_rewrite(
             or progress.descendants != tuple(entry.old for entry in record.replayed)
         ):
             raise PubanonError('rewrite record conflicts with completed snapshot')
-        _candidate.verify_retained_candidate(paths, g, p, record, env=env)
+        _verification.verify_retained_candidate(paths, g, p, record, env=env, recovery=recovery)
         _clear_pause(paths, p.name, store)
         _remove_completed_rewrite_record(paths, p.name)
         return record
@@ -285,7 +277,7 @@ def continue_rewrite(
             record.commit, record.replaces, record.prestate_main, descendants, 'replaying'
         )
         _records.save_rewrite(paths, p.name, progress)
-    anchor = _candidate.verify_rewrite_progress(paths, p.name, record, progress)
+    anchor = _verification.verify_rewrite_progress(paths, p.name, record, progress)
     base = progress.replayed[-1].new if progress.replayed else record.commit
     if anchor != base:
         _update_ref(store, _candidate.CANDIDATE_REF, base, anchor)
@@ -294,8 +286,9 @@ def continue_rewrite(
         return record
     _clear_pause(paths, p.name, store)
     complete = _complete(record, progress)
+    # Save completed replay first so a failed proof remains resumable with prepare --continue.
     _records.save_candidate(paths, p.name, complete)
-    _candidate.verify_retained_candidate(paths, g, p, complete, env=env)
+    _verification.verify_retained_candidate(paths, g, p, complete, env=env, recovery=recovery)
     _remove_completed_rewrite_record(paths, p.name)
     return complete
 
@@ -316,7 +309,5 @@ def resolve_replacement(
         if selector == 'all'
         else _history.select_publication(paths, project, selector, include_deleted=True).commit
     )
-    _candidate.replacement_descendants(
-        _candidate.candidate_store_path(paths, project), selected, main
-    )
+    _candidate.replacement_descendants(_store.candidate_store_path(paths, project), selected, main)
     return selected, 'all' if selector == 'all' else 'one'

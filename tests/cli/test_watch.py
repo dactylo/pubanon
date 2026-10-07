@@ -23,44 +23,41 @@ def test_watch_defaults_reach_observation_functions(
     assert project is not None
     received: list[tuple[object, ...]] = []
 
-    class _WatchModule:
-        @staticmethod
-        def _watch_ci(
-            *args: object,
-            staged: bool,
-            version: str | None,
-            timeout: int,
-        ) -> None:
-            actual_paths, actual_global, actual_project = args
+    def _watch_ci(
+        *args: object,
+        staged: bool,
+        version: str | None,
+        timeout: int,
+    ) -> None:
+        actual_paths, actual_global, actual_project = args
 
-            received.append(
-                (
-                    actual_paths,
-                    actual_global,
-                    actual_project,
-                    {'staged': staged, 'version': version, 'timeout': timeout},
-                )
+        received.append(
+            (
+                actual_paths,
+                actual_global,
+                actual_project,
+                {'staged': staged, 'version': version, 'timeout': timeout},
             )
+        )
 
-        @staticmethod
-        def _watch_package(
-            *args: object,
-            version: str | None,
-            timeout: int,
-        ) -> None:
-            actual_paths, actual_global, actual_project = args
+    def _watch_package(
+        *args: object,
+        version: str | None,
+        timeout: int,
+    ) -> None:
+        actual_paths, actual_global, actual_project = args
 
-            received.append(
-                (
-                    actual_paths,
-                    actual_global,
-                    actual_project,
-                    {'version': version, 'timeout': timeout},
-                )
+        received.append(
+            (
+                actual_paths,
+                actual_global,
+                actual_project,
+                {'version': version, 'timeout': timeout},
             )
+        )
 
-    monkeypatch.setattr(_watch, 'watch_ci', _WatchModule._watch_ci)
-    monkeypatch.setattr(_watch, 'watch_package', _WatchModule._watch_package)
+    monkeypatch.setattr(_watch, 'watch_ci', _watch_ci)
+    monkeypatch.setattr(_watch, 'watch_package', _watch_package)
 
     assert _cli.main(['stage', 'watch', '--project', project.name]) == 0
     assert _cli.main(['stage', 'watch', '--project', project.name, '--timeout', '45']) == 0

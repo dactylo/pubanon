@@ -1,8 +1,8 @@
-# Pubanon operations guide
+# pubanon operations guide
 
 This guide helps you recover interrupted work, inspect or remove saved snapshots, repair local
 history, and back up the private source. If the source, prepared release, configuration, account,
-or GitHub repository no longer matches the saved state, Pubanon stops and reports what needs
+or GitHub repository no longer matches the saved state, pubanon stops and reports what needs
 attention. See the [operator guide](guide.md) for complete publication paths.
 
 ## Find the task
@@ -18,12 +18,14 @@ attention. See the [operator guide](guide.md) for complete publication paths.
 
 ## Recover first
 
-- If Pubanon reports that no push was attempted, correct the reported problem and rerun the same
+- If pubanon reports that no push was attempted, correct the reported problem and rerun the same
   command.
-- If a push may have been sent but Pubanon could not verify the result, run
+- If a push may have been sent but pubanon could not verify the result, run
   `pubanon publish --resolve`. Do not resend or discard the snapshot first.
-- If Pubanon verified the publication but could not finish its local records, correct the local
+- If pubanon verified the publication but could not finish its local records, correct the local
   write problem and run `pubanon publish --resolve`.
+- If the code was published but its release page was not created or verified, run the reported
+  `pubanon release create TAG` command. It succeeds without another write if the page now matches.
 - For replacement conflicts, interrupted watches, reveal, staging, and other cases, follow the
   [detailed recovery steps](#retrying-an-interrupted-command).
 
@@ -32,23 +34,23 @@ attention. See the [operator guide](guide.md) for complete publication paths.
 The table lists changes to GitHub and the optional login session. Each command previews the target
 and change before it runs.
 
-| Command                                | External change                                                                                                                                                               | What stays unchanged                                                     |
-| -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| `pubanon setup` (selected login only)  | Starts the GitHub CLI browser login you select; `gh` may store credentials and select HTTPS.                                                                                  | No repository creation, push, visibility change, or `gh auth setup-git`. |
-| `pubanon repo create`                  | Creates the configured empty repository with its saved visibility.                                                                                                            | No push or visibility change.                                            |
-| `pubanon publish`                      | Atomically publishes the snapshot; an explicit replacement rewrites `main` and its planned tags.                                                                              | No repository creation, visibility change, staging, or package upload.   |
-| `pubanon release create TAG`           | Creates a GitHub release page for a verified published tag after confirmation.                                                                                                | No snapshot push, tag creation, or package upload.                       |
-| `pubanon release edit TAG`             | Changes the selected page's title or notes after confirmation.                                                                                                                | Keeps the tag, status, assets, and other page settings.                  |
-| `pubanon repo restore --to remote`     | Pushes retained published history to an empty or exact-prefix repository.                                                                                                     | No new snapshot, imported foreign history, or tag movement.              |
-| `pubanon run NAME [--version VERSION]` | Performs the GitHub changes named by the workflow stages.                                                                                                                     | No undeclared or later stage; `--yes` cannot add one.                    |
-| `pubanon repo reveal`                  | Makes the configured private repository public after checks and acknowledgment.                                                                                               | No branch or tag push, and no package upload.                            |
-| `pubanon stage push`                   | Creates the private staging repository with separate approval, or updates its `main` branch. With `ci_workflow`, it may create `CI_RUN_ON_PUSH=false` and request one CI run. | No final publication or tag push.                                        |
-| `pubanon stage repair`                 | May correct the private staging repository's default branch after approval.                                                                                                   | No staging push or final publication.                                    |
-| `pubanon stage forget`                 | No external change; removes local staging tracking.                                                                                                                           | Keeps the staging repository and publication route.                      |
-| `pubanon stage delete`                 | Deletes the selected private staging repository after its own preview and confirmation.                                                                                       | Refuses the final repository; no change to local published history.      |
+| Command                                | External change                                                                                                                                                                                                        | What stays unchanged                                                     |
+| -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `pubanon setup` (selected login only)  | Starts the GitHub CLI browser login you select; `gh` may store credentials and select HTTPS.                                                                                                                           | No repository creation, push, visibility change, or `gh auth setup-git`. |
+| `pubanon repo create`                  | Creates the configured empty repository with its saved visibility.                                                                                                                                                     | No push or visibility change.                                            |
+| `pubanon publish`                      | Atomically publishes the snapshot; an explicit replacement rewrites `main` and its planned tags. Creates a release page for a tagged version after publication when release pages are on or `--release-page` is given. | No repository creation, visibility change, staging, or package upload.   |
+| `pubanon release create TAG`           | Creates a GitHub release page for a verified published tag after confirmation.                                                                                                                                         | No snapshot push, tag creation, or package upload.                       |
+| `pubanon release edit TAG`             | Changes the selected page's title or notes after confirmation.                                                                                                                                                         | Keeps the tag, status, assets, and other page settings.                  |
+| `pubanon repo restore --to remote`     | Pushes retained published history to an empty or exact-prefix repository.                                                                                                                                              | No new snapshot, imported foreign history, or tag movement.              |
+| `pubanon run NAME [--version VERSION]` | Performs the GitHub changes named by the workflow stages. A `publish` stage creates a release page under the same rule.                                                                                                | No undeclared or later stage; `--yes` cannot add one.                    |
+| `pubanon repo reveal`                  | Makes the configured private repository public after checks and acknowledgment.                                                                                                                                        | No branch or tag push, and no package upload.                            |
+| `pubanon stage push`                   | Creates the private staging repository with separate approval, or updates its `main` branch. With `ci_workflow`, it may create `CI_RUN_ON_PUSH=false` and request one CI run.                                          | No final publication or tag push.                                        |
+| `pubanon stage repair`                 | May correct the private staging repository's default branch after approval.                                                                                                                                            | No staging push or final publication.                                    |
+| `pubanon stage forget`                 | No external change; removes local staging tracking.                                                                                                                                                                    | Keeps the staging repository and publication route.                      |
+| `pubanon stage delete`                 | Deletes the selected private staging repository after its own preview and confirmation.                                                                                                                                | Refuses the final repository; no change to local published history.      |
 
 Apart from the optional GitHub login, `setup`, `init`, `prepare`, `inspect`, and
-`repo restore --to local` change only Pubanon's own configuration and data. Before pushing,
+`repo restore --to local` change only pubanon's own configuration and data. Before pushing,
 `publish` adds a private bookmark to the source commit, and `publish --resolve` may add one when it
 records an older snapshot. `discard` and `delete` remove the bookmarks and local data they own. If
 you enable [local source tags](#local-source-tags), publication, `list`, and `show` create or
@@ -57,11 +59,12 @@ files, or other tags.
 
 `doctor`, `status`, `repo verify`, `stage status`, `repo watch`, `package watch`, `release list`,
 `release show`, and `publish --resolve` change nothing outside your machine, although several of
-them read from GitHub or PyPI.
+them read from GitHub or PyPI. `publish --resolve` reports a missing release page and its recovery
+command without creating the page.
 
 ## GitHub login during setup
 
-Setup probes the current account with captured output. Pubanon never prints that raw output. If the
+Setup probes the current account with captured output. pubanon never prints that raw output. If the
 probe fails, setup does not assume that you are logged out: it offers retry, explicit login, or
 cancel. Login runs this GitHub CLI operation without a shell:
 
@@ -69,13 +72,13 @@ cancel. Login runs this GitHub CLI operation without a shell:
 gh auth login --hostname github.com --git-protocol https --web
 ```
 
-Pubanon states that it is handing over the terminal, then starts it. During this one selected
+pubanon states that it is handing over the terminal, then starts it. During this one selected
 session, `gh` owns the terminal, browser authorization, output, credential storage, and HTTPS
-protocol selection. Pubanon does not collect a token, request insecure storage, upload SSH keys, or
+protocol selection. pubanon does not collect a token, request insecure storage, upload SSH keys, or
 run `gh auth setup-git`.
 
 Setup checks the account again after login, even when `gh` reports success, and saves nothing until
-it has shown you the identity, account, and every sensitive term. Pubanon cannot undo a login that
+it has shown you the identity, account, and every sensitive term. pubanon cannot undo a login that
 `gh` completed; if setup stops afterwards, rerun `pubanon setup` to recheck the account and
 continue. If saving succeeded but the final readiness check failed, the configuration stays saved
 and the rerun checks it again. Rerunning setup on a complete configuration leaves its contents
@@ -85,12 +88,12 @@ unchanged, but on Linux and macOS it may restore owner-only file permissions. Us
 
 ## Registry and draft recovery
 
-The project registry records each canonical source path and its project name in JSON. If Pubanon
+The project registry records each canonical source path and its project name in JSON. If pubanon
 reports an invalid registry, inspect the file path in the error. Restore a known backup of that
 file, or reconstruct the current JSON mapping from the known `source_path` and `name` in each saved
 project configuration. Keep the damaged file until you have confirmed the replacement. Commands
 that accept `--project NAME` can select an existing project explicitly while the registry is being
-repaired. Pubanon does not silently reset a damaged registry.
+repaired. pubanon does not silently reset a damaged registry.
 
 If saving the registry or an `init` draft fails, the previous file is normally left intact. If the
 error says the new file may have been saved, inspect the file before retrying.
@@ -98,7 +101,7 @@ error says the new file may have been saved, inspect the file before retrying.
 ## Input and cancellation
 
 For menus and yes/no questions, press the bracketed letter; no Enter is needed. For text fields,
-type your answer and press Enter. Menu letters are case-insensitive. An answer Pubanon does not
+type your answer and press Enter. Menu letters are case-insensitive. An answer pubanon does not
 recognize is explained and asked again; a typo never ends a command or discards earlier answers. A
 blank answer takes the default shown in brackets; questions without a default are asked again.
 Questions that publish, change visibility, or acknowledge exposure have no default.
@@ -109,11 +112,11 @@ or cancel at a menu and pressing Ctrl-C before a change starts also report `Canc
 writes nothing until you save, and completed GitHub authentication stays in effect. End of input is
 an error with status 1 and asks you to rerun in an interactive terminal.
 
-An interruption during or after a change may leave an unknown or partial outcome. Pubanon reports
+An interruption during or after a change may leave an unknown or partial outcome. pubanon reports
 what it knows and how to recover instead of claiming that nothing changed. In particular, if a
 publication push may have been sent, follow `Next: pubanon publish --resolve` before retrying.
 
-Pubanon never hides what you type and never masks what it shows you. Its privacy check runs on the
+pubanon never hides what you type and never masks what it shows you. Its privacy check runs on the
 content about to be published, not on your terminal. Displayed text escapes terminal control
 characters and backslashes so that output cannot alter your terminal.
 
@@ -137,7 +140,7 @@ a separate copy. `pubanon status` shows the number of preserved copies. Use
 snapshot, `pubanon inspect` lists the copies directly. Open a listed copy in your editor to review
 its files.
 
-Before reusing a directory, Pubanon compares its files, paths, symlink targets, and executable
+Before reusing a directory, pubanon compares its files, paths, symlink targets, and executable
 flags with the saved snapshot. If anything differs, inspection stops rather than present changed
 files as the snapshot.
 
@@ -165,16 +168,16 @@ effect before asking. See [what commands change](#what-commands-change).
 
 ## Published history and source recovery
 
-Before `publish` pushes, Pubanon bookmarks the snapshot's original source commit in your source
+Before `publish` pushes, pubanon bookmarks the snapshot's original source commit in your source
 repository; `prepare` alone creates no bookmark. A published snapshot also has a private record and
-a bookmark in Pubanon's local published-history store. Together they keep the exact published files
+a bookmark in pubanon's local published-history store. Together they keep the exact published files
 and the original source revision available even after you rebase a branch. Neither the bookmark nor
 the record changes when history is later rewritten.
 
 Use `pubanon list` to list locally known snapshots. `pubanon show prepared` displays the saved
 snapshot; its commit prefix also selects it when unambiguous. For published snapshots, `show`
 accepts `latest` for the most recent publication, a tag such as `v0.1.0`, or an unambiguous commit
-prefix. A tag selects the commit it points to now. If the tag no longer exists, Pubanon looks for a
+prefix. A tag selects the commit it points to now. If the tag no longer exists, pubanon looks for a
 saved record with that version and reports an ambiguity when several match. Superseded snapshots
 are no longer part of the published history; select them by commit prefix.
 `pubanon show v0.1.0 --verbose` gives the exact publication and source commit IDs, saved
@@ -183,7 +186,7 @@ stored in UTC and displayed in your local time with seconds and a timezone; it i
 Git author date. The command provides a concrete `git -C ... worktree add --detach ...` command for
 the original source revision when the source repository is available. Run that command yourself to
 browse the complete private source revision; run its matching `git -C ... worktree remove ...`
-command when finished. Pubanon does not create or remove source worktrees. A source worktree can
+command when finished. pubanon does not create or remove source worktrees. A source worktree can
 retain Git objects after a bookmark is removed.
 
 Both `pubanon list --verbose` and `pubanon show VERSION --verbose` also search your current local
@@ -228,9 +231,9 @@ pubanon init --source-tags
 pubanon list
 ```
 
-Pubanon creates a lightweight tag such as `pubanon/v0.1.0` in the source repository after confirmed
+pubanon creates a lightweight tag such as `pubanon/v0.1.0` in the source repository after confirmed
 publication. For an unversioned snapshot, it uses `pubanon/` followed by the full snapshot ID.
-These source tags are separate from release tags in the published repository; Pubanon does not push
+These source tags are separate from release tags in the published repository; pubanon does not push
 them. You can inspect one directly:
 
 ```sh
@@ -238,7 +241,7 @@ git show pubanon/v0.1.0
 ```
 
 `pubanon list` and `pubanon show` also create missing source tags and refresh existing ones. If the
-original source has left your current branch's history after a rewrite, Pubanon uses the latest
+original source has left your current branch's history after a rewrite, pubanon uses the latest
 commit with identical contents. If no match exists, the tag keeps pointing to the original source.
 A replacement publication updates the version's tag to its replacement source. For a replayed
 release, the tag identifies its original source input; use `inspect --published` to see the
@@ -266,16 +269,16 @@ replacement may move or remove tags only as already reviewed in that snapshot.
   [conflict procedure](guide.md#correcting-published-history).
 - If `publish` fails or you decline before the push, the snapshot remains available. Correct the
   reported condition and rerun `publish`.
-- If Pubanon cannot tell whether a sent push succeeded, run `pubanon publish --resolve`. Do not
+- If pubanon cannot tell whether a sent push succeeded, run `pubanon publish --resolve`. Do not
   resend or discard first. Resolution reads the recorded destination and either records success or
   confirms that nothing changed.
-- If Pubanon reports that publication was verified on the host but local finalization is
+- If pubanon reports that publication was verified on the host but local finalization is
   incomplete, the publication has landed. Do not publish a new snapshot or discard the recovery
   record. Correct the reported local write failure, then run `pubanon publish --resolve`, which
   finishes the local records safely. Review copies remain on disk.
-- Ctrl-C exits with status 130. If it arrives before the push, Pubanon reports that nothing was
-  pushed. If it arrives during the push, before Pubanon has confirmed the result, the outcome is
-  unknown: run `pubanon publish --resolve`. If the result was already confirmed, Pubanon reports
+- Ctrl-C exits with status 130. If it arrives before the push, pubanon reports that nothing was
+  pushed. If it arrives during the push, before pubanon has confirmed the result, the outcome is
+  unknown: run `pubanon publish --resolve`. If the result was already confirmed, pubanon reports
   the success, and keeps what `publish --resolve` needs if local records were still being finished.
 - If `run NAME` stops, rerun the same invocation. Completed publication is recognized by its exact
   version, and only the declared later stages run. If you edit the workflow declaration, the next
@@ -300,10 +303,10 @@ replacement may move or remove tags only as already reviewed in that snapshot.
   checked; ambiguous checks need the multiple matches resolved; failed checks need inspection and a
   fixed or rerun workflow. The default is 1800 seconds; set another positive whole number with
   `--timeout SECONDS`.
-- If a reveal stops after a possible visibility change, rerun `pubanon repo reveal`. Pubanon
+- If a reveal stops after a possible visibility change, rerun `pubanon repo reveal`. pubanon
   reports the current exposure and verifies the result; it does not promise rollback. If the
   project declares public visibility while the host remains private, first decide the intended
-  visibility: make the host public outside Pubanon or set the project declaration back to private,
+  visibility: make the host public outside pubanon or set the project declaration back to private,
   then rerun reveal.
 
 ## Unattended releases
@@ -355,7 +358,7 @@ part of the published Git history. Deleting an original snapshot leaves a replay
 bookmark in place, and the reverse, so the same source history may stay protected.
 
 `clean` and `delete` preview before asking for confirmation; `--yes` skips that confirmation.
-Snapshot deletion commands release Pubanon's own retention references as part of deleting a
+Snapshot deletion commands release pubanon's own retention references as part of deleting a
 snapshot. They do not change your source branches, tags, files, or worktrees, run Git garbage
 collection, or change GitHub. Git may reclaim unreachable objects during later maintenance; cleanup
 does not promise immediate space savings.
@@ -374,7 +377,7 @@ evidence after checking the host yourself.
 `clean` removes all known project review copies. Later inspection can recreate them from retained
 snapshots. An unknown publication outcome must be resolved before ordinary `discard`.
 
-To remove a project's local Pubanon data entirely, run `pubanon forget`. It previews the
+To remove a project's local pubanon data entirely, run `pubanon forget`. It previews the
 registration, configuration file, and data paths, then asks for confirmation; `--yes` skips the
 question. This removes snapshots, review copies, publication records, staging tracking, rewrite
 state, init drafts, and the local published-history store. The same empty `project.lock` file and
@@ -399,8 +402,8 @@ tracking names a different repository, deletion stops; inspect that repository, 
 publication route.
 
 Declining keeps the repository and its tracking, and `--yes` skips only the confirmation. If GitHub
-reports the repository as missing or inaccessible, Pubanon does not take that as proof that it is
-gone and deletes nothing. After deleting, Pubanon confirms that the repository is gone before
+reports the repository as missing or inaccessible, pubanon does not take that as proof that it is
+gone and deletes nothing. After deleting, pubanon confirms that the repository is gone before
 clearing tracking. GitHub may still keep its data for a while.
 
 `init --relocate` shows distinguishable old and new source roots before confirmation. Relocation
@@ -409,9 +412,9 @@ requires snapshots to be prepared again; existing publication history is unchang
 ## When a snapshot must be prepared again
 
 A retained snapshot stays bound to the source commit, publication policy, publication identity,
-destination, expected visibility, required checks, and Pubanon's built-in safety rules used to
-prepare it. Changing one of those facts invalidates it. Pubanon refuses publication and tells you
-to run:
+destination, expected visibility, required checks, `ci_workflow`, the expected GitHub account, and
+pubanon's built-in safety rules used to prepare it. Changing one of those facts invalidates it.
+pubanon refuses publication and tells you to run:
 
 ```sh
 pubanon discard
@@ -421,7 +424,7 @@ pubanon prepare
 Changes to the named source branch or tag do not alter the saved snapshot. Interactive publication
 shows a warning, then the normal publication review and confirmation. Publishing uses the saved
 snapshot. `--yes` still refuses a changed source reference. If the pinned commit itself is gone,
-discard and prepare again. Pubanon also refuses a damaged or inconsistent snapshot.
+discard and prepare again. pubanon also refuses a damaged or inconsistent snapshot.
 
 Publication routes, workflow declarations, staging settings, package-observation settings, and
 repository settings do not replace a retained snapshot. Commands that use them still verify their
@@ -491,12 +494,15 @@ watches show what they are waiting for and report progress at least every 30 sec
 to interrupt and rerun with the same selection.
 
 Before making a private repository public, `repo reveal` verifies all branches and tags, required
-CI, optional package state, declared settings, sanitized Git content, and identity metadata. It
-separately lists Actions runs and artifacts, saves the complete list where only you can read it,
-and gives you exact run links plus the repository Actions page for manual review. Pubanon does not
-scan Actions logs or artifact contents. Review the repository Activity page too; Git history checks
-do not cover these retained hosted records. After changing visibility, reveal verifies visibility,
-branches, tags, and settings again.
+CI, optional package state, declared settings, sanitized Git content, and identity metadata. Reveal
+re-checks the tag, title, and notes of every non-draft release page under the current sensitive
+terms and refuses if any page matches. With `ci_workflow` configured, reveal requires the latest
+push run of that workflow for the release commit to pass, including any required checks, using the
+same evidence as `repo watch`. It separately lists Actions runs and artifacts, saves the complete
+list where only you can read it, and gives you exact run links plus the repository Actions page for
+manual review. pubanon does not scan Actions logs or artifact contents. Review the repository
+Activity page too; Git history checks do not cover these retained hosted records. After changing
+visibility, reveal verifies visibility, branches, tags, and settings again.
 
 When both the project declaration and host are already public, repeated reveal checks only current
 visibility, published refs, and repository settings. Run `pubanon audit --remote` to apply the
@@ -538,11 +544,11 @@ Repair can restore history that your current rules flag, so you can review it lo
 does not acknowledge the exposure or waive the checks for publishing, `repo restore --to remote`,
 and reveal. Afterwards, run `pubanon audit --remote` to check the restored history against your
 current rules. These checks confirm content and structure; matching names and refs cannot prove
-that Pubanon created every imported commit.
+that pubanon created every imported commit.
 
 ## Private source backups
 
-Back up the private source with a bundle, which is one file holding every branch, tag, and Pubanon
+Back up the private source with a bundle, which is one file holding every branch, tag, and pubanon
 source bookmark:
 
 ```sh
@@ -551,10 +557,10 @@ git bundle create /path/to/backup.bundle --all
 
 An offline copy made with `git clone --mirror` to a local or removable path is also acceptable. The
 mirror's own `origin` entry points at the source; that is fine because the mirror is not the
-repository Pubanon reads.
+repository pubanon reads.
 
-Restore every branch, tag, and Pubanon source bookmark without configuring a remote. Replace
-`ORIGINAL_SOURCE_BRANCH` with the branch used by the private source; Pubanon's publication branch
+Restore every branch, tag, and pubanon source bookmark without configuring a remote. Replace
+`ORIGINAL_SOURCE_BRANCH` with the branch used by the private source; pubanon's publication branch
 is always `main`, but the source branch need not be.
 
 ```sh
@@ -579,18 +585,18 @@ pubanon init --project NAME --relocate
 
 Without `--project`, `init` derives a name from the directory and would create a new project.
 Relocation changes the source path, which is part of the snapshot's configuration fingerprint, so a
-retained snapshot is refused with "publication configuration changed after prepare". Run
+retained snapshot is refused with "the configuration changed after the snapshot was prepared". Run
 `pubanon discard`, then `pubanon prepare` again. Published history and the local published-history
 store are unaffected.
 
 Never push private history to any hosting service, by URL or otherwise, even to a private
-repository. The absence of a configured remote does not make such a push compatible with Pubanon's
+repository. The absence of a configured remote does not make such a push compatible with pubanon's
 contract.
 
 ## Disconnecting an alternate object store
 
 An alternates file means the source borrows Git objects from another repository. Removing that file
-first can make branches and tags unreadable. Pubanon refuses this source and does not change it
+first can make branches and tags unreadable. pubanon refuses this source and does not change it
 automatically.
 
 Stop other Git writers and run the following from the source repository. Keep the original object
@@ -636,13 +642,13 @@ not delete the borrowed object store until independent verification succeeds.
 
 ## Residual risks
 
-Pubanon proves that the host's reachable branches, tags, and Git objects match the sanitized
+pubanon proves that the host's reachable branches, tags, and Git objects match the sanitized
 history it published. It cannot prove that forks, remnants of deleted Git references, or external
 caches are absent. Deleting a repository or rewriting published history does not reliably erase
 earlier exposure.
 
 Published work also carries behavioral fingerprints, including push timing, release cadence, and
-coding style. A determined investigator may correlate them. Pubanon warns about content it can
+coding style. A determined investigator may correlate them. pubanon warns about content it can
 identify, but an operator can still authorize identifying content after a warning. Review both the
 snapshot and the timing of publication with that limit in mind.
 
@@ -650,7 +656,7 @@ Content checks can miss terms in UTF-16 or UTF-32 files, or terms written with l
 characters. See [how a release works](guide.md#how-a-release-works) for their limits, and inspect
 the selected files for anything the checks may miss.
 
-Pubanon can rebuild its local published-history copy from a verified host repository. If both the
-host repository and that local copy are lost, the old published history is gone. Pubanon cannot
+pubanon can rebuild its local published-history copy from a verified host repository. If both the
+host repository and that local copy are lost, the old published history is gone. pubanon cannot
 reconstruct it from private history without creating a new sanitized release. The next publication
 starts a new first release only after your explicit acknowledgment.

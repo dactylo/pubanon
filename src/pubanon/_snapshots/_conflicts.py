@@ -3,7 +3,6 @@
 import ntpath
 import os
 import re
-import shutil
 import stat
 import sys
 import tempfile
@@ -15,7 +14,7 @@ from typing import Literal, cast
 from pubanon import _filesystem, _windows_fs
 from pubanon._errors import PubanonError
 from pubanon._run import OID_HEX, GitResult, run_git
-from pubanon._snapshots._candidate import materialize_directory
+from pubanon._snapshots._inspection import materialize_directory
 from pubanon._snapshots._records import ConflictEntry, ConflictStage, Resolution, RewritePause
 from pubanon._snapshots._source import (
     Entry,
@@ -551,7 +550,7 @@ def export_conflicts(store: Path, directory: Path, pause: RewritePause) -> None:
             raise PubanonError('cannot export conflicts through a symlink')
         if directory.exists():
             _check_directory(directory, trusted_parent=directory.parent)
-            shutil.rmtree(directory)
+            _filesystem.remove_tree(directory)
         directory.mkdir(mode=0o700)
         _filesystem.chmod(directory, 0o700)
         materialize_directory(directory / 'tree', snapshot)
@@ -567,14 +566,16 @@ def export_conflicts(store: Path, directory: Path, pause: RewritePause) -> None:
             with target.open('xb') as stream:
                 stream.write(blob)
             _filesystem.chmod(target, 0o600)
-        temporary = directory / 'resolutions.toml.tmp'
-        with temporary.open('xb') as manifest:
-            _filesystem.fchmod(manifest.fileno(), 0o600)
-            manifest.write(content)
-            manifest.flush()
-            os.fsync(manifest.fileno())
-        _filesystem.replace(temporary, directory / 'resolutions.toml')
-        _filesystem.sync_directory(directory)
+        _filesystem.write_private(directory / 'resolutions.toml', content)
+    except _filesystem.DurableWriteError as exc:
+        if exc.interrupted and not exc.replacement_attempted:
+            raise KeyboardInterrupt from exc.__cause__
+        message = (
+            'merge conflict export may have been saved'
+            if exc.replaced or (exc.interrupted and exc.replacement_attempted)
+            else 'cannot export saved merge conflicts'
+        )
+        raise PubanonError(message) from exc.__cause__
     except (OSError, ValueError) as exc:
         raise PubanonError('cannot export saved merge conflicts') from exc
 

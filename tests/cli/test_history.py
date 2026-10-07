@@ -15,7 +15,16 @@ import pytest
 from pubanon import _cli, _config
 from pubanon._cli import _history as cli_history
 from pubanon._remote import _host
-from pubanon._snapshots import _candidate, _history, _records, _source
+from pubanon._snapshots import (
+    _candidate,
+    _discard,
+    _history,
+    _inspection,
+    _records,
+    _source,
+    _store,
+    _verification,
+)
 from pubanon._terminal import escape
 from tests._cli import prepare, record_publication, record_published_main
 from tests._git import git_env, remove_tree
@@ -30,13 +39,15 @@ def test_delete_prepared_directs_to_discard_before_any_change(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, project, candidate = prepare(tmp_path, source, monkeypatch)
-    inspection = _candidate.materialize_inspect(paths, project.name, candidate)
+    inspection = _verification.materialize_inspect(
+        paths, project.name, _verification.prove_objects(paths, project.name, candidate)
+    )
     capsys.readouterr()
 
     assert _cli.main(['delete', 'prepared', '--project', project.name]) == 1
     captured = capsys.readouterr()
     assert 'pubanon discard' in captured.err
-    assert _candidate.load_candidate(paths, project.name) == candidate
+    assert _records.load_candidate(paths, project.name) == candidate
     assert inspection.exists()
 
 
@@ -54,7 +65,7 @@ def test_history_ambiguous_recorded_tag_lists_exact_choices(
             [
                 'git',
                 '-C',
-                _candidate.candidate_store_path(paths, project.name),
+                _store.candidate_store_path(paths, project.name),
                 'commit-tree',
                 candidate.tree,
                 '-p',
@@ -155,7 +166,7 @@ def test_history_deduplicates_confirmed_snapshot_awaiting_local_finalization(
     assert 'Local recording: incomplete\n' in rendered
     assert 'unresolved' not in rendered
     assert rendered.rstrip().endswith('Next: pubanon publish --project=demo --resolve')
-    assert _candidate.load_candidate(paths, project.name) == pending
+    assert _records.load_candidate(paths, project.name) == pending
 
 
 def test_history_delete_hides_recordless_entry(
@@ -167,7 +178,7 @@ def test_history_delete_hides_recordless_entry(
     source = make_repo(files={'README.md': 'public\n'})
     paths, project, candidate = prepare(tmp_path, source, monkeypatch)
     record_published_main(paths, project, candidate)
-    _candidate.discard(paths, project.name, force=False)
+    _discard.discard(paths, project.name, force=False)
     capsys.readouterr()
     assert _cli.main(['delete', 'latest', '--project', project.name, '--yes']) == 0
     assert 'Deleted the local snapshot' in capsys.readouterr().out
@@ -187,7 +198,7 @@ def test_history_delete_preserves_unrelated_pending_candidate(
     unrelated = replace(candidate, commit='d' * 40, state=_candidate.STATE_UNKNOWN_OUTCOME)
     _candidate.save_candidate(paths, project.name, unrelated)
     assert _cli.main(['delete', entry.commit, '--project', project.name, '--yes']) == 0
-    assert _candidate.load_candidate(paths, project.name) == unrelated
+    assert _records.load_candidate(paths, project.name) == unrelated
 
 
 @pytest.mark.slow
@@ -202,7 +213,7 @@ def test_history_delete_preserves_user_managed_source_worktree(
     bookmark = _source.describe_bookmark(source, project.name, candidate.commit)
     _source.ensure_bookmark(bookmark, candidate.pinned.commit)
     record_publication(paths, project, replace(candidate, source_bookmark=bookmark))
-    _candidate.record_path(paths, project.name).unlink()
+    _records.candidate_path(paths, project.name).unlink()
     worktree = tmp_path / 'user managed source'
     subprocess.run(
         ['git', '-C', source, 'checkout', '--detach', candidate.pinned.commit],
@@ -240,7 +251,7 @@ def test_history_delete_rechecks_refs_after_confirmation(
     bookmark = _source.describe_bookmark(source, project.name, candidate.commit)
     _source.ensure_bookmark(bookmark, candidate.pinned.commit)
     record_publication(paths, project, replace(candidate, source_bookmark=bookmark))
-    _candidate.record_path(paths, project.name).unlink()
+    _records.candidate_path(paths, project.name).unlink()
     subprocess.run(
         ['git', '-C', source, 'commit', '--allow-empty', '-qm', 'later source'],
         check=True,
@@ -274,8 +285,8 @@ def test_history_delete_retries_recordless_archive_after_tombstone(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, project, candidate = prepare(tmp_path, source, monkeypatch)
-    _candidate.discard(paths, project.name, force=False)
-    store = _candidate.candidate_store_path(paths, project.name)
+    _discard.discard(paths, project.name, force=False)
+    store = _store.candidate_store_path(paths, project.name)
     archive = _records.publication_ref(candidate.commit)
     subprocess.run(
         ['git', '-C', store, 'update-ref', archive, candidate.commit], check=True, env=git_env()
@@ -313,7 +324,7 @@ def test_history_empty_does_not_create_store(
     assert capsys.readouterr().out == (
         'No recorded snapshot history.\n\nNext: pubanon prepare --project=demo\n'
     )
-    assert not _candidate.candidate_store_path(paths, project.name).exists()
+    assert not _store.candidate_store_path(paths, project.name).exists()
 
 
 @pytest.mark.slow
@@ -326,12 +337,13 @@ def test_history_missing_objects_retains_known_record(
     source = make_repo(files={'README.md': 'public\n'})
     paths, project, candidate = prepare(tmp_path, source, monkeypatch)
     record_publication(paths, project, candidate)
-    remove_tree(_candidate.candidate_store_path(paths, project.name))
+    remove_tree(_store.candidate_store_path(paths, project.name))
     capsys.readouterr()
 
     assert _cli.main(['show', candidate.commit, '--project', project.name, '--verbose']) == 0
     output = re.sub(r': +', ': ', capsys.readouterr().out)
     assert f'Snapshot commit: {candidate.commit}\n' in output
+    assert 'Published snapshot' in output
     assert f'Original source: {candidate.pinned.commit}\n' in output
     assert (
         'Change summary and published inspection unavailable: local Git objects are missing'
@@ -366,7 +378,7 @@ def test_history_renders_replaced_derived_source_input_and_recorded_visibility(
             ),
         ),
     )
-    store = _candidate.candidate_store_path(paths, project.name)
+    store = _store.candidate_store_path(paths, project.name)
     replacement = (
         subprocess.run(
             ['git', '-C', store, 'commit-tree', candidate.tree, '-m', 'Current publication'],
@@ -409,7 +421,7 @@ def test_history_reports_deletion_receipt_scan_failure(
     source = make_repo(files={'README.md': 'public\n'})
     paths, project, candidate = prepare(tmp_path, source, monkeypatch)
     record_published_main(paths, project, candidate)
-    _candidate.discard(paths, project.name, force=False)
+    _discard.discard(paths, project.name, force=False)
     _records.mark_publication_deleted(paths, project.name, candidate.commit)
     directory = _records.publication_path(paths, project.name, candidate.commit).parent
     real_scandir = os.scandir
@@ -469,7 +481,7 @@ def test_history_summary_uses_selected_parent_and_bounds_file_listing(
     source = make_repo(files={'README.md': 'public\n'})
     paths, project, candidate = prepare(tmp_path, source, monkeypatch)
     record_published_main(paths, project, candidate)
-    _candidate.record_path(paths, project.name).unlink()
+    _records.candidate_path(paths, project.name).unlink()
     for index in range(25):
         (source / f'file-{index:02}.txt').write_text('added\n')
     subprocess.run(['git', '-C', source, 'add', '.'], check=True, env=git_env())
@@ -477,7 +489,7 @@ def test_history_summary_uses_selected_parent_and_bounds_file_listing(
     assert (
         _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths', '--yes']) == 0
     )
-    selected = _candidate.load_candidate(paths, project.name)
+    selected = _records.load_candidate(paths, project.name)
     assert selected is not None
     record_published_main(paths, project, selected)
     capsys.readouterr()
@@ -505,7 +517,7 @@ def test_show_prepared_snapshot_by_explicit_selector(
     assert 'Prepared snapshot' in shown
     assert candidate.commit in shown
     assert _cli.main(['inspect', '--project', project.name]) == 0
-    assert _candidate.inspection_paths(paths, project.name)
+    assert _inspection.inspection_paths(paths, project.name)
 
 
 @pytest.mark.slow
@@ -533,7 +545,7 @@ def test_verbose_history_finds_latest_source_contents_after_rewrite(
     _config.save_project(paths, project)
     published = record_publication(paths, project, candidate)
     record_published_main(paths, project, candidate)
-    _candidate.record_path(paths, project.name).unlink()
+    _records.candidate_path(paths, project.name).unlink()
     if source_tags:
         subprocess.run(
             ['git', '-C', source, 'tag', 'pubanon/v1.2.3', candidate.pinned.commit],
@@ -611,7 +623,7 @@ def test_verbose_history_reports_zero_matches_without_losing_original(
     _config.save_project(paths, project)
     published = record_publication(paths, project, candidate)
     record_published_main(paths, project, candidate)
-    _candidate.record_path(paths, project.name).unlink()
+    _records.candidate_path(paths, project.name).unlink()
     (source / 'README.md').write_text('different\n')
     subprocess.run(['git', '-C', source, 'add', 'README.md'], check=True, env=git_env())
     subprocess.run(
@@ -653,7 +665,7 @@ def test_history_delete_confirms_exact_local_cleanup(
     candidate = replace(candidate, source_bookmark=bookmark)
     record_publication(paths, project, candidate)
     record_published_main(paths, project, candidate)
-    _candidate.record_path(paths, project.name).unlink()
+    _records.candidate_path(paths, project.name).unlink()
     if choice != 'yes':
         answers(
             [
@@ -701,7 +713,7 @@ def test_history_displays_incomplete_replacement_without_a_publishable_tip(
     def _load_candidate(_paths: _config.Paths, _project: str) -> _candidate.CandidateRecord:
         return incomplete
 
-    monkeypatch.setattr(_candidate, 'load_candidate', _load_candidate)
+    monkeypatch.setattr(_records, 'load_candidate', _load_candidate)
     capsys.readouterr()
     argv = ['list', '--project', project.name]
     if verbose:
@@ -744,7 +756,7 @@ def test_history_empty_keeps_candidate_recovery_priority(
         line.split() for line in rendered.splitlines()
     ]
     if unknown:
-        assert 'Pubanon could not confirm whether publication completed.' in rendered
+        assert 'pubanon could not confirm whether publication completed.' in rendered
     assert rendered.rstrip().endswith(f'Next: {expected}')
 
 
@@ -766,7 +778,7 @@ def test_history_lists_and_shows_local_publication(
             [
                 'git',
                 '-C',
-                _candidate.candidate_store_path(paths, project.name),
+                _store.candidate_store_path(paths, project.name),
                 'update-ref',
                 f'refs/tags/v{version}',
                 candidate.commit,
@@ -780,7 +792,7 @@ def test_history_lists_and_shows_local_publication(
         candidate = replace(candidate, source_bookmark=bookmark)
         _candidate.save_candidate(paths, project.name, candidate)
         record_publication(paths, project, candidate)
-    _candidate.record_path(paths, project.name).unlink()
+    _records.candidate_path(paths, project.name).unlink()
     monkeypatch.chdir(tmp_path)
 
     def _unexpected_host(*_args: object, **_kwargs: object) -> Never:
@@ -863,7 +875,7 @@ def test_history_lists_correction_and_rebuilt_snapshots_with_their_own_versions(
     def _load_candidate(_paths: _config.Paths, _project: str) -> _candidate.CandidateRecord:
         return replacement
 
-    monkeypatch.setattr(_candidate, 'load_candidate', _load_candidate)
+    monkeypatch.setattr(_records, 'load_candidate', _load_candidate)
     capsys.readouterr()
     assert _cli.main(['list', '--project', project.name]) == 0
     rendered = re.sub(r': +', ': ', capsys.readouterr().out)
@@ -906,10 +918,10 @@ def test_history_reports_unprotected_or_missing_original_source(
     assert _cli.main(['show', candidate.commit, '--project', project.name, '--verbose']) == 0
     output = re.sub(r': +', ': ', capsys.readouterr().out)
     if missing_source:
-        assert f'Recorded source repository: {escape(str(source))}\n' in output
+        assert f'Recorded source repository: {escape((source).as_posix())}\n' in output
         assert 'Source unavailable:' in output
     else:
-        assert f'Source: available at {escape(str(source))}\n' in output
+        assert f'Source: available at {escape((source).as_posix())}\n' in output
         assert 'View source: git ' in output
         assert 'Remove source worktree: git ' in output
 

@@ -14,7 +14,15 @@ from pubanon._cli import _arguments
 from pubanon._config import Paths, ProjectConfig
 from pubanon._errors import OperationCanceled, PubanonError
 from pubanon._run import GitResult
-from pubanon._snapshots import _candidate, _history, _records, _rewrite, _source
+from pubanon._snapshots import (
+    _candidate,
+    _history,
+    _inspection,
+    _records,
+    _rewrite,
+    _source,
+    _store,
+)
 from pubanon._snapshots._source import (
     Entry,
     PinnedSource,
@@ -80,7 +88,7 @@ def _derived_entry(
         if record.derivation
         else None
     )
-    commit = _commit(_candidate.candidate_store_path(paths, project.name), record.tree, when=when)
+    commit = _commit(_store.candidate_store_path(paths, project.name), record.tree, when=when)
     bookmark = None
     if source_commit is not None and record.source_bookmark is not None:
         bookmark = _source.describe_bookmark(project.source_path, project.name, commit)
@@ -94,7 +102,7 @@ def _derived_entry(
     )
     _records.save_publication(paths, project.name, derived)
     _git(
-        _candidate.candidate_store_path(paths, project.name),
+        _store.candidate_store_path(paths, project.name),
         'update-ref',
         _records.publication_ref(commit),
         commit,
@@ -149,9 +157,16 @@ def _record(commit: str, tree: str, *, tag: str, confirmed: int) -> _records.Pub
     )
 
 
+def _literal_publication(tmp_path: Path) -> tuple[Paths, _history.PublicationEntry]:
+    paths = _paths(tmp_path)
+    commit = 'a' * 40
+    record = _record(commit, 'b' * 40, tag='v1.0.0', confirmed=1_700_000_100)
+    return paths, _history.PublicationEntry(commit, ('v1.0.0',), None, record)
+
+
 def _published_file(tmp_path: Path) -> tuple[Paths, _history.PublicationEntry]:
     paths = _paths(tmp_path)
-    store = _candidate.store_path(paths, 'example')
+    store = _store.store_path(paths, 'example')
     blob = _git(store, 'hash-object', '-w', '--stdin', input_bytes=b'published\n')
     tree = _git(store, 'mktree', input_bytes=f'100644 blob {blob}\tREADME.md\n'.encode())
     commit = _commit(store, tree, when=1_700_000_000)
@@ -178,7 +193,7 @@ def _delete_entry(
     )
     _records.save_publication(paths, project.name, record)
     _git(
-        _candidate.candidate_store_path(paths, project.name),
+        _store.candidate_store_path(paths, project.name),
         'update-ref',
         _records.publication_ref(entry.commit),
         entry.commit,
@@ -191,7 +206,7 @@ def test_archive_roots_reads_owned_refs_with_one_git_query(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, count: int
 ) -> None:
     paths = _paths(tmp_path)
-    store = _candidate.store_path(paths, 'example')
+    store = _store.store_path(paths, 'example')
     tree = _git(store, 'mktree', input_bytes=b'')
     commits = {_commit(store, tree, when=1_700_000_000 + offset) for offset in range(count)}
     for commit in commits:
@@ -214,7 +229,7 @@ def test_archive_roots_reads_owned_refs_with_one_git_query(
 @pytest.mark.parametrize('changed', ['symbolic', 'wrong-target', 'malformed'])
 def test_archive_roots_refuses_conflicting_refs(tmp_path: Path, changed: str) -> None:
     paths = _paths(tmp_path)
-    store = _candidate.store_path(paths, 'example')
+    store = _store.store_path(paths, 'example')
     tree = _git(store, 'mktree', input_bytes=b'')
     first = _commit(store, tree, when=1_700_000_000)
     second = _commit(store, tree, when=1_700_000_001)
@@ -245,7 +260,7 @@ def test_delete_retry_selects_exact_project_in_both_cleanup_paths(
     recordless: bool,
     name: str,
 ) -> None:
-    paths, original = _published_file(tmp_path)
+    paths, original = _literal_publication(tmp_path)
     entry = replace(original, record=None) if recordless else original
     project = replace(_guidance_project(tmp_path), name=name)
     if not recordless:
@@ -261,7 +276,7 @@ def test_delete_retry_selects_exact_project_in_both_cleanup_paths(
     def _fail_cleanup(*_args: object, **_kwargs: object) -> bool:
         raise OSError('injected cleanup failure')
 
-    monkeypatch.setattr(_candidate, 'clean_inspect', _fail_cleanup)
+    monkeypatch.setattr(_inspection, 'clean_inspect', _fail_cleanup)
     with pytest.raises(PubanonError, match='cleanup is incomplete') as error:
         _history.delete_publication(paths, project, entry)
     assert error.value.recovery is not None
@@ -273,7 +288,7 @@ def test_delete_retry_selects_exact_project_in_both_cleanup_paths(
 def test_deleting_archive_tip_keeps_other_listed_snapshots(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     project = _guidance_project(tmp_path)
-    store = _candidate.store_path(paths, project.name)
+    store = _store.store_path(paths, project.name)
     tree = _git(store, 'mktree', input_bytes=b'')
     old = _commit(store, tree, when=1_700_000_000)
     tip = _commit(store, tree, parent=old, when=1_700_000_001)
@@ -299,7 +314,7 @@ def test_derived_delete_refuses_conflicting_owned_refs(
     derived = _derived_entry(paths, project, original, 1_700_000_001)
     assert derived.record is not None
     assert derived.record.source_bookmark is not None
-    store = _candidate.candidate_store_path(paths, project.name)
+    store = _store.candidate_store_path(paths, project.name)
     if changed == 'symbolic-source':
         _git(source, 'symbolic-ref', derived.record.source_bookmark.refname, 'refs/heads/main')
     elif changed == 'symbolic-archive':
@@ -394,7 +409,7 @@ def test_derived_source_cleanup_uses_input_commit_and_keeps_worktree(
 def test_derived_source_guidance_keeps_input_provenance_without_locator(
     tmp_path: Path, known_source: bool
 ) -> None:
-    paths, entry = _published_file(tmp_path)
+    paths, entry = _literal_publication(tmp_path)
     assert entry.record is not None
     source_commit = 'c' * 40 if known_source else None
     derivation = _records.Derivation('d' * 40, source_commit, 'e' * 40, ())
@@ -418,28 +433,22 @@ def test_derived_source_guidance_keeps_input_provenance_without_locator(
 
 def test_history_ambiguous_commit_prefix_names_alternatives(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
-    store = _candidate.store_path(paths, 'example')
-    tree = _git(store, 'mktree', input_bytes=b'')
-    first = _commit(store, tree, when=1_700_000_000)
-    second = next(
-        oid
-        for when in range(1_700_000_001, 1_700_001_000)
-        if (oid := _commit(store, tree, when=when)).startswith(first[0])
-    )
-    _git(store, 'update-ref', 'refs/heads/main', first)
-    _records.save_publication(
-        paths, 'example', _record(second, tree, tag='v2.0.0', confirmed=1_700_000_200)
+    first = 'a' * 40
+    second = 'a' + 'b' * 39
+    entries = (
+        _history.PublicationEntry(first, ('v1.0.0',), None, None),
+        _history.PublicationEntry(second, ('v2.0.0',), None, None),
     )
 
     with pytest.raises(PubanonError, match='ambiguous') as error:
-        _history.select_publication(paths, 'example', first[0])
+        _history.select_publication(paths, 'example', first[0], entries=entries)
     assert first[:12] in error.value.render()
     assert second[:12] in error.value.render()
 
 
 def test_history_combines_records_and_recorded_refs(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
-    store = _candidate.store_path(paths, 'example')
+    store = _store.store_path(paths, 'example')
     tree = _git(store, 'mktree', input_bytes=b'')
     old = _commit(store, tree, when=1_700_000_200)
     current = _commit(store, tree, parent=old, when=1_700_000_100)
@@ -482,7 +491,7 @@ def test_history_delete_accepts_absent_archive_and_verified_relocation(
     source.rename(moved)
     project = replace(project, source_path=moved)
     _git(
-        _candidate.candidate_store_path(paths, project.name),
+        _store.candidate_store_path(paths, project.name),
         'update-ref',
         '-d',
         _records.publication_ref(entry.commit),
@@ -500,7 +509,7 @@ def test_history_delete_derives_future_inputs_before_rewrite_record_exists(tmp_p
     assert original.record is not None
     assert original.record.pinned is not None
     assert original.record.source_bookmark is not None
-    store = _candidate.candidate_store_path(paths, 'example')
+    store = _store.candidate_store_path(paths, 'example')
     middle = _commit(store, original.record.tree, parent=original.commit, when=1_700_000_001)
     tip = _commit(store, original.record.tree, parent=middle, when=1_700_000_002)
     record = replace(
@@ -550,7 +559,7 @@ def test_history_delete_handles_source_states(
         source.rename(tmp_path / 'unregistered-move')
         with pytest.raises(PubanonError, match='unavailable') as error:
             _history.delete_publication(paths, project, entry)
-        assert escape(str(source / '.git')) in error.value.render()
+        assert escape((source / '.git').as_posix()) in error.value.render()
         assert _records.load_publication(paths, project.name, entry.commit) == entry.record
         assert _candidate.publication_archive(paths, project.name, entry.commit)
         return
@@ -619,7 +628,7 @@ def test_history_delete_preflights_changed_refs(
     assert entry.record is not None
     assert entry.record.pinned is not None
     assert entry.record.source_bookmark is not None
-    repo = source if changed == 'source' else _candidate.candidate_store_path(paths, project.name)
+    repo = source if changed == 'source' else _store.candidate_store_path(paths, project.name)
     tree = _git(repo, 'rev-parse', 'HEAD^{tree}') if changed == 'source' else entry.record.tree
     other = _commit(repo, tree, when=1_700_001_000)
     ref = (
@@ -725,7 +734,7 @@ def test_history_delete_preserves_untagged_ancestor_during_replace_all(
     _records.publication_path(paths, project.name, entry.commit).unlink()
     _records.save_publication(paths, project.name, record)
     entry = replace(entry, tags=(), record=record)
-    store = _candidate.candidate_store_path(paths, project.name)
+    store = _store.candidate_store_path(paths, project.name)
     old_tip = _commit(store, record.tree, parent=entry.commit, when=1_700_000_001)
     correction = _commit(store, record.tree, when=1_700_000_002)
     _git(store, 'update-ref', 'refs/heads/main', old_tip)
@@ -797,7 +806,7 @@ def test_history_delete_releases_only_owned_preservation(
     assert entry.record is not None
     assert entry.record.pinned is not None
     assert entry.record.source_bookmark is not None
-    store = _candidate.candidate_store_path(paths, project.name)
+    store = _store.candidate_store_path(paths, project.name)
     if operational:
         _git(store, 'update-ref', 'refs/heads/main', entry.commit)
         _git(store, 'update-ref', 'refs/tags/v1.0.0', entry.commit)
@@ -900,7 +909,7 @@ def test_history_delete_retries_failed_deletion_record(
 ) -> None:
     source = make_repo(files={'README.md': 'private source\n'})
     paths, project, entry = _delete_entry(tmp_path, source)
-    store = _candidate.candidate_store_path(paths, project.name)
+    store = _store.candidate_store_path(paths, project.name)
     _git(store, 'update-ref', 'refs/heads/main', entry.commit)
 
     def _fail_marker(_paths: Paths, _project: str, _commit: str) -> None:
@@ -996,7 +1005,7 @@ def test_history_derived_recovery_survives_independent_delete_and_repeat_replace
 
 def test_history_lists_archived_recordless_chain_but_not_rewrite_refs(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
-    store = _candidate.store_path(paths, 'example')
+    store = _store.store_path(paths, 'example')
     tree = _git(store, 'mktree', input_bytes=b'')
     old = _commit(store, tree, when=1_700_000_000)
     tip = _commit(store, tree, parent=old, when=1_700_000_001)
@@ -1026,7 +1035,7 @@ def test_history_lists_archived_recordless_chain_but_not_rewrite_refs(tmp_path: 
 
 def test_history_operational_tag_wins_over_unrelated_saved_labels(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
-    store = _candidate.store_path(paths, 'example')
+    store = _store.store_path(paths, 'example')
     tree = _git(store, 'mktree', input_bytes=b'')
     old = _commit(store, tree, when=1_700_000_000)
     new = _commit(store, tree, when=1_700_000_100)
@@ -1048,6 +1057,16 @@ def test_history_operational_tag_wins_over_unrelated_saved_labels(tmp_path: Path
         _history.select_publication(paths, 'example', 'v1.0.0')
 
 
+def test_history_record_without_local_main_is_not_replaced(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    record = _record('a' * 40, 'b' * 40, tag='v1.0.0', confirmed=1_700_000_000)
+    _records.save_publication(paths, 'example', record)
+
+    (entry,) = _history.publications(paths, 'example')
+
+    assert not entry.replaced
+
+
 def test_history_record_without_store_does_not_create_one(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     record = _record('a' * 40, 'b' * 40, tag='v1.0.0', confirmed=1_700_000_000)
@@ -1057,7 +1076,7 @@ def test_history_record_without_store_does_not_create_one(tmp_path: Path) -> Non
 
     assert entry.record == record
     assert entry.commit_time is None
-    assert not _candidate.candidate_store_path(paths, 'example').exists()
+    assert not _store.candidate_store_path(paths, 'example').exists()
 
 
 @pytest.mark.slow
@@ -1073,7 +1092,7 @@ def test_history_records_repeated_replay_as_input_chain(tmp_path: Path) -> None:
         ),
     )
     _history.record_publication(paths, project, first)
-    store = _candidate.candidate_store_path(paths, project.name)
+    store = _store.candidate_store_path(paths, project.name)
     tip, tags = _records.candidate_poststate(first)
     _git(store, 'update-ref', 'refs/heads/main', tip)
     for tag, commit in tags.items():
@@ -1086,7 +1105,7 @@ def test_history_records_repeated_replay_as_input_chain(tmp_path: Path) -> None:
         entry._replace(data=b'corrected again\n') if entry.path == 'base.txt' else entry
         for entry in source
     )
-    second = _candidate.build_candidate(
+    _candidate.build_candidate(
         paths,
         g,
         project,
@@ -1138,7 +1157,7 @@ def test_history_records_replay_release_intent_and_preserves_tags(
     tmp_path: Path, descendant: int, tags: tuple[str, ...], intent: str | None
 ) -> None:
     paths, g, project, old = _rewrite_history(tmp_path)
-    store = _candidate.candidate_store_path(paths, project.name)
+    store = _store.candidate_store_path(paths, project.name)
     _git(store, 'update-ref', '-d', f'refs/tags/v1.0.{descendant}')
     for tag in tags:
         _git(store, 'update-ref', f'refs/tags/{tag}', old[descendant])
@@ -1192,7 +1211,7 @@ def test_history_records_replay_release_intent_and_preserves_tags(
 
 def test_history_replacement_chain_selects_current_tag(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
-    store = _candidate.store_path(paths, 'example')
+    store = _store.store_path(paths, 'example')
     tree = _git(store, 'mktree', input_bytes=b'')
     commits = [_commit(store, tree, when=1_700_000_000 + i) for i in range(3)]
     _git(store, 'update-ref', 'refs/tags/v1.0.0', commits[-1])
@@ -1215,7 +1234,7 @@ def test_history_replacement_chain_selects_current_tag(tmp_path: Path) -> None:
 
 def test_history_replacement_selects_current_tag_and_retains_old_record(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
-    store = _candidate.store_path(paths, 'example')
+    store = _store.store_path(paths, 'example')
     tree = _git(store, 'mktree', input_bytes=b'')
     old = _commit(store, tree, when=1_700_000_000)
     new = _commit(store, tree, when=1_700_000_100)
@@ -1249,7 +1268,7 @@ def test_history_replacement_selects_current_tag_and_retains_old_record(tmp_path
 
 def test_history_resolves_only_publication_selectors(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
-    store = _candidate.store_path(paths, 'example')
+    store = _store.store_path(paths, 'example')
     tree = _git(store, 'mktree', input_bytes=b'')
     old = _commit(store, tree, when=1_700_000_000)
     current = _commit(store, tree, parent=old, when=1_700_000_100)
@@ -1278,7 +1297,7 @@ def test_history_resolves_only_publication_selectors(tmp_path: Path) -> None:
 
 def test_history_retains_archives_after_store_repair(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
-    store = _candidate.store_path(paths, 'example')
+    store = _store.store_path(paths, 'example')
     tree = _git(store, 'mktree', input_bytes=b'')
     archived = _commit(store, tree, when=1_700_000_000)
     current = _commit(store, tree, when=1_700_000_100)
@@ -1332,7 +1351,7 @@ def test_inspect_publication_refuses_missing_or_conflicting_objects_before_refre
         with pytest.raises(PubanonError):
             _history.inspect_publication(paths, 'example', bad, refresh=True)
         assert (copy / 'README.md').read_bytes() == b'keep edits\n'
-    _git(_candidate.candidate_store_path(paths, 'example'), 'prune', '--expire=now')
+    _git(_store.candidate_store_path(paths, 'example'), 'prune', '--expire=now')
     with pytest.raises(PubanonError) as error:
         _history.inspect_publication(paths, 'example', entry, refresh=True)
     assert 'pubanon repo restore --to local' in error.value.render()
@@ -1369,7 +1388,7 @@ def test_recordless_delete_retains_archive_when_tombstone_directory_is_a_file(
     paths, published = _published_file(tmp_path)
     project = _guidance_project(tmp_path)
     entry = replace(published, record=None)
-    store = _candidate.candidate_store_path(paths, project.name)
+    store = _store.candidate_store_path(paths, project.name)
     archive = _records.publication_ref(entry.commit)
     _git(store, 'update-ref', archive, entry.commit)
     directory = _records.publication_path(paths, project.name, entry.commit).parent
@@ -1405,14 +1424,14 @@ def test_recordless_delete_retries_without_releasing_other_publications(
     assert original.record.pinned is not None
     _records.publication_path(paths, project.name, original.commit).unlink()
     entry = replace(original, record=None)
-    store = _candidate.candidate_store_path(paths, project.name)
+    store = _store.candidate_store_path(paths, project.name)
 
     def _fail_cleanup(*_args: object, **_kwargs: object) -> None:
         raise OSError('injected cleanup failure')
 
     with monkeypatch.context() as fault:
         if boundary == 'inspection':
-            fault.setattr(_candidate, 'clean_inspect', _fail_cleanup)
+            fault.setattr(_inspection, 'clean_inspect', _fail_cleanup)
         elif boundary == 'tombstone':
             fault.setattr(_filesystem, 'sync_directory', _fail_cleanup)
         else:
@@ -1440,7 +1459,7 @@ def test_recordless_delete_retries_without_releasing_other_publications(
 def test_source_guidance_distinguishes_recordless_entry_and_forwards_relocation(
     tmp_path: Path,
 ) -> None:
-    paths, entry = _published_file(tmp_path)
+    paths, entry = _literal_publication(tmp_path)
     project = _guidance_project(tmp_path)
     assert (
         'not recorded' in _history.source_guidance(paths, project, replace(entry, record=None))[0]
@@ -1464,7 +1483,7 @@ def test_source_guidance_distinguishes_recordless_entry_and_forwards_relocation(
 def test_source_guidance_handles_existing_worktree_and_unprotected_source(
     tmp_path: Path, state: str
 ) -> None:
-    paths, entry = _published_file(tmp_path)
+    paths, entry = _literal_publication(tmp_path)
     assert entry.record is not None
     assert entry.record.pinned is not None
     source_commit = entry.record.pinned.commit
@@ -1506,7 +1525,7 @@ def test_source_guidance_handles_existing_worktree_and_unprotected_source(
 def test_source_guidance_omits_unsafe_command_and_handles_unavailable_source(
     tmp_path: Path,
 ) -> None:
-    paths, entry = _published_file(tmp_path)
+    paths, entry = _literal_publication(tmp_path)
     assert entry.record is not None
     assert entry.record.pinned is not None
     bookmark = SourceBookmark(
@@ -1538,7 +1557,7 @@ def test_source_guidance_omits_unsafe_command_and_handles_unavailable_source(
 
 @pytest.mark.parametrize('name', ['source', 'source space', "source'quote", 'repo/.git'])
 def test_source_guidance_quotes_exact_commands(tmp_path: Path, name: str) -> None:
-    paths, entry = _published_file(tmp_path)
+    paths, entry = _literal_publication(tmp_path)
     source = tmp_path / name
     source.mkdir(parents=True)
     assert entry.record is not None
@@ -1571,7 +1590,7 @@ def test_source_guidance_quotes_exact_commands(tmp_path: Path, name: str) -> Non
 
 
 def test_source_guidance_refuses_symlinked_worktree_parent(tmp_path: Path) -> None:
-    paths, entry = _published_file(tmp_path)
+    paths, entry = _literal_publication(tmp_path)
     assert entry.record is not None
     source = tmp_path / 'source'
     source.mkdir()

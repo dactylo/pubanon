@@ -1,4 +1,4 @@
-"""Provide the Pubanon command-line entry point."""
+"""Provide the pubanon command-line entry point."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ from pubanon._cli import (
 )
 from pubanon._cli import _history as cli_history
 from pubanon._cli import _remote as cli_remote
+from pubanon._cli._downstream import closable_stdout
 from pubanon._errors import OperationCanceled, PubanonError
 from pubanon._terminal import (
     color_context,
@@ -80,10 +81,7 @@ def _dispatch(args: argparse.Namespace) -> None:
         _setup.doctor()
 
     def _dispatch_setup(args: argparse.Namespace) -> None:
-        if args.edit:
-            _setup.setup(edit=True)
-        else:
-            _setup.setup()
+        _setup.setup(edit=args.edit)
 
     handlers: dict[str, Callable[[argparse.Namespace], None]] = {
         'audit': _audit.command_audit,
@@ -137,11 +135,6 @@ def _print_installed_version() -> None:
     print(f'pubanon {installed_version}')
 
 
-def _report_error(error: PubanonError) -> None:
-    """Report a refusal with its diagnostic values."""
-    print(diagnostic(error, stream=sys.stderr), file=sys.stderr)
-
-
 def _main(argv: Sequence[str] | None = None) -> int:
     """Parse and dispatch one command, translating failures to process exit statuses."""
     with ExitStack() as contexts:
@@ -155,24 +148,18 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 _print_installed_version()
             else:
                 _arguments.validate_options(parser, args)
-                try:
-                    selected = getattr(args, 'project', None)
-                    implicit = _implicit_guidance_project(args)
-                    with guidance_context(
-                        project=selected,
-                        implicit_project=implicit if selected in {None, implicit} else None,
-                    ):
-                        try:
-                            _dispatch(args)
-                        except PubanonError as error:
-                            if error.recovery is not None:
-                                error.recovery = guidance(error.recovery)
-                            raise
-                except OperationCanceled:
-                    raise
-                except PubanonError as error:
-                    _report_error(error)
-                    return 1
+                selected = getattr(args, 'project', None)
+                implicit = _implicit_guidance_project(args)
+                with guidance_context(
+                    project=selected,
+                    implicit_project=implicit if selected in {None, implicit} else None,
+                ):
+                    try:
+                        _dispatch(args)
+                    except PubanonError as error:
+                        if error.recovery is not None:
+                            error.recovery = guidance(error.recovery)
+                        raise
         except SystemExit as exc:
             return exc.code if isinstance(exc.code, int) else 2
         except OperationCanceled as error:
@@ -188,8 +175,18 @@ def _main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
+def _report_error(error: PubanonError) -> None:
+    """Report a refusal with its diagnostic values."""
+    print(diagnostic(error, stream=sys.stderr), file=sys.stderr)
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     """Run one command with consistent color policy, including help and errors.
+
+    If a reader closes standard output early, the remaining output is discarded
+    and the exit status reflects the work completed before the closure.
+    Without a standard output stream at all, the command is refused before any
+    other work.
 
     Args:
         argv: Arguments excluding the executable, or None for process
@@ -199,6 +196,13 @@ def main(argv: Iterable[str] | None = None) -> int:
         Zero for success, one for refusal, two for usage errors, or 130 for
         interruption.
     """
+    if sys.stdout is None:
+        # Started with standard output closed: nothing can be delivered, and
+        # the closed-stdout wrapper cannot wrap a missing stream.
+        _report_error(PubanonError('standard output is unavailable'))
+        return 1
     arguments = list(sys.argv[1:] if argv is None else argv)
-    with output_encoding_context():
+    # Restoring the error policy flushes the real stream, so the wrapper must
+    # first silence a closed descriptor: keep it inside the encoding context.
+    with output_encoding_context(), closable_stdout():
         return _main(arguments)

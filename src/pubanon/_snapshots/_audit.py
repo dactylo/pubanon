@@ -9,7 +9,7 @@ from typing import NamedTuple
 
 from pubanon._config import GlobalConfig, Paths, ProjectConfig, rule_labels
 from pubanon._errors import PubanonError
-from pubanon._gate import GateHit, RuleClass, first_match, gate_unit
+from pubanon._gate import GateHit, RuleClass, first_match, gate_unit, match_excerpt
 from pubanon._run import OID_HEX, git_failure_fact, run_git
 from pubanon._snapshots._source import (
     Entry,
@@ -44,6 +44,19 @@ class AuditFinding(NamedTuple):
     unit: str
     rule_class: RuleClass
     term: str
+
+
+class HistoryDetail(NamedTuple):
+    """Retain a finding category and unescaped operator-facing description.
+
+    Attributes:
+        rule_class: Rule category used for filtering and display labels.
+        description: Literal terms, paths, and witness context; escape for
+            display.
+    """
+
+    rule_class: RuleClass
+    description: str
 
 
 class HistoryEvidence(NamedTuple):
@@ -122,18 +135,6 @@ class _ParsedCommit(NamedTuple):
     problems: tuple[str, ...]
 
 
-def _excerpt_span(data: bytes, start: int, end: int) -> tuple[int, int] | None:
-    """Map exact matched bytes to display characters without splitting UTF-8."""
-    if end > len(data):
-        return None
-    try:
-        matched = data[start:end].decode('utf-8')
-    except UnicodeDecodeError:
-        return None
-    prefix = len(data[:start].decode('utf-8', errors='replace'))
-    return prefix, prefix + len(matched)
-
-
 def _logical_commit_fields(
     oid: str,
     headers: bytes,
@@ -170,21 +171,7 @@ def _match_context(
         data.decode('utf-8')
     except UnicodeDecodeError:
         return f'{label} bytes {start}:{end}', None, None
-    line_start = data.rfind(b'\n', 0, start) + 1
-    line_end = data.find(b'\n', end)
-    if line_end < 0:
-        line_end = len(data)
-    left = max(line_start, start - 60)
-    right = min(line_end, end + 60)
-    raw_excerpt = data[left:right].rstrip(b'\r')
-    excerpt = raw_excerpt.decode('utf-8', errors='replace')
-    span = _excerpt_span(raw_excerpt, start - left, end - left)
-    if left > line_start:
-        excerpt = '...' + excerpt
-        if span is not None:
-            span = span[0] + 3, span[1] + 3
-    if right < line_end:
-        excerpt += '...'
+    excerpt, span = match_excerpt(data, start, end)
     line = data[:start].count(b'\n') + 1
     if label == 'blob':
         label = f'{unit.removeprefix("path:")}:{line}'
@@ -407,12 +394,12 @@ def _parse_diff(
     return tuple(parsed)
 
 
-def _parse_object_response(
+def _parse_object_header(
     output: bytes,
     offset: int,
     query: bytes,
-) -> tuple[tuple[bytes, bytes] | None, int]:
-    """Parse one exact `cat-file --batch` response."""
+) -> tuple[tuple[bytes, int] | None, int]:
+    """Parse the shared header grammar for body and metadata batch responses."""
     header_end = output.find(b'\n', offset)
     if header_end < 0:
         raise PubanonError('Git returned an unterminated published object header')
@@ -429,8 +416,43 @@ def _parse_object_response(
         raise PubanonError('Git returned an unsupported published object type')
     if re.fullmatch(rb'0|[1-9][0-9]*', raw_size) is None:
         raise PubanonError('Git returned a malformed published object size')
-    size = int(raw_size)
-    data_start = header_end + 1
+    return (object_type, int(raw_size)), header_end + 1
+
+
+def _check_blob_objects(store: Path, queries: Sequence[bytes]) -> dict[bytes, tuple[bytes, bytes]]:
+    """Validate ordinary blobs without bodies, returning empty identity-only payloads."""
+    if not queries:
+        return {}
+    result = run_git(
+        ['--git-dir', str(store.absolute()), 'cat-file', '--batch-check'],
+        cwd=store,
+        input_bytes=b''.join(query + b'\n' for query in queries),
+        check=False,
+    )
+    if result.returncode != 0:
+        raise PubanonError('published object read failed', fact=git_failure_fact(result))
+    objects: dict[bytes, tuple[bytes, bytes]] = {}
+    offset = 0
+    for query in queries:
+        header, offset = _parse_object_header(result.stdout, offset, query)
+        if header is None or header[0] != b'blob':
+            raise PubanonError('published blob object could not be read')
+        objects[query] = (b'blob', b'')
+    if offset != len(result.stdout):
+        raise PubanonError('Git returned trailing published object data')
+    return objects
+
+
+def _parse_object_response(
+    output: bytes,
+    offset: int,
+    query: bytes,
+) -> tuple[tuple[bytes, bytes] | None, int]:
+    """Parse one exact `cat-file --batch` response."""
+    header, data_start = _parse_object_header(output, offset, query)
+    if header is None:
+        return None, data_start
+    object_type, size = header
     data_end = data_start + size
     if data_end >= len(output) or output[data_end : data_end + 1] != b'\n':
         raise PubanonError('Git returned a truncated published object')
@@ -525,7 +547,7 @@ def _audit_commit_objects(
     objects: Mapping[bytes, tuple[bytes, bytes] | None],
     focused: frozenset[str],
     rules: Mapping[RuleClass, Collection[str]],
-    global_config: GlobalConfig,
+    identity: str,
 ) -> tuple[
     dict[AuditFinding, HistoryEvidence],
     dict[AuditFinding, HistoryEvidence],
@@ -535,10 +557,7 @@ def _audit_commit_objects(
     full_findings: dict[AuditFinding, HistoryEvidence] = {}
     focused_findings: dict[AuditFinding, HistoryEvidence] = {}
     parsed_by_commit: dict[str, _ParsedCommit] = {}
-    identity = (
-        re.escape(f'{global_config.anon_name} <{global_config.anon_email}>'.encode())
-        + rb' [0-9]+ \+0000'
-    )
+    identity_pattern = re.escape(identity.encode()) + rb' [0-9]+ \+0000'
     for oid in commits:
         object_value = objects.get(oid.encode('ascii'))
         if object_value is None or object_value[0] != b'commit':
@@ -550,7 +569,7 @@ def _audit_commit_objects(
         _add_findings(full_findings, unit, message, rules, (oid, 'message'))
         if oid in focused:
             _add_findings(focused_findings, unit, message, rules, (oid, 'message'))
-        parsed = _parse_commit_headers(oid, headers, identity)
+        parsed = _parse_commit_headers(oid, headers, identity_pattern)
         for field, value in parsed.header_values:
             unit = f'{oid[:12]}:header:{field}'
             _add_findings(full_findings, unit, value, rules, (oid, f'header {field} value'))
@@ -703,7 +722,7 @@ def history_details(
     derived: Collection[str],
     *,
     short_commits: bool = False,
-) -> dict[str, str]:
+) -> tuple[HistoryDetail, ...]:
     """Collect literal history evidence for operator review.
 
     Args:
@@ -714,25 +733,25 @@ def history_details(
         short_commits: Display 12-character commit IDs instead of full IDs.
 
     Returns:
-        One labeled detail per finding in established order. Values contain
+        One structured detail per finding in established order. Values contain
         terms and paths; callers escape these values for terminal display.
     """
     evidence = {item.finding: item for item in audit.evidence}
-    details: dict[str, str] = {}
-    for index, finding in enumerate(audit.findings, 1):
+    details: list[HistoryDetail] = []
+    for finding in audit.findings:
         item = evidence[finding]
         location = item.description
         if item.commit is not None:
             commit = item.commit[:12] if short_commits else item.commit
             location = f'commit {commit}; {location}'
-        label = (
-            'historical exposure'
-            if finding.rule_class is RuleClass.IDENTITY_CRITICAL
-            else 'policy mismatch'
-        )
         sources = ', '.join(rule_labels(GateHit(*finding), g, p, derived))
-        details[f'{label} {index}'] = f'{finding.unit}; {sources}; {location}; term {finding.term}'
-    return details
+        details.append(
+            HistoryDetail(
+                finding.rule_class,
+                f'{finding.unit}; {sources}; {location}; term {finding.term}',
+            )
+        )
+    return tuple(details)
 
 
 def published_commits(
@@ -745,7 +764,7 @@ def published_commits(
     """List published commits in one full or incremental history range.
 
     Args:
-        paths: Derived Pubanon paths.
+        paths: Derived pubanon paths.
         project: Registered project name.
 
         new: New published main tip.
@@ -813,7 +832,7 @@ def audit_history_pair(  # noqa: PLR0913, PLR0917
     focused_commits: Iterable[str],
     focused_tags: Mapping[str, str],
     rules: Mapping[RuleClass, Collection[str]],
-    global_config: GlobalConfig,
+    identity: str,
     *,
     tip: str,
 ) -> tuple[HistoryAudit, HistoryAudit]:
@@ -823,7 +842,7 @@ def audit_history_pair(  # noqa: PLR0913, PLR0917
     Malformed or unsafe reconstructed tree data may raise `PubanonError`.
 
     Args:
-        paths: Derived Pubanon paths.
+        paths: Derived pubanon paths.
         project: Registered project name.
         commits: Full duplicate-free tip-to-root commit chain, ending at the
             root. The first commit must be `tip`.
@@ -832,7 +851,7 @@ def audit_history_pair(  # noqa: PLR0913, PLR0917
             an incremental replacement for that walk.
         focused_tags: Direct tags included in the focused projection.
         rules: Reusable current term collections grouped by rule class.
-        global_config: Current publication identity expected in every commit.
+        identity: Expected publication identity in `name <email>` form.
 
         tip: Published main tip naming the first commit in `commits`; every tag
             target must belong to that main history.
@@ -859,7 +878,7 @@ def audit_history_pair(  # noqa: PLR0913, PLR0917
         objects,
         focused_set,
         rules,
-        global_config,
+        identity,
     )
     topology_problems = _topology_problems(commits, parsed_by_commit, tip)
     if topology_problems or any(commit.tree is None for commit in parsed_by_commit.values()):
@@ -872,7 +891,26 @@ def audit_history_pair(  # noqa: PLR0913, PLR0917
             for query in _object_queries(raw_commits, parsed_diff, tags, focused_tags)
             if query not in objects
         )
-        objects.update(read_objects(store, remaining_queries))
+        if rules:
+            objects.update(read_objects(store, remaining_queries))
+        else:
+            symlink_oids = {
+                change.new_oid
+                for _commit, changes in parsed_diff
+                for change in changes
+                if change.new_mode == _SYMLINK_MODE
+            }
+            # A shared file/symlink blob needs its body for every symlink occurrence.
+            objects.update(
+                read_objects(
+                    store, tuple(query for query in remaining_queries if query in symlink_oids)
+                )
+            )
+            objects.update(
+                _check_blob_objects(
+                    store, tuple(query for query in remaining_queries if query not in symlink_oids)
+                )
+            )
         path_findings, focused_path_findings = _walk_history(
             parsed_diff, objects, focused_set, rules
         )
@@ -917,7 +955,7 @@ def audit_history(  # noqa: PLR0913, PLR0917
     commits: Sequence[str],
     tags: Mapping[str, str],
     rules: Mapping[RuleClass, Collection[str]],
-    g: GlobalConfig,
+    identity: str,
     *,
     tip: str,
 ) -> HistoryAudit:
@@ -930,13 +968,13 @@ def audit_history(  # noqa: PLR0913, PLR0917
     this same full walk, not an incremental chain.
 
     Args:
-        paths: Derived Pubanon paths.
+        paths: Derived pubanon paths.
         project: Registered project name.
         commits: Full duplicate-free tip-to-root commit chain, ending at the
             root. The first commit must be `tip`.
         tags: Published tag names mapped to direct object IDs.
         rules: Reusable current term collections grouped by rule class.
-        g: Current publication identity expected in every commit.
+        identity: Expected publication identity in `name <email>` form.
         tip: Published main tip naming the first commit in `commits`; every tag
             target must belong to that main history.
 
@@ -948,5 +986,7 @@ def audit_history(  # noqa: PLR0913, PLR0917
     Raises:
         PubanonError: Published Git data is malformed or cannot be read.
     """
-    full, _focused = audit_history_pair(paths, project, commits, tags, (), {}, rules, g, tip=tip)
+    full, _focused = audit_history_pair(
+        paths, project, commits, tags, (), {}, rules, identity, tip=tip
+    )
     return full

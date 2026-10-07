@@ -38,6 +38,18 @@ class GateHit(NamedTuple):
     term: str
 
 
+def _excerpt_span(data: bytes, start: int, end: int) -> tuple[int, int] | None:
+    """Map exact matched bytes to display characters without splitting UTF-8."""
+    if end > len(data):
+        return None
+    try:
+        matched = data[start:end].decode('utf-8')
+    except UnicodeDecodeError:
+        return None
+    prefix = len(data[:start].decode('utf-8', errors='replace'))
+    return prefix, prefix + len(matched)
+
+
 def _fold_with_spans(text: str) -> tuple[str, list[tuple[int, int]]]:
     """Return normalized casefolded text mapped to complete source spans."""
     decomposed: list[tuple[str, int]] = []
@@ -188,3 +200,36 @@ def gate_unit(
         for rule_class, terms in rules.items()
         for term in _term_hits(views, terms)
     ]
+
+
+def match_excerpt(data: bytes, start: int, end: int) -> tuple[str, tuple[int, int] | None]:
+    """Return unescaped source context and its exact character highlight span.
+
+    Args:
+        data: Gate unit containing the match; undecodable bytes use replacement
+            characters.
+        start: Inclusive matched byte offset.
+        end: Exclusive matched byte offset.
+
+    Returns:
+        Text with at most 60 surrounding bytes on each side, bounded by LF
+        lines, with ellipses for omitted context. The character span is None
+        when the matched bytes cannot be represented exactly as UTF-8 text.
+        Callers own binary detection and terminal escaping.
+    """
+    line_start = data.rfind(b'\n', 0, start) + 1
+    line_end = data.find(b'\n', end)
+    if line_end < 0:
+        line_end = len(data)
+    left = max(line_start, start - 60)
+    right = min(line_end, end + 60)
+    raw_excerpt = data[left:right].rstrip(b'\r')
+    excerpt = raw_excerpt.decode('utf-8', errors='replace')
+    span = _excerpt_span(raw_excerpt, start - left, end - left)
+    if left > line_start:
+        excerpt = '...' + excerpt
+        if span is not None:
+            span = span[0] + 3, span[1] + 3
+    if right < line_end:
+        excerpt += '...'
+    return excerpt, span

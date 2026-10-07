@@ -13,7 +13,7 @@ from urllib.parse import unquote_to_bytes
 from pubanon._config import require_project_name
 from pubanon._errors import PubanonError
 from pubanon._run import OID_HEX, GitResult, git_failure_fact, run_git
-from pubanon._terminal import escape
+from pubanon._terminal import escape, path_text
 
 _BATCH_HEADER_FIELD_COUNT = 3
 _BOOKMARK_REF = re.compile(rf'refs/pubanon/publications/([^/]+)/({OID_HEX})')
@@ -286,13 +286,38 @@ def _check_bookmark(bookmark: SourceBookmark, source_commit: str) -> None:
         raise PubanonError('invalid source bookmark')
     try:
         common = bookmark.git_common_dir.resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
+    except OSError as exc:
         raise PubanonError('recorded source repository is unavailable') from exc
     if not common.is_dir() or common != bookmark.git_common_dir:
         raise PubanonError('recorded source repository is unavailable')
     result = _bookmark_git(bookmark, ['rev-parse', '--path-format=absolute', '--git-common-dir'])
     if result.returncode != 0 or not _matches_git_path_output(result.stdout, common):
         raise PubanonError('recorded source repository is unavailable')
+
+
+def check_bookmark_release(bookmark: SourceBookmark, source_commit: str) -> bool:
+    """Verify that an owned bookmark can be released at its recorded commit.
+
+    An absent ref is safe to treat as an already completed release.
+
+    Args:
+        bookmark: Recorded location and name of the owned source ref.
+        source_commit: Exact commit expected at the ref.
+
+    Returns:
+        Whether the bookmark still exists at `source_commit`.
+
+    Raises:
+        PubanonError: The repository or bookmark is invalid, the ref is
+            symbolic or points elsewhere, or its target cannot be inspected.
+    """
+    _check_bookmark(bookmark, source_commit)
+    current = _bookmark_target(bookmark)
+    if current is None:
+        return False
+    if current != source_commit:
+        raise PubanonError('source bookmark changed to another commit')
+    return True
 
 
 def check_source_safety(root: Path) -> None:
@@ -323,7 +348,7 @@ def check_source_safety(root: Path) -> None:
             fact='an alternate object store is configured',
             recovery=(
                 'run git repack -a while alternates still exist; then temporarily rename '
-                f'{escape(str(alternates))} and verify all branch/tag tips and '
+                f'{escape(path_text(alternates))} and verify all branch/tag tips and '
                 'reachable objects with git fsck --full before removing the saved file. '
                 'Restore it on any failure; see '
                 'docs/guide.md#disconnecting-an-alternate-object-store'
@@ -554,12 +579,8 @@ def remove_bookmark(bookmark: SourceBookmark, source_commit: str) -> None:
         PubanonError: The original repository is invalid, the ref is symbolic
             or points elsewhere, or the checked deletion fails.
     """
-    _check_bookmark(bookmark, source_commit)
-    current = _bookmark_target(bookmark)
-    if current is None:
+    if not check_bookmark_release(bookmark, source_commit):
         return
-    if current != source_commit:
-        raise PubanonError('source bookmark changed to another commit')
     command = f'delete {bookmark.refname} {source_commit}\n'.encode()
     result = _bookmark_git(bookmark, ['update-ref', '--no-deref', '--stdin'], input_bytes=command)
     if result.returncode != 0:
@@ -593,7 +614,7 @@ def repository_root(selected: Path) -> Path:
         raise PubanonError('cannot identify one canonical Git worktree root')
     try:
         canonical = root.resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
+    except OSError as exc:
         raise PubanonError('cannot identify one canonical Git worktree root') from exc
     if not canonical.is_dir():
         raise PubanonError('cannot identify one canonical Git worktree root')
@@ -641,7 +662,7 @@ def describe_bookmark(source: Path, project: str, publication: str) -> SourceBoo
         raise PubanonError('Git returned an ambiguous common directory')
     try:
         common = common.resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
+    except OSError as exc:
         raise PubanonError('Git returned an unavailable common directory') from exc
     return SourceBookmark(root, common, refname)
 

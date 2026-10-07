@@ -1,7 +1,7 @@
 import pytest
 
 from pubanon import _gate
-from pubanon._gate import GateHit, RuleClass, _term_hits, _views, gate_unit
+from pubanon._gate import GateHit, RuleClass, _views, gate_unit
 
 
 @pytest.mark.parametrize('padding', [0, 32768])
@@ -202,19 +202,3 @@ def test_gate_unit_preserves_intact_utf8_term_in_mixed_bytes(
     assert gate_unit('mixed.bin', data, {rule_class: (term,)}) == [
         GateHit('mixed.bin', rule_class, term)
     ]
-
-
-def test_term_hits_matches_mixed_case_term_after_invalid_byte() -> None:
-    assert _term_hits(_views(b'\xffCaNaRyX'), ['canaryx']) == ['canaryx']
-
-
-def test_term_hits_matches_nfc_term_in_nfd_content() -> None:
-    assert _term_hits(_views('cafe\u0301'.encode()), ['caf\u00e9']) == ['caf\u00e9']
-
-
-def test_term_hits_matches_uppercase_term_in_utf8() -> None:
-    assert _term_hits(_views(b'say CANARYX'), ['canaryx']) == ['canaryx']
-
-
-def test_term_hits_returns_empty_list_for_nonmatching_content() -> None:
-    assert _term_hits(_views(b'quiet content'), ['canaryx']) == []

@@ -6,8 +6,9 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import Literal
+from unittest.mock import Mock
 
 import pytest
 
@@ -21,8 +22,19 @@ if os.name != 'nt':
 
 from pubanon import _terminal
 from pubanon._errors import OperationCanceled, PubanonError
-from pubanon._remote._host import CheckVerdict
+from pubanon._remote._host import CheckState, CheckVerdict
 
+_ASK_DIRECTLY = (
+    'from pubanon._terminal import ask\nprint("RESULT", repr(ask("Description")), flush=True)\n'
+)
+_ASK_THROUGH_MAIN = (
+    'from pubanon import _cli\n'
+    'from pubanon._terminal import ask\n'
+    'def _command(_args):\n'
+    '    print("RESULT", repr(ask("Description")), flush=True)\n'
+    '_cli._dispatch = _command\n'
+    'raise SystemExit(_cli.main(["setup"]))\n'
+)
 _Script = Callable[[Sequence[tuple[str, str]]], None]
 
 
@@ -38,7 +50,7 @@ def test_ask_blank_takes_default(answers: _Script) -> None:
 
 
 def test_ask_choices_add_colon_to_plain_question(answers: _Script) -> None:
-    answers([('Terms: [a]dd / [r]eplace / re[m]ove / [d]one: ', 'REMOVE')])
+    answers([('Terms: [a]dd / [r]eplace / re[m]ove / [d]one: ', 'm')])
     assert _terminal.ask('Terms', choices=['add', 'replace', 're[m]ove', 'done']) == 'remove'
 
 
@@ -105,7 +117,7 @@ def test_ask_two_choices_render_retry_hint(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     prompt = 'Whitespace: [k]eep / [r]e-enter: '
-    answers([(prompt, 'x'), (prompt, 'keep')])
+    answers([(prompt, 'x'), (prompt, 'k')])
     assert _terminal.ask('Whitespace:', choices=['keep', 're-enter']) == 'keep'
     assert capsys.readouterr().out == 'Choose keep or re-enter.\n'
 
@@ -138,24 +150,24 @@ def test_color_context_restores_nested_mode_after_failure(
     assert _terminal.style('Label') == 'Label'
 
 
+def test_confirm_accepts_uppercase_key(answers: _Script) -> None:
+    answers([('Publish? [y/n] ', 'Y')])
+    assert _terminal.confirm('Publish?') is True
+
+
 def test_confirm_reasks_on_blank_without_default(
     answers: _Script, capsys: pytest.CaptureFixture[str]
 ) -> None:
     answers(
         [
             ('Publish? [y/n] ', ''),
-            ('Publish? [y/n] ', 'maybe'),
-            ('Publish? [y/n] ', 'later'),
+            ('Publish? [y/n] ', 'x'),
+            ('Publish? [y/n] ', '?'),
             ('Publish? [y/n] ', 'n'),
         ]
     )
     assert _terminal.confirm('Publish?') is False
     assert capsys.readouterr().out == 'Enter y or n.\n' * 3
-
-
-def test_confirm_strips_surrounding_whitespace(answers: _Script) -> None:
-    answers([('Publish? [y/n] ', ' yes ')])
-    assert _terminal.confirm('Publish?') is True
 
 
 def test_confirmation_resets_color_before_answer(
@@ -182,12 +194,12 @@ def test_display_path_abbreviates_home_and_escapes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     home = tmp_path / 'home'
-    expected = r'~\\report\x1b.txt' if os.name == 'nt' else r'~/report\x1b.txt'
+    expected = r'~/report\x1b.txt'
     assert _terminal.display_path(home / 'report\x1b.txt') == expected
     outside = tmp_path / 'elsewhere'
-    assert _terminal.display_path(outside) == _terminal.escape(str(outside))
+    assert _terminal.display_path(outside) == _terminal.escape(outside.as_posix())
     monkeypatch.chdir(tmp_path)
-    assert _terminal.display_path(Path('elsewhere')) == _terminal.escape(str(outside))
+    assert _terminal.display_path(Path('elsewhere')) == _terminal.escape(outside.as_posix())
     command = _terminal.shell_command('cat', str(home / 'report.txt'))
     assert command is not None
     assert shlex.split(command) == ['cat', str(home / 'report.txt')]
@@ -423,7 +435,7 @@ def test_display_duration_uses_whole_minutes(seconds: int, expected: str) -> Non
     ],
 )
 def test_display_check_result_preserves_nonpassing_verdicts(
-    state: str, detail: str, expected: str
+    state: CheckState, detail: str, expected: str
 ) -> None:
     assert _terminal.display_check_result(CheckVerdict('build', state, detail)) == expected
 
@@ -452,8 +464,8 @@ def test_diagnostic_layout(error: PubanonError, expected: str) -> None:
         assert _terminal.diagnostic(error) == expected
 
 
-@pytest.mark.parametrize(('reply', 'expected'), [('s', 'save'), ('SAVE', 'save'), (' e ', 'edit')])
-def test_ask_choices_accept_letter_or_word(answers: _Script, reply: str, expected: str) -> None:
+@pytest.mark.parametrize(('reply', 'expected'), [('s', 'save'), ('E', 'edit')])
+def test_ask_choices_accept_single_keys(answers: _Script, reply: str, expected: str) -> None:
     answers([('Save? [s]ave / [e]dit / [c]ancel: ', reply)])
     assert _terminal.ask('Save?', choices=['save', 'edit', 'cancel']) == expected
 
@@ -488,7 +500,7 @@ def test_color_context_controls_terminal_style(
     ('default', 'prompt', 'reply', 'expected'),
     [
         (None, 'Publish? [y/n] ', 'y', True),
-        (None, 'Publish? [y/n] ', 'NO', False),
+        (None, 'Publish? [y/n] ', 'N', False),
         (True, 'Publish? [Y/n] ', '', True),
         (False, 'Publish? [y/N] ', '', False),
     ],
@@ -528,6 +540,7 @@ def test_escape_preserves_spelling_and_renders_unicode_controls(text: str, expec
     assert _terminal.escape(text) == expected
 
 
+@pytest.mark.parametrize('script', [_ASK_DIRECTLY, _ASK_THROUGH_MAIN], ids=['terminal', 'main'])
 @pytest.mark.parametrize(
     ('keys', 'expected'),
     [
@@ -535,15 +548,11 @@ def test_escape_preserves_spelling_and_renders_unicode_controls(text: str, expec
         (b'a' * 60 + b'\x1b[D' * 35 + b'\x7f' * 5 + b'Z\n', b'a' * 20 + b'Z' + b'a' * 35),
     ],
 )
-def test_free_text_edits_across_wrapped_lines(keys: bytes, expected: bytes) -> None:
+def test_free_text_edits_across_wrapped_lines(script: str, keys: bytes, expected: bytes) -> None:
     if os.name == 'nt':
         pytest.skip('requires a POSIX pseudoterminal')
     master, slave = pty.openpty()
     termios.tcsetwinsize(slave, (24, 40))
-    script = (
-        'from pubanon._terminal import ask\n'
-        'print("RESULT", repr(ask("Description")), flush=True)\n'
-    )
     try:
         with subprocess.Popen(
             [sys.executable, '-c', script],
@@ -978,6 +987,33 @@ def test_windows_menu_reads_one_console_key(
 def test_windows_menu_treats_eof_keys_as_unavailable(character: str) -> None:
     with pytest.raises(EOFError):
         _terminal._read_key_windows('Proceed? ', lambda: character, lambda: False)
+
+
+@pytest.mark.parametrize(
+    ('absolute', 'expected'),
+    [
+        (PureWindowsPath('C:/home/sample'), '~'),
+        (PureWindowsPath('C:/home/sample/my project/file.py'), '~/my project/file.py'),
+        (PureWindowsPath('D:/repo/file.py'), 'D:/repo/file.py'),
+        (PureWindowsPath('//server/share/file.py'), '//server/share/file.py'),
+        (
+            PureWindowsPath('//?/C:/repo/file.py'),
+            _terminal.escape(str(PureWindowsPath('//?/C:/repo/file.py'))),
+        ),
+        (
+            PureWindowsPath('//./pipe/tool'),
+            _terminal.escape(str(PureWindowsPath('//./pipe/tool'))),
+        ),
+        (PurePosixPath(r'/repo/literal\name.py'), _terminal.escape(r'/repo/literal\name.py')),
+    ],
+)
+def test_display_path_preserves_meaning_across_platforms(
+    absolute: PurePath, expected: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = Mock(spec=Path)
+    path.absolute.return_value = absolute
+    monkeypatch.setattr(Path, 'home', lambda: PureWindowsPath('C:/home/sample'))
+    assert _terminal.display_path(path) == expected
 
 
 def test_windows_menu_turns_ctrl_c_into_interrupt() -> None:

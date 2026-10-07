@@ -22,7 +22,7 @@ from pubanon._remote import _host, _stage, _watch
 from pubanon._remote._host import CheckVerdict, Destination, RemoteRefs
 from pubanon._remote._package import PackageRelease
 from pubanon._remote._stage import _save_stage
-from pubanon._snapshots import _candidate
+from pubanon._snapshots import _candidate, _store
 from pubanon._terminal import verbose_context
 from tests._cli import gh_calls, prepare
 from tests.remote.test_stage import (
@@ -68,7 +68,7 @@ def _integrated_watch_target(
         assert timeout > 0
         return RemoteRefs('a' * 40, {})
 
-    monkeypatch.setattr(_stage, 'read_remote_refs', _refs)
+    monkeypatch.setattr(_host, 'read_remote_refs', _refs)
     return paths, g, p
 
 
@@ -296,7 +296,7 @@ def _destination(
 
 
 def _record_stage(paths: Paths, project: str, record: _stage.StageRecord) -> None:
-    _candidate.store_path(paths, project)
+    _store.candidate_store_path(paths, project).mkdir(parents=True)
     _save_stage(paths, project, record)
 
 
@@ -322,7 +322,7 @@ def _stub_remote_refs(monkeypatch: pytest.MonkeyPatch, refs: RemoteRefs) -> None
         del timeout
         return refs
 
-    monkeypatch.setattr(_watch, 'ls_remote', _read_refs)
+    monkeypatch.setattr(_host, 'ls_remote', _read_refs)
 
 
 def _published_refs(
@@ -381,9 +381,9 @@ def _stub_staged_destination(
             discussions=False,
         )
 
-    monkeypatch.setattr(_stage, 'repository_settings', _settings)
+    monkeypatch.setattr(_host, 'repository_settings', _settings)
     monkeypatch.setattr(_stage, '_stage_destination', _staging_destination)
-    monkeypatch.setattr(_stage, 'require_authenticated_account', _require_account)
+    monkeypatch.setattr(_host, 'require_authenticated_account', _require_account)
     monkeypatch.setattr(_stage, '_verify_stage_facts', _verify_facts)
 
 
@@ -472,7 +472,7 @@ def test_ci_verdicts_reads_each_configured_check_once_in_order(
         calls.append((*coordinates, commit, name))
         return CheckVerdict(name, 'success', 'success')
 
-    monkeypatch.setattr(_watch, 'check_result', _check)
+    monkeypatch.setattr(_host, 'check_result', _check)
 
     assert _watch.ci_verdicts(_destination(), 'a' * 40, ('Build', 'Test')) == [
         CheckVerdict('Build', 'success', 'success'),
@@ -697,7 +697,7 @@ def test_check_recovery_matches_observed_state(
         assert timeout > 0
         return verdict
 
-    monkeypatch.setattr(_watch, 'check_result', _check)
+    monkeypatch.setattr(_host, 'check_result', _check)
 
     with pytest.raises(PubanonError) as raised:
         _watch._wait_for_checks(_destination(), 'a' * 40, ('CI',), 1)
@@ -799,9 +799,9 @@ def test_package_watch_passes_decreasing_positive_remaining_time(
         clock._now += 1
         return PackageRelease(version, (f'demo-{version}.tar.gz',))
 
-    monkeypatch.setattr(_watch, 'verify_destination', _verify)
-    monkeypatch.setattr(_watch, 'ls_remote', _refs)
-    monkeypatch.setattr(_watch, 'check_result', _check)
+    monkeypatch.setattr(_host, 'verify_destination', _verify)
+    monkeypatch.setattr(_host, 'ls_remote', _refs)
+    monkeypatch.setattr(_host, 'check_result', _check)
     monkeypatch.setattr(_watch, 'release_state', _release)
 
     _watch.watch_package(paths, global_config, project, version=None, timeout=30)
@@ -863,9 +863,9 @@ def test_published_ci_watch_passes_decreasing_positive_remaining_time(
         clock._now += 1
         return CheckVerdict(name, 'success', 'success')
 
-    monkeypatch.setattr(_watch, 'verify_destination', _verify)
-    monkeypatch.setattr(_watch, 'ls_remote', _refs)
-    monkeypatch.setattr(_watch, 'check_result', _check)
+    monkeypatch.setattr(_host, 'verify_destination', _verify)
+    monkeypatch.setattr(_host, 'ls_remote', _refs)
+    monkeypatch.setattr(_host, 'check_result', _check)
 
     _watch.watch_ci(paths, global_config, project, staged=False, version=None, timeout=30)
 
@@ -886,13 +886,13 @@ def test_published_ci_watch_refuses_moved_main_before_checks(
     local_main = 'a' * 40
     paths, global_config, project = _configs(tmp_path)
     _published_refs(monkeypatch, local_main, {})
-    monkeypatch.setattr(_watch, 'verify_destination', _verify_selected)
+    monkeypatch.setattr(_host, 'verify_destination', _verify_selected)
     _stub_remote_refs(monkeypatch, RemoteRefs('b' * 40, {}, ()))
 
     def _unexpected(*_args: object) -> CheckVerdict:
         pytest.fail('check read occurred after published main drift')
 
-    monkeypatch.setattr(_watch, 'check_result', _unexpected)
+    monkeypatch.setattr(_host, 'check_result', _unexpected)
 
     with pytest.raises(PubanonError, match='host refs do not match'):
         _watch.watch_ci(paths, global_config, project, staged=False, version=None, timeout=30)
@@ -905,13 +905,13 @@ def test_published_ci_watch_refuses_unexpected_branch_before_checks(
     main = 'a' * 40
     paths, global_config, project = _configs(tmp_path)
     _published_refs(monkeypatch, main, {})
-    monkeypatch.setattr(_watch, 'verify_destination', _verify_selected)
+    monkeypatch.setattr(_host, 'verify_destination', _verify_selected)
     _stub_remote_refs(monkeypatch, RemoteRefs(main, {}, (('backup', main),)))
 
     def _unexpected(*_args: object) -> CheckVerdict:
         pytest.fail('check read occurred with an unexpected published branch')
 
-    monkeypatch.setattr(_watch, 'check_result', _unexpected)
+    monkeypatch.setattr(_host, 'check_result', _unexpected)
 
     with pytest.raises(PubanonError, match='host refs do not match') as raised:
         _watch.watch_ci(paths, global_config, project, staged=False, version=None, timeout=30)
@@ -930,13 +930,13 @@ def test_published_package_watch_refuses_deleted_tag_before_checks_or_index(
     package = PackageObservation('pypi', 'demo', ('Release',))
     paths, global_config, project = _configs(tmp_path, package=package)
     _published_refs(monkeypatch, main, {'v1.2.3': tag_commit})
-    monkeypatch.setattr(_watch, 'verify_destination', _verify_selected)
+    monkeypatch.setattr(_host, 'verify_destination', _verify_selected)
     _stub_remote_refs(monkeypatch, RemoteRefs(main, {}, ()))
 
     def _unexpected(*_args: object) -> object:
         pytest.fail('downstream observation occurred after published tag deletion')
 
-    monkeypatch.setattr(_watch, 'check_result', _unexpected)
+    monkeypatch.setattr(_host, 'check_result', _unexpected)
     monkeypatch.setattr(_watch, 'release_state', _unexpected)
 
     with pytest.raises(PubanonError, match='host refs do not match'):
@@ -952,7 +952,7 @@ def test_published_package_watch_refuses_unexpected_tag_before_checks_or_index(
     package = PackageObservation('pypi', 'demo', ('Release',))
     paths, global_config, project = _configs(tmp_path, package=package)
     _published_refs(monkeypatch, main, tags)
-    monkeypatch.setattr(_watch, 'verify_destination', _verify_selected)
+    monkeypatch.setattr(_host, 'verify_destination', _verify_selected)
     _stub_remote_refs(
         monkeypatch,
         RemoteRefs(main, {**tags, 'v2.0.0': 'c' * 40}, ()),
@@ -961,7 +961,7 @@ def test_published_package_watch_refuses_unexpected_tag_before_checks_or_index(
     def _unexpected(*_args: object) -> object:
         pytest.fail('downstream observation occurred with an unexpected published tag')
 
-    monkeypatch.setattr(_watch, 'check_result', _unexpected)
+    monkeypatch.setattr(_host, 'check_result', _unexpected)
     monkeypatch.setattr(_watch, 'release_state', _unexpected)
 
     with pytest.raises(PubanonError, match='host refs do not match'):
@@ -1061,7 +1061,7 @@ def test_staged_watch_polls_missing_check_until_success(
         return next(states)
 
     monkeypatch.setattr(_watch, 'verify_staged_target', _verify)
-    monkeypatch.setattr(_watch, 'check_result', _check)
+    monkeypatch.setattr(_host, 'check_result', _check)
     clock = _patch_clock(monkeypatch)
 
     _watch.watch_ci(paths, global_config, project, staged=True, version=None, timeout=30)
@@ -1084,7 +1084,7 @@ def test_staged_watch_propagates_verification_failure_before_checks(
         pytest.fail('check read occurred after staging verification failed')
 
     monkeypatch.setattr(_watch, 'verify_staged_target', _verify)
-    monkeypatch.setattr(_watch, 'check_result', _unexpected)
+    monkeypatch.setattr(_host, 'check_result', _unexpected)
 
     with pytest.raises(PubanonError) as raised:
         _watch.watch_ci(paths, global_config, project, staged=True, version=None, timeout=30)
@@ -1151,8 +1151,8 @@ def test_staged_watch_uses_recorded_coordinates_and_commit(
         return CheckVerdict(name, 'success', 'success')
 
     _stub_staged_destination(monkeypatch, _verify)
-    monkeypatch.setattr(_stage, 'read_remote_refs', _refs)
-    monkeypatch.setattr(_watch, 'check_result', _check)
+    monkeypatch.setattr(_host, 'read_remote_refs', _refs)
+    monkeypatch.setattr(_host, 'check_result', _check)
 
     _watch.watch_ci(paths, global_config, project, staged=True, version=None, timeout=30)
 
@@ -1207,7 +1207,7 @@ def test_staged_watch_uses_shared_staged_target_verification_before_checks(
         return CheckVerdict(name, 'success', 'success')
 
     monkeypatch.setattr(_watch, 'verify_staged_target', _verify)
-    monkeypatch.setattr(_watch, 'check_result', _check)
+    monkeypatch.setattr(_host, 'check_result', _check)
 
     _watch.watch_ci(paths, global_config, project, staged=True, version=None, timeout=30)
 
@@ -1229,7 +1229,7 @@ def test_staged_watch_uses_timeout_signal_stage_and_makes_no_later_call(
         pytest.fail('check read occurred after staged ref timeout')
 
     monkeypatch.setattr(_watch, 'verify_staged_target', _verify)
-    monkeypatch.setattr(_watch, 'check_result', _unexpected)
+    monkeypatch.setattr(_host, 'check_result', _unexpected)
     clock = _patch_clock(monkeypatch)
 
     with pytest.raises(PubanonError, match='observation timed out') as exc_info:
@@ -1314,7 +1314,7 @@ def test_wait_stops_before_later_request_after_failed_check(
     package = PackageObservation('pypi', 'demo', checks)
     paths, global_config, project = _configs(tmp_path, package=package)
     _published_refs(monkeypatch, 'b' * 40, {'v1.2.3': 'a' * 40})
-    monkeypatch.setattr(_watch, 'verify_destination', _verify_selected)
+    monkeypatch.setattr(_host, 'verify_destination', _verify_selected)
     calls: list[str] = []
 
     def _check(
@@ -1336,7 +1336,7 @@ def test_wait_stops_before_later_request_after_failed_check(
     def _unexpected(*_args: object, **_kwargs: object) -> Never:
         pytest.fail('package index was observed after a terminal check result')
 
-    monkeypatch.setattr(_watch, 'check_result', _check)
+    monkeypatch.setattr(_host, 'check_result', _check)
     monkeypatch.setattr(_watch, 'release_state', _unexpected)
     clock = _patch_clock(monkeypatch)
 
@@ -1458,7 +1458,7 @@ def test_watch_ci_prints_each_final_result_once_when_other_checks_advance(
     paths, global_config, project = _configs(tmp_path)
     project = replace(project, required_checks=('Build', 'Tests'))
     _published_refs(monkeypatch, commit, {})
-    monkeypatch.setattr(_watch, 'verify_destination', _verify_selected)
+    monkeypatch.setattr(_host, 'verify_destination', _verify_selected)
     states = iter(
         [
             CheckVerdict('Build', 'success', 'first run'),
@@ -1478,7 +1478,7 @@ def test_watch_ci_prints_each_final_result_once_when_other_checks_advance(
         assert timeout is not None
         return next(states)
 
-    monkeypatch.setattr(_watch, 'check_result', _check)
+    monkeypatch.setattr(_host, 'check_result', _check)
     _patch_clock(monkeypatch)
 
     _watch.watch_ci(paths, global_config, project, staged=False, version=None, timeout=30)
@@ -1523,7 +1523,7 @@ def test_watch_ci_reports_target_state_changes_and_elapsed_before_waiting(
     commit = 'a' * 40
     paths, global_config, project = _configs(tmp_path)
     _published_refs(monkeypatch, commit, {})
-    monkeypatch.setattr(_watch, 'verify_destination', _verify_selected)
+    monkeypatch.setattr(_host, 'verify_destination', _verify_selected)
     states = iter(
         [
             CheckVerdict('CI', 'pending', 'queued'),
@@ -1548,7 +1548,7 @@ def test_watch_ci_reports_target_state_changes_and_elapsed_before_waiting(
         clock._now += seconds
 
     monkeypatch.setattr(_watch, '_sleep', _sleep)
-    monkeypatch.setattr(_watch, 'check_result', _check)
+    monkeypatch.setattr(_host, 'check_result', _check)
 
     _watch.watch_ci(paths, global_config, project, staged=False, version=None, timeout=60)
 
@@ -1683,9 +1683,9 @@ def test_watch_ci_translates_in_flight_expiry_and_makes_no_later_call(
             _raise_observation_timeout()
         return CheckVerdict(name, 'success', 'success')
 
-    monkeypatch.setattr(_watch, 'verify_destination', _verify)
-    monkeypatch.setattr(_watch, 'ls_remote', _refs)
-    monkeypatch.setattr(_watch, 'check_result', _check)
+    monkeypatch.setattr(_host, 'verify_destination', _verify)
+    monkeypatch.setattr(_host, 'ls_remote', _refs)
+    monkeypatch.setattr(_host, 'check_result', _check)
     clock = _patch_clock(monkeypatch)
 
     with (
@@ -1720,9 +1720,9 @@ def test_watch_ci_zero_timeout_starts_no_network_call(
     def _unexpected(*_args: object, **_kwargs: object) -> Never:
         pytest.fail('network call started with no remaining observation time')
 
-    monkeypatch.setattr(_watch, 'verify_destination', _unexpected)
-    monkeypatch.setattr(_watch, 'ls_remote', _unexpected)
-    monkeypatch.setattr(_watch, 'check_result', _unexpected)
+    monkeypatch.setattr(_host, 'verify_destination', _unexpected)
+    monkeypatch.setattr(_host, 'ls_remote', _unexpected)
+    monkeypatch.setattr(_host, 'check_result', _unexpected)
     clock = _patch_clock(monkeypatch)
 
     with pytest.raises(PubanonError, match='observation timed out') as exc_info:
@@ -1740,8 +1740,8 @@ def test_watch_package_failed_check_never_reads_index_or_polls(
     package = PackageObservation('pypi', 'demo', ('Release',))
     paths, global_config, project = _configs(tmp_path, package=package)
     _published_refs(monkeypatch, 'b' * 40, {'v1.2.3': 'a' * 40})
-    monkeypatch.setattr(_watch, 'verify_destination', _verify_selected)
-    monkeypatch.setattr(_watch, 'check_result', _failed_check)
+    monkeypatch.setattr(_host, 'verify_destination', _verify_selected)
+    monkeypatch.setattr(_host, 'check_result', _failed_check)
 
     def _unexpected(*_args: object) -> PackageRelease | None:
         pytest.fail('package index read occurred after a failed release check')
@@ -1763,8 +1763,8 @@ def test_watch_package_metadata_without_files_remains_incomplete_until_timeout(
     package = PackageObservation('pypi', 'demo', ('Release',))
     paths, global_config, project = _configs(tmp_path, package=package)
     _published_refs(monkeypatch, 'b' * 40, {'v1.2.3': 'a' * 40})
-    monkeypatch.setattr(_watch, 'verify_destination', _verify_selected)
-    monkeypatch.setattr(_watch, 'check_result', _successful_check)
+    monkeypatch.setattr(_host, 'verify_destination', _verify_selected)
+    monkeypatch.setattr(_host, 'check_result', _successful_check)
 
     def _metadata_only(
         _index: str,
@@ -1796,7 +1796,7 @@ def test_watch_package_missing_check_expires_without_reading_index(
     package = PackageObservation('pypi', 'demo', ('Release',))
     paths, global_config, project = _configs(tmp_path, package=package)
     _published_refs(monkeypatch, 'b' * 40, {'v1.2.3': 'a' * 40})
-    monkeypatch.setattr(_watch, 'verify_destination', _verify_selected)
+    monkeypatch.setattr(_host, 'verify_destination', _verify_selected)
     calls = 0
 
     def _check(
@@ -1815,7 +1815,7 @@ def test_watch_package_missing_check_expires_without_reading_index(
     def _unexpected(*_args: object, **_kwargs: object) -> Never:
         pytest.fail('package index read occurred while a release check was missing')
 
-    monkeypatch.setattr(_watch, 'check_result', _check)
+    monkeypatch.setattr(_host, 'check_result', _check)
     monkeypatch.setattr(_watch, 'release_state', _unexpected)
     clock = _patch_clock(monkeypatch)
 
@@ -1837,8 +1837,8 @@ def test_watch_package_pending_check_never_reads_index(
     package = PackageObservation('pypi', 'demo', ('Release',))
     paths, global_config, project = _configs(tmp_path, package=package)
     _published_refs(monkeypatch, 'b' * 40, {'v1.2.3': 'a' * 40})
-    monkeypatch.setattr(_watch, 'verify_destination', _verify_selected)
-    monkeypatch.setattr(_watch, 'check_result', _pending_check)
+    monkeypatch.setattr(_host, 'verify_destination', _verify_selected)
+    monkeypatch.setattr(_host, 'check_result', _pending_check)
 
     def _unexpected(*_args: object) -> PackageRelease | None:
         pytest.fail('package index read occurred while release checks were pending')
@@ -1859,8 +1859,8 @@ def test_watch_package_persistent_absence_expires_as_pending(
     package = PackageObservation('pypi', 'demo', ('Release',))
     paths, global_config, project = _configs(tmp_path, package=package)
     _published_refs(monkeypatch, 'b' * 40, {'v1.2.3': 'a' * 40})
-    monkeypatch.setattr(_watch, 'verify_destination', _verify_selected)
-    monkeypatch.setattr(_watch, 'check_result', _successful_check)
+    monkeypatch.setattr(_host, 'verify_destination', _verify_selected)
+    monkeypatch.setattr(_host, 'check_result', _successful_check)
     monkeypatch.setattr(_watch, 'release_state', _absent_release)
     clock = _patch_clock(monkeypatch)
 
@@ -1897,7 +1897,7 @@ def test_watch_package_polls_absence_then_reports_published_files(
         startup.append(output)
         return _verify_selected(selected_paths, selected_global, selected, timeout=timeout)
 
-    monkeypatch.setattr(_watch, 'verify_destination', _verify)
+    monkeypatch.setattr(_host, 'verify_destination', _verify)
     check_calls = 0
 
     def _check(*_args: object, timeout: float | None = None) -> CheckVerdict:
@@ -1931,7 +1931,7 @@ def test_watch_package_polls_absence_then_reports_published_files(
         release_calls.append((index, name, version))
         return next(states)
 
-    monkeypatch.setattr(_watch, 'check_result', _check)
+    monkeypatch.setattr(_host, 'check_result', _check)
     monkeypatch.setattr(_watch, 'release_state', _release)
     clock = _patch_clock(monkeypatch)
 
@@ -1979,8 +1979,8 @@ def test_watch_package_rejects_release_returned_after_deadline(
     package = PackageObservation('pypi', 'demo', ('Release',))
     paths, global_config, project = _configs(tmp_path, package=package)
     _published_refs(monkeypatch, 'b' * 40, {'v1.2.3': 'a' * 40})
-    monkeypatch.setattr(_watch, 'verify_destination', _verify_selected)
-    monkeypatch.setattr(_watch, 'check_result', _successful_check)
+    monkeypatch.setattr(_host, 'verify_destination', _verify_selected)
+    monkeypatch.setattr(_host, 'check_result', _successful_check)
     clock = _patch_clock(monkeypatch)
     calls = 0
 
@@ -2043,9 +2043,9 @@ def test_watch_package_translates_in_flight_release_expiry_and_stops(
         events.append('package release')
         _raise_observation_timeout()
 
-    monkeypatch.setattr(_watch, 'verify_destination', _verify)
-    monkeypatch.setattr(_watch, 'ls_remote', _refs)
-    monkeypatch.setattr(_watch, 'check_result', _check)
+    monkeypatch.setattr(_host, 'verify_destination', _verify)
+    monkeypatch.setattr(_host, 'ls_remote', _refs)
+    monkeypatch.setattr(_host, 'check_result', _check)
     monkeypatch.setattr(_watch, 'release_state', release)
     clock = _patch_clock(monkeypatch)
 

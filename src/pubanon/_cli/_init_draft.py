@@ -1,9 +1,6 @@
 """Persist resumable guided-init drafts."""
 
 import json
-import os
-import tempfile
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -21,6 +18,7 @@ _DEFAULT_PENDING = (
     'publication_route',
     'source_tags',
     'checks',
+    'release_pages',
     'description',
     'issues',
     'wiki',
@@ -42,6 +40,7 @@ _DRAFT_KEYS = frozenset(
         'publication_route',
         'projects',
         'pull_requests',
+        'release_pages',
         'discussions',
         'repo',
         'required_checks',
@@ -72,7 +71,7 @@ class Draft:
         source: Source repository selected for the project.
         commit: Current saved source selection. Resume may replace it when the
             selected source changes.
-        self_publication: Whether the source product is Pubanon itself.
+        self_publication: Whether the source product is pubanon itself.
         pending: Init choices that remain unanswered.
         phase: Current file-selection phase.
         reviewing: Whether the operator is reviewing completed choices.
@@ -90,6 +89,7 @@ class Draft:
         projects: Selected projects setting, when answered.
         pull_requests: Selected pull requests setting, when answered.
         discussions: Selected discussions setting, when answered.
+        release_pages: Whether tagged publications create release pages.
     """
 
     source: Path
@@ -112,6 +112,7 @@ class Draft:
     projects: bool | None = None
     pull_requests: bool | None = None
     discussions: bool | None = None
+    release_pages: bool = False
 
 
 class InvalidDraftError(PubanonError):
@@ -176,6 +177,7 @@ def _payload(draft: Draft) -> dict[str, object]:
         'commit': draft.commit,
         'self_publication': draft.self_publication,
         'source_tags': draft.source_tags,
+        'release_pages': draft.release_pages,
         'pending': list(draft.pending),
         'phase': draft.phase,
         'reviewing': draft.reviewing,
@@ -270,6 +272,7 @@ def _draft(data: object) -> Draft:
         projects=_optional_boolean(values, 'projects'),
         pull_requests=_optional_boolean(values, 'pull_requests'),
         discussions=_optional_boolean(values, 'discussions'),
+        release_pages=_boolean(values, 'release_pages'),
     )
 
 
@@ -277,7 +280,7 @@ def load(paths: Paths, name: str) -> Draft | None:
     """Load one project init draft when it exists.
 
     Args:
-        paths: Derived Pubanon configuration and data paths.
+        paths: Derived pubanon configuration and data paths.
         name: Project whose draft should be loaded.
 
     Returns:
@@ -291,7 +294,7 @@ def load(paths: Paths, name: str) -> Draft | None:
         content = _path(paths, name).read_text(encoding='utf-8')
     except FileNotFoundError:
         return None
-    except (OSError, RuntimeError, UnicodeError) as exc:
+    except (OSError, UnicodeError) as exc:
         raise PubanonError('cannot load init draft') from exc
     try:
         data = json.loads(content)
@@ -304,7 +307,7 @@ def remove(paths: Paths, name: str) -> None:
     """Remove one project init draft when it exists.
 
     Args:
-        paths: Derived Pubanon configuration and data paths.
+        paths: Derived pubanon configuration and data paths.
         name: Project whose draft should be removed.
 
     Raises:
@@ -312,7 +315,7 @@ def remove(paths: Paths, name: str) -> None:
     """
     try:
         _path(paths, name).unlink(missing_ok=True)
-    except (OSError, RuntimeError) as exc:
+    except OSError as exc:
         raise PubanonError('cannot remove init draft') from exc
 
 
@@ -320,7 +323,7 @@ def save(paths: Paths, name: str, draft: Draft) -> None:
     """Atomically save one project init draft with owner-only POSIX permissions.
 
     Args:
-        paths: Derived Pubanon configuration and data paths.
+        paths: Derived pubanon configuration and data paths.
         name: Project whose draft should be saved.
         draft: Complete guided-init state to persist.
 
@@ -335,39 +338,16 @@ def save(paths: Paths, name: str, draft: Draft) -> None:
     except (TypeError, ValueError, UnicodeError) as exc:
         raise PubanonError('invalid init draft') from exc
 
-    directory = create_data_dirs(paths, name)
+    create_data_dirs(paths, name)
     destination = _path(paths, name)
-    descriptor: int | None = None
-    temporary: Path | None = None
     try:
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix='.init-draft-',
-            suffix='.tmp',
-            dir=directory,
+        _filesystem.write_private(destination, content)
+    except _filesystem.DurableWriteError as exc:
+        if exc.interrupted and not exc.replacement_attempted:
+            raise KeyboardInterrupt from exc.__cause__
+        message = (
+            'init draft may have been saved'
+            if exc.replaced or (exc.interrupted and exc.replacement_attempted)
+            else 'cannot save init draft'
         )
-        temporary = Path(temporary_name)
-        _filesystem.fchmod(descriptor, 0o600)
-        handle = os.fdopen(descriptor, 'wb')
-        descriptor = None
-        try:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        except (OSError, RuntimeError):
-            with suppress(OSError, RuntimeError):
-                handle.close()
-            raise
-        handle.close()
-        _filesystem.replace(temporary, destination)
-    except (OSError, RuntimeError) as exc:
-        if descriptor is not None:
-            with suppress(OSError, RuntimeError):
-                os.close(descriptor)
-        if temporary is not None:
-            with suppress(OSError, RuntimeError):
-                temporary.unlink(missing_ok=True)
-        raise PubanonError('cannot save init draft') from exc
-    try:
-        _filesystem.sync_directory(directory)
-    except (OSError, RuntimeError, KeyboardInterrupt) as exc:
-        raise PubanonError('init draft may have been saved') from exc
+        raise PubanonError(message) from exc.__cause__

@@ -5,7 +5,7 @@ import pubanon
 
 
 def test_pubanon_is_the_only_supported_identity() -> None:
-    project = tomllib.loads(Path('pyproject.toml').read_text())
+    project = tomllib.loads((Path(__file__).parents[1] / 'pyproject.toml').read_text())
     assert pubanon.__all__ == []
     assert project['project']['name'] == 'pubanon'
     assert project['project']['scripts'] == {'pubanon': 'pubanon._cli:main'}

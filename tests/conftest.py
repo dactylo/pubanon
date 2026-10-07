@@ -61,7 +61,10 @@ def _refuse_unscripted_input(monkeypatch: pytest.MonkeyPatch) -> None:
         pytest.fail(f'unscripted prompt: {prompt!r}')
 
     def _scripted_key(prompt: str) -> str:
-        return builtins.input(prompt)
+        reply = builtins.input(prompt)
+        if len(reply) > 1:
+            pytest.fail(f'scripted key reply must be one character: {reply!r}')
+        return reply
 
     monkeypatch.setattr('builtins.input', _refuse)
     monkeypatch.setattr(_terminal, '_read_key', _scripted_key)
@@ -158,10 +161,6 @@ def make_repo(tmp_path: Path) -> Callable[..., Path]:
                 'git',
                 '-C',
                 repo,
-                '-c',
-                'user.name=Test User',
-                '-c',
-                'user.email=test@example.invalid',
                 'commit',
                 '--allow-empty',
                 '-qm',

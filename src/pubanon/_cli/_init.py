@@ -6,6 +6,7 @@ import csv
 import io
 import os
 import shlex
+import sys
 import tomllib
 from dataclasses import replace
 from pathlib import Path
@@ -30,6 +31,7 @@ from pubanon._terminal import (
     heading,
     next_step,
     output,
+    path_text,
     style,
 )
 
@@ -68,7 +70,7 @@ def _choose_saved_draft(
 ) -> str:
     """Offer only choices valid for a saved draft's source."""
     heading('Saved setup draft', separate=True)
-    print(f'{style("Source:")} {escape(str(draft.source))}')
+    print(f'{style("Source:")} {escape(path_text(draft.source))}')
     same_source = _config.same_source(draft.source, ctx.project.source_path)
     choices = ['resume', 'start over', 'quit'] if same_source else ['start over', 'quit']
     if not same_source:
@@ -132,6 +134,7 @@ def _draft_edit(draft: _init_draft.Draft) -> _init_draft.Draft:
             'visibility',
             'route',
             'tags',
+            're[l]ease pages',
             'policy',
             'checks',
             'settings',
@@ -143,6 +146,7 @@ def _draft_edit(draft: _init_draft.Draft) -> _init_draft.Draft:
         'visibility': ('visibility',),
         'route': ('publication_route',),
         'tags': ('source_tags',),
+        'release pages': ('release_pages',),
         'policy': ('selection',),
         'checks': ('checks',),
         'settings': ('description', 'issues', 'wiki', 'projects', 'pull_requests', 'discussions'),
@@ -173,6 +177,28 @@ def _draft_flagged_choice(paths: list[str], draft: _init_draft.Draft) -> _init_d
         output('There is no earlier file choice.', kind='note')
         return draft
     return replace(draft, flagged=(*draft.flagged, (remaining[0], choice)))
+
+
+def _edited_release_pages(
+    project: _config.ProjectConfig, *, enabled: bool
+) -> _config.ProjectConfig:
+    """Keep the saved page settings when their effective enablement is unchanged."""
+    if enabled == _config.release_pages_enabled(project):
+        return project
+    return replace(
+        project,
+        release_page=replace(
+            project.release_page or _config.ReleasePageSettings(), enabled=enabled
+        ),
+    )
+
+
+def _feature_prompt(step: str, default: bool | None) -> bool:
+    """Ask whether one repository feature is enabled, starting from its saved value."""
+    if step == 'pull_requests':
+        output('pubanon publishes from the private source and does not merge on GitHub.')
+    label = step.replace('_', ' ')
+    return confirm(f'Enable {label}?', default=(step == 'issues') if default is None else default)
 
 
 def _host_segment_prompt(field: str, prompt: str, *, default: str) -> str:
@@ -254,6 +280,7 @@ def _project_review(
             ('Files', f'{included_count} included, {excluded_count} excluded'),
             ('Required checks', escape(checks)),
             ('Source tags', 'yes' if project.source_tags else 'no'),
+            ('Release pages', 'yes' if _config.release_pages_enabled(project) else 'no'),
             ('Description', escape(settings.description or '(empty)')),
             ('Features', _lifecycle.feature_summary(settings)),
         ]
@@ -337,6 +364,18 @@ def _load_init_draft(
     return _checkpoint_init(ctx, draft)
 
 
+def _release_pages_prompt(*, route: str, checks: tuple[str, ...], default: bool) -> bool:
+    """Explain when release pages are created, then ask whether to create them."""
+    print('Release pages announce published versions.')
+    print('Creating one can start release workflows, such as package uploads.')
+    if route == 'staged' and checks:
+        print('Each page is created when you publish, after staging checks pass.')
+    else:
+        print('Each page is created right after publishing, before CI runs.')
+        print('To wait for CI, answer no and run pubanon release create later.')
+    return confirm('Create a release page for each published version?', default=default)
+
+
 def _replace_project_context(
     ctx: _context.ProjectContext,
     project: _config.ProjectConfig,
@@ -402,6 +441,10 @@ def _project_from_draft(
         publication_route=draft.publication_route or ctx.project.publication_route,
         required_checks=draft.required_checks or (),
         source_tags=draft.source_tags,
+        release_page=replace(
+            ctx.project.release_page or _config.ReleasePageSettings(),
+            enabled=draft.release_pages,
+        ),
         settings=settings,
         self_publication=draft.self_publication,
     )
@@ -470,8 +513,6 @@ def _draft_selection(
     ctx: _context.ProjectContext,
     snapshot: _source.Snapshot,
     draft: _init_draft.Draft,
-    *,
-    verbose: bool,
 ) -> _init_draft.Draft:
     """Review a resumable selection and allow correction before continuing."""
     print('Choose the files to publish. Nothing is published now.')
@@ -488,9 +529,7 @@ def _draft_selection(
         elif draft.phase == 'groups':
             draft = _checkpoint_init(ctx, _draft_group_choice(ctx, snapshot, draft))
         else:
-            _selection.show_selection(
-                _project_from_draft(ctx, snapshot, draft), paths, verbose=verbose
-            )
+            _selection.show_selection(_project_from_draft(ctx, snapshot, draft), paths)
             choice = ask('Use this selection?', choices=['continue', 'review', 'back', 'quit'])
             if choice == 'quit':
                 raise OperationCanceled('Canceled.')
@@ -509,8 +548,8 @@ def _report_existing_project_init(
     project: _config.ProjectConfig,
     *,
     relocated: bool,
-    route_changed: bool,
-    source_tags_changed: bool,
+    project_changed: bool,
+    self_publication_enabled: bool,
 ) -> None:
     """Report the state changes made by initialization of an existing project."""
     heading(f'Project {escape(project.name)}')
@@ -518,10 +557,11 @@ def _report_existing_project_init(
         [
             ('Route', escape(project.publication_route)),
             ('Source tags', 'yes' if project.source_tags else 'no'),
+            ('Release pages', 'yes' if _config.release_pages_enabled(project) else 'no'),
         ]
     )
     project_file = paths.config_dir / 'projects' / f'{project.name}.toml'
-    detail(f'Project configuration: {escape(str(project_file))}')
+    detail(f'Project configuration: {escape(path_text(project_file))}')
     if relocated:
         output(
             f'Relocated project {escape(project.name)} to the current source repository.',
@@ -530,10 +570,13 @@ def _report_existing_project_init(
     else:
         output(
             f'Updated project {escape(project.name)} and its source registration.'
-            if route_changed or source_tags_changed
+            if project_changed
             else f'Refreshed source registration for project {escape(project.name)}.',
             kind='success',
         )
+    if self_publication_enabled:
+        output('Enabled self_publication.', kind='success')
+    print('To change settings, run `pubanon init --edit`.')
     try:
         known_existing = _candidate.published_refs(paths, project.name)[0] is not None
     except PubanonError:
@@ -545,8 +588,8 @@ def _review_relocation(project: _config.ProjectConfig, source: Path, *, yes: boo
     """Require distinguishable source paths before approving relocation."""
     heading('Source relocation')
     for label, value in {
-        'Old source': str(project.source_path),
-        'New source': str(source),
+        'Old source': path_text(project.source_path),
+        'New source': path_text(source),
     }.items():
         print(f'{style(escape(label) + ":")} {escape(value)}')
     if yes:
@@ -574,10 +617,23 @@ def _select_check_numbers(names: tuple[str, ...]) -> tuple[str, ...] | None:
         output(f'Choose numbers from 1 to {len(names)}.', kind='warning')
 
 
+def _settings_prompt(current: _config.Settings) -> _config.Settings:
+    """Edit the repository description and features, starting from saved values."""
+    return replace(
+        current,
+        description=_description_prompt(current.description),
+        issues=_feature_prompt('issues', current.issues),
+        wiki=_feature_prompt('wiki', current.wiki),
+        projects=_feature_prompt('projects', current.projects),
+        pull_requests=_feature_prompt('pull_requests', current.pull_requests),
+        discussions=_feature_prompt('discussions', current.discussions),
+    )
+
+
 def _show_discovered_checks(discovered: _workflow_checks.Discovery) -> None:
     """List check names and the execution limitations needing review."""
     heading('GitHub checks found in selected workflow files', separate=True)
-    print('Choose which results Pubanon waits for. This does not change which jobs GitHub runs.')
+    print('Choose which results pubanon waits for. This does not change which jobs GitHub runs.')
     for number, name in enumerate(discovered.names, start=1):
         print(f'  {number}. {escape(name)}')
         for caution in discovered.cautions:
@@ -596,7 +652,7 @@ def _required_checks_prompt(
     """Offer workflow check names, preserving a manual CSV entry option."""
     discovered = _workflow_checks.discover(snapshot)
     if discovered.notes:
-        heading('Checks Pubanon could not list automatically', separate=True)
+        heading('Checks pubanon could not list automatically', separate=True)
         for note in discovered.notes:
             output(escape(note), kind='warning')
         output(
@@ -625,6 +681,11 @@ def _required_checks_prompt(
         return {'all listed': discovered.names, 'none': (), 'keep current': default}[action]
 
 
+def _source_tags_prompt(*, default: bool) -> bool:
+    """Ask whether to mark the source commit of each publication with a local tag."""
+    return confirm('Create local tags marking the source of each publication?', default=default)
+
+
 def _visibility_prompt(*, default: str) -> str:
     """Read a supported visibility without discarding prior answers."""
     while True:
@@ -641,7 +702,7 @@ def _draft_field(
     step = draft.pending[0]
     if step in {'owner', 'repo'}:
         default = (
-            draft.owner or ctx.global_config.accounts['github']
+            draft.owner or ctx.global_config.accounts[ctx.project.host]
             if step == 'owner'
             else draft.repo or ctx.project.name
         )
@@ -674,27 +735,115 @@ def _draft_field(
     elif step == 'source_tags':
         draft = replace(
             draft,
-            source_tags=confirm(
-                'Create local tags marking the source of each publication?',
-                default=draft.source_tags,
+            source_tags=_source_tags_prompt(default=draft.source_tags),
+        )
+    elif step == 'release_pages':
+        draft = replace(
+            draft,
+            release_pages=_release_pages_prompt(
+                route=draft.publication_route or ctx.project.publication_route,
+                checks=draft.required_checks or (),
+                default=draft.release_pages,
             ),
         )
     else:
-        default = getattr(draft, step)
-        if step == 'pull_requests':
-            output('Pubanon publishes from the private source and does not merge on GitHub.')
-        label = step.replace('_', ' ')
-        enabled = confirm(
-            f'Enable {label}?', default=(step == 'issues') if default is None else default
-        )
-        draft = replace(draft, **{step: enabled})
+        draft = replace(draft, **{step: _feature_prompt(step, getattr(draft, step))})
     return _checkpoint_init(ctx, replace(draft, pending=draft.pending[1:]))
+
+
+def _edit_project_section(
+    ctx: _context.ProjectContext,
+    snapshot: _source.Snapshot,
+    project: _config.ProjectConfig,
+) -> _config.ProjectConfig:
+    """Change one selected settings section while keeping every other saved value."""
+    action = ask(
+        'Edit:',
+        choices=['visibility', 'route', 'tags', 're[l]ease pages', 'checks', 'settings', 'back'],
+    )
+    if action == 'visibility':
+        visibility = _visibility_prompt(default=project.visibility)
+        if visibility != project.visibility:
+            output(
+                'Changing the expected visibility invalidates a prepared snapshot.',
+                kind='warning',
+            )
+        project = replace(project, visibility=visibility)
+    elif action == 'route':
+        project = replace(
+            project,
+            publication_route=_publication_route_prompt(default=project.publication_route),
+        )
+    elif action == 'tags':
+        project = replace(project, source_tags=_source_tags_prompt(default=project.source_tags))
+    elif action == 'release pages':
+        enabled = _release_pages_prompt(
+            route=project.publication_route,
+            checks=project.required_checks,
+            default=_config.release_pages_enabled(project),
+        )
+        project = _edited_release_pages(project, enabled=enabled)
+    elif action == 'checks':
+        checks = _required_checks_prompt(
+            default=project.required_checks,
+            snapshot=_selection.sanitized_snapshot(
+                _replace_project_context(ctx, project), snapshot
+            ),
+        )
+        if checks != project.required_checks:
+            output('Changing required checks invalidates a prepared snapshot.', kind='warning')
+        project = replace(project, required_checks=checks)
+    elif action == 'settings':
+        if project.settings is None:
+            raise PubanonError('repository settings are missing')
+        project = replace(project, settings=_settings_prompt(project.settings))
+    return project
+
+
+def _edit_existing_project(ctx: _context.ProjectContext) -> None:
+    """Review, change, and save the settings of an existing project."""
+    if not sys.stdin.isatty():
+        raise PubanonError(
+            'init --edit requires an interactive terminal',
+            recovery='rerun pubanon init --edit in an interactive terminal',
+        )
+    source = ctx.project.source_path
+    _source.check_source_safety(source)
+    snapshot = _source.read_snapshot(source, _source.pin(source, 'HEAD').commit)
+    original = ctx.project
+    project = original
+    project_file = ctx.paths.config_dir / 'projects' / f'{project.name}.toml'
+    output('To change the selected files, run pubanon prepare and choose review.', kind='note')
+    while True:
+        _project_review(project, snapshot, ctx.global_config)
+        action = ask('Save this configuration?', choices=['save', 'edit', 'cancel'])
+        if action == 'cancel':
+            raise OperationCanceled('Canceled. Nothing was saved.')
+        if action == 'save':
+            if project == original:
+                output('No changes to save.', kind='note')
+                return
+            try:
+                _lifecycle.gate_host_fields(ctx.paths, ctx.global_config, project)
+            except PubanonError as error:
+                print(diagnostic(error))
+                output('Edit the field named in the error before saving.', kind='warning')
+                output(
+                    'For fields not listed in Edit, cancel and edit the project file: '
+                    f'{escape(path_text(project_file))}',
+                    kind='warning',
+                )
+                continue
+            break
+        project = _edit_project_section(ctx, snapshot, project)
+    _config.save_project(ctx.paths, project)
+    output(f'Saved project {escape(project.name)}.', kind='success')
+    detail(f'Project configuration: {escape(path_text(project_file))}')
 
 
 def _initial_project(
     ctx: _context.ProjectContext,
     *,
-    verbose: bool,
     route: str | None,
     source_tags: bool | None,
 ) -> _config.ProjectConfig:
@@ -704,7 +853,7 @@ def _initial_project(
     pinned = _source.pin(source, 'HEAD')
     snapshot = _source.read_snapshot(source, pinned.commit)
     heading('Project source')
-    print(f'{style("Source repository root:")} {escape(str(source))}')
+    print(f'{style("Source repository root:")} {escape(path_text(source))}')
     resume = (
         'pubanon init'
         if ctx.project.name == source.name
@@ -715,7 +864,7 @@ def _initial_project(
         while draft.pending:
             step = draft.pending[0]
             if step == 'selection':
-                draft = _draft_selection(ctx, snapshot, draft, verbose=verbose)
+                draft = _draft_selection(ctx, snapshot, draft)
             elif step == 'review':
                 draft = _draft_review(ctx, snapshot, draft)
             else:
@@ -742,14 +891,26 @@ def command_init(args: argparse.Namespace) -> None:
     name = args.project or registered or source.name
     _config.require_project_name(name)
     project_file = paths.config_dir / 'projects' / f'{name}.toml'
+    if args.edit and not project_file.exists():
+        raise PubanonError('no saved project to edit', recovery='pubanon init')
     if args.yes and not project_file.exists():
         raise PubanonError(
             '--yes cannot answer policy proposals',
-            recovery=(f'author {escape(str(project_file))} explicitly, then rerun pubanon init'),
+            recovery=(
+                f'author {escape(path_text(project_file))} explicitly, then rerun pubanon init'
+            ),
         )
     with _config.project_lock(paths, name):
         if project_file.exists():
             project = _config.load_project(paths, name)
+            if args.edit:
+                if not _config.same_source(project.source_path, source):
+                    raise PubanonError(
+                        'configured source path differs from the current source',
+                        recovery='rerun pubanon init --relocate, then pubanon init --edit',
+                    )
+                _edit_existing_project(_context.ProjectContext(paths, global_config, project))
+                return
             relocated = False
             route_changed = args.publication_route is not None and (
                 args.publication_route != project.publication_route
@@ -757,6 +918,7 @@ def command_init(args: argparse.Namespace) -> None:
             source_tags_changed = (
                 args.source_tags is not None and args.source_tags != project.source_tags
             )
+            self_publication_changed = args.self_publication and not project.self_publication
             if not _config.same_source(project.source_path, source):
                 if not args.relocate:
                     raise PubanonError(
@@ -773,17 +935,19 @@ def command_init(args: argparse.Namespace) -> None:
                     source_tags=(
                         project.source_tags if args.source_tags is None else args.source_tags
                     ),
+                    self_publication=project.self_publication or self_publication_changed,
                 )
                 _config.install_project(paths, project)
                 relocated = True
             else:
-                if route_changed or source_tags_changed:
+                if route_changed or source_tags_changed or self_publication_changed:
                     project = replace(
                         project,
                         publication_route=args.publication_route or project.publication_route,
                         source_tags=(
                             project.source_tags if args.source_tags is None else args.source_tags
                         ),
+                        self_publication=project.self_publication or self_publication_changed,
                     )
                     _config.save_project(paths, project)
                 _config.registry_set(paths, source, name)
@@ -791,15 +955,15 @@ def command_init(args: argparse.Namespace) -> None:
                 paths,
                 project,
                 relocated=relocated,
-                route_changed=route_changed,
-                source_tags_changed=source_tags_changed,
+                project_changed=route_changed or source_tags_changed or self_publication_changed,
+                self_publication_enabled=self_publication_changed,
             )
             return
         preliminary = _config.ProjectConfig(
             name=name,
             source_path=source,
-            host='github',
-            owner=global_config.accounts['github'],
+            host=_config.DEFAULT_HOST,
+            owner=global_config.accounts[_config.DEFAULT_HOST],
             repo=name,
             visibility='private',
             allow=(),
@@ -813,7 +977,6 @@ def command_init(args: argparse.Namespace) -> None:
         )
         project = _initial_project(
             _context.ProjectContext(paths, global_config, preliminary),
-            verbose=args.verbose,
             route=args.publication_route,
             source_tags=args.source_tags,
         )
@@ -821,5 +984,5 @@ def command_init(args: argparse.Namespace) -> None:
         _init_draft.remove(paths, name)
 
     output(f'Saved project {escape(name)}.', kind='success')
-    detail(f'Project configuration: {escape(str(project_file))}')
+    detail(f'Project configuration: {escape(path_text(project_file))}')
     next_step('pubanon repo create')

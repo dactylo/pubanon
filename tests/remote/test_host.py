@@ -216,6 +216,33 @@ def _write_responses(path: Path, responses: list[dict[str, object]]) -> None:
     path.write_text(json.dumps(responses))
 
 
+def test_all_releases_reads_every_page_in_order(fake_gh: Path, tmp_path: Path) -> None:
+    pages = [
+        [_release(f'v1.0.{index}') for index in range(start, stop)]
+        for start, stop in ((0, 100), (100, 200), (200, 202))
+    ]
+    _write_responses(
+        fake_gh,
+        [
+            {
+                'args': [
+                    'api',
+                    '--method',
+                    'GET',
+                    f'repos/publication-owner/public-repo/releases?per_page=100&page={page}',
+                ],
+                'stdout': json.dumps(entries),
+            }
+            for page, entries in enumerate(pages, 1)
+        ],
+    )
+
+    releases = _host.all_releases(_destination())
+
+    assert [release.tag for release in releases] == [f'v1.0.{index}' for index in range(202)]
+    assert len(_gh_calls(tmp_path)) == 3
+
+
 def test_authenticated_account_hides_malformed_response(fake_gh: Path) -> None:
     _write_responses(fake_gh, [{'args': _ACCOUNT_ARGS, 'stdout': 'first\nsecond\n'}])
 
@@ -311,6 +338,16 @@ def test_authenticated_account_returns_verified_login(fake_gh: Path) -> None:
     assert _host.authenticated_account() == 'verified-account'
 
 
+def test_blob_url_quotes_every_path_component(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', 'file:///local/{owner}/{repo}.git')
+    assert _host.blob_url('public-owner', 'public-repo', 'v1.2.3', 'docs/my notes.md') == (
+        'https://github.com/public-owner/public-repo/blob/v1.2.3/docs/my%20notes.md'
+    )
+    assert _host.blob_url('public-owner', 'public-repo', 'v1.2/3', 'docs/a#b?.md') == (
+        'https://github.com/public-owner/public-repo/blob/v1.2%2F3/docs/a%23b%3F.md'
+    )
+
+
 def test_check_recovery_accepts_one_pass_verdicts() -> None:
     verdicts = (
         verdict
@@ -367,7 +404,7 @@ def test_check_result_refuses_mismatched_commit(fake_gh: Path) -> None:
     }
     _write_responses(fake_gh, [{'args': args, 'stdout': json.dumps(payload) + '\n'}])
 
-    with pytest.raises(PubanonError, match='GitHub returned check results Pubanon could not read'):
+    with pytest.raises(PubanonError, match='GitHub returned check results pubanon could not read'):
         _host.check_result(('publication-owner', 'public-repo'), 'a' * 40, 'CI')
 
 
@@ -569,7 +606,17 @@ def test_delete_repository_accepts_success(fake_gh: Path, tmp_path: Path) -> Non
     assert _gh_calls(tmp_path) == [{'args': args, 'stdin': ''}]
 
 
-def test_delete_repository_refuses_absent_repository(fake_gh: Path) -> None:
+@pytest.mark.parametrize(
+    ('stdout', 'stderr'),
+    [
+        ('{"message":"Not Found","status":"404"}\n', ''),
+        ('{"status":404}\n', ''),
+        ('', 'gh: Not Found (HTTP 404)\n'),
+    ],
+)
+def test_delete_repository_refuses_absent_repository(
+    fake_gh: Path, stdout: str, stderr: str
+) -> None:
     args = ['api', '-X', 'DELETE', 'repos/publication-owner/public-repo']
     _write_responses(
         fake_gh,
@@ -577,7 +624,8 @@ def test_delete_repository_refuses_absent_repository(fake_gh: Path) -> None:
             {
                 'args': args,
                 'returncode': 1,
-                'stdout': '{"message":"Not Found","status":"404"}\n',
+                'stdout': stdout,
+                'stderr': stderr,
             }
         ],
     )
@@ -961,8 +1009,8 @@ def test_gh_timeout_discards_child_streams(monkeypatch: pytest.MonkeyPatch) -> N
         _host._gh(['api', 'user'], timeout=2.5)
 
     assert type(exc_info.value).__name__ == 'ObservationTimeoutError'
-    assert exc_info.value.stdout == b''
-    assert exc_info.value.stderr == b''
+    assert 'stdout' not in vars(exc_info.value)
+    assert 'stderr' not in vars(exc_info.value)
     graph = _exception_graph(exc_info.value)
     assert graph == (exc_info.value,)
     assert 'private-canary' not in repr([vars(error) for error in graph])
@@ -1028,6 +1076,38 @@ def test_list_releases_rejects_malformed_page(fake_gh: Path, response: dict[str,
 
     with pytest.raises(PubanonError, match='invalid release response'):
         _host.list_releases(_destination(), limit=30)
+
+
+@pytest.mark.parametrize(
+    ('response', 'error'),
+    [
+        (
+            {'stdout': json.dumps([_release('v1.0.0') | {'draft': 'false'}])},
+            'invalid release response',
+        ),
+        ({'returncode': 1, 'stderr': 'authentication failed'}, 'authentication failed'),
+    ],
+)
+def test_all_releases_propagates_invalid_or_failed_page(
+    fake_gh: Path, response: dict[str, object], error: str
+) -> None:
+    _write_responses(
+        fake_gh,
+        [
+            {
+                'args': [
+                    'api',
+                    '--method',
+                    'GET',
+                    'repos/publication-owner/public-repo/releases?per_page=100&page=1',
+                ],
+                **response,
+            }
+        ],
+    )
+
+    with pytest.raises(PubanonError, match=error):
+        _host.all_releases(_destination())
 
 
 def test_list_releases_respects_limit_across_pages(fake_gh: Path, tmp_path: Path) -> None:
@@ -1600,6 +1680,41 @@ def test_read_remote_refs_propagates_timeout(monkeypatch: pytest.MonkeyPatch) ->
         _host.read_remote_refs(_destination(), timeout=2.5)
 
 
+def test_release_read_passes_remaining_deadline_to_each_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remaining = iter((5.0, 6.0))
+    timeouts: list[float | None] = []
+
+    def _run(_args: list[str], *, timeout: float | None = None) -> bytes:
+        timeouts.append(timeout)
+        if len(timeouts) == 1:
+            return json.dumps([_release(f'v1.0.{index}') for index in range(100)]).encode()
+        return b'[]'
+
+    monkeypatch.setattr(_host, '_monotonic', lambda: next(remaining))
+    monkeypatch.setattr(_host, '_gh', _run)
+
+    assert _host.all_releases(_destination(), deadline=10.0)
+    assert timeouts == [5.0, 4.0]
+
+
+@pytest.mark.parametrize('operation', ['all', 'read'])
+def test_release_read_rejects_expired_deadline_before_gh(
+    operation: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_host, '_monotonic', lambda: 10.0)
+
+    if operation == 'all':
+        with pytest.raises(ObservationTimeoutError):
+            _host.all_releases(_destination(), deadline=9.0)
+    else:
+        with pytest.raises(ObservationTimeoutError):
+            _host.read_release(_destination(), 'v1.0.0', deadline=9.0)
+
+    assert not (tmp_path / 'fake-gh-calls.jsonl').exists()
+
+
 @pytest.mark.parametrize('operation', ['create', 'edit'])
 def test_release_write_uses_verified_tag_and_retained_stdin(
     operation: str,
@@ -1634,6 +1749,39 @@ def test_release_write_uses_verified_tag_and_retained_stdin(
         '-',
     ]
     assert kwargs['input'] == notes
+
+
+@pytest.mark.parametrize('mark_latest', [True, False])
+def test_create_release_sets_latest_only_when_disabled(
+    mark_latest: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def _run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0, b'', b'')
+
+    monkeypatch.setattr(_host.subprocess, 'run', _run)
+    _host.create_release(
+        _destination(), 'v1.0.0', title='Page', notes=b'Exact notes\n', mark_latest=mark_latest
+    )
+
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args == [
+        'gh',
+        'release',
+        'create',
+        'v1.0.0',
+        '--repo',
+        'publication-owner/public-repo',
+        '--verify-tag',
+        '--title=Page',
+        '--notes-file',
+        '-',
+        *(['--latest=false'] if not mark_latest else []),
+    ]
+    assert kwargs['input'] == b'Exact notes\n'
 
 
 @pytest.mark.parametrize(
@@ -1816,7 +1964,7 @@ def test_check_result_refuses_inconsistent_cardinality(
     ]
     _write_responses(fake_gh, [{'args': args, 'stdout': json.dumps(payload) + '\n'}])
 
-    with pytest.raises(PubanonError, match='GitHub returned check results Pubanon could not read'):
+    with pytest.raises(PubanonError, match='GitHub returned check results pubanon could not read'):
         _host.check_result(('publication-owner', 'public-repo'), 'a' * 40, 'CI')
 
 
@@ -2171,6 +2319,10 @@ def test_read_remote_refs_refuses_malformed_output(
             b'1111111111111111111111111111111111111111\trefs/heads/main\n'
         ),
         (
+            b'0000000000000000000000000000000000000000\trefs/heads/main\n'
+            b'0000000000000000000000000000000000000000\trefs/heads/main\n'
+        ),
+        (
             b'0000000000000000000000000000000000000000\trefs/tags/v1.0.0\n'
             b'1111111111111111111111111111111111111111\trefs/tags/v1.0.0\n'
         ),
@@ -2217,17 +2369,6 @@ def test_remote_refs_records_unexpected_branch_as_fact() -> None:
     refs = _remote_refs(output)
 
     assert refs.branches == (('feature', oid_b),)
-
-
-def test_remote_refs_still_refuses_malformed_and_duplicates() -> None:
-    oid_a = 'a' * 40
-    outputs = (
-        b'garbage\n',
-        f'{oid_a}\trefs/heads/main\n{oid_a}\trefs/heads/main\n'.encode(),
-    )
-    for output in outputs:
-        with pytest.raises(PubanonError):
-            _remote_refs(output)
 
 
 @pytest.mark.parametrize(
@@ -2423,14 +2564,15 @@ def test_repository_visible_returns_false_for_http_404_fallback(fake_gh: Path) -
     assert not _host.repository_visible('publication-owner', 'public-repo')
 
 
-def test_repository_visible_returns_false_for_json_404(fake_gh: Path) -> None:
+@pytest.mark.parametrize('status', ['"404"', '404'])
+def test_repository_visible_returns_false_for_json_404(fake_gh: Path, status: str) -> None:
     _write_responses(
         fake_gh,
         [
             {
                 'args': _REPOSITORY_ARGS,
                 'returncode': 1,
-                'stdout': '{"message":"Not Found","status":"404"}\n',
+                'stdout': f'{{"message":"Not Found","status":{status}}}\n',
             }
         ],
     )

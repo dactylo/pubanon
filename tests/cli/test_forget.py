@@ -12,9 +12,10 @@ import pytest
 
 from pubanon import _cli, _config
 from pubanon._cli import _forget
-from pubanon._snapshots import _candidate, _records
+from pubanon._snapshots import _records, _verification
 from pubanon._terminal import display_path, escape
 from tests._cli import gh_calls, prepare, record_publication
+from tests._git import git_env
 from tests._setup import configure
 
 
@@ -142,7 +143,7 @@ def test_forget_checks_recovery_before_changes(
                 str(worktree),
             ]
         else:
-            assert escape(str(directory / state)) in error
+            assert escape((directory / state).as_posix()) in error
             assert 'invalid' in error
 
 
@@ -165,7 +166,7 @@ def test_forget_keeps_a_lock_acquired_at_completion(
         assert _cli.main(['forget', '--project', 'demo', '--yes']) == 0
         assert (paths.data_dir / 'projects' / 'demo' / 'project.lock').exists()
         assert _cli.main(['status', '--project', 'demo']) == 1
-        assert 'another Pubanon command is running for this project' in capsys.readouterr().err
+        assert 'another pubanon command is running for this project' in capsys.readouterr().err
 
 
 def test_forget_refuses_held_lock(
@@ -177,7 +178,7 @@ def test_forget_refuses_held_lock(
     paths, _, _ = configure(tmp_path, monkeypatch, make_repo())
     with _held_lock('demo'):
         assert _cli.main(['forget', '--project', 'demo', '--yes']) == 1
-    assert 'another Pubanon command is running for this project' in capsys.readouterr().err
+    assert 'another pubanon command is running for this project' in capsys.readouterr().err
     assert (paths.config_dir / 'projects' / 'demo.toml').exists()
 
 
@@ -189,7 +190,8 @@ def test_forget_removes_local_state_keeps_source_and_lock(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, project, record = prepare(tmp_path, source, monkeypatch)
-    subprocess.run(['git', '-C', source, 'tag', 'pubanon/v1.0.0'], check=True)
+    monkeypatch.setenv('GIT_DIR', str(tmp_path / 'inherited.git'))
+    subprocess.run(['git', '-C', source, 'tag', 'pubanon/v1.0.0'], check=True, env=git_env())
     directory = paths.data_dir / 'projects' / project.name
     lock = directory / 'project.lock'
     identity = lock.stat().st_ino
@@ -198,10 +200,12 @@ def test_forget_removes_local_state_keeps_source_and_lock(
     (outside / 'kept').touch()
     (directory / 'link').symlink_to(outside, target_is_directory=True)
     (directory / 'draft.json').write_text('{}')
-    inspection = _candidate.materialize_inspect(paths, project.name, record)
+    inspection = _verification.materialize_inspect(
+        paths, project.name, _verification.prove_objects(paths, project.name, record)
+    )
     assert inspection.exists()
     record_publication(paths, project, record)
-    refs = subprocess.check_output(['git', '-C', source, 'show-ref'])
+    refs = subprocess.check_output(['git', '-C', source, 'show-ref'], env=git_env())
     capsys.readouterr()
     monkeypatch.chdir(source)
 
@@ -212,7 +216,7 @@ def test_forget_removes_local_state_keeps_source_and_lock(
     assert (outside / 'kept').exists()
     assert _config.registry_lookup(paths, source) is None
     assert not (paths.config_dir / 'projects' / 'demo.toml').exists()
-    assert subprocess.check_output(['git', '-C', source, 'show-ref']) == refs
+    assert subprocess.check_output(['git', '-C', source, 'show-ref'], env=git_env()) == refs
     assert gh_calls(tmp_path) == []
     rendered = capsys.readouterr().out
     for expected in (
@@ -228,12 +232,13 @@ def test_forget_removes_local_state_keeps_source_and_lock(
     assert 'configuration' in capsys.readouterr().err
     with _held_lock('demo'):
         assert _cli.main(['status', '--project', 'demo']) == 1
-        assert 'another Pubanon command is running for this project' in capsys.readouterr().err
+        assert 'another pubanon command is running for this project' in capsys.readouterr().err
     answers = iter(['c', '', '', '', '', '', '', '', '', 's'])
 
     def _answer(prompt: str) -> str:
         if prompt.startswith('Publication route (staged/direct) [') or prompt in {
             'Create local tags marking the source of each publication? [y/N] ',
+            'Create a release page for each published version? [y/N] ',
             'Enable pull requests? [y/N] ',
             'Enable discussions? [y/N] ',
         }:

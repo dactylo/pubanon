@@ -11,8 +11,8 @@ from pubanon import (
 )
 from pubanon._cli import _context
 from pubanon._errors import PubanonError
-from pubanon._remote import _stage
-from pubanon._snapshots import _candidate, _history, _records
+from pubanon._remote import _releases, _stage
+from pubanon._snapshots import _history, _inspection, _records, _reports, _verification
 from pubanon._terminal import (
     display_path,
     escape,
@@ -22,6 +22,7 @@ from pubanon._terminal import (
     next_step,
     output,
     style,
+    verbose_enabled,
 )
 from pubanon._terminal import (
     field as terminal_field,
@@ -36,7 +37,6 @@ def _inspection_details(
     selected: Path,
     copies: tuple[Path, ...],
     *,
-    verbose: bool,
     snapshot: str | None = None,
 ) -> str:
     """Describe verified read-only snapshot files and optional review directories."""
@@ -44,7 +44,7 @@ def _inspection_details(
     if snapshot is not None:
         lines.extend(['  ' + terminal_field('Snapshot', snapshot), ''])
     lines.append(terminal_field('Review copy', display_path(selected)))
-    if verbose:
+    if verbose_enabled():
         older = [copy for copy in copies if copy != selected]
         if older:
             lines.extend(['', style('Directories from earlier snapshots', 'heading')])
@@ -53,74 +53,69 @@ def _inspection_details(
     return '\n'.join(lines)
 
 
-def _inspect_published(
-    ctx: _context.ProjectContext, selector: str, *, refresh: bool, verbose: bool = False
-) -> None:
+def _inspect_published(ctx: _context.ProjectContext, selector: str, *, refresh: bool) -> None:
     """Inspect the verified read-only files of one saved publication."""
     entry = _history.select_publication(ctx.paths, ctx.project.name, selector)
-    selected = _candidate.inspection_path(ctx.paths, ctx.project.name, entry.commit)
-    copies = _candidate.inspection_paths(ctx.paths, ctx.project.name)
+    selected = _inspection.inspection_path(ctx.paths, ctx.project.name, entry.commit)
+    copies = _inspection.inspection_paths(ctx.paths, ctx.project.name)
     if refresh:
         print(f'{style("Replacing review copy:")} {display_path(selected)}')
         output('All current contents of this directory will be replaced.', kind='warning')
         sys.stdout.flush()
     inspection = _history.inspect_publication(ctx.paths, ctx.project.name, entry, refresh=refresh)
     identity = escape(', '.join(entry.tags) or 'untagged')
-    snapshot_id = entry.commit if verbose else entry.commit[:12]
+    snapshot_id = entry.commit if verbose_enabled() else entry.commit[:12]
     heading('Published snapshot', separate=refresh)
     fields([('Snapshot', snapshot_id), ('Version', identity)])
-    print('\n' + _inspection_details(inspection, copies, verbose=verbose))
+    print('\n' + _inspection_details(inspection, copies))
     print()
     next_step(
         _context.project_command(
             ctx.project.name,
             'show',
             f'--project={ctx.project.name}',
-            entry.commit if verbose else entry.commit[:12],
+            entry.commit if verbose_enabled() else entry.commit[:12],
         )
     )
 
 
 def _inspect_rewritten_copy(
     ctx: _context.ProjectContext,
-    record: _candidate.CandidateRecord,
+    proof: _verification.ObjectProof,
     selector: str,
     *,
     refresh: bool,
-    verbose: bool = False,
-) -> None:
+) -> Path:
     """Show the exact copy targeted by refresh before materializing it."""
-    commit = _candidate.select_rewritten_commit(record, selector)
-    selected_path = _candidate.inspection_path(ctx.paths, ctx.project.name, commit)
-    copies = _candidate.inspection_paths(ctx.paths, ctx.project.name)
+    record = proof.record
+    commit = _verification.select_rewritten_commit(record, selector)
+    selected_path = _inspection.inspection_path(ctx.paths, ctx.project.name, commit)
+    copies = _inspection.inspection_paths(ctx.paths, ctx.project.name)
     if refresh:
         print(terminal_field('Replacing review copy', display_path(selected_path)))
         output('All current contents of this directory will be replaced.', kind='warning')
         sys.stdout.flush()
-    selected = _candidate.inspect_rewritten(
-        ctx.paths, ctx.project.name, record, selector, refresh=refresh
+    selected = _verification.inspect_rewritten(
+        ctx.paths, ctx.project.name, proof, selector, refresh=refresh
     )
-    print(
-        _candidate.inspect_report(
-            ctx.paths, record, ctx.global_config, ctx.project, verbose=verbose
-        )
-    )
+    print(_reports.inspect_report(ctx.paths, proof, ctx.global_config, ctx.project))
     print(
         '\n'
         + _inspection_details(
             selected,
             copies,
-            verbose=verbose,
-            snapshot=commit if verbose else commit[:12],
+            snapshot=commit if verbose_enabled() else commit[:12],
         )
     )
     print()
     next_step(_stage.candidate_next_action(ctx.paths, ctx.global_config, ctx.project, record))
 
+    return selected
+
 
 def _inspection_listing(paths: _config.Paths, name: str) -> list[str]:
     """Describe preserved snapshot directories independently of snapshot state."""
-    copies = _candidate.inspection_paths(paths, name)
+    copies = _inspection.inspection_paths(paths, name)
     if not copies:
         return []
     return [
@@ -144,46 +139,42 @@ def _inspect_without_candidate(paths: _config.Paths, name: str, *, refresh: bool
 
 def inspection_copy(
     ctx: _context.ProjectContext,
-    record: _candidate.CandidateRecord,
+    proof: _verification.ObjectProof,
     *,
     refresh: bool = False,
     workflow: bool = False,
-    verbose: bool = False,
 ) -> Path:
     """Materialize a selected copy and describe its deliberate retention lifecycle.
 
     Args:
         ctx: Project context for the retained snapshot.
-        record: Candidate to materialize under its snapshot identity.
+        proof: Object evidence obtained for this review step.
         refresh: Replace all contents of an existing inspection directory.
         workflow: Omit the candidate report and next action handled by the
             workflow.
-        verbose: Include directories preserved from earlier snapshots.
 
     Returns:
         The inspection directory, retained until explicitly cleaned or
         refreshed.
     """
-    selected = _candidate.inspection_path(
+    record = proof.record
+    selected = _inspection.inspection_path(
         ctx.paths, ctx.project.name, _records.candidate_tip(record)
     )
-    copies = _candidate.inspection_paths(ctx.paths, ctx.project.name)
+    copies = _inspection.inspection_paths(ctx.paths, ctx.project.name)
     if refresh:
         print(f'{style("Replacing review copy:")} {display_path(selected)}')
         print(
             style('All current contents of this directory will be replaced.', 'warning'),
             flush=True,
         )
-    inspection = _candidate.materialize_inspect(
-        ctx.paths, ctx.project.name, record, refresh=refresh
+    inspection = _verification.materialize_inspect(
+        ctx.paths, ctx.project.name, proof, refresh=refresh
     )
-    details = _inspection_details(inspection, copies, verbose=verbose)
+    details = _inspection_details(inspection, copies)
     if not workflow:
-        print(
-            _candidate.inspect_report(
-                ctx.paths, record, ctx.global_config, ctx.project, verbose=verbose
-            )
-        )
+        print(_reports.inspect_report(ctx.paths, proof, ctx.global_config, ctx.project))
+        _releases.show_planned_page(ctx.paths, ctx.project, record)
     print('\n' + details)
     print()
     if not workflow:
@@ -200,29 +191,16 @@ def command_inspect(args: argparse.Namespace) -> None:
     with _config.project_lock(paths, name):
         ctx = _context.load_context(paths, name)
         if args.published is not None:
-            _inspect_published(ctx, args.published, refresh=args.refresh, verbose=args.verbose)
+            _inspect_published(ctx, args.published, refresh=args.refresh)
             return
-        record = _candidate.load_candidate(paths, name)
+        record = _records.load_candidate(paths, name)
         if record is None:
             _inspect_without_candidate(
                 paths, name, refresh=args.refresh or args.rewritten is not None
             )
             return
+        proof = _verification.prove_objects(paths, name, record)
         if args.rewritten is not None:
-            _inspect_rewritten_copy(
-                ctx, record, args.rewritten, refresh=args.refresh, verbose=args.verbose
-            )
+            _inspect_rewritten_copy(ctx, proof, args.rewritten, refresh=args.refresh)
             return
-        inspection_copy(ctx, record, refresh=args.refresh, verbose=args.verbose)
-
-
-def inspection_status(paths: _config.Paths, name: str) -> list[str]:
-    """Summarize preserved copies and point to their detailed listing."""
-    copies = _candidate.inspection_paths(paths, name)
-    if not copies:
-        return []
-    command = style(guidance('pubanon inspect --verbose'), 'choice')
-    return [
-        terminal_field('Snapshot directories', str(len(copies))),
-        terminal_field('View directories', command),
-    ]
+        inspection_copy(ctx, proof, refresh=args.refresh)

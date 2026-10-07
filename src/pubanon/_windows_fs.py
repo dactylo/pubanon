@@ -1,4 +1,4 @@
-"""Provide Windows read-only attributes and durable file replacement."""
+"""Provide native Windows entry checks and durable file replacement."""
 
 import ctypes
 import os
@@ -22,10 +22,9 @@ class _Function(Protocol):
         ...
 
 
-def _error(code: int | None = None) -> OSError:
+def _error() -> OSError:
     """Capture a Win32 error while its thread-local value is still current."""
-    if code is None:
-        code = cast('Callable[[], int]', getattr(ctypes, 'get_last_error', None))()
+    code = cast('Callable[[], int]', getattr(ctypes, 'get_last_error', None))()
     return cast('Callable[[int], OSError]', getattr(ctypes, 'WinError', None))(code)
 
 
@@ -51,22 +50,6 @@ def check_directory(path: Path) -> None:
     """Require a directory entry without traversing a leaf link during cleanup."""
     if not stat.S_ISDIR(path.lstat().st_mode) or path.is_junction():
         raise OSError('not a plain directory')
-
-
-def chmod(path: Path, mode: int, *, follow_symlinks: bool = True) -> None:
-    """Set the ordinary read-only attribute without changing access control lists.
-
-    Args:
-        path: File or directory to update.
-        mode: Owner-write selects writable; otherwise select read-only.
-        follow_symlinks: Whether to update a link target instead of the link.
-    """
-    path.chmod(mode, follow_symlinks=follow_symlinks)
-
-
-def fchmod(fd: int, mode: int) -> None:
-    """Set an open file's read-only attribute without changing its access list."""
-    os.chmod(fd, mode)
 
 
 def read_entry(path: Path) -> tuple[int, bytes]:

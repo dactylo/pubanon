@@ -1,16 +1,16 @@
 # pubanon
 
-Pubanon publishes selected files from a private Git repository to GitHub under a separate name and
+pubanon publishes selected files from a private Git repository to GitHub under a separate name and
 email. Each release creates one publication commit without copying your private commit history.
 Choose the files, review the prepared release, and confirm publication.
 
-Pubanon checks the selected content for configured sensitive terms. It does not rewrite secrets out
+pubanon checks the selected content for configured sensitive terms. It does not rewrite secrets out
 of files. You control what you publish; the
 [content matching limits](docs/guide.md#how-a-release-works) explain what the checks can detect.
 
 ## Installation
 
-You need Python 3.13 or newer, Git 2.41.0 or newer, and the GitHub CLI (`gh`). Pubanon targets
+You need Python 3.13 or newer, Git 2.41.0 or newer, and the GitHub CLI (`gh`). pubanon targets
 Linux, macOS, and native Windows. See [platform requirements](docs/platforms.md) for details.
 
 From a checkout of this repository, install the command with [uv](https://docs.astral.sh/uv/):
@@ -39,8 +39,8 @@ Setup asks for the name and email to use in published Git history, the terms you
 private, and the default publication route for new projects. The built-in route is `staged`; choose
 `direct` if you intend to publish without private staging. Setup verifies your GitHub CLI account
 and shows your answers before saving. Choose the name and email you want readers to see: existing
-publication commits keep that identity. Use `pubanon setup --edit` to change saved answers or
-`pubanon doctor` to check readiness.
+publication commits keep that identity. Use `pubanon setup --edit` to change saved answers,
+`pubanon init --edit` to change a project's settings, or `pubanon doctor` to check readiness.
 
 ### Select your project and files
 
@@ -51,10 +51,11 @@ cd /path/to/private-project
 pubanon init
 ```
 
-Follow the prompts to choose files, a GitHub destination, a publication route, and repository
-settings. Choose the `staged` route and `private` visibility for this walkthrough so you can test
-before the final upload and check the result on GitHub before making it public. Review your choices
-and save. Pubanon stores its configuration outside the source repository.
+Follow the prompts to choose files, a GitHub destination, a publication route, whether to create
+release pages, and repository settings. Choose the `staged` route and `private` visibility for this
+walkthrough so you can test before the final upload and check the result on GitHub before making it
+public. Review your choices and save. pubanon stores its configuration outside the source
+repository.
 
 ### Prepare and review
 
@@ -68,7 +69,7 @@ pubanon stage watch
 ```
 
 `prepare` saves the selected committed files as a local *snapshot*; uncommitted changes are left
-out. If the selected `pyproject.toml` declares a package version, Pubanon uses it for the release
+out. If the selected `pyproject.toml` declares a package version, pubanon uses it for the release
 tag; otherwise the snapshot is untagged. See [version tags](docs/guide.md#version-tags) to choose
 an explicit version.
 
@@ -99,12 +100,15 @@ exists. Before the first upload, keep in mind that GitHub can retain old commits
 logs, and artifacts even after history is replaced. Staging lets you test before anything reaches
 the final repository.
 
-`publish` asks for confirmation, then sends the snapshot to the final repository. On the `staged`
-route, it first checks that the staged snapshot passed its configured checks. `repo watch` waits
-for the final repository's own CI; skip it if neither `ci_workflow` nor checks are configured.
-`repo reveal` checks the published history and settings, links the repository's Activity and
-Actions pages for you to review, and asks before making the repository public. Pubanon does not
-scan logs or artifact contents.
+`publish` asks for confirmation, then sends the snapshot to the final repository. If you turned on
+release pages, a tagged publication also gets a release page, shown in the preview first. A new
+page defaults to the tag as its title and a link to a published root `CHANGELOG.md` as its notes,
+or empty notes when that file is absent. Otherwise pubanon prints the command that adds one later.
+On the `staged` route, `publish` first checks that the staged snapshot passed its configured
+checks. `repo watch` waits for the final repository's own CI; skip it if neither `ci_workflow` nor
+checks are configured. `repo reveal` checks the published history and settings, links the
+repository's Activity and Actions pages for you to review, and asks before making the repository
+public. pubanon does not scan logs or artifact contents.
 
 For the next release, commit your changes, updating the package version if you have one, and repeat
 these steps without `repo create` and `repo reveal`.
@@ -115,7 +119,7 @@ these steps without `repo create` and `repo reveal`.
 | --------------------------------------------------------------- | ----------------------------------------------------------------------------- |
 | Publish another release or choose a workflow                    | [Publication guide](docs/guide.md)                                            |
 | Publish without private staging                                 | [Direct publication](docs/guide.md#direct-publication)                        |
-| Add or edit a GitHub release page for a published tag           | [Release pages](docs/guide.md#github-release-pages)                           |
+| Configure, create, or recover a GitHub release page             | [Release pages](docs/guide.md#github-release-pages)                           |
 | Change the selected files, CI checks, or other project settings | [Project configuration](docs/guide.md#edit-an-existing-project)               |
 | Run CI privately before publishing                              | [Private staging](docs/guide.md#private-first-ci)                             |
 | Inspect an earlier release or recover its private source        | [Published history](docs/operations.md#published-history-and-source-recovery) |
@@ -136,3 +140,7 @@ The [development guide](docs/development.md) lists the required tools. With them
 make setup
 make check
 ```
+
+## License
+
+pubanon is available under the [MIT License](LICENSE).

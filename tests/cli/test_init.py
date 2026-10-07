@@ -18,7 +18,10 @@ from tests._cli import gh_calls
 from tests._git import git_env
 from tests._setup import configure
 
-_Script = Callable[[Sequence[tuple[str, str]]], None]
+_Script = Callable[[Sequence[str | tuple[str, str]]], None]
+
+_PAGES = 'Create a release page for each published version? [y/N] '
+_SAVE = 'Save this configuration? [s]ave / [e]dit / [c]ancel: '
 
 
 def _assert_initial_selection_sections(output: str) -> None:
@@ -42,7 +45,7 @@ def _assert_initial_selection_sections(output: str) -> None:
     assert '    src/a.py\n' in published
     assert '    src/b.py\n' in published
     excluded = output.split('Excluded files\n', maxsplit=1)[1]
-    assert '  .pubanon.toml - Pubanon configuration (always excluded)\n' in excluded
+    assert '  .pubanon.toml - pubanon configuration (always excluded)\n' in excluded
     assert '  keys/id_rsa\n\n  Exclusions override included directories.\n' in excluded
 
 
@@ -77,6 +80,8 @@ def _default_route(answer: Callable[[str], str]) -> Callable[[str], str]:
         if prompt == 'Create local tags marking the source of each publication? [y/N] ':
             return ''
         if prompt in {'Enable pull requests? [y/N] ', 'Enable discussions? [y/N] '}:
+            return ''
+        if prompt == 'Create a release page for each published version? [y/N] ':
             return ''
         return answer(prompt)
 
@@ -125,13 +130,14 @@ def test_init_collects_complete_repository_settings_for_new_project(
         'Repository visibility (private/public) [private]: ': '',
         'Publication route (staged/direct) [staged]: ': '',
         'Required CI checks (comma separated, blank for none): ': '',
+        'Create a release page for each published version? [y/N] ': 'y',
         'Repository description (blank for none): ': 'Example project',
         'Enable issues? [Y/n] ': '',
         'Enable wiki? [y/N] ': '',
-        'Enable projects? [y/N] ': 'yes',
+        'Enable projects? [y/N] ': 'y',
         'Enable pull requests? [y/N] ': '',
-        'Enable discussions? [y/N] ': 'yes',
-        'Create local tags marking the source of each publication? [y/N] ': 'yes',
+        'Enable discussions? [y/N] ': 'y',
+        'Create local tags marking the source of each publication? [y/N] ': 'y',
         'Save this configuration? [s]ave / [e]dit / [c]ancel: ': 's',
     }
 
@@ -156,9 +162,11 @@ def test_init_collects_complete_repository_settings_for_new_project(
         discussions=True,
     )
     assert project.source_tags is True
+    assert project.release_page == _config.ReleasePageSettings(enabled=True)
     assert prompts.count('Create local tags marking the source of each publication? [y/N] ') == 1
     text = (paths.config_dir / 'projects' / 'demo.toml').read_text()
     assert '[settings]\ndescription = "Example project"\n' in text
+    assert '[release_page]\nenabled = true\n' in text
     assert 'projects = true\npull_requests = false\ndiscussions = true\n' in text
     assert prompts.index('Enable projects? [y/N] ') < prompts.index('Enable pull requests? [y/N] ')
     assert prompts.index('Enable pull requests? [y/N] ') < prompts.index(
@@ -167,8 +175,15 @@ def test_init_collects_complete_repository_settings_for_new_project(
     assert prompts.index('Required CI checks (comma separated, blank for none): ') < prompts.index(
         'Repository description (blank for none): '
     )
+    page_prompt = 'Create a release page for each published version? [y/N] '
+    assert prompts.index('Required CI checks (comma separated, blank for none): ') < (
+        prompts.index(page_prompt)
+    )
+    assert prompts.index(page_prompt) < prompts.index('Repository description (blank for none): ')
     review = capsys.readouterr().out
-    assert 'Pubanon publishes from the private source and does not merge on GitHub.' in review
+    assert 'Each page is created right after publishing, before CI runs.' in review
+    assert 'Release pages:' in review
+    assert 'pubanon publishes from the private source and does not merge on GitHub.' in review
     assert 'Features:' in review
     assert 'issues, projects, and discussions on' in review
     assert 'wiki and pull requests off' in review
@@ -236,6 +251,245 @@ def test_init_does_not_offer_checks_from_excluded_workflow(
     assert 'GitHub checks found' not in capsys.readouterr().out
 
 
+@pytest.mark.parametrize('page', [None, _config.ReleasePageSettings(enabled=None)])
+def test_init_edit_accepting_off_release_pages_keeps_unset_configuration(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    answers: _Script,
+    page: _config.ReleasePageSettings | None,
+) -> None:
+    source = make_repo(files={'README.md': 'public\n'})
+    paths, _global_config, project = configure(tmp_path, monkeypatch, source)
+    assert project is not None
+    _config.save_project(paths, replace(project, release_page=page))
+    project_file = paths.config_dir / 'projects' / 'demo.toml'
+    before = project_file.read_bytes()
+    monkeypatch.chdir(source)
+    monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+    answers([(_SAVE, 'e'), 'l', (_PAGES, ''), (_SAVE, 's')])
+
+    assert _cli.main(['init', '--edit']) == 0
+
+    assert project_file.read_bytes() == before
+    assert _config.load_project(paths, 'demo').release_page == page
+
+
+def test_init_edit_can_correct_description_after_failed_save(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    answers: _Script,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = make_repo(files={'README.md': 'public\n'})
+    paths, _global_config, project = configure(tmp_path, monkeypatch, source)
+    assert project is not None
+    assert project.settings is not None
+    monkeypatch.chdir(source)
+    monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+    feature_answers = [
+        ('Enable issues? [Y/n] ', ''),
+        ('Enable wiki? [y/N] ', ''),
+        ('Enable projects? [y/N] ', ''),
+        ('Enable pull requests? [y/N] ', ''),
+        ('Enable discussions? [y/N] ', ''),
+    ]
+    answers(
+        [
+            (_SAVE, 'e'),
+            's',
+            ('Repository description (blank for none): ', 'Private Person'),
+            *feature_answers,
+            (_SAVE, 's'),
+            (_SAVE, 'e'),
+            's',
+            ('Description: [k]eep / [r]eplace / [c]lear [keep]: ', 'r'),
+            ('Repository description (blank for none): ', 'Public tool'),
+            *feature_answers,
+            (_SAVE, 's'),
+        ]
+    )
+
+    assert _cli.main(['init', '--edit']) == 0
+
+    assert _config.load_project(paths, 'demo').settings == replace(
+        project.settings, description='Public tool'
+    )
+    out = capsys.readouterr().out
+    assert 'repository description did not pass content checks' in out
+    assert 'Saved project demo.' in out
+
+
+def test_init_edit_cancel_or_unchanged_save_writes_nothing(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    answers: _Script,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = make_repo(files={'README.md': 'public\n'})
+    paths, _global_config, _project = configure(tmp_path, monkeypatch, source)
+    project_file = paths.config_dir / 'projects' / 'demo.toml'
+    before = project_file.read_bytes()
+    monkeypatch.chdir(source)
+    monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+
+    answers([(_SAVE, 'c')])
+    assert _cli.main(['init', '--edit']) == 130
+    answers([(_SAVE, 's')])
+    assert _cli.main(['init', '--edit']) == 0
+
+    assert 'No changes to save.' in capsys.readouterr().out
+    assert project_file.read_bytes() == before
+
+
+def test_init_edit_changes_checks_and_repository_settings(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    answers: _Script,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = make_repo(files={'README.md': 'public\n'})
+    paths, _global_config, project = configure(tmp_path, monkeypatch, source)
+    assert project is not None
+    assert project.settings is not None
+    monkeypatch.chdir(source)
+    monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+    answers(
+        [
+            (_SAVE, 'e'),
+            'c',
+            ('Required CI checks (comma separated, blank for none): ', 'test'),
+            (_SAVE, 'e'),
+            's',
+            ('Repository description (blank for none): ', 'Public tool'),
+            ('Enable issues? [Y/n] ', 'n'),
+            ('Enable wiki? [y/N] ', ''),
+            ('Enable projects? [y/N] ', ''),
+            ('Enable pull requests? [y/N] ', ''),
+            ('Enable discussions? [y/N] ', 'y'),
+            (_SAVE, 's'),
+        ]
+    )
+
+    assert _cli.main(['init', '--edit']) == 0
+
+    saved = _config.load_project(paths, 'demo')
+    assert saved.required_checks == ('test',)
+    assert saved.settings == replace(
+        project.settings, description='Public tool', issues=False, discussions=True
+    )
+    assert saved.allow == project.allow
+    assert (saved.owner, saved.repo) == (project.owner, project.repo)
+    assert 'Changing required checks invalidates a prepared snapshot.' in capsys.readouterr().out
+
+
+def test_init_edit_invalid_saved_default_branch_can_cancel_after_failed_save(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    answers: _Script,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = make_repo(files={'README.md': 'public\n'})
+    paths, global_config, project = configure(tmp_path, monkeypatch, source)
+    assert project is not None
+    _config.save_global(
+        paths,
+        replace(global_config, sensitive_terms=(*global_config.sensitive_terms, 'main')),
+        paths.global_config.read_bytes(),
+    )
+    project_file = paths.config_dir / 'projects' / 'demo.toml'
+    before = project_file.read_bytes()
+    monkeypatch.chdir(source)
+    monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+    answers(
+        [
+            (_SAVE, 'e'),
+            't',
+            ('Create local tags marking the source of each publication? [y/N] ', 'y'),
+            (_SAVE, 's'),
+            (_SAVE, 'c'),
+        ]
+    )
+
+    assert _cli.main(['init', '--edit']) == 130
+
+    assert project_file.read_bytes() == before
+    out = capsys.readouterr().out
+    assert 'repository default branch did not pass content checks' in out
+    assert 'cancel and edit the project file' in out
+    assert escape(project_file.as_posix()) in out
+
+
+def test_init_edit_refuses_without_project_or_terminal(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    unregistered = make_repo(files={'README.md': 'public\n'})
+    configure(tmp_path, monkeypatch)
+    monkeypatch.chdir(unregistered)
+    assert _cli.main(['init', '--edit']) == 1
+    error = capsys.readouterr().err
+    assert 'no saved project to edit' in error
+    assert 'pubanon init' in error
+
+    source = make_repo(name='registered', files={'README.md': 'public\n'})
+    configure(tmp_path / 'second', monkeypatch, source)
+    monkeypatch.chdir(source)
+    monkeypatch.setattr(sys.stdin, 'isatty', lambda: False)
+    assert _cli.main(['init', '--edit']) == 1
+    assert 'init --edit requires an interactive terminal' in capsys.readouterr().err
+
+
+def test_init_edit_turns_on_release_pages_and_keeps_other_settings(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    answers: _Script,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = make_repo(files={'README.md': 'public\n'})
+    paths, _global_config, project = configure(tmp_path, monkeypatch, source)
+    assert project is not None
+    project = replace(
+        project,
+        allow=('README.md',),
+        deny=('private/**',),
+        _stage_repo='private-stage',
+        workflows={'ship': ('publish',)},
+        package=_config.PackageObservation('pypi', 'demo', ('published',)),
+        commit_message=_config.CommitMessageSettings(
+            tagged='Release {tag}', untagged='Update publication'
+        ),
+        release_page=_config.ReleasePageSettings(
+            enabled=False,
+            title='Version {version}',
+            notes='Notes for {version}',
+            changelog='CHANGELOG.md',
+        ),
+    )
+    _config.save_project(paths, project)
+    monkeypatch.chdir(source)
+    monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+    answers([(_SAVE, 'e'), 'l', (_PAGES, 'y'), (_SAVE, 's')])
+
+    assert _cli.main(['init', '--edit']) == 0
+
+    assert project.release_page is not None
+    assert _config.load_project(paths, 'demo') == replace(
+        project,
+        release_page=replace(project.release_page, enabled=True),
+    )
+    out = capsys.readouterr().out
+    assert 'To change the selected files, run pubanon prepare and choose review.' in out
+    assert 'Saved project demo.' in out
+
+
 def test_init_existing_project_with_local_publication_offers_prepare(
     tmp_path: Path,
     make_repo: Callable[..., Path],
@@ -257,6 +511,35 @@ def test_init_existing_project_with_local_publication_offers_prepare(
     assert _cli.main(['init', '--project', project.name]) == 0
     assert observed == [(paths, project.name)]
     assert 'Next: pubanon prepare' in capsys.readouterr().out
+
+
+def test_init_final_review_can_change_release_pages(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_repo(files={'README.md': 'public\n'})
+    paths, _global_config, _project = configure(tmp_path, monkeypatch)
+    monkeypatch.chdir(source)
+    saves = iter(['e', 's'])
+    page_answers = iter(['', 'y'])
+
+    def _answer(prompt: str) -> str:
+        if prompt.startswith('Use this selection?'):
+            return 'c'
+        if prompt == 'Save this configuration? [s]ave / [e]dit / [c]ancel: ':
+            return next(saves)
+        if prompt.startswith('Edit: '):
+            assert 're[l]ease pages' in prompt
+            return 'l'
+        if prompt == 'Create a release page for each published version? [y/N] ':
+            return next(page_answers)
+        return ''
+
+    monkeypatch.setattr('builtins.input', _answer)
+    assert _cli.main(['init', '--project', 'demo']) == 0
+    saved = _config.load_project(paths, 'demo')
+    assert saved.release_page == _config.ReleasePageSettings(enabled=True)
 
 
 def test_init_final_review_revises_resolved_policy_membership(
@@ -374,7 +657,7 @@ def test_init_holds_project_lock_while_reading_the_source(
 
     def _check_while_locked(root: Path) -> None:
         with (
-            pytest.raises(PubanonError, match='another Pubanon command is running'),
+            pytest.raises(PubanonError, match='another pubanon command is running'),
             _config.project_lock(paths, 'demo'),
         ):
             pytest.fail('init did not hold its project lock')
@@ -579,7 +862,7 @@ def test_init_refuses_noncanonical_stored_subdirectory_without_relocation(
     assert _config.load_project(paths, 'demo').source_path == nested.resolve()
     assert (paths.config_dir / 'projects' / 'demo.toml').read_bytes() == original
 
-    answers = iter(['yes', 'yes', '', '', '', '', 's'])
+    answers = iter(['y', 'y', '', '', '', '', 's'])
 
     def _confirm(_prompt: str) -> str:
         return next(answers)
@@ -588,6 +871,33 @@ def test_init_refuses_noncanonical_stored_subdirectory_without_relocation(
     assert _cli.main(['init', '--project', 'demo', '--relocate']) == 0
     assert _config.load_project(paths, 'demo').source_path == source.resolve()
     assert _config.registry_lookup(paths, source) == 'demo'
+
+
+def test_init_relocation_enables_self_publication(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    old_source = make_repo('old', files={'README.md': 'old\n'})
+    new_source = make_repo('new', files={'README.md': 'new\n'})
+    paths, _, project = configure(tmp_path, monkeypatch, old_source)
+    assert project is not None
+    _config.save_project(paths, replace(project, self_publication=False))
+    monkeypatch.chdir(new_source)
+
+    def _confirm(prompt: str) -> str:
+        assert prompt == 'Move this project to the new source path? [y/n] '
+        return 'y'
+
+    monkeypatch.setattr('builtins.input', _confirm)
+    assert _cli.main(['init', '--project', 'demo', '--relocate', '--self-publication']) == 0
+    changed = _config.load_project(paths, 'demo')
+    assert changed.source_path == new_source.resolve()
+    assert changed.self_publication is True
+    output = capsys.readouterr().out
+    assert 'Relocated project demo to the current source repository.' in output
+    assert 'Enabled self_publication.' in output
 
 
 def test_init_relocation_registry_collision_preserves_existing_config(
@@ -649,7 +959,7 @@ def test_init_relocation_reserves_new_source_before_saving_configuration(
         reservation_seen.append(registry == {str(new_source.resolve()): actual_project.name})
         real_save_project(actual_paths, actual_project)
 
-    answers = iter([('Move this project to the new source path? [y/n] ', 'yes')])
+    answers = iter([('Move this project to the new source path? [y/n] ', 'y')])
 
     def _confirm(prompt: str) -> str:
         expected_prompt, answer = next(answers)
@@ -666,7 +976,7 @@ def test_init_relocation_reserves_new_source_before_saving_configuration(
     output = capsys.readouterr().out
     assert 'Relocated project demo to the current source repository.' in output
     assert 'Next: pubanon repo create --project=demo' in output
-    assert escape(str(paths.config_dir / 'projects' / 'demo.toml')) not in output
+    assert escape((paths.config_dir / 'projects' / 'demo.toml').as_posix()) not in output
 
 
 def test_init_renders_registered_project_with_its_configured_terms(
@@ -703,6 +1013,7 @@ def test_init_rerun_leaves_existing_settings_untouched(
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, _global_config, project = configure(tmp_path, monkeypatch, source)
@@ -726,6 +1037,9 @@ def test_init_rerun_leaves_existing_settings_untouched(
 
     assert _cli.main(['init']) == 0
     assert _config.load_project(paths, 'demo').settings == settings
+    out = capsys.readouterr().out
+    assert 'Release pages:' in out
+    assert 'To change settings, run `pubanon init --edit`.' in out
 
 
 def test_init_reserves_new_source_before_saving_configuration(
@@ -763,7 +1077,7 @@ def test_init_reserves_new_source_before_saving_configuration(
     output = capsys.readouterr().out
     assert 'Saved project demo.' in output
     assert 'Next: pubanon repo create --project=demo' in output
-    assert escape(str(paths.config_dir / 'projects' / 'demo.toml')) not in output
+    assert escape((paths.config_dir / 'projects' / 'demo.toml').as_posix()) not in output
 
 
 def test_init_resume_can_back_up_a_group_choice(
@@ -890,12 +1204,12 @@ def test_init_retries_description_matching_sensitive_term(
         ('Enable projects? [y/N] ', 'y'),
         (
             (
-                'Edit: [d]estination / [v]isibility / [r]oute / [t]ags / [p]olicy / '
-                '[c]hecks / [s]ettings / [b]ack: '
+                'Edit: [d]estination / [v]isibility / [r]oute / [t]ags / '
+                're[l]ease pages / [p]olicy / [c]hecks / [s]ettings / [b]ack: '
             ),
             's',
         ),
-        ('Description: [k]eep / [r]eplace / [c]lear [keep]: ', 'replace'),
+        ('Description: [k]eep / [r]eplace / [c]lear [keep]: ', 'r'),
         ('Repository description (blank for none): ', 'Published demo'),
         ('Enable issues? [y/N] ', ''),
         ('Enable wiki? [Y/n] ', ''),
@@ -950,7 +1264,7 @@ def test_init_retries_late_answer_without_losing_policy(
             'Published demo',
             'y',
             'n',
-            'no',
+            'n',
             's',
         ]
     )
@@ -986,15 +1300,15 @@ def test_init_retries_late_answer_without_losing_policy(
 
 def test_init_review_shows_overridden_private_staging_destination(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    source = make_repo(files={'README.md': 'public\n'})
+    source = tmp_path / 'source'
+    source.mkdir()
     _paths, _global_config, project = configure(tmp_path, monkeypatch, source)
     assert project is not None
     reviewed = replace(project, _stage_repo='review-snapshots', publication_route='staged')
-    snapshot = _source.read_snapshot(source, _source.pin(source, 'HEAD').commit)
+    snapshot = (_source.Entry('README.md', 0o100644, 'blob', b'public\n'),)
 
     _init._project_review(reviewed, snapshot, _global_config)
 
@@ -1118,7 +1432,7 @@ def test_init_reviews_complete_configuration_before_save(
     )
     review = reviews[0]
     for expected in (
-        escape(str(source.resolve())),
+        escape((source.resolve()).as_posix()),
         'anonymous-account/demo (private)',
         'anonymous-account/demo-stage (private)',
         'Route:',
@@ -1131,6 +1445,10 @@ def test_init_reviews_complete_configuration_before_save(
         'issues on; wiki, projects, pull requests, and discussions off',
     ):
         assert expected in review
+    assert re.search(
+        r'Release pages:\s+no',
+        review,
+    )
     assert 'Publication uses the main branch.' not in review
     assert not (paths.config_dir / 'projects' / 'demo.toml').exists()
     assert not paths.registry.exists()
@@ -1148,7 +1466,7 @@ def test_init_route_flag_preserves_prepared_candidate_and_other_settings(
     assert project is not None
     monkeypatch.chdir(source)
     assert _cli.main(['prepare', '--project', 'demo', '--acknowledge-new-paths', '--yes']) == 0
-    candidate = _candidate.load_candidate(paths, 'demo')
+    candidate = _records.load_candidate(paths, 'demo')
     assert candidate is not None
     candidate_file = _records.candidate_path(paths, 'demo')
     candidate_bytes = candidate_file.read_bytes()
@@ -1177,7 +1495,7 @@ def test_init_route_flag_preserves_prepared_candidate_and_other_settings(
     changed = _config.load_project(paths, 'demo')
     assert changed == replace(project, publication_route='staged', source_tags=True)
     assert _config.fingerprint(global_config, changed) == candidate.fingerprint
-    assert _candidate.load_candidate(paths, 'demo') == candidate
+    assert _records.load_candidate(paths, 'demo') == candidate
     assert candidate_file.read_bytes() == candidate_bytes
     retained_commit = subprocess.run(
         ['git', '--git-dir', str(store), 'cat-file', 'commit', candidate.commit],
@@ -1257,43 +1575,50 @@ def test_init_same_source_uses_idempotent_registry_update(
     output = capsys.readouterr().out
     assert 'Refreshed source registration for project demo.' in output
     assert 'Next: pubanon repo create' in output
-    assert escape(str(paths.config_dir / 'projects' / 'demo.toml')) not in output
+    assert escape((paths.config_dir / 'projects' / 'demo.toml').as_posix()) not in output
 
 
-@pytest.mark.parametrize('exit_mode', ['quit', 'interrupt'])
-def test_init_saved_draft_prompt_retains_progress_on_cancel(
+def test_init_self_publication_flag_enables_existing_project(
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
+    answers: _Script,
     capsys: pytest.CaptureFixture[str],
-    exit_mode: str,
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
-    paths, _global, _project = configure(tmp_path, monkeypatch)
+    paths, _, _ = configure(tmp_path, monkeypatch)
     monkeypatch.chdir(source)
-    commit = _source.pin(source, 'HEAD').commit
-    _init_draft.save(paths, 'demo', _init_draft.Draft(source, commit, self_publication=False))
-    draft_path = paths.data_dir / 'projects' / 'demo' / 'init-draft.json'
-    saved = draft_path.read_bytes()
-
-    def _cancel(prompt: str) -> str:
-        assert prompt == 'Saved setup: [r]esume / [s]tart over / [q]uit: '
-        if exit_mode == 'interrupt':
-            raise KeyboardInterrupt
-        return 'q'
-
-    monkeypatch.setattr('builtins.input', _cancel)
-
-    assert _cli.main(['init', '--project', 'demo']) == 130
-    output = capsys.readouterr()
-    assert (
-        output.out.count('Setup progress saved. Rerun pubanon init --project=demo to resume.') == 1
+    monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+    answers(
+        [
+            ('Use this selection? [c]ontinue / [r]eview / [b]ack / [q]uit: ', 'c'),
+            ('GitHub owner [anonymous-account]: ', ''),
+            ('GitHub repository [demo]: ', ''),
+            ('Repository visibility (private/public) [private]: ', ''),
+            ('Publication route (staged/direct) [staged]: ', ''),
+            ('Create local tags marking the source of each publication? [y/N] ', ''),
+            ('Required CI checks (comma separated, blank for none): ', ''),
+            ('Create a release page for each published version? [y/N] ', ''),
+            ('Repository description (blank for none): ', ''),
+            ('Enable issues? [Y/n] ', ''),
+            ('Enable wiki? [y/N] ', ''),
+            ('Enable projects? [y/N] ', ''),
+            ('Enable pull requests? [y/N] ', ''),
+            ('Enable discussions? [y/N] ', ''),
+            ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
+        ]
     )
-    assert 'The setup draft is kept.' in output.err
-    assert 'project configuration was not saved' in output.err
-    assert 'Next: rerun pubanon init --project=demo to resume' in output.err
-    assert draft_path.read_bytes() == saved
-    assert not (paths.config_dir / 'projects' / 'demo.toml').exists()
+    assert _cli.main(['init', '--project', 'demo']) == 0
+    assert _config.load_project(paths, 'demo').self_publication is False
+    capsys.readouterr()
+
+    assert _cli.main(['init', '--self-publication', '--yes']) == 0
+    assert _config.load_project(paths, 'demo').self_publication is True
+    assert 'Enabled self_publication.' in capsys.readouterr().out
+
+    assert _cli.main(['init', '--yes']) == 0
+    assert _config.load_project(paths, 'demo').self_publication is True
+    assert 'Enabled self_publication.' not in capsys.readouterr().out
 
 
 def test_init_self_publication_flag_sets_project_field(
@@ -1315,6 +1640,7 @@ def test_init_self_publication_flag_sets_project_field(
             ('Publication route (staged/direct) [staged]: ', ''),
             ('Create local tags marking the source of each publication? [y/N] ', ''),
             ('Required CI checks (comma separated, blank for none): ', ''),
+            ('Create a release page for each published version? [y/N] ', ''),
             ('Repository description (blank for none): ', ''),
             ('Enable issues? [Y/n] ', ''),
             ('Enable wiki? [y/N] ', ''),
@@ -1357,9 +1683,9 @@ def test_init_skips_globally_ignored_directories(
 
     def answer(prompt: str) -> str:
         if prompt.startswith('Use this selection?'):
-            return 'continue'
+            return 'c'
         if prompt.startswith('Save this configuration?'):
-            return 'save'
+            return 's'
         if prompt.startswith(('Include', 'Selection pattern', 'Replacement pattern')):
             pytest.fail(f'Unexpected selection question: {prompt}')
         if prompt.startswith(
@@ -1369,6 +1695,7 @@ def test_init_skips_globally_ignored_directories(
                 'Repository visibility',
                 'Publication route',
                 'Required CI checks',
+                'Create a release page',
                 'Repository description',
                 'Enable issues',
                 'Enable wiki',
@@ -1417,9 +1744,9 @@ def test_init_skips_globally_ignored_files(
 
     def answer(prompt: str) -> str:
         if prompt.startswith('Use this selection?'):
-            return 'continue'
+            return 'c'
         if prompt.startswith('Save this configuration?'):
-            return 'save'
+            return 's'
         if prompt.startswith(('Include', 'Selection pattern', 'Replacement pattern')):
             pytest.fail(f'Unexpected selection question: {prompt}')
         if prompt.startswith(
@@ -1429,6 +1756,7 @@ def test_init_skips_globally_ignored_files(
                 'Repository visibility',
                 'Publication route',
                 'Required CI checks',
+                'Create a release page',
                 'Repository description',
                 'Enable issues',
                 'Enable wiki',
@@ -1544,6 +1872,107 @@ def test_init_start_over_replaces_draft_only_on_explicit_choice(
     assert not draft.exists()
 
 
+def test_init_yes_refuses_policy_proposals_without_writing_project(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = make_repo(files={'README.md': 'public\n'})
+    paths, _global_config, _project = configure(tmp_path, monkeypatch)
+    monkeypatch.chdir(source)
+
+    assert _cli.main(['init', '--project', 'demo', '--yes']) == 1
+    error = capsys.readouterr().err
+    assert '--yes cannot answer policy proposals' in error
+    assert escape((paths.config_dir / 'projects' / 'demo.toml').as_posix()) in error
+    assert 'then rerun pubanon init --project=demo' in error
+    assert not (paths.config_dir / 'projects' / 'demo.toml').exists()
+    assert not paths.registry.exists()
+    assert not (paths.data_dir / 'projects' / 'demo').exists()
+
+
+def test_project_from_draft_omits_reserved_case_variants_from_proposed_groups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / 'source'
+    source.mkdir()
+    paths, global_config, project = configure(tmp_path, monkeypatch, source)
+    assert project is not None
+    snapshot = tuple(
+        _source.Entry(path, 0o100644, 'blob', b'fixture')
+        for path in ('.PubAnon.toml', 'nested/.PUBANON.TOML', 'README.md')
+    )
+    draft = _init_draft.Draft(source, 'a' * 40, self_publication=True)
+
+    proposed = _init._project_from_draft(
+        _context.ProjectContext(paths, global_config, project), snapshot, draft
+    )
+
+    assert proposed.project.allow == ('README.md',)
+
+
+@pytest.mark.parametrize(
+    ('route', 'checks', 'timing'),
+    [
+        ('staged', ('test',), 'Each page is created when you publish, after staging checks pass.'),
+        ('staged', (), 'Each page is created right after publishing, before CI runs.'),
+        ('direct', ('test',), 'Each page is created right after publishing, before CI runs.'),
+    ],
+)
+def test_release_pages_prompt_explains_when_pages_are_created(
+    route: str,
+    checks: tuple[str, ...],
+    timing: str,
+    answers: _Script,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    answers([('Create a release page for each published version? [y/N] ', 'y')])
+    assert _init._release_pages_prompt(route=route, checks=checks, default=False) is True
+    out = capsys.readouterr().out
+    assert 'Release pages announce published versions.' in out
+    assert 'Creating one can start release workflows, such as package uploads.' in out
+    assert timing in out
+    waits = 'To wait for CI, answer no and run pubanon release create later.'
+    assert (waits in out) is (timing.startswith('Each page is created right after'))
+
+
+@pytest.mark.parametrize('exit_mode', ['quit', 'interrupt'])
+def test_init_saved_draft_prompt_retains_progress_on_cancel(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    exit_mode: str,
+) -> None:
+    source = make_repo(files={'README.md': 'public\n'})
+    paths, _global, _project = configure(tmp_path, monkeypatch)
+    monkeypatch.chdir(source)
+    commit = _source.pin(source, 'HEAD').commit
+    _init_draft.save(paths, 'demo', _init_draft.Draft(source, commit, self_publication=False))
+    draft_path = paths.data_dir / 'projects' / 'demo' / 'init-draft.json'
+    saved = draft_path.read_bytes()
+
+    def _cancel(prompt: str) -> str:
+        assert prompt == 'Saved setup: [r]esume / [s]tart over / [q]uit: '
+        if exit_mode == 'interrupt':
+            raise KeyboardInterrupt
+        return 'q'
+
+    monkeypatch.setattr('builtins.input', _cancel)
+
+    assert _cli.main(['init', '--project', 'demo']) == 130
+    output = capsys.readouterr()
+    assert (
+        output.out.count('Setup progress saved. Rerun pubanon init --project=demo to resume.') == 1
+    )
+    assert 'The setup draft is kept.' in output.err
+    assert 'project configuration was not saved' in output.err
+    assert 'Next: rerun pubanon init --project=demo to resume' in output.err
+    assert draft_path.read_bytes() == saved
+    assert not (paths.config_dir / 'projects' / 'demo.toml').exists()
+
+
 @pytest.mark.parametrize('choice', ['s', 'q', 'interrupt'])
 def test_init_unusable_draft_offers_start_over_or_quit(
     tmp_path: Path,
@@ -1643,26 +2072,6 @@ def test_init_other_source_draft_prompt_keeps_draft_without_offering_resume_here
     assert not (paths.config_dir / 'projects' / 'demo.toml').exists()
 
 
-def test_init_yes_refuses_policy_proposals_without_writing_project(
-    tmp_path: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    source = make_repo(files={'README.md': 'public\n'})
-    paths, _global_config, _project = configure(tmp_path, monkeypatch)
-    monkeypatch.chdir(source)
-
-    assert _cli.main(['init', '--project', 'demo', '--yes']) == 1
-    error = capsys.readouterr().err
-    assert '--yes cannot answer policy proposals' in error
-    assert escape(str(paths.config_dir / 'projects' / 'demo.toml')) in error
-    assert 'then rerun pubanon init --project=demo' in error
-    assert not (paths.config_dir / 'projects' / 'demo.toml').exists()
-    assert not paths.registry.exists()
-    assert not (paths.data_dir / 'projects' / 'demo').exists()
-
-
 @pytest.mark.parametrize(('flag', 'selected'), [(None, 'direct'), ('staged', 'staged')])
 def test_new_project_uses_global_route_or_explicit_override(
     tmp_path: Path,
@@ -1686,6 +2095,7 @@ def test_new_project_uses_global_route_or_explicit_override(
         'GitHub repository [demo]: ': '',
         'Repository visibility (private/public) [private]: ': '',
         'Required CI checks (comma separated, blank for none): ': '',
+        'Create a release page for each published version? [y/N] ': '',
         'Create local tags marking the source of each publication? [y/N] ': '',
         'Repository description (blank for none): ': '',
         'Enable issues? [Y/n] ': '',
@@ -1780,11 +2190,11 @@ def test_init_continue_accepts_complete_guided_policy_proposal(
 
     output = ''.join((*before_action, capsys.readouterr().out))
     if verbosity_args:
-        assert before_action[0].count(escape(str(complete_list))) == 1
+        assert before_action[0].count(escape((complete_list).as_posix())) == 1
     else:
-        assert escape(str(complete_list)) not in before_action[0]
+        assert escape((complete_list).as_posix()) not in before_action[0]
     assert 'Project source' in before_action[0]
-    assert escape(str(source.resolve())) in before_action[0]
+    assert escape((source.resolve()).as_posix()) in before_action[0]
     for path in ('.env', 'README.md', 'docs/guide.md', 'src/a.py', 'src/b.py'):
         assert f'  {path}\n' in before_action[0]
     assert json.loads(complete_list.read_text(encoding='utf-8')) == [
@@ -1808,7 +2218,7 @@ def test_init_continue_accepts_complete_guided_policy_proposal(
     assert (
         'Include these files? [i]nclude / [e]xclude / [c]ustomize / [b]ack / [q]uit: '
     ) not in prompts
-    assert not any('Pubanon repository' in prompt for prompt in prompts)
+    assert not any('pubanon repository' in prompt for prompt in prompts)
     project = _config.load_project(paths, 'demo')
     assert project.allow == ('README.md', 'docs/guide.md', 'src/**', '.env')
     assert project.deny == ('keys/id_rsa',)
@@ -1900,9 +2310,9 @@ def test_init_resumes_saved_answers_without_repeating_selection(
 @pytest.mark.parametrize(
     'case',
     [
-        ('clear', None, ''),
+        ('c', None, ''),
         ('', None, 'Published demo'),
-        ('replace', 'New description', 'New description'),
+        ('r', 'New description', 'New description'),
     ],
 )
 def test_init_review_can_clear_keep_or_replace_description(
@@ -1929,8 +2339,8 @@ def test_init_review_can_clear_keep_or_replace_description(
         ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 'e'),
         (
             (
-                'Edit: [d]estination / [v]isibility / [r]oute / [t]ags / [p]olicy / '
-                '[c]hecks / [s]ettings / [b]ack: '
+                'Edit: [d]estination / [v]isibility / [r]oute / [t]ags / '
+                're[l]ease pages / [p]olicy / [c]hecks / [s]ettings / [b]ack: '
             ),
             's',
         ),
@@ -1964,26 +2374,6 @@ def test_init_review_can_clear_keep_or_replace_description(
     )
 
 
-def test_project_from_draft_omits_reserved_case_variants_from_proposed_groups(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    source = tmp_path / 'source'
-    source.mkdir()
-    paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
-    snapshot = tuple(
-        _source.Entry(path, 0o100644, 'blob', b'fixture')
-        for path in ('.PubAnon.toml', 'nested/.PUBANON.TOML', 'README.md')
-    )
-    draft = _init_draft.Draft(source, 'a' * 40, self_publication=True)
-
-    proposed = _init._project_from_draft(
-        _context.ProjectContext(paths, global_config, project), snapshot, draft
-    )
-
-    assert proposed.project.allow == ('README.md',)
-
-
 def test_relocation_invalidates_candidate_and_discard_prepare_recovers(
     tmp_path: Path,
     make_repo: Callable[..., Path],
@@ -2010,7 +2400,7 @@ def test_relocation_invalidates_candidate_and_discard_prepare_recovers(
     )
     monkeypatch.chdir(source)
     assert _cli.main(['prepare', '--project', 'demo', '--acknowledge-new-paths', '--yes']) == 0
-    assert _candidate.load_candidate(paths, 'demo') is not None
+    assert _records.load_candidate(paths, 'demo') is not None
 
     moved = tmp_path / 'restored-elsewhere'
     monkeypatch.chdir(tmp_path)
@@ -2018,7 +2408,7 @@ def test_relocation_invalidates_candidate_and_discard_prepare_recovers(
     monkeypatch.chdir(moved)
 
     def _confirm(_prompt: str) -> str:
-        return 'yes'
+        return 'y'
 
     monkeypatch.setattr('builtins.input', _confirm)
     assert _cli.main(['init', '--project', 'demo', '--relocate']) == 0
@@ -2029,7 +2419,7 @@ def test_relocation_invalidates_candidate_and_discard_prepare_recovers(
 
     assert _cli.main(['discard', '--project', 'demo']) == 0
     assert _cli.main(['prepare', '--project', 'demo', '--acknowledge-new-paths', '--yes']) == 0
-    record = _candidate.load_candidate(paths, 'demo')
+    record = _records.load_candidate(paths, 'demo')
     assert record is not None
     assert record.fingerprint == _config.fingerprint(
         _config.load_global(paths), _config.load_project(paths, 'demo')
@@ -2050,7 +2440,7 @@ def test_resumed_route_and_source_tags_choices_survive_global_default_change(
         'GitHub repository [demo]: ': '',
         'Repository visibility (private/public) [private]: ': '',
         'Publication route (staged/direct) [staged]: ': '',
-        'Create local tags marking the source of each publication? [y/N] ': 'yes',
+        'Create local tags marking the source of each publication? [y/N] ': 'y',
     }
 
     def _interrupt(prompt: str) -> str:
@@ -2072,6 +2462,7 @@ def test_resumed_route_and_source_tags_choices_survive_global_default_change(
     remaining = {
         'Saved setup: [r]esume / [s]tart over / [q]uit: ': 'r',
         'Required CI checks (comma separated, blank for none): ': '',
+        'Create a release page for each published version? [y/N] ': '',
         'Repository description (blank for none): ': '',
         'Enable issues? [Y/n] ': '',
         'Enable wiki? [y/N] ': '',

@@ -40,28 +40,18 @@ from pubanon._remote._host import (
     Destination,
     RemoteRefs,
     SettingsFacts,
-    check_recovery,
-    check_result,
-    create_repository,
-    delete_repository,
-    push,
-    read_remote_refs,
-    repository_facts,
-    repository_settings,
-    repository_visible,
-    require_authenticated_account,
-    set_default_branch,
 )
 from pubanon._run import OID_HEX
-from pubanon._snapshots._candidate import (
-    candidate_store_path,
-    inspect_next_action,
+from pubanon._snapshots._candidate import publication_archive
+from pubanon._snapshots._records import (
+    CandidateRecord,
+    candidate_tip,
     load_candidate,
-    publication_archive,
-    store_path,
-    verify_retained_candidate,
+    load_publication,
 )
-from pubanon._snapshots._records import CandidateRecord, candidate_tip, load_publication
+from pubanon._snapshots._reports import inspect_next_action
+from pubanon._snapshots._store import candidate_store_path, store_path
+from pubanon._snapshots._verification import verify_retained_candidate
 from pubanon._terminal import (
     confirm,
     detail,
@@ -137,7 +127,7 @@ def _backup_stage(path: Path, content: bytes) -> None:
             os.fsync(handle.fileno())
         _filesystem.sync_directory(path.parent)
         complete = True
-    except (OSError, RuntimeError) as exc:
+    except OSError as exc:
         raise PubanonError('cannot back up malformed stage record') from exc
     finally:
         if descriptor is not None:
@@ -237,7 +227,7 @@ def _preview_stage_repair(
 def _push_stage_main(dest: Destination, store: Path, tip: str, observed_tip: str | None) -> None:
     """Push only main with a lease against the freshly observed tip."""
     try:
-        push(
+        _host.push(
             dest,
             store,
             [
@@ -269,14 +259,6 @@ def _record_string(data: dict[str, object], key: str) -> str:
             recovery='pubanon stage repair or pubanon stage forget',
         )
     return value
-
-
-def _remaining_timeout(timeout: float, started: float) -> float:
-    """Return the positive remainder of one supplied timeout budget."""
-    remaining = timeout - (_monotonic() - started)
-    if remaining <= 0:
-        raise ObservationTimeoutError
-    return remaining
 
 
 def _report_stage_default_change(refs: RemoteRefs, settings: SettingsFacts, *, yes: bool) -> None:
@@ -347,7 +329,7 @@ def _clear_stage(paths: Paths, project: str) -> None:
     """Remove one advisory stage record if present."""
     try:
         _stage_path(paths, project).unlink(missing_ok=True)
-    except (OSError, RuntimeError) as exc:
+    except OSError as exc:
         raise PubanonError('cannot clear stage record') from exc
 
 
@@ -391,7 +373,7 @@ def _status_checks(dest: Destination, stage: StageRecord, p: ProjectConfig) -> N
 
     verdicts: list[CheckVerdict] = []
     for name in p.required_checks:
-        verdict = check_result((dest.owner, dest.repo), stage.commit, name)
+        verdict = _host.check_result((dest.owner, dest.repo), stage.commit, name)
         verdicts.append(verdict)
     if all(verdict.state == 'success' for verdict in verdicts):
         output(
@@ -416,7 +398,7 @@ def _status_checks(dest: Destination, stage: StageRecord, p: ProjectConfig) -> N
     raise PubanonError(
         'required checks are not acceptable for the staged commit',
         fact=','.join(f'{escape(verdict.name)}:{escape(verdict.state)}' for verdict in verdicts),
-        recovery=check_recovery(verdicts, retry='rerun `pubanon stage status`'),
+        recovery=_host.check_recovery(verdicts, retry='rerun `pubanon stage status`'),
     )
 
 
@@ -532,40 +514,26 @@ def _save_stage(paths: Paths, project: str, record: StageRecord) -> None:
         previous = path.read_bytes()
     except FileNotFoundError:
         previous = None
-    except (OSError, RuntimeError) as exc:
+    except OSError as exc:
         raise PubanonError('cannot read existing stage record') from exc
     if previous is not None:
         try:
             _parse_stage(previous)
         except _InvalidStageRecordError:
             _backup_stage(path, previous)
-    descriptor: int | None = None
-    temporary: Path | None = None
-    replaced = False
     try:
-        descriptor, name = tempfile.mkstemp(prefix=f'{path.name}.tmp-', dir=path.parent)
-        temporary = Path(name)
-        _filesystem.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, 'wb') as handle:
-            descriptor = None
-            handle.write(content.encode('utf-8'))
-            handle.flush()
-            os.fsync(handle.fileno())
-        _filesystem.replace(temporary, path)
-        replaced = True
-        _filesystem.sync_directory(path.parent)
-    except (OSError, RuntimeError, UnicodeError) as exc:
+        _filesystem.write_private(path, content.encode('utf-8'))
+    except UnicodeError as exc:
+        raise PubanonError('cannot save stage record') from exc
+    except _filesystem.DurableWriteError as exc:
+        if exc.interrupted and not exc.replacement_attempted:
+            raise KeyboardInterrupt from exc.__cause__
         message = (
-            'cannot confirm durable stage record save' if replaced else 'cannot save stage record'
+            'cannot confirm durable stage record save'
+            if exc.replaced or (exc.interrupted and exc.replacement_attempted)
+            else 'cannot save stage record'
         )
-        raise PubanonError(message) from exc
-    finally:
-        if descriptor is not None:
-            with suppress(OSError):
-                os.close(descriptor)
-        if temporary is not None:
-            with suppress(OSError):
-                temporary.unlink(missing_ok=True)
+        raise PubanonError(message) from exc.__cause__
 
 
 def _record_stage_push(paths: Paths, project: str, record: StageRecord) -> None:
@@ -661,7 +629,9 @@ def _verify_stage_facts(
     timeout: float | None = None,
 ) -> None:
     """Require exact private facts for one staging destination."""
-    actual = repository_facts(dest.owner, dest.repo, timeout=timeout, missing_recovery=recovery)
+    actual = _host.repository_facts(
+        dest.owner, dest.repo, timeout=timeout, missing_recovery=recovery
+    )
     _require_stage_facts(dest, actual, recovery=recovery)
 
 
@@ -692,9 +662,9 @@ def _verify_stage_refs(refs: RemoteRefs) -> None:
 def _observe_stage_repair(dest: Destination) -> _StageObservation:
     """Read current private facts and supported staging refs without mutation."""
     _verify_stage_facts(dest, recovery='inspect GitHub access, then rerun pubanon stage repair')
-    refs = read_remote_refs(dest)
+    refs = _host.read_remote_refs(dest)
     _verify_stage_refs(refs)
-    settings = repository_settings(dest.owner, dest.repo)
+    settings = _host.repository_settings(dest.owner, dest.repo)
     return _StageObservation(refs, settings.default_branch)
 
 
@@ -705,7 +675,7 @@ def _repair_stage_default(dest: Destination, tip: str) -> None:
         'verify main and its default branch, then rerun pubanon stage repair'
     )
     try:
-        set_default_branch(dest.owner, dest.repo, 'main')
+        _host.set_default_branch(dest.owner, dest.repo, 'main')
         observed = _observe_stage_repair(dest)
         _require_repair_tip(tip, observed.refs.main)
         _verify_stage_default(observed.default)
@@ -724,7 +694,7 @@ def _verify_pushed_stage(
     dest: Destination, tip: str, refs: RemoteRefs, settings: SettingsFacts
 ) -> None:
     """Verify pushed refs and make the first main the default when needed."""
-    readback = read_remote_refs(dest)
+    readback = _host.read_remote_refs(dest)
     _verify_stage_refs(readback)
     if readback.main != tip:
         raise PubanonError(
@@ -734,9 +704,9 @@ def _verify_pushed_stage(
         )
 
     if refs.main is None and settings.default_branch != 'main':
-        set_default_branch(dest.owner, dest.repo, 'main')
+        _host.set_default_branch(dest.owner, dest.repo, 'main')
     _verify_stage_facts(dest, recovery='pubanon stage repair')
-    _verify_stage_default(repository_settings(dest.owner, dest.repo).default_branch)
+    _verify_stage_default(_host.repository_settings(dest.owner, dest.repo).default_branch)
 
 
 def _finish_stage_push(
@@ -760,7 +730,7 @@ def load_stage(paths: Paths, project: str) -> StageRecord | None:
     """Load one strict stage record if present.
 
     Args:
-        paths: Derived Pubanon configuration and data paths.
+        paths: Derived pubanon configuration and data paths.
         project: Registered project name.
 
     Returns:
@@ -774,7 +744,7 @@ def load_stage(paths: Paths, project: str) -> StageRecord | None:
         content = path.read_bytes()
     except FileNotFoundError:
         return None
-    except (OSError, RuntimeError) as exc:
+    except OSError as exc:
         raise PubanonError('cannot read stage record') from exc
     return _parse_stage(content)
 
@@ -787,7 +757,7 @@ def _repair_stage(paths: Paths, g: GlobalConfig, p: ProjectConfig, *, yes: bool)
     except _InvalidStageRecordError:
         stage = None
         output('Malformed tracking will be backed up before replacement.', kind='warning')
-    require_authenticated_account(dest.account, authority='staging configuration')
+    _host.require_authenticated_account(dest.account, authority='staging configuration')
     observed = _observe_stage_repair(dest)
     tip = observed.refs.main
     if tip is None:
@@ -838,8 +808,8 @@ def _status_target(
     """Report observed staging facts and identify a snapshot without changing state."""
     dest = _stage_destination(paths, g, p)
     stage, tracking_error = _status_tracking(paths, p, shown_commits)
-    require_authenticated_account(dest.account, authority='staging configuration')
-    facts = repository_facts(
+    _host.require_authenticated_account(dest.account, authority='staging configuration')
+    facts = _host.repository_facts(
         dest.owner,
         dest.repo,
         missing_recovery='inspect GitHub access, then rerun pubanon stage status',
@@ -850,7 +820,7 @@ def _status_target(
     )
     heading(f'Staging repository {escape(dest.owner)}/{escape(dest.repo)} (private)')
     detail(field('Repository URL', escape(dest.url)))
-    refs = read_remote_refs(dest)
+    refs = _host.read_remote_refs(dest)
     detail(
         field(
             'Observed remote commit',
@@ -864,7 +834,7 @@ def _status_target(
                 _status_commit(commit, f'remote branch {escape(branch)}', shown_commits),
             )
         )
-    settings = repository_settings(dest.owner, dest.repo)
+    settings = _host.repository_settings(dest.owner, dest.repo)
     detail(field('Default branch', escape(settings.default_branch)))
     _verify_stage_refs(refs)
     _verify_stage_default(settings.default_branch)
@@ -895,7 +865,7 @@ def candidate_next_action(
     """Suggest a local route step after snapshot recovery has been considered.
 
     Args:
-        paths: Derived local Pubanon paths.
+        paths: Derived local pubanon paths.
         g: Global configuration for snapshot fingerprint recovery.
         p: Project configuration with the selected route.
         record: Retained candidate, or `None` when preparation is needed.
@@ -945,7 +915,7 @@ def stage_delete(
     The caller must hold the project lock for the complete operation.
 
     Args:
-        paths: Derived Pubanon configuration and data paths.
+        paths: Derived pubanon configuration and data paths.
         g: Global publication identity configuration.
         p: Project publication configuration.
 
@@ -969,8 +939,8 @@ def stage_delete(
             recovery='inspect the recorded target; use pubanon stage forget to remove tracking',
         )
 
-    require_authenticated_account(dest.account, authority='staging configuration')
-    if not repository_visible(dest.owner, dest.repo):
+    _host.require_authenticated_account(dest.account, authority='staging configuration')
+    if not _host.repository_visible(dest.owner, dest.repo):
         raise PubanonError(
             'staging repository is absent or inaccessible before deletion',
             recovery='inspect the host; use pubanon stage forget to remove local tracking',
@@ -989,9 +959,9 @@ def stage_delete(
         f'Delete the staging repository {escape(dest.owner)}/{escape(dest.repo)}?'
     ):
         raise OperationCanceled('Canceled. Nothing was deleted.')
-    delete_repository(dest.owner, dest.repo)
+    _host.delete_repository(dest.owner, dest.repo)
     try:
-        visible = repository_visible(dest.owner, dest.repo)
+        visible = _host.repository_visible(dest.owner, dest.repo)
     except OperationCanceled:
         raise
     except PubanonError as exc:
@@ -1014,12 +984,11 @@ def stage_delete(
     output('The source and final repositories were not changed.', kind='note')
 
 
-def stage_forget(paths: Paths, g: GlobalConfig, p: ProjectConfig, *, yes: bool) -> None:
+def stage_forget(paths: Paths, p: ProjectConfig, *, yes: bool) -> None:
     """Forget local staged-candidate comparison without contacting the host.
 
     The caller must hold the project lock for the complete operation.
     """
-    del g
     if not _stage_path(paths, p.name).exists():
         output('No local staging record exists.')
         return
@@ -1053,7 +1022,7 @@ def stage_push(
     The caller must hold the project lock for the complete operation.
 
     Args:
-        paths: Derived Pubanon configuration and data paths.
+        paths: Derived pubanon configuration and data paths.
         g: Global publication identity configuration.
         p: Project publication configuration.
 
@@ -1076,8 +1045,8 @@ def stage_push(
         output('Malformed tracking will be backed up before replacement.', kind='warning')
     dest = _stage_destination(paths, g, p)
 
-    require_authenticated_account(dest.account, authority='staging configuration')
-    if creating_repository := not repository_visible(dest.owner, dest.repo):
+    _host.require_authenticated_account(dest.account, authority='staging configuration')
+    if creating_repository := not _host.repository_visible(dest.owner, dest.repo):
         heading('Staging repository creation')
         fields(
             [
@@ -1089,7 +1058,7 @@ def stage_push(
             f'Create the private staging repository {escape(dest.owner)}/{escape(dest.repo)}?'
         ):
             raise OperationCanceled('Canceled. Nothing was created.')
-        create_repository(
+        _host.create_repository(
             dest,
             p.settings,
             settings_recovery=(
@@ -1098,9 +1067,9 @@ def stage_push(
             ),
         )
     _verify_stage_facts(dest, recovery='pubanon stage repair')
-    refs = read_remote_refs(dest)
+    refs = _host.read_remote_refs(dest)
     _verify_stage_refs(refs)
-    settings = repository_settings(dest.owner, dest.repo)
+    settings = _host.repository_settings(dest.owner, dest.repo)
     if refs.main is not None:
         _verify_stage_default(settings.default_branch)
     expected_old = refs.main
@@ -1157,7 +1126,7 @@ def stage_repair(paths: Paths, g: GlobalConfig, p: ProjectConfig, *, yes: bool) 
     """Reconnect recognized staging state under the caller's project lock.
 
     Args:
-        paths: Derived Pubanon configuration and data paths.
+        paths: Derived pubanon configuration and data paths.
         g: Global publication identity configuration.
         p: Project publication configuration.
         yes: Whether to approve the previewed repair without confirmation.
@@ -1183,7 +1152,7 @@ def stage_status(paths: Paths, g: GlobalConfig, p: ProjectConfig) -> None:
     """Report read-only staging facts, candidate agreement, and exact snapshot CI.
 
     Args:
-        paths: Derived Pubanon configuration and data paths.
+        paths: Derived pubanon configuration and data paths.
         g: Global publication identity configuration.
         p: Project publication configuration.
 
@@ -1243,7 +1212,7 @@ def staging_repository_visible(
     """Report staging visibility after local gates and the account check.
 
     Args:
-        paths: Derived Pubanon configuration and data paths.
+        paths: Derived pubanon configuration and data paths.
         g: Global publication identity configuration.
         p: Project publication configuration.
 
@@ -1259,8 +1228,8 @@ def staging_repository_visible(
             request fails.
     """
     dest = _stage_destination(paths, g, p)
-    require_authenticated_account(dest.account, authority='staging configuration')
-    return repository_visible(dest.owner, dest.repo)
+    _host.require_authenticated_account(dest.account, authority='staging configuration')
+    return _host.repository_visible(dest.owner, dest.repo)
 
 
 def verify_staged_target(
@@ -1273,7 +1242,7 @@ def verify_staged_target(
     """Verify and return one exact staged destination and commit record.
 
     Args:
-        paths: Derived Pubanon configuration and data paths.
+        paths: Derived pubanon configuration and data paths.
         g: Global publication identity configuration.
         p: Project publication configuration.
 
@@ -1311,25 +1280,31 @@ def verify_staged_target(
         )
     try:
         if timeout is None:
-            require_authenticated_account(destination.account, authority='staging configuration')
+            _host.require_authenticated_account(
+                destination.account, authority='staging configuration'
+            )
             _verify_stage_facts(destination, recovery='pubanon stage repair')
         else:
-            require_authenticated_account(
+            _host.require_authenticated_account(
                 destination.account,
                 authority='staging configuration',
-                timeout=_remaining_timeout(timeout, started),
+                timeout=_host.remaining_timeout(timeout, started, _monotonic()),
             )
             _verify_stage_facts(
                 destination,
                 recovery='pubanon stage repair',
-                timeout=_remaining_timeout(timeout, started),
+                timeout=_host.remaining_timeout(timeout, started, _monotonic()),
             )
     except ObservationTimeoutError as exc:
         raise ObservationTimeoutError(stage='account/repository verification') from exc
     try:
-        refs = read_remote_refs(
+        refs = _host.read_remote_refs(
             destination,
-            timeout=None if timeout is None else _remaining_timeout(timeout, started),
+            timeout=(
+                None
+                if timeout is None
+                else _host.remaining_timeout(timeout, started, _monotonic())
+            ),
         )
     except ObservationTimeoutError as exc:
         raise ObservationTimeoutError(stage='refs') from exc
@@ -1342,10 +1317,14 @@ def verify_staged_target(
             recovery='pubanon stage repair or pubanon stage push',
         )
     try:
-        settings = repository_settings(
+        settings = _host.repository_settings(
             destination.owner,
             destination.repo,
-            timeout=None if timeout is None else _remaining_timeout(timeout, started),
+            timeout=(
+                None
+                if timeout is None
+                else _host.remaining_timeout(timeout, started, _monotonic())
+            ),
         )
     except ObservationTimeoutError as exc:
         raise ObservationTimeoutError(stage='repository settings verification') from exc

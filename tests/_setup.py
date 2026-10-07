@@ -46,6 +46,7 @@ def configure(
         self_publication=True,
         required_checks=(),
         publication_route='direct',
+        release_page=_config.ReleasePageSettings(enabled=False),
         settings=_config.Settings(
             '',
             'main',

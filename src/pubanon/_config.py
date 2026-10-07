@@ -1,4 +1,4 @@
-"""Load Pubanon configuration and coordinate local project state."""
+"""Load pubanon configuration and coordinate local project state."""
 
 # pyright: reportPrivateUsage=false
 
@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import string
 import tempfile
 import tomllib
 import unicodedata
@@ -19,19 +20,25 @@ from pubanon import _filesystem, _locking
 from pubanon._errors import PubanonError
 from pubanon._gate import GateHit, RuleClass, first_match, gate_unit
 from pubanon._policy import RESERVED_DENY, literal_pattern
-from pubanon._terminal import escape
-from pubanon._toml import toml_array, toml_string
+from pubanon._terminal import display_path, escape, path_text
+from pubanon._toml import toml_array, toml_multiline_string, toml_string
 
+DEFAULT_HOST = 'github'
 PUBLICATION_ROUTES = frozenset({'direct', 'staged'})
 VISIBILITIES = frozenset({'private', 'public'})
 
-_ADAPTER_KEYS = frozenset({'github'})
+_ADAPTER_KEYS = frozenset({DEFAULT_HOST})
 _CI_WORKFLOW_PATTERN = re.compile(r'[A-Za-z0-9_-][A-Za-z0-9._-]*\.ya?ml')
+_COMMIT_MESSAGE_KEYS = frozenset({'tagged', 'untagged'})
+_COMMIT_MESSAGE_TAGGED_DEFAULT = 'release: {tag}'
+_COMMIT_MESSAGE_TAGGED_FIELDS = frozenset({'tag', 'version'})
+_COMMIT_MESSAGE_UNTAGGED_DEFAULT = 'publication update'
+_COMMIT_MESSAGE_UNTAGGED_FIELDS: frozenset[str] = frozenset()
 _EXPOSURE_DIGEST_LENGTH = 64
 _GLOBAL_KEYS = frozenset(
     {'accounts', 'anon_email', 'anon_name', 'default_publication_route', 'sensitive_terms'}
 )
-_HOSTS = frozenset({'github'})
+_HOSTS = frozenset({DEFAULT_HOST})
 _IDENTITY_SOURCE_RECOVERY: Mapping[str, str] = {
     'sensitive_terms': (
         'remove the value from sensitive_terms or choose another publication identity'
@@ -67,8 +74,20 @@ _PROJECT_KEYS = frozenset(
     }
 )
 _PROJECT_OPTIONAL_KEYS = frozenset(
-    {'acknowledged_exposure', 'ci_workflow', 'package', 'source_tags', 'stage_repo', 'workflow'}
+    {
+        'acknowledged_exposure',
+        'ci_workflow',
+        'commit_message',
+        'package',
+        'release_page',
+        'source_tags',
+        'stage_repo',
+        'workflow',
+    }
 )
+_RELEASE_PAGE_KEYS = frozenset({'changelog', 'enabled', 'notes', 'title'})
+_RELEASE_PAGE_NOTES_FIELDS = frozenset({'changelog_url', 'tag', 'version'})
+_RELEASE_PAGE_TITLE_FIELDS = frozenset({'tag', 'version'})
 _SETTINGS_KEYS = frozenset(
     {'default_branch', 'description', 'discussions', 'issues', 'projects', 'pull_requests', 'wiki'}
 )
@@ -83,6 +102,19 @@ _WORKFLOW_STAGES = (
     'repo reveal',
     'package watch',
 )
+
+
+@dataclass(frozen=True)
+class CommitMessageSettings:
+    """Hold optional message templates for new publication commits.
+
+    Attributes:
+        tagged: Template for a new tagged publication.
+        untagged: Template for a new untagged publication.
+    """
+
+    tagged: str | None = None
+    untagged: str | None = None
 
 
 @dataclass(frozen=True)
@@ -103,6 +135,7 @@ class GlobalConfig:
             paths, matched case-insensitively.
         ignored_directories: Literal source-relative directories excluded in
             every project, matched case-insensitively.
+        commit_message: Optional templates for new publication commits.
     """
 
     anon_name: str
@@ -112,6 +145,7 @@ class GlobalConfig:
     default_publication_route: str = 'staged'
     ignored_directories: tuple[str, ...] = ()
     ignored_files: tuple[str, ...] = ()
+    commit_message: CommitMessageSettings | None = None
 
 
 @dataclass(frozen=True)
@@ -130,11 +164,11 @@ class PackageObservation:
 
 
 class Paths(NamedTuple):
-    """Hold the derived Pubanon configuration and data paths.
+    """Hold the derived pubanon configuration and data paths.
 
     Attributes:
-        config_dir: Root directory for Pubanon configuration.
-        data_dir: Root directory for Pubanon operational state.
+        config_dir: Root directory for pubanon configuration.
+        data_dir: Root directory for pubanon operational state.
         global_config: Global configuration file location.
         registry: Source-to-project registry file location.
     """
@@ -169,6 +203,25 @@ class Settings:
 
 
 @dataclass(frozen=True)
+class ReleasePageSettings:
+    """Hold optional settings for a publication release page.
+
+    Absent values remain unset until a page is prepared for publication.
+
+    Attributes:
+        enabled: Whether tagged publications create a page; None means off.
+        title: One-line page title template.
+        changelog: Repository-relative POSIX changelog path.
+        notes: Page notes template.
+    """
+
+    enabled: bool | None = None
+    title: str | None = None
+    changelog: str | None = None
+    notes: str | None = None
+
+
+@dataclass(frozen=True)
 class ProjectConfig:
     """Hold one project's publication intent and policy.
 
@@ -185,7 +238,7 @@ class ProjectConfig:
             publication.
         extra_terms: Project-specific terms that must remain private.
         hygiene_terms: Project-specific terms reported as policy mismatches.
-        self_publication: Whether to omit the default Pubanon hygiene term.
+        self_publication: Whether to omit the default pubanon hygiene term.
         required_checks: Host checks required when validating staged or
             published commits.
         settings: Intended host repository settings. `None` is used only while
@@ -199,6 +252,9 @@ class ProjectConfig:
             repository.
         ci_workflow: Workflow filename under `.github/workflows/` that supplies
             publication evidence when set.
+        release_page: Optional release page settings; `None` means the table is
+            absent.
+        commit_message: Optional templates for new publication commits.
     """
 
     name: str
@@ -222,11 +278,13 @@ class ProjectConfig:
     publication_route: str = 'staged'
     source_tags: bool = False
     ci_workflow: str | None = None
+    release_page: ReleasePageSettings | None = None
+    commit_message: CommitMessageSettings | None = None
 
 
 def _close_lock_quietly(lock_file: IO[bytes]) -> None:
     """Close a lock file without replacing an earlier failure."""
-    with suppress(OSError, RuntimeError):
+    with suppress(OSError):
         lock_file.close()
 
 
@@ -240,7 +298,7 @@ def _acquire_lock(lock_file: IO[bytes], message: str) -> None:
             message,
             recovery='retry after the active operation finishes',
         ) from exc
-    except (OSError, RuntimeError) as exc:
+    except OSError as exc:
         _close_lock_quietly(lock_file)
         raise PubanonError('cannot access operation lock') from exc
 
@@ -262,6 +320,7 @@ def _home_path(env: Mapping[str, str]) -> Path:
     """Return the absolute operator home without exposing resolution details."""
     try:
         home = Path(env.get('HOME') or '~').expanduser()
+    # Path.expanduser fails when it cannot determine the home directory.
     except (OSError, RuntimeError) as exc:
         raise PubanonError('cannot resolve home directory') from exc
     if not home.is_absolute():
@@ -278,7 +337,7 @@ def _is_within(path: Path, directory: Path, message: str) -> bool:
             if ancestor.samefile(root):
                 relative = (*existing.relative_to(ancestor).parts, *suffix)
                 return relative[: len(root_suffix)] == root_suffix
-    except (OSError, RuntimeError) as exc:
+    except OSError as exc:
         raise PubanonError(message) from exc
     return False
 
@@ -286,7 +345,7 @@ def _is_within(path: Path, directory: Path, message: str) -> bool:
 def _load_registry(path: Path) -> dict[str, str]:
     """Load the source-to-project registry."""
     diagnostic = {
-        'fact': f'registry file: {escape(str(path))}',
+        'fact': f'registry file: {escape(path_text(path))}',
         'recovery': (
             'restore a known backup or reconstruct the registry from known project '
             'configuration; pass --project NAME to use an existing project'
@@ -296,6 +355,7 @@ def _load_registry(path: Path) -> dict[str, str]:
         if not path.exists():
             return {}
         data = json.loads(path.read_text(encoding='utf-8'))
+    # json.loads raises RecursionError for deeply nested registry data.
     except (OSError, RuntimeError, UnicodeError, json.JSONDecodeError) as exc:
         raise PubanonError('invalid project registry', **diagnostic) from exc
     if not isinstance(data, dict):
@@ -320,7 +380,7 @@ def _open_lock(path: Path) -> IO[bytes]:
             _filesystem.chmod(path.parent, 0o700)
         lock_file = path.open('ab')
         _filesystem.fchmod(lock_file.fileno(), 0o600)
-    except (OSError, RuntimeError) as exc:
+    except OSError as exc:
         if lock_file is not None:
             _close_lock_quietly(lock_file)
         raise PubanonError('cannot access operation lock') from exc
@@ -331,18 +391,18 @@ def _release_lock(lock_file: IO[bytes]) -> None:
     """Release one lock and translate ordinary cleanup failures."""
     try:
         _locking.release(lock_file.fileno())
-    except (OSError, RuntimeError) as exc:
+    except OSError as exc:
         _close_lock_quietly(lock_file)
         raise PubanonError('cannot release operation lock') from exc
     try:
         lock_file.close()
-    except (OSError, RuntimeError) as exc:
+    except OSError as exc:
         raise PubanonError('cannot release operation lock') from exc
 
 
 @contextmanager
 def _exclusive_lock(path: Path, message: str) -> Generator[None]:
-    """Hold one nonblocking lock for a cooperating Pubanon operation."""
+    """Hold one nonblocking lock for a cooperating pubanon operation."""
     lock_file = _open_lock(path)
     _acquire_lock(lock_file, message)
     try:
@@ -453,6 +513,13 @@ def _require_table(data: Mapping[str, object], key: str) -> dict[str, object]:
     return table
 
 
+def _commit_message_table(data: Mapping[str, object], scope: str) -> dict[str, object]:
+    """Require a commit message table and identify its configuration scope."""
+    if not isinstance(data['commit_message'], dict):
+        raise PubanonError(f'commit_message in the {scope} must be a table')
+    return _require_table(data, 'commit_message')
+
+
 def _require_tuple_strings(data: Mapping[str, object], key: str) -> tuple[str, ...]:
     """Return one required tuple of string configuration values."""
     value = data[key]
@@ -468,11 +535,13 @@ def _resolve_path(path: Path, message: str) -> Path:
     """Resolve a path while replacing private filesystem diagnostics."""
     try:
         return path.resolve()
-    except (OSError, RuntimeError) as exc:
+    except OSError as exc:
         raise PubanonError(message) from exc
 
 
-def _settings_from_mapping(data: Mapping[str, object]) -> Settings:
+def _settings_from_mapping(
+    data: Mapping[str, object], *, project_file: Path | None = None
+) -> Settings:
     """Validate and return one repository settings summary."""
     _require_exact_keys(data, _SETTINGS_KEYS, 'settings')
     settings = Settings(
@@ -485,13 +554,15 @@ def _settings_from_mapping(data: Mapping[str, object]) -> Settings:
         discussions=_require_boolean(data, 'discussions'),
     )
     if settings.default_branch != 'main':
-        raise PubanonError('settings.default_branch must be main')
+        raise PubanonError(
+            'settings.default_branch must be main',
+            recovery=(
+                f'set settings.default_branch = "main" in {display_path(project_file)}'
+                if project_file is not None
+                else None
+            ),
+        )
     return settings
-
-
-def _sync_directory(path: Path) -> None:
-    """Complete the platform-specific commit for a prior file replacement."""
-    _filesystem.sync_directory(path)
 
 
 def _toml_array(values: tuple[str, ...]) -> str:
@@ -508,6 +579,42 @@ def _toml_string(value: str) -> str:
         return toml_string(value)
     except ValueError as exc:
         raise PubanonError('invalid project configuration text') from exc
+
+
+def _commit_message_content(settings: CommitMessageSettings | None) -> str:
+    """Render declared commit message templates in one optional table."""
+    if settings is None:
+        return ''
+    content = '[commit_message]\n'
+    for key, value in (('tagged', settings.tagged), ('untagged', settings.untagged)):
+        if value is not None:
+            try:
+                encoded = toml_multiline_string(value) if '\n' in value else _toml_string(value)
+            except ValueError as exc:
+                raise PubanonError('invalid configuration text') from exc
+            content += f'{key} = {encoded}\n'
+    return content
+
+
+def _release_page_content(page: ReleasePageSettings | None) -> str:
+    """Render an optional release page table with only declared keys."""
+    if page is None:
+        return ''
+    content = '[release_page]\n'
+    if page.enabled is not None:
+        content += f'enabled = {str(page.enabled).lower()}\n'
+    for key, value in (
+        ('title', page.title),
+        ('changelog', page.changelog),
+        ('notes', page.notes),
+    ):
+        if value is not None:
+            try:
+                encoded = toml_multiline_string(value) if '\n' in value else _toml_string(value)
+            except ValueError as exc:
+                raise PubanonError('invalid project configuration text') from exc
+            content += f'{key} = {encoded}\n'
+    return content
 
 
 def _validate_acknowledged_exposure(value: object) -> str:
@@ -545,6 +652,101 @@ def _validate_package(value: object) -> PackageObservation | None:
             'release_checks': list(value.release_checks),
         }
     )
+
+
+def _validate_template(value: str, allowed: frozenset[str], key: str, scope: str) -> None:
+    """Refuse template syntax other than whole fields named in `allowed`."""
+    fact = (
+        'Supported fields: ' + ', '.join(sorted(allowed))
+        if allowed
+        else 'This key accepts no fields; write {{ and }} for literal braces.'
+    )
+    try:
+        parts = list(string.Formatter().parse(value))
+    except ValueError as exc:
+        raise PubanonError(f'{key} in the {scope} has unbalanced braces', fact=fact) from exc
+    for _literal, name, spec, conversion in parts:
+        if name is not None and (name not in allowed or spec or conversion is not None):
+            raise PubanonError(
+                f'{key} in the {scope} has an unsupported field: {escape(name)}',
+                fact=fact,
+            )
+
+
+def _commit_message_from_mapping(data: Mapping[str, object], scope: str) -> CommitMessageSettings:
+    """Validate and return optional commit message templates."""
+    unknown = sorted(data.keys() - _COMMIT_MESSAGE_KEYS)
+    if unknown:
+        raise PubanonError(f'unknown commit_message key in the {scope}: {", ".join(unknown)}')
+    values: dict[str, str] = {}
+    for key, allowed in (
+        ('tagged', _COMMIT_MESSAGE_TAGGED_FIELDS),
+        ('untagged', _COMMIT_MESSAGE_UNTAGGED_FIELDS),
+    ):
+        if key not in data:
+            continue
+        value = data[key]
+        full_key = f'commit_message.{key}'
+        if not isinstance(value, str):
+            raise PubanonError(f'{full_key} in the {scope} must be a string')
+        if not value.strip():
+            raise PubanonError(f'{full_key} in the {scope} must not be blank')
+        _validate_template(value, allowed, full_key, scope)
+        values[key] = value
+    return CommitMessageSettings(**values)
+
+
+def _release_page_from_mapping(data: Mapping[str, object]) -> ReleasePageSettings:
+    """Validate and return optional release page settings."""
+    unknown = sorted(data.keys() - _RELEASE_PAGE_KEYS)
+    if unknown:
+        raise PubanonError(f'unknown release_page key: {", ".join(unknown)}')
+    enabled = _require_boolean(data, 'enabled') if 'enabled' in data else None
+    title = _require_string(data, 'title') if 'title' in data else None
+    changelog = _require_string(data, 'changelog') if 'changelog' in data else None
+    notes = _require_string(data, 'notes') if 'notes' in data else None
+    if title is not None:
+        if not title or '\r' in title or '\n' in title:
+            raise PubanonError('release_page.title must be one nonempty line')
+        _validate_template(
+            title, _RELEASE_PAGE_TITLE_FIELDS, 'release_page.title', 'project configuration'
+        )
+    if changelog is not None and (
+        not changelog
+        or changelog.startswith('/')
+        or '\\' in changelog
+        or any(unicodedata.category(character) == 'Cc' for character in changelog)
+        or any(part in {'', '.', '..'} for part in changelog.split('/'))
+    ):
+        raise PubanonError('release_page.changelog must be a repository-relative POSIX path')
+    if notes is not None:
+        _validate_template(
+            notes, _RELEASE_PAGE_NOTES_FIELDS, 'release_page.notes', 'project configuration'
+        )
+    return ReleasePageSettings(enabled=enabled, title=title, changelog=changelog, notes=notes)
+
+
+def _validate_commit_message_settings(settings: object, scope: str) -> None:
+    """Apply parsed-table rules to optional in-memory message templates."""
+    if settings is None:
+        return
+    if not isinstance(settings, CommitMessageSettings):
+        raise PubanonError(f'commit_message in the {scope} must be a table')
+    _commit_message_from_mapping(
+        {key: value for key, value in vars(settings).items() if value is not None}, scope
+    )
+
+
+def _validate_release_page_settings(page: object) -> None:
+    """Apply the parsed-table rules to optional in-memory settings."""
+    if page is None:
+        return
+    if not isinstance(page, ReleasePageSettings):
+        raise PubanonError('release_page must be a table')
+    data: dict[str, object] = {
+        'release_page': {key: value for key, value in vars(page).items() if value is not None}
+    }
+    _release_page_from_mapping(_require_table(data, 'release_page'))
 
 
 def _validate_windows_project_name(name: str) -> None:
@@ -616,17 +818,17 @@ def _write_global_temporary(directory: Path, payload: bytes) -> Path:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        except (OSError, RuntimeError, UnicodeError, KeyboardInterrupt):
-            with suppress(OSError, RuntimeError):
+        except (OSError, UnicodeError, KeyboardInterrupt):
+            with suppress(OSError):
                 handle.close()
             raise
         handle.close()
-    except (OSError, RuntimeError, UnicodeError, KeyboardInterrupt):
+    except (OSError, UnicodeError, KeyboardInterrupt):
         if descriptor is not None:
-            with suppress(OSError, RuntimeError):
+            with suppress(OSError):
                 os.close(descriptor)
         if temporary is not None:
-            with suppress(OSError, RuntimeError):
+            with suppress(OSError):
                 temporary.unlink(missing_ok=True)
         raise
     return temporary
@@ -635,57 +837,17 @@ def _write_global_temporary(directory: Path, payload: bytes) -> Path:
 def _write_registry(paths: Paths, registry: dict[str, str]) -> None:
     """Durably replace registry contents while its lock is held."""
     payload = (json.dumps(registry, separators=(',', ':')) + '\n').encode('utf-8')
-    descriptor: int | None = None
-    temporary: Path | None = None
-    replacement_attempted = False
     try:
-        try:
-            descriptor, temporary_name = tempfile.mkstemp(
-                prefix='.registry-', suffix='.tmp', dir=paths.registry.parent
-            )
-            temporary = Path(temporary_name)
-            _filesystem.fchmod(descriptor, 0o600)
-            handle = os.fdopen(descriptor, 'wb')
-            descriptor = None
-            try:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            except (OSError, RuntimeError, KeyboardInterrupt):
-                with suppress(OSError, RuntimeError):
-                    handle.close()
-                raise
-            handle.close()
-            replacement_attempted = True
-            _filesystem.replace(temporary, paths.registry)
-        except (OSError, RuntimeError) as exc:
-            raise PubanonError(
-                'cannot update project registry',
-                fact=f'registry file: {escape(str(paths.registry))}',
-            ) from exc
-        except KeyboardInterrupt as exc:
-            raise PubanonError(
-                (
-                    'project registry may have been saved'
-                    if replacement_attempted
-                    else 'cannot update project registry'
-                ),
-                fact=f'registry file: {escape(str(paths.registry))}',
-            ) from exc
-    finally:
-        if descriptor is not None:
-            with suppress(OSError, RuntimeError):
-                os.close(descriptor)
-        if temporary is not None:
-            with suppress(OSError, RuntimeError):
-                temporary.unlink(missing_ok=True)
-    try:
-        _sync_directory(paths.registry.parent)
-    except (OSError, RuntimeError, KeyboardInterrupt) as exc:
+        _filesystem.write_private(paths.registry, payload)
+    except _filesystem.DurableWriteError as exc:
+        message = (
+            'project registry may have been saved'
+            if exc.replaced or (exc.interrupted and exc.replacement_attempted)
+            else 'cannot update project registry'
+        )
         raise PubanonError(
-            'project registry may have been saved',
-            fact=f'registry file: {escape(str(paths.registry))}',
-        ) from exc
+            message, fact=f'registry file: {escape(path_text(paths.registry))}'
+        ) from exc.__cause__
 
 
 def assemble_rules(
@@ -729,10 +891,30 @@ def check_publication_state_paths(
             if _is_within(selected_path, directory, 'cannot inspect selected snapshot path'):
                 raise PubanonError(
                     'selected snapshot includes private publication state',
-                    fact=escape(str(source / selected)),
-                    recovery=f'Exclude {escape(str(directory))} from selection or relocate '
+                    fact=escape(path_text(source / selected)),
+                    recovery=f'Exclude {escape(path_text(directory))} from selection or relocate '
                     'private state outside the source repository.',
                 )
+
+
+def commit_message_template(g: GlobalConfig, p: ProjectConfig, *, tagged: bool) -> str:
+    """Resolve the template for a new publication by project, global, then built-in default.
+
+    Args:
+        g: Global configuration with optional message defaults.
+        p: Project configuration with optional message overrides.
+        tagged: Whether the new publication has a version tag.
+
+    Returns:
+        The selected template before field rendering.
+    """
+    key = 'tagged' if tagged else 'untagged'
+    for settings in (p.commit_message, g.commit_message):
+        if settings is not None:
+            value = getattr(settings, key)
+            if value is not None:
+                return value
+    return _COMMIT_MESSAGE_TAGGED_DEFAULT if tagged else _COMMIT_MESSAGE_UNTAGGED_DEFAULT
 
 
 def configuration_error(path: Path, role: str, cause: Exception) -> PubanonError:
@@ -762,7 +944,7 @@ def configuration_error(path: Path, role: str, cause: Exception) -> PubanonError
         category = 'invalid UTF-8'
     return PubanonError(
         f'invalid {role} configuration: {category}',
-        recovery=f'review {role} configuration at {escape(str(path))}',
+        recovery=f'review {role} configuration at {escape(path_text(path))}',
     )
 
 
@@ -770,12 +952,13 @@ def _load_toml(path: Path, role: str) -> dict[str, object]:
     """Load TOML with a usable file location and a safe failure category."""
     try:
         return tomllib.loads(path.read_text(encoding='utf-8'))
+    # tomllib.loads raises RecursionError for deeply nested configuration.
     except (OSError, RuntimeError, UnicodeError, tomllib.TOMLDecodeError) as exc:
         raise configuration_error(path, role, exc) from exc
 
 
 def derive_paths(env: Mapping[str, str]) -> Paths:
-    """Derive Pubanon paths from one environment snapshot.
+    """Derive pubanon paths from one environment snapshot.
 
     Args:
         env: Environment variables captured for the command. Nonempty
@@ -861,6 +1044,39 @@ def global_deny(g: GlobalConfig) -> tuple[str, ...]:
             else (literal_pattern(file),)
         )
     )
+
+
+def global_mapping(cfg: GlobalConfig) -> dict[str, object]:
+    """Represent one global configuration in the loader's mapping format.
+
+    Args:
+        cfg: Global configuration to represent.
+
+    Returns:
+        Mapping accepted by `global_from_mapping`.
+
+    Raises:
+        PubanonError: The account mapping cannot be represented.
+    """
+    try:
+        accounts = dict(cfg.accounts)
+    except (TypeError, ValueError) as exc:
+        raise PubanonError('accounts must be a table') from exc
+    data: dict[str, object] = {
+        'anon_name': cfg.anon_name,
+        'anon_email': cfg.anon_email,
+        'accounts': accounts,
+        'sensitive_terms': list(cfg.sensitive_terms),
+        'ignored_directories': list(cfg.ignored_directories),
+        'ignored_files': list(cfg.ignored_files),
+        'default_publication_route': cfg.default_publication_route,
+    }
+    if cfg.commit_message is not None:
+        _validate_commit_message_settings(cfg.commit_message, 'global configuration')
+        data['commit_message'] = {
+            key: value for key, value in vars(cfg.commit_message).items() if value is not None
+        }
+    return data
 
 
 def identity_refusal(sources: Sequence[str]) -> PubanonError:
@@ -956,6 +1172,21 @@ def derived_private_terms(
     )
 
 
+def release_pages_enabled(p: ProjectConfig) -> bool:
+    """Report whether tagged publications of a project create release pages.
+
+    Release pages are off unless the project's `[release_page]` table sets
+    `enabled = true`. Per-publication options can still request one page.
+
+    Args:
+        p: Project configuration to inspect.
+
+    Returns:
+        True only when `release_page.enabled` is explicitly true.
+    """
+    return p.release_page is not None and p.release_page.enabled is True
+
+
 def require_project_name(name: str) -> str:
     """Return one path-safe project name.
 
@@ -976,7 +1207,7 @@ def require_project_name(name: str) -> str:
 
 
 def create_data_dirs(paths: Paths, name: str | None) -> Path:
-    """Create Pubanon data directories for one optional project.
+    """Create pubanon data directories for one optional project.
 
     POSIX mode bits restrict the directories to owner-only access.
 
@@ -1000,8 +1231,9 @@ def create_data_dirs(paths: Paths, name: str | None) -> Path:
         for level in levels:
             level.mkdir(mode=0o700, exist_ok=True)
             _filesystem.chmod(level, 0o700)
+    # Path.mkdir(parents=True) can recurse through deeply nested missing parents.
     except (OSError, RuntimeError) as exc:
-        raise PubanonError('cannot create Pubanon data directories') from exc
+        raise PubanonError('cannot create pubanon data directories') from exc
     return levels[-1]
 
 
@@ -1022,7 +1254,7 @@ def project_lock(paths: Paths, name: str) -> Generator[None]:
     """
     create_data_dirs(paths, name)
     lock_path = paths.data_dir / 'projects' / name / 'project.lock'
-    with _exclusive_lock(lock_path, 'another Pubanon command is running for this project'):
+    with _exclusive_lock(lock_path, 'another pubanon command is running for this project'):
         yield
 
 
@@ -1180,7 +1412,7 @@ def same_source(a: Path, b: Path) -> bool:
         return True
     try:
         return a.exists() and b.exists() and a.samefile(b)
-    except (OSError, RuntimeError):
+    except OSError:
         return False
 
 
@@ -1236,6 +1468,7 @@ def setup_lock(paths: Paths) -> Generator[None]:
     try:
         paths.config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         _filesystem.chmod(paths.config_dir, 0o700)
+    # Path.mkdir(parents=True) can recurse through deeply nested missing parents.
     except (OSError, RuntimeError) as exc:
         raise PubanonError('cannot access operation lock') from exc
     with _exclusive_lock(paths.config_dir / 'setup.lock', 'global setup is active'):
@@ -1310,7 +1543,7 @@ def gate_host_coordinates(
     """Gate locally selected host coordinates before any host contact.
 
     Args:
-        paths: Derived Pubanon configuration and data paths.
+        paths: Derived pubanon configuration and data paths.
         g: Global publication identity configuration.
         p: Project publication configuration.
 
@@ -1337,7 +1570,7 @@ def gate_host_coordinates(
                 hit.rule_class is RuleClass.HYGIENE and hit.term == 'pubanon' for hit in hits
             ):
                 recovery = (
-                    'A built-in rule flags the word pubanon. If you are publishing Pubanon '
+                    'A built-in rule flags the word pubanon. If you are publishing pubanon '
                     'itself, enable self_publication. During setup, press Ctrl-C and rerun '
                     'your init command with --self-publication '
                     '(pubanon init --self-publication), then choose Resume.'
@@ -1421,11 +1654,12 @@ def validate_ignored_file(value: str) -> str:
         ) from error
 
 
-def validate_settings(value: object) -> Settings | None:
+def validate_settings(value: object, *, project_file: Path | None = None) -> Settings | None:
     """Validate optional in-memory repository settings.
 
     Args:
         value: Candidate settings value.
+        project_file: Optional project file to identify in recovery advice.
 
     Returns:
         The validated settings, or `None` when settings are undeclared.
@@ -1446,7 +1680,8 @@ def validate_settings(value: object) -> Settings | None:
             'projects': value.projects,
             'pull_requests': value.pull_requests,
             'discussions': value.discussions,
-        }
+        },
+        project_file=project_file,
     )
 
 
@@ -1534,6 +1769,8 @@ def _validate_project_config(cfg: ProjectConfig, expected_name: str) -> None:
     validate_settings(cfg.settings)
     _validate_acknowledged_exposure(cfg.acknowledged_exposure)
     _validate_package(cfg.package)
+    _validate_commit_message_settings(cfg.commit_message, 'project configuration')
+    _validate_release_page_settings(cfg.release_page)
     _validate_workflows(cfg.workflows)
     if _require_string(data, 'name') != expected_name:
         raise PubanonError('project configuration name does not match requested project')
@@ -1555,7 +1792,7 @@ def global_from_mapping(data: Mapping[str, object]) -> GlobalConfig:
         {
             key: value
             for key, value in data.items()
-            if key not in {'ignored_directories', 'ignored_files'}
+            if key not in {'commit_message', 'ignored_directories', 'ignored_files'}
         },
         _GLOBAL_KEYS,
         'global configuration',
@@ -1565,7 +1802,7 @@ def global_from_mapping(data: Mapping[str, object]) -> GlobalConfig:
     return GlobalConfig(
         anon_name=_require_identity(data, 'anon_name'),
         anon_email=_require_identity(data, 'anon_email'),
-        accounts={'github': _require_string(accounts, 'github')},
+        accounts={DEFAULT_HOST: _require_string(accounts, DEFAULT_HOST)},
         sensitive_terms=_require_terms(data, 'sensitive_terms', require_one=True),
         ignored_files=tuple(
             validate_ignored_file(value) for value in _require_strings(data, 'ignored_files')
@@ -1581,11 +1818,18 @@ def global_from_mapping(data: Mapping[str, object]) -> GlobalConfig:
         default_publication_route=_require_choice(
             data, 'default_publication_route', PUBLICATION_ROUTES
         ),
+        commit_message=(
+            _commit_message_from_mapping(
+                _commit_message_table(data, 'global configuration'), 'global configuration'
+            )
+            if 'commit_message' in data
+            else None
+        ),
     )
 
 
 def load_global(paths: Paths) -> GlobalConfig:
-    """Load the global Pubanon configuration.
+    """Load the global pubanon configuration.
 
     Args:
         paths: Paths derived for this command.
@@ -1601,7 +1845,7 @@ def load_global(paths: Paths) -> GlobalConfig:
 
 
 def load_project(paths: Paths, name: str) -> ProjectConfig:
-    """Load one project's Pubanon configuration.
+    """Load one project's pubanon configuration.
 
     Args:
         paths: Paths derived for this command.
@@ -1623,15 +1867,7 @@ def load_project(paths: Paths, name: str) -> ProjectConfig:
     if missing:
         raise PubanonError(f'missing project configuration key: {", ".join(missing)}')
     repo = validate_host_segment('repo', data['repo'])
-    try:
-        settings = _settings_from_mapping(_require_table(data, 'settings'))
-    except PubanonError as exc:
-        if str(exc) != 'settings.default_branch must be main':
-            raise
-        raise PubanonError(
-            str(exc),
-            recovery=(f'set settings.default_branch = "main" in {escape(str(project_file))}'),
-        ) from None
+    settings = _settings_from_mapping(_require_table(data, 'settings'), project_file=project_file)
     config = ProjectConfig(
         name=_require_string(data, 'name'),
         source_path=_require_absolute_path(data, 'source_path'),
@@ -1660,6 +1896,18 @@ def load_project(paths: Paths, name: str) -> ProjectConfig:
             _workflows_from_mapping(_require_table(data, 'workflow')) if 'workflow' in data else {}
         ),
         ci_workflow=_validate_ci_workflow(data.get('ci_workflow')),
+        release_page=(
+            _release_page_from_mapping(_require_table(data, 'release_page'))
+            if 'release_page' in data
+            else None
+        ),
+        commit_message=(
+            _commit_message_from_mapping(
+                _commit_message_table(data, 'project configuration'), 'project configuration'
+            )
+            if 'commit_message' in data
+            else None
+        ),
     )
     _validate_project_config(config, name)
     return config
@@ -1681,21 +1929,7 @@ def save_global(paths: Paths, cfg: GlobalConfig, original: bytes | None) -> None
             or cannot be saved. A post-replace failure reports that it may have
             been saved.
     """
-    try:
-        accounts = dict(cfg.accounts)
-    except (TypeError, ValueError) as exc:
-        raise PubanonError('accounts must be a table') from exc
-    config = global_from_mapping(
-        {
-            'anon_name': cfg.anon_name,
-            'anon_email': cfg.anon_email,
-            'accounts': accounts,
-            'sensitive_terms': list(cfg.sensitive_terms),
-            'ignored_directories': list(cfg.ignored_directories),
-            'ignored_files': list(cfg.ignored_files),
-            'default_publication_route': cfg.default_publication_route,
-        }
-    )
+    config = global_from_mapping(global_mapping(cfg))
     content = (
         f'anon_name = {_toml_string(config.anon_name)}\n'
         f'anon_email = {_toml_string(config.anon_email)}\n'
@@ -1704,8 +1938,9 @@ def save_global(paths: Paths, cfg: GlobalConfig, original: bytes | None) -> None
         f'ignored_directories = {_toml_array(config.ignored_directories)}\n'
         f'default_publication_route = {_toml_string(config.default_publication_route)}\n'
         '[accounts]\n'
-        f'github = {_toml_string(config.accounts["github"])}\n'
+        f'{DEFAULT_HOST} = {_toml_string(config.accounts[DEFAULT_HOST])}\n'
     )
+    content += _commit_message_content(config.commit_message)
     try:
         payload = content.encode('utf-8')
     except UnicodeError as exc:
@@ -1718,6 +1953,7 @@ def save_global(paths: Paths, cfg: GlobalConfig, original: bytes | None) -> None
             _filesystem.chmod(paths.config_dir, 0o700)
             temporary = _write_global_temporary(paths.config_dir, payload)
             _require_global_snapshot(paths.global_config, original)
+        # Path.mkdir(parents=True) can recurse through deeply nested missing parents.
         except (OSError, RuntimeError, UnicodeError) as exc:
             raise PubanonError('cannot save global configuration') from exc
 
@@ -1728,15 +1964,15 @@ def save_global(paths: Paths, cfg: GlobalConfig, original: bytes | None) -> None
                 'global configuration may have been saved',
                 recovery='rerun pubanon setup',
             ) from exc
-        except (OSError, RuntimeError) as exc:
+        except OSError as exc:
             raise PubanonError('cannot save global configuration') from exc
     finally:
         if temporary is not None:
-            with suppress(OSError, RuntimeError):
+            with suppress(OSError):
                 temporary.unlink(missing_ok=True)
     try:
-        _sync_directory(paths.config_dir)
-    except (OSError, RuntimeError, KeyboardInterrupt) as exc:
+        _filesystem.sync_directory(paths.config_dir)
+    except (OSError, KeyboardInterrupt) as exc:
         raise PubanonError(
             'global configuration may have been saved',
             recovery='rerun pubanon setup',
@@ -1744,7 +1980,7 @@ def save_global(paths: Paths, cfg: GlobalConfig, original: bytes | None) -> None
 
 
 def save_project(paths: Paths, cfg: ProjectConfig) -> None:
-    """Save one project's Pubanon configuration with owner-only POSIX permissions.
+    """Save one project's pubanon configuration with owner-only POSIX permissions.
 
     The caller must hold the project lock for the complete save operation.
 
@@ -1798,39 +2034,30 @@ def save_project(paths: Paths, cfg: ProjectConfig) -> None:
             f'name = {_toml_string(cfg.package.name)}\n'
             f'release_checks = {_toml_array(cfg.package.release_checks)}\n'
         )
+    content += _release_page_content(cfg.release_page)
+    content += _commit_message_content(cfg.commit_message)
     for workflow_name, stages in cfg.workflows.items():
         content += f'[workflow.{_toml_string(workflow_name)}]\nstages = {_toml_array(stages)}\n'
     payload = content.encode('utf-8')
     projects_dir = paths.config_dir / 'projects'
     project_file = projects_dir / f'{cfg.name}.toml'
-    temporary = project_file.with_suffix('.toml.tmp')
-    descriptor: int | None = None
     try:
         paths.config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         _filesystem.chmod(paths.config_dir, 0o700)
         projects_dir.mkdir(mode=0o700, exist_ok=True)
         _filesystem.chmod(projects_dir, 0o700)
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        _filesystem.fchmod(descriptor, 0o600)
-        handle = os.fdopen(descriptor, 'wb')
-        descriptor = None
-        try:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        except (OSError, RuntimeError, UnicodeError):
-            with suppress(OSError, RuntimeError):
-                handle.close()
-            raise
-        handle.close()
-        _filesystem.replace(temporary, project_file)
-        _sync_directory(projects_dir)
+        _filesystem.write_private(project_file, payload)
+    except _filesystem.DurableWriteError as exc:
+        if exc.interrupted and not exc.replacement_attempted:
+            raise KeyboardInterrupt from exc.__cause__
+        message = (
+            'project configuration may have been saved'
+            if exc.replaced or (exc.interrupted and exc.replacement_attempted)
+            else 'cannot save project configuration'
+        )
+        raise PubanonError(message) from exc.__cause__
+    # Path.mkdir(parents=True) can recurse through deeply nested missing parents.
     except (OSError, RuntimeError, UnicodeError) as exc:
-        if descriptor is not None:
-            with suppress(OSError, RuntimeError):
-                os.close(descriptor)
-        with suppress(OSError, RuntimeError):
-            temporary.unlink(missing_ok=True)
         raise PubanonError('cannot save project configuration') from exc
 
 

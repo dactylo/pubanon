@@ -433,7 +433,7 @@ def test_listing_invalid_publication_filename_reports_retained_path(tmp_path: Pa
     with pytest.raises(PubanonError, match='invalid published snapshot commit ID') as error:
         _records.list_publications(paths, 'example')
 
-    assert error.value.fact == escape(str(path))
+    assert error.value.fact == escape((path).as_posix())
     assert path.read_text() == 'malformed record'
 
 
@@ -1043,6 +1043,21 @@ def test_rewrite_round_trip_permissions_and_atomic_replace(tmp_path: Path, phase
     assert not list(path.parent.glob('*.tmp'))
     _records.save_rewrite(paths, 'example', changed)
     assert _records.load_rewrite(paths, 'example') == changed
+
+
+def test_save_candidate_directory_failure_reports_possible_save(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _paths(tmp_path)
+    record = _candidate(tmp_path)
+
+    def _fail_directory(_path: Path) -> None:
+        raise OSError('directory sync failed')
+
+    monkeypatch.setattr(_filesystem, 'sync_directory', _fail_directory)
+    with pytest.raises(PubanonError, match='snapshot record may have been saved'):
+        _records.save_candidate(paths, 'example', record)
+    assert _records.load_candidate(paths, 'example') == record
 
 
 def test_save_candidate_refuses_surrogate_message(tmp_path: Path) -> None:

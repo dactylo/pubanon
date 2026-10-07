@@ -1,9 +1,10 @@
 import json
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, assert_type
+from typing import assert_type
 
 import pytest
 
@@ -12,28 +13,13 @@ from pubanon import (
     _config,
 )
 from pubanon._errors import PubanonError
-from pubanon._remote import _host, _publish, _stage
-from pubanon._snapshots import _candidate, _source
+from pubanon._remote import _host, _publish, _releases, _stage
+from pubanon._snapshots import _candidate, _records, _source
 from tests._cli import gh_calls, prepare, save_workflows
 from tests._git import git_env
 from tests._setup import configure
 from tests.remote.test_publish import _configure_staged_candidate
 from tests.remote.test_stage import _git
-
-if TYPE_CHECKING:
-    from pubanon._cli._context import ProjectContext
-    from pubanon._cli._remote import publish_context
-
-    def _assert_publish_context_type(
-        ctx: ProjectContext,
-        record: _candidate.CandidateRecord,
-    ) -> None:
-        assert_type(
-            publish_context(ctx, record, yes=True, unattended=True),
-            _publish.PublishContext,
-        )
-
-    assert callable(_assert_publish_context_type)
 
 
 @pytest.fixture
@@ -65,7 +51,7 @@ def staged_publication_cli(
         )
         == 0
     )
-    record = _candidate.load_candidate(paths, project.name)
+    record = _records.load_candidate(paths, project.name)
     assert record is not None
     host = tmp_path / 'final.git'
     subprocess.run(['git', 'init', '--bare', '-q', host], check=True, env=git_env())
@@ -95,9 +81,7 @@ def staged_publication_cli(
             ]
         )
     )
-    ctx = _publish.PublishContext(
-        paths, global_config, project, record, _yes=True, _unattended=True
-    )
+    ctx = _publish.PublishContext(paths, global_config, project, record, _yes=True)
     _configure_staged_candidate(ctx, fake_gh, monkeypatch)
     return ctx, host
 
@@ -145,7 +129,7 @@ def test_publish_decline_keeps_snapshot_and_does_not_push(
     assert 'Canceled. Nothing was published.' in error
     assert 'The prepared snapshot is kept.' in error
     assert f'Next: pubanon publish --project={ctx._project.name}' in error
-    retained = _candidate.load_candidate(ctx._paths, ctx._project.name)
+    retained = _records.load_candidate(ctx._paths, ctx._project.name)
     assert retained is not None
     assert retained.commit == ctx._record.commit
     assert retained.state == _candidate.STATE_RETAINED
@@ -184,6 +168,37 @@ def test_publish_gates_current_coordinates_before_host_access(
     assert not (tmp_path / 'fake-gh-calls.jsonl').exists()
 
 
+def test_publish_notes_are_read_once_before_lock_and_passed_exactly(
+    tmp_path: Path, make_repo: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_repo()
+    paths, _global, project = configure(tmp_path, monkeypatch, source)
+    assert project is not None
+    assert _cli.main(['prepare', '--project', project.name, '--version', '1.2.3', '--yes']) == 0
+    notes_path = tmp_path / 'notes.md'
+    notes_path.write_bytes(b'Exact\r\nnotes\n')
+    monkeypatch.chdir(tmp_path)
+    captured: list[_publish.PublishContext] = []
+    original_lock = _config.project_lock
+
+    @contextmanager
+    def _lock(lock_paths: _config.Paths, name: str) -> Generator[None]:
+        notes_path.write_bytes(b'changed after read')
+        with original_lock(lock_paths, name):
+            yield
+
+    monkeypatch.setattr(_config, 'project_lock', _lock)
+    monkeypatch.setattr(_publish, 'publish', captured.append)
+    assert (
+        _cli.main(['publish', '--project', project.name, '--release-notes-file', 'notes.md']) == 0
+    )
+    assert len(captured) == 1
+    assert captured[0]._release_page.notes == b'Exact\r\nnotes\n'
+    assert captured[0]._release_page.notes_file == notes_path
+    assert not captured[0]._release_page.skip
+    assert _records.load_candidate(paths, project.name) is not None
+
+
 def test_publish_preserves_candidate_when_destination_is_inaccessible(
     tmp_path: Path,
     fake_gh: Path,
@@ -217,7 +232,7 @@ def test_publish_preserves_candidate_when_destination_is_inaccessible(
     def _unexpected_push(*_args: object, **_kwargs: object) -> None:
         pytest.fail('publication attempted after repository lookup failed')
 
-    monkeypatch.setattr(_publish, 'push', _unexpected_push)
+    monkeypatch.setattr(_host, 'push', _unexpected_push)
     capsys.readouterr()
 
     assert _cli.main(['publish', '--project', project.name]) == 1
@@ -226,7 +241,21 @@ def test_publish_preserves_candidate_when_destination_is_inaccessible(
     assert f'Cannot access GitHub repository {project.owner}/{project.repo}' in error
     assert 'does not exist or this account lacks access' in error
     assert 'run `pubanon repo create --project=demo`, then retry' in error
-    assert _candidate.load_candidate(paths, project.name) == record
+    assert _records.load_candidate(paths, project.name) == record
+
+
+def test_publish_release_page_option_requests_one_page(
+    tmp_path: Path, make_repo: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_repo()
+    _paths, _global, project = configure(tmp_path, monkeypatch, source)
+    assert project is not None
+    assert _cli.main(['prepare', '--project', project.name, '--version', '1.2.3', '--yes']) == 0
+    captured: list[_publish.PublishContext] = []
+    monkeypatch.setattr(_publish, 'publish', captured.append)
+    assert _cli.main(['publish', '--project', project.name, '--release-page']) == 0
+    assert len(captured) == 1
+    assert captured[0]._release_page == _releases.PageRequest(requested=True)
 
 
 def test_publish_resolve_preserves_recorded_authority_across_current_gate_drift(
@@ -281,7 +310,7 @@ def test_publish_resolve_preserves_recorded_authority_across_current_gate_drift(
         remote_reads.append(destination)
         return _host.RemoteRefs(record.prestate_main, record.prestate_tags)
 
-    monkeypatch.setattr(_publish, 'ls_remote', _remote_refs)
+    monkeypatch.setattr(_host, 'ls_remote', _remote_refs)
     capsys.readouterr()
 
     assert _cli.main(['publish', '--project', project.name, '--resolve', '--yes']) == 0
@@ -317,7 +346,7 @@ def test_publish_resolve_refuses_malformed_recorded_coordinates_before_host_acce
         project.name,
         replace(record, state=_candidate.STATE_UNKNOWN_OUTCOME),
     )
-    record_file = _candidate.record_path(paths, project.name)
+    record_file = _records.candidate_path(paths, project.name)
     record_file.write_text(
         record_file.read_text(encoding='utf-8').replace(
             f'repo = "{record.destination.repo}"',
@@ -376,8 +405,8 @@ def test_publish_resolve_reports_published_outcome_after_real_local_finalization
     ) -> _host.RemoteRefs:
         return _host.RemoteRefs(record.commit, {})
 
-    monkeypatch.setattr(_publish, 'verify_recorded_destination', _verified_destination)
-    monkeypatch.setattr(_publish, 'ls_remote', _remote_refs)
+    monkeypatch.setattr(_host, 'verify_recorded_destination', _verified_destination)
+    monkeypatch.setattr(_host, 'ls_remote', _remote_refs)
     capsys.readouterr()
 
     assert _cli.main(['publish', '--project', project.name, '--resolve', '--yes']) == 0
@@ -398,7 +427,7 @@ def test_publish_resolve_reports_published_outcome_after_real_local_finalization
     assert output.index('The snapshot was published') < output.index('Local snapshot state')
     assert output.index('Local snapshot state') < output.index('A private bookmark')
     assert output.index('Next:') > output.index('Details:')
-    assert _candidate.load_candidate(paths, project.name) is None
+    assert _records.load_candidate(paths, project.name) is None
     assert _candidate.published_refs(paths, project.name) == (record.commit, {})
     source_tag = _git(
         source, 'for-each-ref', '--format=%(objectname)', f'refs/tags/pubanon/{record.commit}'
@@ -448,8 +477,8 @@ def test_publish_resolve_reports_real_not_sent_state_update(
     ) -> _host.RemoteRefs:
         return _host.RemoteRefs(record.prestate_main, record.prestate_tags)
 
-    monkeypatch.setattr(_publish, 'verify_recorded_destination', _verified_destination)
-    monkeypatch.setattr(_publish, 'ls_remote', _remote_refs)
+    monkeypatch.setattr(_host, 'verify_recorded_destination', _verified_destination)
+    monkeypatch.setattr(_host, 'ls_remote', _remote_refs)
     capsys.readouterr()
 
     assert _cli.main(['publish', '--project', project.name, '--resolve', '--yes']) == 0
@@ -463,7 +492,7 @@ def test_publish_resolve_reports_real_not_sent_state_update(
     assert output.index('The repository still points') < output.index('Your snapshot is available')
     assert output.index('Your snapshot is available') < output.index('Details:')
     assert output.index('Details:') < output.index('Next:')
-    retained = _candidate.load_candidate(paths, project.name)
+    retained = _records.load_candidate(paths, project.name)
     assert retained is not None
     assert retained.state == _candidate.STATE_RETAINED
     assert retained.commit == record.commit
@@ -483,7 +512,7 @@ def test_repo_restore_remote_skips_candidate_requirement_and_builds_sync_context
     def _sync(ctx: _publish.SyncContext) -> None:
         with (
             pytest.raises(
-                PubanonError, match='another Pubanon command is running for this project'
+                PubanonError, match='another pubanon command is running for this project'
             ),
             _config.project_lock(paths, project.name),
         ):
@@ -500,7 +529,6 @@ def test_repo_restore_remote_skips_candidate_requirement_and_builds_sync_context
     assert sync_context._global_config == global_config
     assert sync_context._project == project
     assert sync_context._yes is True
-    assert sync_context._unattended is True
 
 
 @pytest.mark.slow
@@ -514,9 +542,8 @@ def test_staged_publication_commands_recheck_ci_before_exact_final_push(
 ) -> None:
     command, yes = case
     ctx, host = staged_publication_cli
-    paths, global_config, project, record = (
+    paths, project, record = (
         ctx._paths,
-        ctx._global_config,
         ctx._project,
         ctx._record,
     )
@@ -545,7 +572,7 @@ def test_staged_publication_commands_recheck_ci_before_exact_final_push(
         + ['--project', project.name]
         + (['--yes'] if yes else [])
     )
-    real_push = _publish.push
+    real_push = _host.push
     pushed: list[str] = []
     confirmed: list[str] = []
 
@@ -557,14 +584,14 @@ def test_staged_publication_commands_recheck_ci_before_exact_final_push(
         pushed.append(destination.repo)
         return real_push(destination, cwd, args)
 
-    monkeypatch.setattr(_publish, 'push', _push)
+    monkeypatch.setattr(_host, 'push', _push)
     monkeypatch.setattr(_publish, 'confirm', _confirm)
     capsys.readouterr()
     assert _cli.main(argv) == 1
     assert f'pubanon stage watch --project={project.name}' in capsys.readouterr().err
     assert confirmed == []
     assert pushed == []
-    assert _candidate.load_candidate(paths, project.name) == record
+    assert _records.load_candidate(paths, project.name) == record
     assert _git(host, 'for-each-ref') == b''
 
     # A success response for another SHA is not evidence for this candidate.
@@ -573,7 +600,7 @@ def test_staged_publication_commands_recheck_ci_before_exact_final_push(
     fake_gh.write_text(json.dumps(responses))
     assert _cli.main(argv) == 1
     assert pushed == []
-    assert _candidate.load_candidate(paths, project.name) == record
+    assert _records.load_candidate(paths, project.name) == record
 
     check_run['head_sha'] = record.commit
     responses[-1]['stdout'] = json.dumps({'total_count': 1, 'check_runs': [check_run]})
@@ -591,7 +618,7 @@ def test_staged_publication_commands_recheck_ci_before_exact_final_push(
     assert len([args for args in gh_calls(fake_gh.parent) if '/check-runs?' in args[1]]) == 3
 
     # Synchronization restores published history without staging prerequisites.
-    _stage.stage_forget(paths, global_config, project, yes=True)
+    _stage.stage_forget(paths, project, yes=True)
     _git(host, 'update-ref', '-d', 'refs/heads/main')
     _git(host, 'update-ref', '-d', 'refs/tags/v1.0.0')
     assert (
@@ -602,6 +629,72 @@ def test_staged_publication_commands_recheck_ci_before_exact_final_push(
         assert _cli.main(argv) == 0
         assert 'already published' in capsys.readouterr().out
     assert len([args for args in gh_calls(fake_gh.parent) if '/check-runs?' in args[1]]) == 3
+
+
+@pytest.mark.parametrize('page_state', ['present', 'absent', 'failed', 'disabled'])
+def test_publish_resolve_reports_page_without_writing(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    page_state: str,
+) -> None:
+    source = make_repo(files={'README.md': 'public\n'})
+    paths, project, record = prepare(tmp_path, source, monkeypatch, version='1.2.3')
+    _config.save_project(
+        paths,
+        replace(
+            project, release_page=_config.ReleasePageSettings(enabled=page_state != 'disabled')
+        ),
+    )
+    bookmark = _source.describe_bookmark(source, project.name, record.commit)
+    _source.ensure_bookmark(bookmark, record.pinned.commit)
+    record = replace(record, source_bookmark=bookmark)
+    _candidate.save_candidate(
+        paths, project.name, replace(record, state=_candidate.STATE_UNKNOWN_OUTCOME)
+    )
+    destination = _publish._destination_from_record(record)
+    page = _host.GitHubRelease(
+        'v1.2.3', 'custom', '', 'https://example.invalid/page', draft=True, prerelease=False
+    )
+    reads: list[str] = []
+
+    def _destination(*_args: object) -> _host.Destination:
+        return destination
+
+    def _refs(*_args: object, **_kwargs: object) -> _host.RemoteRefs:
+        return _host.RemoteRefs(record.commit, {'v1.2.3': record.commit})
+
+    def _read(_destination: _host.Destination, tag: str) -> _host.GitHubRelease | None:
+        assert _records.load_candidate(paths, project.name) is None
+        reads.append(tag)
+        if page_state == 'failed':
+            raise PubanonError('lookup failed')
+        return page if page_state == 'present' else None
+
+    def _write(*_args: object, **_kwargs: object) -> None:
+        pytest.fail('resolve must not write a page')
+
+    monkeypatch.setattr(_host, 'verify_recorded_destination', _destination)
+    monkeypatch.setattr(_host, 'verify_destination', _destination)
+    monkeypatch.setattr(_host, 'ls_remote', _refs)
+    monkeypatch.setattr(_host, 'read_release', _read)
+    monkeypatch.setattr(_host, 'create_release', _write)
+    capsys.readouterr()
+    assert _cli.main(['publish', '--project', project.name, '--resolve']) == 0
+    captured = capsys.readouterr()
+    assert 'The snapshot was published and verified' in captured.out
+    assert _records.load_candidate(paths, project.name) is None
+    assert reads == ([] if page_state == 'disabled' else ['v1.2.3'])
+    if page_state == 'present':
+        assert f'Release page: {page.url}' in captured.out
+    elif page_state == 'absent':
+        assert 'no page exists' in captured.out
+        assert 'pubanon release create v1.2.3 --project=demo' in captured.out
+    elif page_state == 'failed':
+        assert 'warning:' in captured.out
+        assert 'could not look up the release page' in captured.out
+        assert 'no page exists' not in captured.out
 
 
 def test_unknown_outcome_names_resolve(

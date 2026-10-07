@@ -3,8 +3,7 @@
 import os
 import re
 import tomllib
-from collections.abc import Mapping
-from contextlib import suppress
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -20,7 +19,7 @@ from pubanon._snapshots._source import (
     bookmark_ref,
     path_portability_keys,
 )
-from pubanon._terminal import escape
+from pubanon._terminal import escape, path_text
 from pubanon._toml import toml_string
 
 STATE_RETAINED = 'retained'
@@ -360,26 +359,20 @@ def _optional_string(data: Mapping[str, object], key: str, error: str) -> str | 
     return value
 
 
-def _project_dir(paths: Paths, project: str) -> Path:
-    """Resolve a path-safe project data directory."""
-    require_project_name(project)
-    return paths.data_dir / 'projects' / project
-
-
 def _publication_inventory(directory: Path, suffix: str, error: str) -> tuple[Path, ...]:
     """Enumerate one complete publication inventory or refuse an unreadable directory."""
     try:
         entries = os.scandir(directory)
     except FileNotFoundError:
         return ()
-    except (OSError, RuntimeError) as exc:
+    except OSError as exc:
         raise PubanonError(error) from exc
     try:
         with entries:
             return tuple(
                 Path(entry.path) for entry in entries if _matches_suffix(entry.name, suffix)
             )
-    except (OSError, RuntimeError) as exc:
+    except OSError as exc:
         raise PubanonError(error) from exc
 
 
@@ -389,20 +382,9 @@ def _read(path: Path, error: str, *, fact: str | None = None) -> dict[str, objec
         if not path.exists():
             return None
         return tomllib.loads(path.read_text(encoding='utf-8'))
+    # tomllib.loads raises RecursionError for deeply nested records.
     except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
         raise PubanonError(error, fact=fact) from exc
-
-
-def _replacement_tags(record: CandidateRecord) -> dict[str, str]:
-    """Derive the complete tag mapping from the frozen replacement mapping."""
-    if record.replace_scope == 'all':
-        return {} if record.tag_intent is None else {record.tag_intent: record.commit}
-    mapping = {record.replaces: record.commit}
-    mapping.update((entry.old, entry.new) for entry in record.replayed)
-    tags = {tag: mapping.get(oid, oid) for tag, oid in record.prestate_tags.items()}
-    if record.replaces not in record.prestate_tags.values() and record.tag_intent is not None:
-        tags[record.tag_intent] = record.commit
-    return tags
 
 
 def _resolution_data(resolution: Resolution) -> dict[str, _TOML_VALUE]:
@@ -967,68 +949,23 @@ def _validate_tags(tags: dict[str, str], error: str) -> None:
         raise PubanonError(error)
 
 
-def _validate_candidate(record: CandidateRecord, project: str) -> None:
-    """Validate complete or interrupted candidate state without consulting Git."""
-    error = 'invalid snapshot record'
-    _validate_common(record, project, error)
-    _validate_pinned(record.pinned, error)
-    if record.state not in _VALID_STATES:
-        raise PubanonError(error)
-    if record.prestate_main is not None and _OID_PATTERN.fullmatch(record.prestate_main) is None:
-        raise PubanonError(error)
-    _validate_tags(record.prestate_tags, error)
-    if record.replaces is None:
-        if record.tip is not None or record.poststate_tags is not None or record.replayed:
-            raise PubanonError(error)
-        return
-    if record.prestate_main is None:
-        raise PubanonError(error)
-    if record.replace_scope == 'all' and record.replaces != record.prestate_main:
-        raise PubanonError(error)
-    if record.tip is None and record.poststate_tags is None and not record.replayed:
-        return
-    if record.tip is None or record.poststate_tags is None:
-        raise PubanonError(error)
-    _validate_replayed(record.replayed, project, error)
-    _validate_tags(record.poststate_tags, error)
-    if (
-        record.tip != (record.replayed[-1].new if record.replayed else record.commit)
-        or record.poststate_tags != _replacement_tags(record)
-        or (record.replace_scope == 'all' and record.replayed)
-        or any(
-            entry.old == record.replaces or entry.new == record.commit for entry in record.replayed
-        )
-    ):
-        raise PubanonError(error)
-
-
-def _write(path: Path, content: str, error: str, *, fact: str | None = None) -> None:
+def _write(
+    path: Path, content: str, error: str, saved_error: str, *, fact: str | None = None
+) -> None:
     """Durably replace one private record through a same-directory temporary."""
-    temporary = path.with_name(f'{path.name}.tmp')
-    descriptor = None
     try:
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        _filesystem.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, 'wb') as handle:
-            descriptor = None
-            handle.write(content.encode('utf-8'))
-            handle.flush()
-            os.fsync(handle.fileno())
-        _filesystem.replace(temporary, path)
-        _filesystem.sync_directory(path.parent)
-    except (OSError, RuntimeError, UnicodeError) as exc:
+        _filesystem.write_private(path, content.encode('utf-8'))
+    except UnicodeError as exc:
         raise PubanonError(error, fact=fact) from exc
-    finally:
-        if descriptor is not None:
-            with suppress(OSError):
-                os.close(descriptor)
-        with suppress(OSError):
-            temporary.unlink(missing_ok=True)
-
-
-def candidate_path(paths: Paths, project: str) -> Path:
-    """Return the active snapshot record path."""
-    return _project_dir(paths, project) / 'candidate.toml'
+    except _filesystem.DurableWriteError as exc:
+        if exc.interrupted and not exc.replacement_attempted:
+            raise KeyboardInterrupt from exc.__cause__
+        message = (
+            saved_error
+            if exc.replaced or (exc.interrupted and exc.replacement_attempted)
+            else error
+        )
+        raise PubanonError(message, fact=fact) from exc.__cause__
 
 
 def candidate_tip(record: CandidateRecord) -> str:
@@ -1062,9 +999,24 @@ def candidate_poststate(record: CandidateRecord) -> tuple[str, dict[str, str]]:
     return tip, tags
 
 
+def project_dir(paths: Paths, project: str) -> Path:
+    """Resolve a validated project data directory.
+
+    Raises:
+        PubanonError: The project name is invalid.
+    """
+    require_project_name(project)
+    return paths.data_dir / 'projects' / project
+
+
+def candidate_path(paths: Paths, project: str) -> Path:
+    """Return the active snapshot record path."""
+    return project_dir(paths, project) / 'candidate.toml'
+
+
 def deleted_publications(paths: Paths, project: str) -> set[str]:
     """Read local deletions that must not be rediscovered through Git history."""
-    directory = _project_dir(paths, project) / 'publications'
+    directory = project_dir(paths, project) / 'publications'
     return {
         path.stem
         for path in _publication_inventory(
@@ -1072,6 +1024,205 @@ def deleted_publications(paths: Paths, project: str) -> set[str]:
         )
         if _OID_PATTERN.fullmatch(path.stem) is not None
     }
+
+
+def publication_path(paths: Paths, project: str, commit: str) -> Path:
+    """Return a confirmed record path keyed by its full commit ID."""
+    path = project_dir(paths, project) / 'publications' / f'{commit}.toml'
+    if _OID_PATTERN.fullmatch(commit) is None:
+        raise PubanonError('invalid published snapshot commit ID', fact=escape(path_text(path)))
+    return path
+
+
+def load_publication(paths: Paths, project: str, commit: str) -> PublicationRecord | None:
+    """Load a confirmed record keyed by its full commit ID.
+
+    Returns:
+        The validated record, or `None` when it is absent.
+
+    Raises:
+        PubanonError: The record has malformed or unsupported schema or
+            provenance, or its commit does not match its filename.
+    """
+    error = 'invalid published snapshot record'
+    path = publication_path(paths, project, commit)
+    data = _read(path, error, fact=escape(path_text(path)))
+    if data is None:
+        return None
+    version = data.get('schema_version')
+    if type(version) is not int or version != 1:
+        raise PubanonError('unsupported published snapshot record schema version', fact=commit)
+    if data.keys() - _PUBLICATION_KEYS or _PUBLICATION_REQUIRED - data.keys():
+        raise PubanonError(error, fact=commit)
+    confirmed_at = data.get('confirmed_at')
+    if not isinstance(confirmed_at, datetime):
+        raise PubanonError(error, fact=commit)
+    record = PublicationRecord(
+        commit=_string(data, 'commit', error),
+        tree=_string(data, 'tree', error),
+        snapshot_digest=_string(data, 'snapshot_digest', error),
+        fingerprint=_string(data, 'fingerprint', error),
+        message=_string(data, 'message', error),
+        tag_intent=_optional_string(data, 'tag_intent', error),
+        pinned=_pinned(data, error) if 'pinned' in data else None,
+        destination=_destination(data, error),
+        confirmed_at=confirmed_at,
+        source_bookmark=_bookmark(data, project, commit, error),
+        replaces=_optional_string(data, 'replaces', error),
+        replace_scope=_scope(data, error),
+        derivation=_derivation(data, error),
+    )
+    _validate_publication(record, project)
+    record = replace(record, confirmed_at=record.confirmed_at.astimezone(UTC))
+    if record.commit != commit:
+        raise PubanonError('published snapshot record filename does not match commit', fact=commit)
+    return record
+
+
+def list_publications(paths: Paths, project: str) -> tuple[PublicationRecord, ...]:
+    """List every valid confirmed record without treating temporary files as entries.
+
+    Raises:
+        PubanonError: An entry is invalid or disappears during the listing. No
+            partial result is returned.
+    """
+    directory = project_dir(paths, project) / 'publications'
+    paths_found = sorted(
+        _publication_inventory(directory, '.toml', 'cannot list published snapshot records')
+    )
+    records: list[PublicationRecord] = []
+    for path in paths_found:
+        record = load_publication(paths, project, path.stem)
+        if record is None:
+            raise PubanonError(
+                'published snapshot record disappeared while listing', fact=path.name
+            )
+        records.append(record)
+    return tuple(records)
+
+
+def mark_publication_deleted(paths: Paths, project: str, commit: str) -> None:
+    """Persist a deletion without retaining Git objects or source provenance.
+
+    The caller must hold the project lock for the complete operation.
+    """
+    path = publication_path(paths, project, commit).with_suffix('.deleted')
+    try:
+        create_data_dirs(paths, project)
+        path.parent.mkdir(mode=0o700, exist_ok=True)
+    except OSError as exc:
+        raise PubanonError('cannot save local snapshot deletion', fact=commit) from exc
+    _write(
+        path,
+        '',
+        'cannot save local snapshot deletion',
+        'local snapshot deletion may have been saved',
+        fact=commit,
+    )
+
+
+def publication_ref(commit: str) -> str:
+    """Return the publication-store reference protecting one commit."""
+    if _OID_PATTERN.fullmatch(commit) is None:
+        raise PubanonError('invalid published snapshot commit ID')
+    return f'refs/pubanon/published/{commit}'
+
+
+def publication_source(record: PublicationRecord) -> str | None:
+    """Return pinned source provenance or the original input of a derivation.
+
+    Returns:
+        The recorded source commit, or `None` when no source input is known.
+    """
+    if record.pinned is not None:
+        return record.pinned.commit
+    return record.derivation.original_source if record.derivation is not None else None
+
+
+def relocate_publication_source(
+    paths: Paths, project: str, expected: PublicationRecord, bookmark: SourceBookmark
+) -> PublicationRecord:
+    """Durably replace only a verified source locator before local deletion.
+
+    Callers hold the project lock and verify the exact bookmark and source OID
+    at the relocated repository. All provenance and confirmation time remain
+    unchanged; a changed or missing prior record refuses the replacement.
+    """
+    if expected.source_bookmark is None or bookmark.refname != expected.source_bookmark.refname:
+        raise PubanonError('relocated source bookmark conflicts with publication')
+    record = replace(expected, source_bookmark=bookmark)
+    _validate_publication(record, project)
+    if load_publication(paths, project, expected.commit) != expected:
+        raise PubanonError('published snapshot record changed before source relocation')
+    path = publication_path(paths, project, expected.commit)
+    _write(
+        path,
+        _publication_text(record),
+        'cannot save relocated publication source',
+        'relocated publication source may have been saved',
+        fact=escape(path_text(path)),
+    )
+    return record
+
+
+def replacement_poststate_tags(
+    record: CandidateRecord, replayed: Sequence[ReplayEntry]
+) -> dict[str, str]:
+    """Derive resulting tags from a replacement and its completed replay entries.
+
+    Args:
+        record: Replacement candidate supplying the frozen tag map and intent.
+        replayed: Completed old-to-new mappings, including partial rewrite
+            progress.
+
+    Returns:
+        A new tag mapping that preserves unaffected tags for a single
+        replacement, or contains only the intended tag when replacing all
+        history.
+    """
+    if record.replace_scope == 'all':
+        return {} if record.tag_intent is None else {record.tag_intent: record.commit}
+    mapping = {record.replaces: record.commit}
+    mapping.update((entry.old, entry.new) for entry in replayed)
+    tags = {tag: mapping.get(oid, oid) for tag, oid in record.prestate_tags.items()}
+    if record.replaces not in record.prestate_tags.values() and record.tag_intent is not None:
+        tags[record.tag_intent] = record.commit
+    return tags
+
+
+def _validate_candidate(record: CandidateRecord, project: str) -> None:
+    """Validate complete or interrupted candidate state without consulting Git."""
+    error = 'invalid snapshot record'
+    _validate_common(record, project, error)
+    _validate_pinned(record.pinned, error)
+    if record.state not in _VALID_STATES:
+        raise PubanonError(error)
+    if record.prestate_main is not None and _OID_PATTERN.fullmatch(record.prestate_main) is None:
+        raise PubanonError(error)
+    _validate_tags(record.prestate_tags, error)
+    if record.replaces is None:
+        if record.tip is not None or record.poststate_tags is not None or record.replayed:
+            raise PubanonError(error)
+        return
+    if record.prestate_main is None:
+        raise PubanonError(error)
+    if record.replace_scope == 'all' and record.replaces != record.prestate_main:
+        raise PubanonError(error)
+    if record.tip is None and record.poststate_tags is None and not record.replayed:
+        return
+    if record.tip is None or record.poststate_tags is None:
+        raise PubanonError(error)
+    _validate_replayed(record.replayed, project, error)
+    _validate_tags(record.poststate_tags, error)
+    if (
+        record.tip != (record.replayed[-1].new if record.replayed else record.commit)
+        or record.poststate_tags != replacement_poststate_tags(record, record.replayed)
+        or (record.replace_scope == 'all' and record.replayed)
+        or any(
+            entry.old == record.replaces or entry.new == record.commit for entry in record.replayed
+        )
+    ):
+        raise PubanonError(error)
 
 
 def load_candidate(paths: Paths, project: str) -> CandidateRecord | None:
@@ -1119,146 +1270,14 @@ def load_candidate(paths: Paths, project: str) -> CandidateRecord | None:
     return record
 
 
-def publication_path(paths: Paths, project: str, commit: str) -> Path:
-    """Return a confirmed record path keyed by its full commit ID."""
-    path = _project_dir(paths, project) / 'publications' / f'{commit}.toml'
-    if _OID_PATTERN.fullmatch(commit) is None:
-        raise PubanonError('invalid published snapshot commit ID', fact=escape(str(path)))
-    return path
-
-
-def load_publication(paths: Paths, project: str, commit: str) -> PublicationRecord | None:
-    """Load a confirmed record keyed by its full commit ID.
-
-    Returns:
-        The validated record, or `None` when it is absent.
-
-    Raises:
-        PubanonError: The record has malformed or unsupported schema or
-            provenance, or its commit does not match its filename.
-    """
-    error = 'invalid published snapshot record'
-    path = publication_path(paths, project, commit)
-    data = _read(path, error, fact=escape(str(path)))
-    if data is None:
-        return None
-    version = data.get('schema_version')
-    if type(version) is not int or version != 1:
-        raise PubanonError('unsupported published snapshot record schema version', fact=commit)
-    if data.keys() - _PUBLICATION_KEYS or _PUBLICATION_REQUIRED - data.keys():
-        raise PubanonError(error, fact=commit)
-    confirmed_at = data.get('confirmed_at')
-    if not isinstance(confirmed_at, datetime):
-        raise PubanonError(error, fact=commit)
-    record = PublicationRecord(
-        commit=_string(data, 'commit', error),
-        tree=_string(data, 'tree', error),
-        snapshot_digest=_string(data, 'snapshot_digest', error),
-        fingerprint=_string(data, 'fingerprint', error),
-        message=_string(data, 'message', error),
-        tag_intent=_optional_string(data, 'tag_intent', error),
-        pinned=_pinned(data, error) if 'pinned' in data else None,
-        destination=_destination(data, error),
-        confirmed_at=confirmed_at,
-        source_bookmark=_bookmark(data, project, commit, error),
-        replaces=_optional_string(data, 'replaces', error),
-        replace_scope=_scope(data, error),
-        derivation=_derivation(data, error),
-    )
-    _validate_publication(record, project)
-    record = replace(record, confirmed_at=record.confirmed_at.astimezone(UTC))
-    if record.commit != commit:
-        raise PubanonError('published snapshot record filename does not match commit', fact=commit)
-    return record
-
-
-def list_publications(paths: Paths, project: str) -> tuple[PublicationRecord, ...]:
-    """List every valid confirmed record without treating temporary files as entries.
-
-    Raises:
-        PubanonError: An entry is invalid or disappears during the listing. No
-            partial result is returned.
-    """
-    directory = _project_dir(paths, project) / 'publications'
-    paths_found = sorted(
-        _publication_inventory(directory, '.toml', 'cannot list published snapshot records')
-    )
-    records: list[PublicationRecord] = []
-    for path in paths_found:
-        record = load_publication(paths, project, path.stem)
-        if record is None:
-            raise PubanonError(
-                'published snapshot record disappeared while listing', fact=path.name
-            )
-        records.append(record)
-    return tuple(records)
-
-
-def mark_publication_deleted(paths: Paths, project: str, commit: str) -> None:
-    """Persist a deletion without retaining Git objects or source provenance.
-
-    The caller must hold the project lock for the complete operation.
-    """
-    path = publication_path(paths, project, commit).with_suffix('.deleted')
-    try:
-        create_data_dirs(paths, project)
-        path.parent.mkdir(mode=0o700, exist_ok=True)
-    except (OSError, RuntimeError) as exc:
-        raise PubanonError('cannot save local snapshot deletion', fact=commit) from exc
-    _write(path, '', 'cannot save local snapshot deletion', fact=commit)
-
-
-def publication_ref(commit: str) -> str:
-    """Return the publication-store reference protecting one commit."""
-    if _OID_PATTERN.fullmatch(commit) is None:
-        raise PubanonError('invalid published snapshot commit ID')
-    return f'refs/pubanon/published/{commit}'
-
-
-def publication_source(record: PublicationRecord) -> str | None:
-    """Return pinned source provenance or the original input of a derivation.
-
-    Returns:
-        The recorded source commit, or `None` when no source input is known.
-    """
-    if record.pinned is not None:
-        return record.pinned.commit
-    return record.derivation.original_source if record.derivation is not None else None
-
-
-def relocate_publication_source(
-    paths: Paths, project: str, expected: PublicationRecord, bookmark: SourceBookmark
-) -> PublicationRecord:
-    """Durably replace only a verified source locator before local deletion.
-
-    Callers hold the project lock and verify the exact bookmark and source OID
-    at the relocated repository. All provenance and confirmation time remain
-    unchanged; a changed or missing prior record refuses the replacement.
-    """
-    if expected.source_bookmark is None or bookmark.refname != expected.source_bookmark.refname:
-        raise PubanonError('relocated source bookmark conflicts with publication')
-    record = replace(expected, source_bookmark=bookmark)
-    _validate_publication(record, project)
-    if load_publication(paths, project, expected.commit) != expected:
-        raise PubanonError('published snapshot record changed before source relocation')
-    path = publication_path(paths, project, expected.commit)
-    _write(
-        path,
-        _publication_text(record),
-        'cannot save relocated publication source',
-        fact=escape(str(path)),
-    )
-    return record
-
-
 def rewrite_directory(paths: Paths, project: str) -> Path:
     """Return the private conflict export directory without creating it."""
-    return _project_dir(paths, project) / 'rewrite'
+    return project_dir(paths, project) / 'rewrite'
 
 
 def rewrite_path(paths: Paths, project: str) -> Path:
     """Return the private durable rewrite record path."""
-    return _project_dir(paths, project) / 'rewrite.toml'
+    return project_dir(paths, project) / 'rewrite.toml'
 
 
 def load_rewrite(paths: Paths, project: str) -> RewriteRecord | None:
@@ -1310,7 +1329,12 @@ def save_candidate(paths: Paths, project: str, record: CandidateRecord) -> None:
     _validate_candidate(record, project)
     content = _candidate_text(record)
     create_data_dirs(paths, project)
-    _write(candidate_path(paths, project), content, 'cannot save snapshot record')
+    _write(
+        candidate_path(paths, project),
+        content,
+        'cannot save snapshot record',
+        'snapshot record may have been saved',
+    )
 
 
 def save_publication(paths: Paths, project: str, record: PublicationRecord) -> None:
@@ -1338,9 +1362,15 @@ def save_publication(paths: Paths, project: str, record: PublicationRecord) -> N
     try:
         path.parent.mkdir(mode=0o700, exist_ok=True)
         _filesystem.chmod(path.parent, 0o700)
-    except (OSError, RuntimeError) as exc:
+    except OSError as exc:
         raise PubanonError('cannot create published snapshot record directory') from exc
-    _write(path, content, 'cannot save published snapshot record', fact=escape(str(path)))
+    _write(
+        path,
+        content,
+        'cannot save published snapshot record',
+        'published snapshot record may have been saved',
+        fact=escape(path_text(path)),
+    )
 
 
 def save_rewrite(paths: Paths, project: str, record: RewriteRecord) -> None:
@@ -1368,4 +1398,9 @@ def save_rewrite(paths: Paths, project: str, record: RewriteRecord) -> None:
         }
     content = '\n'.join(_toml_lines(data, 'invalid rewrite record')) + '\n'
     create_data_dirs(paths, project)
-    _write(rewrite_path(paths, project), content, 'cannot save rewrite record')
+    _write(
+        rewrite_path(paths, project),
+        content,
+        'cannot save rewrite record',
+        'rewrite record may have been saved',
+    )

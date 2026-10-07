@@ -9,8 +9,8 @@ import sys
 import unicodedata
 from contextlib import contextmanager
 from contextvars import ContextVar
-from pathlib import Path
-from typing import TYPE_CHECKING, TextIO
+from pathlib import Path, PurePath, PureWindowsPath
+from typing import TYPE_CHECKING, Literal, TextIO
 
 from pubanon import _errors
 
@@ -31,6 +31,38 @@ else:
 
     _TERMINAL_ERRORS = (EOFError, OSError, termios.error)
 
+PROJECT_COMMANDS: tuple[str, ...] = (
+    'audit',
+    'clean',
+    'delete',
+    'discard',
+    'forget',
+    'init',
+    'inspect',
+    'list',
+    'package watch',
+    'prepare',
+    'publish',
+    'release create',
+    'release edit',
+    'release list',
+    'release show',
+    'repo create',
+    'repo restore',
+    'repo reveal',
+    'repo verify',
+    'repo watch',
+    'run',
+    'show',
+    'stage delete',
+    'stage forget',
+    'stage push',
+    'stage repair',
+    'stage status',
+    'stage watch',
+    'status',
+)
+
 _BYTE_ESCAPE_MAX = 0xFF
 _CHOICE_PAIR_SIZE = 2
 _COLOR_MODE: ContextVar[str] = ContextVar('color_mode', default='auto')
@@ -39,9 +71,9 @@ _GUIDANCE_IMPLICIT_PROJECT: ContextVar[str | None] = ContextVar(
 )
 _GUIDANCE_PROJECT: ContextVar[str | None] = ContextVar('guidance_project', default=None)
 _GUIDANCE_WORKFLOW: ContextVar[bool] = ContextVar('guidance_workflow', default=False)
-_NO = frozenset({'n', 'no'})
+_NO = frozenset({'n'})
 _SHORT_ESCAPE_MAX = 0xFFFF
-_STYLES = {
+_STYLES: dict[StyleKind, str] = {
     'plain': '',
     'note': '2',
     'label': '1',
@@ -52,7 +84,12 @@ _STYLES = {
     'error': '1;31',
 }
 _VERBOSE: ContextVar[bool] = ContextVar('verbose', default=False)
-_YES = frozenset({'y', 'yes'})
+_YES = frozenset({'y'})
+
+
+type StyleKind = Literal[
+    'plain', 'note', 'label', 'heading', 'choice', 'success', 'warning', 'error'
+]
 
 
 def _parse_choices(choices: Iterable[str]) -> list[tuple[str, str, str]]:
@@ -192,7 +229,7 @@ def _read_key(prompt: str) -> str:
 
 
 def _read(prompt: str, *, key: bool = False) -> str:
-    """Read a line or menu key, converting terminal failures to Pubanon errors."""
+    """Read a line or menu key, converting terminal failures to pubanon errors."""
     if not sys.stdin.isatty():
         raise _errors.PubanonError(
             'this step needs an interactive terminal',
@@ -234,16 +271,6 @@ def display_check_result(verdict: CheckVerdict) -> str:
     return 'failed' + (f' ({escape(", ".join(details))})' if details else '')
 
 
-def display_path(path: Path) -> str:
-    """Escape an absolute display path, abbreviating the home directory as `~`."""
-    absolute = path.absolute()
-    try:
-        relative = absolute.relative_to(Path.home())
-    except ValueError:
-        return escape(str(absolute))
-    return escape('~' if relative == Path() else '~' + os.sep + str(relative))
-
-
 @contextmanager
 def guidance_context(
     *, project: str | None = None, implicit_project: str | None = None, workflow: bool = False
@@ -273,6 +300,9 @@ def guidance_context(
 @contextmanager
 def output_encoding_context() -> Generator[None]:
     """Display unencodable CLI text visibly while retaining stream settings."""
+    # Transitional protection while stdio may use a non-UTF-8 locale encoding.
+    # PEP 686 defaults to UTF-8 mode in Python 3.15, but PYTHONUTF8=0 still
+    # disables it; revisit when Python 3.15 becomes the minimum.
     configured: list[tuple[TextIO, Callable[..., object], str]] = []
     try:
         for stream in (sys.stdout, sys.stderr):
@@ -289,6 +319,45 @@ def output_encoding_context() -> Generator[None]:
             reconfigure(errors=errors)
 
 
+def path_text(path: PurePath) -> str:
+    """Use forward slashes for display, preserving Windows namespace spelling."""
+    text = str(path)
+    if isinstance(path, PureWindowsPath) and text.replace('/', '\\').startswith(
+        ('\\\\?\\', '\\\\.\\', '\\??\\')
+    ):
+        return text
+    return path.as_posix()
+
+
+def display_path(path: Path) -> str:
+    """Escape an absolute display path, abbreviating the home directory as `~`."""
+    absolute = path.absolute()
+    rendered = path_text(absolute)
+    if isinstance(absolute, PureWindowsPath) and rendered == str(absolute):
+        # Namespace paths must not be abbreviated into ordinary home paths.
+        return escape(rendered)
+    try:
+        relative = absolute.relative_to(Path.home())
+    except ValueError:
+        return escape(rendered)
+    return escape('~' if not relative.parts else '~/' + path_text(relative))
+
+
+def project_fallback(project: str, action: str, mode: str | None) -> str:
+    """Direct an unrenderable project command to its registered directory.
+
+    Args:
+        project: Project name to escape for display.
+        action: Command phrase and any arguments to escape for display.
+        mode: Optional recovery flag to escape and retain in the instruction.
+    """
+    with_mode = f' with {escape(mode)}' if mode is not None else ''
+    return (
+        f'Choose project {escape(project)} from its registered directory, '
+        f'then rerun the {escape(action)} action{with_mode}.'
+    )
+
+
 def shell_command(*args: str) -> str | None:
     """Render a shell command only when visible text preserves its arguments."""
     command = shlex.join(args)
@@ -302,7 +371,7 @@ def guidance(text: str) -> str:
     Preserve explicit selections for other projects. Remove a selection for the
     project already implied by the current directory.
 
-    Use only for advice written by Pubanon, never file contents, command
+    Use only for advice written by pubanon, never file contents, command
     output, or publication metadata.
     """
     implicit_project = _GUIDANCE_IMPLICIT_PROJECT.get()
@@ -324,21 +393,16 @@ def guidance(text: str) -> str:
         if option is None:
             action = command.removeprefix('pubanon ')
             mode = re.search(r' --(?:clean|continue|resolve)(?=\s|$)', rest)
-            with_mode = f' with {mode.group().strip()}' if mode is not None else ''
-            return (
-                f'Choose project {escape(project)} from its registered directory, '
-                f'then rerun the {action} action{with_mode}.'
+            return project_fallback(
+                project, action, mode.group().strip() if mode is not None else None
             )
         return f'{command} {option}{rest}'
 
     return re.sub(
-        r'(?P<command>(?<![\w/\\])pubanon (?:repo (?:create|verify|reveal|restore)|'
-        r'stage (?:push|status|repair|forget|delete|watch)|package watch|'
-        r'release (?:create|edit|list|show)|'
-        r'repo watch|'
-        r'list|show|delete|clean|forget|init|status|audit|prepare|'
-        r'inspect|discard|publish|run)(?![\w/-]))'
-        r'(?P<rest>(?:(?![`;\n,]| then | or | && ).)*)',
+        r'(?P<command>(?<![\w/\\])pubanon (?:'
+        + '|'.join(re.escape(command) for command in PROJECT_COMMANDS)
+        + r')(?![\w/-]))'
+        + r'(?P<rest>(?:(?![`;\n,]| then | or | && ).)*)',
         _qualify,
         text,
     )
@@ -354,7 +418,7 @@ def verbose_context(enabled: bool) -> Generator[None]:
         _VERBOSE.reset(token)
 
 
-def style(text: str, kind: str = 'label', *, stream: TextIO | None = None) -> str:
+def style(text: str, kind: StyleKind = 'label', *, stream: TextIO | None = None) -> str:
     """Style terminal text according to the scoped color mode.
 
     Args:
@@ -407,7 +471,7 @@ def diagnostic(error: _errors.PubanonError, *, stream: TextIO | None = None) -> 
     return '\n'.join(lines)
 
 
-def field(label: str, value: str, *, kind: str = 'plain') -> str:
+def field(label: str, value: str, *, kind: StyleKind = 'plain') -> str:
     """Render a bold field label and optionally styled value.
 
     Args:
@@ -477,7 +541,7 @@ def heading(text: str, *, separate: bool = False) -> None:
     print(('\n' if separate else '') + style(text.removesuffix(':'), 'heading'))
 
 
-def output(text: str = '', *, kind: str = 'plain') -> None:
+def output(text: str = '', *, kind: StyleKind = 'plain') -> None:
     """Print one terminal message using its presentation role.
 
     Args:
@@ -545,7 +609,7 @@ def ask(
         if not answer and default is not None:
             return default
         for word, letter, _rendered in parsed:
-            if answer in {letter, word.casefold()}:
+            if answer == letter:
                 return word
         output(hint, kind='warning')
 

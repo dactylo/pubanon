@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := all
 
-MDFORMAT_FILES := $(wildcard *.md docs/*.md)
-PYTHON_FILES := src tests
+MARKDOWN_FILES := $(wildcard *.md docs/*.md)
+PYTHON_INPUTS := src tests
 PYTHON ?= python
 VENV_BIN := .venv/bin
 ifeq ($(OS),Windows_NT)
@@ -10,7 +10,7 @@ endif
 DEV_PYTHON := $(VENV_BIN)/python
 export PATH := $(abspath $(VENV_BIN)):$(PATH)
 export UV_SYSTEM_PYTHON := 0
-UV_VERSION := 0.12.13
+UV_VERSION := 0.12.23
 CI_PYTHON := 3.13
 CI_EXTRAS :=
 CI_BUILD_REQUIREMENTS = $(DEV_PYTHON) -c 'import tomllib; print("\n".join(tomllib.load(open("pyproject.toml", "rb"))["build-system"]["requires"]))'
@@ -45,15 +45,15 @@ reinstall:
 	uv tool install --reinstall .
 
 format: env-check
-	$(DEV_PYTHON) -m ruff format $(PYTHON_FILES)
-	$(DEV_PYTHON) -m ruff check --fix $(PYTHON_FILES)
-	$(DEV_PYTHON) -m mdformat $(MDFORMAT_FILES)
+	$(DEV_PYTHON) -m ruff format $(PYTHON_INPUTS)
+	$(DEV_PYTHON) -m ruff check --fix $(PYTHON_INPUTS)
+	$(DEV_PYTHON) -m mdformat $(MARKDOWN_FILES)
 	$(VENV_BIN)/pyproject-fmt pyproject.toml
 
 format-check: env-check
-	$(DEV_PYTHON) -m ruff format --check $(PYTHON_FILES)
-	$(DEV_PYTHON) -m ruff check $(PYTHON_FILES)
-	$(DEV_PYTHON) -m mdformat --check $(MDFORMAT_FILES)
+	$(DEV_PYTHON) -m ruff format --check $(PYTHON_INPUTS)
+	$(DEV_PYTHON) -m ruff check $(PYTHON_INPUTS)
+	$(DEV_PYTHON) -m mdformat --check $(MARKDOWN_FILES)
 	$(VENV_BIN)/pyproject-fmt --check pyproject.toml
 
 lock-check: env-check uv-check
@@ -69,9 +69,9 @@ lock-update: venv-check uv-check
 	$(CI_BUILD_REQUIREMENTS) | $(CI_COMPILE) --group test --constraint requirements-ci.txt --output-file requirements-test.txt
 
 type-check: env-check
-	$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonpath "$(DEV_PYTHON)" --pythonplatform Linux $(PYTHON_FILES)
-	$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonpath "$(DEV_PYTHON)" --pythonplatform Darwin $(PYTHON_FILES)
-	$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonpath "$(DEV_PYTHON)" --pythonplatform Windows $(PYTHON_FILES)
+	$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonpath "$(DEV_PYTHON)" --pythonplatform Linux $(PYTHON_INPUTS)
+	$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonpath "$(DEV_PYTHON)" --pythonplatform Darwin $(PYTHON_INPUTS)
+	$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonpath "$(DEV_PYTHON)" --pythonplatform Windows $(PYTHON_INPUTS)
 
 test: env-check
 	$(DEV_PYTHON) -m pytest -q $(TEST_FLAGS)

@@ -12,6 +12,7 @@ from pubanon._config import (
     stage_repository,
 )
 from pubanon._errors import ObservationTimeoutError, PubanonError
+from pubanon._remote import _host
 from pubanon._remote._ci import (
     RunEvidence,
     RunQuery,
@@ -23,20 +24,11 @@ from pubanon._remote._host import (
     CheckVerdict,
     Destination,
     RemoteRefs,
-    check_recovery,
-    check_result,
-    ls_remote,
-    remote_refs_text,
-    verify_destination,
 )
 from pubanon._remote._package import PackageRelease, release_state
 from pubanon._remote._stage import candidate_next_action, load_stage, verify_staged_target
-from pubanon._snapshots._candidate import (
-    load_candidate,
-    published_refs,
-    tag_intent_for,
-    version_from_tag,
-)
+from pubanon._snapshots._candidate import published_refs, tag_intent_for, version_from_tag
+from pubanon._snapshots._records import load_candidate
 from pubanon._terminal import (
     detail,
     detail_fields,
@@ -250,7 +242,7 @@ def _verified_published_destination(
     local_main, local_tags = published_refs(paths, p.name)
     detail(field('Phase', 'verifying account and repository'))
     try:
-        destination = verify_destination(
+        destination = _host.verify_destination(
             paths,
             g,
             p,
@@ -261,7 +253,7 @@ def _verified_published_destination(
     expected = RemoteRefs(local_main, local_tags, ())
     detail(field('Phase', 'reading published refs'))
     try:
-        remote = ls_remote(
+        remote = _host.ls_remote(
             destination, paths, p.name, timeout=_remaining(deadline, 'refs', retry=retry)
         )
     except ObservationTimeoutError as exc:
@@ -269,8 +261,8 @@ def _verified_published_destination(
     if remote != expected:
         raise PubanonError(
             'host refs do not match local published history',
-            expected=escape(remote_refs_text(expected)),
-            actual=escape(remote_refs_text(remote)),
+            expected=escape(_host.remote_refs_text(expected)),
+            actual=escape(_host.remote_refs_text(remote)),
             recovery=(
                 'remove every destination branch except main, then rerun'
                 if remote.branches
@@ -296,7 +288,7 @@ def _wait_for_checks(
         verdicts: list[CheckVerdict] = []
         for name in checks:
             try:
-                result = check_result(
+                result = _host.check_result(
                     (dest.owner, dest.repo),
                     commit,
                     name,
@@ -308,7 +300,7 @@ def _wait_for_checks(
                 raise PubanonError(
                     'required checks are not acceptable',
                     fact=_check_facts((result,)),
-                    recovery=check_recovery((result,), retry=retry),
+                    recovery=_host.check_recovery((result,), retry=retry),
                 )
             verdicts.append(result)
         current = tuple(verdicts)
@@ -329,7 +321,7 @@ def _wait_for_checks(
             PubanonError(
                 'required checks are pending',
                 fact=_check_facts(unresolved),
-                recovery=check_recovery(unresolved, retry=retry),
+                recovery=_host.check_recovery(unresolved, retry=retry),
             ),
         )
 
@@ -398,7 +390,7 @@ def ci_verdicts(
     Raises:
         PubanonError: A host response is invalid or cannot be read.
     """
-    return [check_result((dest.owner, dest.repo), commit, name) for name in checks]
+    return [_host.check_result((dest.owner, dest.repo), commit, name) for name in checks]
 
 
 def select_package_release(
@@ -409,7 +401,7 @@ def select_package_release(
     """Select an exact published release version and its own tag commit.
 
     Args:
-        paths: Derived Pubanon configuration and data paths.
+        paths: Derived pubanon configuration and data paths.
         project: Registered project name.
         version: Optional exact `X.Y.Z` published release. When omitted,
             selects the numerically greatest strict `X.Y.Z` release tag,
@@ -466,7 +458,7 @@ def watch_ci(  # noqa: PLR0913
     workflow run, including when no required check names are configured.
 
     Args:
-        paths: Derived Pubanon configuration and data paths.
+        paths: Derived pubanon configuration and data paths.
         g: Global publication identity configuration.
         p: Project publication configuration.
 
@@ -563,7 +555,7 @@ def watch_package(
     pending states and continue polling.
 
     Args:
-        paths: Derived Pubanon configuration and data paths.
+        paths: Derived pubanon configuration and data paths.
         g: Global publication identity configuration.
         p: Project publication configuration.
 

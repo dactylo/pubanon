@@ -18,7 +18,7 @@ from pubanon._cli._context import load_context
 from pubanon._errors import ObservationTimeoutError, OperationCanceled, PubanonError
 from pubanon._remote import _host, _lifecycle, _package, _stage, _watch
 from pubanon._remote import _publish as _publish_module
-from pubanon._snapshots import _candidate
+from pubanon._snapshots import _candidate, _discard, _records, _store, _verification
 from pubanon._terminal import escape, next_step
 from tests._cli import (
     gh_calls,
@@ -30,6 +30,7 @@ from tests._cli import (
 from tests._git import git_env
 from tests._permissions import assert_private_mode
 from tests._setup import configure
+from tests.remote.test_releases import _Host as _ReleaseHost
 from tests.remote.test_stage import _git
 
 
@@ -74,7 +75,7 @@ def _assert_staged_check_blocks_publish(
         assert _cli.main(['publish', '--project', project.name, '--yes']) == 1
         assert diagnostic in capsys.readouterr().err
         assert _git(final_host, 'for-each-ref') == b''
-        assert _candidate.load_candidate(paths, project.name) == candidate
+        assert _records.load_candidate(paths, project.name) == candidate
         responses.pop()
     return check_args
 
@@ -124,31 +125,32 @@ def test_run_does_not_relax_visibility_mismatch_without_reveal_suffix(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, project, record = prepare(tmp_path, source, monkeypatch, version='1.0.0')
-    store = _candidate.store_path(paths, project.name)
+    store = _store.store_path(paths, project.name)
     for ref in ('refs/heads/main', 'refs/tags/v1.0.0'):
         subprocess.run(
             ['git', '-C', store, 'update-ref', ref, record.commit], check=True, env=git_env()
         )
-    _candidate.discard(paths, project.name, force=True)
+    _discard.discard(paths, project.name, force=True)
     project = save_workflows(paths, project, observe=('publish', 'repo watch'))
+    _config.save_project(
+        paths, replace(project, release_page=_config.ReleasePageSettings(enabled=True))
+    )
     verified_visibilities: list[str] = []
 
-    class _HostModule:
-        @staticmethod
-        def _verify_destination(
-            _paths: _config.Paths,
-            _global: _config.GlobalConfig,
-            selected: _config.ProjectConfig,
-        ) -> _host.Destination:
-            verified_visibilities.append(selected.visibility)
-            raise PubanonError(
-                'repository visibility does not match configuration',
-                fact='repository visibility',
-                expected='private',
-                actual='public',
-            )
+    def _verify_destination(
+        _paths: _config.Paths,
+        _global: _config.GlobalConfig,
+        selected: _config.ProjectConfig,
+    ) -> _host.Destination:
+        verified_visibilities.append(selected.visibility)
+        raise PubanonError(
+            'repository visibility does not match configuration',
+            fact='repository visibility',
+            expected='private',
+            actual='public',
+        )
 
-    monkeypatch.setattr(_host, 'verify_destination', _HostModule._verify_destination)
+    monkeypatch.setattr(_host, 'verify_destination', _verify_destination)
     capsys.readouterr()
 
     assert (
@@ -168,12 +170,12 @@ def test_run_ending_at_already_published_version_is_a_noop(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, project, record = prepare(tmp_path, source, monkeypatch, version='1.0.0')
-    store = _candidate.store_path(paths, project.name)
+    store = _store.store_path(paths, project.name)
     for ref in ('refs/heads/main', 'refs/tags/v1.0.0'):
         subprocess.run(
             ['git', '-C', store, 'update-ref', ref, record.commit], check=True, env=git_env()
         )
-    _candidate.discard(paths, project.name, force=True)
+    _discard.discard(paths, project.name, force=True)
     project = save_workflows(paths, project, ship=('prepare', 'publish'))
     destination = _host.Destination(
         adapter='github',
@@ -232,9 +234,8 @@ def test_run_fresh_publish_watches_the_exact_published_version_commit(
         )
         assert (inspection / 'README.md').read_text(encoding='utf-8') == 'public\n'
         assert ctx._yes is False
-        assert ctx._unattended is False
         published.append(ctx._record.commit)
-        store = _candidate.store_path(paths, project.name)
+        store = _store.store_path(paths, project.name)
         subprocess.run(
             ['git', '-C', store, 'update-ref', 'refs/heads/main', ctx._record.commit],
             check=True,
@@ -245,36 +246,34 @@ def test_run_fresh_publish_watches_the_exact_published_version_commit(
             check=True,
             env=git_env(),
         )
-        _candidate.discard(paths, project.name, force=True)
+        _discard.discard(paths, project.name, force=True)
 
-    class _WatchModule:
-        @staticmethod
-        def _watch_ci(
-            _paths: _config.Paths,
-            _global: _config.GlobalConfig,
-            _project: _config.ProjectConfig,
-            *,
-            staged: bool,
-            version: str | None,
-            timeout: int,
-        ) -> None:
-            del timeout
-            assert staged is False
-            assert version == '1.0.0'
-            main, tags = _candidate.published_refs(paths, project.name)
-            assert main == tags['v1.0.0']
-            watched.append(tags['v1.0.0'])
+    def _watch_ci(
+        _paths: _config.Paths,
+        _global: _config.GlobalConfig,
+        _project: _config.ProjectConfig,
+        *,
+        staged: bool,
+        version: str | None,
+        timeout: int,
+    ) -> None:
+        del timeout
+        assert staged is False
+        assert version == '1.0.0'
+        main, tags = _candidate.published_refs(paths, project.name)
+        assert main == tags['v1.0.0']
+        watched.append(tags['v1.0.0'])
 
     def _approve(prompt: str) -> str:
         if prompt.startswith('Use this selection?'):
-            assert _candidate.load_candidate(paths, project.name) is None
+            assert _records.load_candidate(paths, project.name) is None
             return 'c'
         prompts.append(prompt)
-        return 'yes'
+        return 'y'
 
     monkeypatch.setattr('builtins.input', _approve)
     monkeypatch.setattr(_publish_module, 'publish', _publish)
-    monkeypatch.setattr(_watch, 'watch_ci', _WatchModule._watch_ci)
+    monkeypatch.setattr(_watch, 'watch_ci', _watch_ci)
 
     assert (
         _cli.main(
@@ -307,16 +306,14 @@ def test_run_holds_project_lock_for_the_complete_workflow(
     assert project is not None
     save_workflows(paths, project, checks=('repo watch',))
 
-    class _WatchModule:
-        @staticmethod
-        def _watch_ci(*_args: object, **_kwargs: object) -> None:
-            with (
-                pytest.raises(PubanonError, match='another Pubanon command is running'),
-                _config.project_lock(paths, project.name),
-            ):
-                pytest.fail('run released its project lock before the last stage')
+    def _watch_ci(*_args: object, **_kwargs: object) -> None:
+        with (
+            pytest.raises(PubanonError, match='another pubanon command is running'),
+            _config.project_lock(paths, project.name),
+        ):
+            pytest.fail('run released its project lock before the last stage')
 
-    monkeypatch.setattr(_watch, 'watch_ci', _WatchModule._watch_ci)
+    monkeypatch.setattr(_watch, 'watch_ci', _watch_ci)
 
     assert _cli.main(['run', 'checks', '--project', project.name, '--yes']) == 0
 
@@ -330,12 +327,14 @@ def test_run_inspect_refuses_invalid_retained_objects_before_replacing_copy(
     source = make_repo(files={'README.md': 'public\n'})
     paths, project, record = prepare(tmp_path, source, monkeypatch)
     save_workflows(paths, project, review=('inspect',))
-    inspection = _candidate.materialize_inspect(paths, project.name, record)
+    inspection = _verification.materialize_inspect(
+        paths, project.name, _verification.prove_objects(paths, project.name, record)
+    )
     subprocess.run(
         [
             'git',
             '-C',
-            _candidate.store_path(paths, project.name),
+            _store.store_path(paths, project.name),
             'update-ref',
             '-d',
             _candidate.CANDIDATE_REF,
@@ -363,15 +362,13 @@ def test_run_observation_requires_no_mutation_confirmation(
 
     watched: list[None] = []
 
-    class _WatchModule:
-        @staticmethod
-        def _watch_ci(*_args: object, **_kwargs: object) -> None:
-            watched.append(None)
+    def _watch_ci(*_args: object, **_kwargs: object) -> None:
+        watched.append(None)
 
     def _decline(_prompt: str) -> str:
         pytest.fail('observation workflow requested mutation approval')
 
-    monkeypatch.setattr(_watch, 'watch_ci', _WatchModule._watch_ci)
+    monkeypatch.setattr(_watch, 'watch_ci', _watch_ci)
     monkeypatch.setattr('builtins.input', _decline)
 
     assert _cli.main(['run', 'checks', '--project', project.name]) == 0
@@ -394,7 +391,7 @@ def test_run_post_publish_cancellation_preserves_private_details_and_completed_f
         ('repo watch',),
         None,
         'v1.0.0',
-        _already_published=True,
+        _published_ctx=ctx,
         _stage_creation_needed=False,
     )
     error = OperationCanceled('operation cancelled', fact='watch stopped', actual='private-canary')
@@ -450,7 +447,7 @@ def test_run_post_publish_failure_names_every_remaining_stepwise_command(
     stub_remote(monkeypatch, destination, _host.RemoteRefs(None, {}))
 
     def _publish(ctx: _publish_module.PublishContext) -> None:
-        store = _candidate.store_path(paths, project.name)
+        store = _store.store_path(paths, project.name)
         refs = ['refs/heads/main']
         if version is not None:
             refs.append(f'refs/tags/v{version}')
@@ -460,15 +457,13 @@ def test_run_post_publish_failure_names_every_remaining_stepwise_command(
                 check=True,
                 env=git_env(),
             )
-        _candidate.discard(paths, project.name, force=True)
+        _discard.discard(paths, project.name, force=True)
 
-    class _WatchModule:
-        @staticmethod
-        def _watch_ci(*_args: object, **_kwargs: object) -> None:
-            raise PubanonError('CI observation failed', recovery='rerun the watch')
+    def _watch_ci(*_args: object, **_kwargs: object) -> None:
+        raise PubanonError('CI observation failed', recovery='rerun the watch')
 
     monkeypatch.setattr(_publish_module, 'publish', _publish)
-    monkeypatch.setattr(_watch, 'watch_ci', _WatchModule._watch_ci)
+    monkeypatch.setattr(_watch, 'watch_ci', _watch_ci)
 
     assert (
         _cli.main(
@@ -504,12 +499,12 @@ def test_run_post_publish_failure_preserves_real_shaped_fact_and_recovery(
     source = make_repo(files={'README.md': 'public\n'})
     paths, project, record = prepare(tmp_path, source, monkeypatch, version='1.0.0')
     monkeypatch.chdir(source if implicit_project else tmp_path)
-    store = _candidate.store_path(paths, project.name)
+    store = _store.store_path(paths, project.name)
     for ref in ('refs/heads/main', 'refs/tags/v1.0.0'):
         subprocess.run(
             ['git', '-C', store, 'update-ref', ref, record.commit], check=True, env=git_env()
         )
-    _candidate.discard(paths, project.name, force=True)
+    _discard.discard(paths, project.name, force=True)
     project = save_workflows(
         paths,
         project,
@@ -529,18 +524,14 @@ def test_run_post_publish_failure_preserves_real_shaped_fact_and_recovery(
         _host.RemoteRefs(record.commit, {'v1.0.0': record.commit}),
     )
 
-    class _WatchModule:
-        @staticmethod
-        def _watch_ci(*_args: object, **_kwargs: object) -> None:
-            raise PubanonError(
-                'required CI checks are not acceptable',
-                fact='build: failed',
-                recovery=(
-                    'rerun the failed workflow, then run `pubanon repo watch --version 1.0.0`'
-                ),
-            )
+    def _watch_ci(*_args: object, **_kwargs: object) -> None:
+        raise PubanonError(
+            'required CI checks are not acceptable',
+            fact='build: failed',
+            recovery=('rerun the failed workflow, then run `pubanon repo watch --version 1.0.0`'),
+        )
 
-    monkeypatch.setattr(_watch, 'watch_ci', _WatchModule._watch_ci)
+    monkeypatch.setattr(_watch, 'watch_ci', _watch_ci)
     capsys.readouterr()
 
     assert (
@@ -599,12 +590,12 @@ def test_run_prepare_and_inspect_materializes_exact_read_only_candidate_copy(
         == 0
     )
 
-    record = _candidate.load_candidate(paths, project.name)
+    record = _records.load_candidate(paths, project.name)
     assert record is not None
     inspection = paths.data_dir / 'projects' / project.name / 'inspections' / record.commit
     output = capsys.readouterr().out
     assert 'Review copy' in output
-    assert escape(str(inspection)) in output
+    assert escape((inspection).as_posix()) in output
     assert 'The snapshot is prepared but has not been published.' in output
     assert 'no action is required' not in output
     assert (inspection / 'README.md').read_bytes() == b'public\x00bytes\n'
@@ -620,8 +611,47 @@ def test_run_prepare_and_inspect_materializes_exact_read_only_candidate_copy(
     assert (inspection / 'README.md').read_bytes() == b'public\x00bytes\n'
     output = capsys.readouterr().out
     assert 'Review copy' in output
-    assert escape(str(inspection)) in output
+    assert escape((inspection).as_posix()) in output
     assert record.commit in output
+
+
+def test_run_prepare_records_configured_global_tagged_message(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_repo(files={'README.md': 'public\n'})
+    paths, g, project = configure(tmp_path, monkeypatch, source)
+    assert project is not None
+    _config.save_global(
+        paths,
+        replace(
+            g,
+            commit_message=_config.CommitMessageSettings(tagged='Release {tag} ({version})'),
+        ),
+        paths.global_config.read_bytes(),
+    )
+    save_workflows(paths, project, review=('prepare',))
+
+    assert (
+        _cli.main(
+            [
+                'run',
+                'review',
+                '--project',
+                project.name,
+                '--version',
+                '1.2.3',
+                '--acknowledge-new-paths',
+                '--yes',
+            ]
+        )
+        == 0
+    )
+
+    record = _records.load_candidate(paths, project.name)
+    assert record is not None
+    assert record.message == 'Release v1.2.3 (1.2.3)'
 
 
 def test_run_prepare_refuses_damaged_retained_candidate(
@@ -637,7 +667,7 @@ def test_run_prepare_refuses_damaged_retained_candidate(
         [
             'git',
             '-C',
-            _candidate.store_path(paths, project.name),
+            _store.store_path(paths, project.name),
             'update-ref',
             '-d',
             _candidate.CANDIDATE_REF,
@@ -692,7 +722,7 @@ def test_run_prepare_resumes_matching_verified_candidate_without_rebuild_or_host
     def _unexpected(*_args: object, **_kwargs: object) -> None:
         pytest.fail('matching retained snapshot was rebuilt or contacted the host')
 
-    monkeypatch.setattr(_prepare, 'build_candidate', _unexpected)
+    monkeypatch.setattr(_prepare, '_build_candidate', _unexpected)
     monkeypatch.setattr(_host, 'verify_destination', _unexpected)
     capsys.readouterr()
 
@@ -700,7 +730,7 @@ def test_run_prepare_resumes_matching_verified_candidate_without_rebuild_or_host
         _cli.main(['run', 'local', '--project', project.name, '--version', '1.0.0', '--yes']) == 0
     )
 
-    assert _candidate.load_candidate(paths, project.name) == record
+    assert _records.load_candidate(paths, project.name) == record
     assert 'Workflow local (direct route): prepare' in capsys.readouterr().out
 
 
@@ -723,16 +753,13 @@ def test_run_preserves_publish_exception_when_reclassification_is_not_published(
     )
     remote_reads = 0
 
-    class _HostModule:
-        @staticmethod
-        def _ls_remote(*_args: object) -> _host.RemoteRefs:
-            nonlocal remote_reads
-            remote_reads += 1
-            return _host.RemoteRefs(None, {})
+    def _ls_remote(*_args: object) -> _host.RemoteRefs:
+        nonlocal remote_reads
+        remote_reads += 1
+        return _host.RemoteRefs(None, {})
 
-        @staticmethod
-        def _verify_destination(*_args: object) -> _host.Destination:
-            return destination
+    def _verify_destination(*_args: object) -> _host.Destination:
+        return destination
 
     def _publish(_ctx: _publish_module.PublishContext) -> None:
         raise PubanonError(
@@ -741,8 +768,8 @@ def test_run_preserves_publish_exception_when_reclassification_is_not_published(
             recovery='pubanon publish --project demo --version 1.0.0',
         )
 
-    monkeypatch.setattr(_host, 'verify_destination', _HostModule._verify_destination)
-    monkeypatch.setattr(_host, 'ls_remote', _HostModule._ls_remote)
+    monkeypatch.setattr(_host, 'verify_destination', _verify_destination)
+    monkeypatch.setattr(_host, 'ls_remote', _ls_remote)
     monkeypatch.setattr(_publish_module, 'publish', _publish)
     capsys.readouterr()
 
@@ -753,7 +780,7 @@ def test_run_preserves_publish_exception_when_reclassification_is_not_published(
     # The retained candidate keeps recovery with the publication primitive;
     # workflow error handling must not reclassify away its evidence.
     assert remote_reads == 1
-    assert _candidate.load_candidate(paths, project.name) == record
+    assert _records.load_candidate(paths, project.name) == record
     error = capsys.readouterr().err
     assert error.startswith('error: publication did not land\n')
     assert 'original publication fact' in error
@@ -780,71 +807,104 @@ def test_run_publish_requires_valid_version_before_host_reads(
     assert 'version must have X.Y.Z form' in capsys.readouterr().err
 
 
+@pytest.mark.parametrize('existing_page', [False, True])
+@pytest.mark.parametrize('page_mode', ['configured', 'notes', 'requested'])
 def test_run_published_resume_allows_public_host_partial_to_reach_reveal(
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    existing_page: bool,
+    page_mode: str,
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, project, record = prepare(tmp_path, source, monkeypatch, version='1.0.0')
-    store = _candidate.store_path(paths, project.name)
+    store = _store.store_path(paths, project.name)
     for ref in ('refs/heads/main', 'refs/tags/v1.0.0'):
         subprocess.run(
             ['git', '-C', store, 'update-ref', ref, record.commit], check=True, env=git_env()
         )
-    _candidate.discard(paths, project.name, force=True)
+    _discard.discard(paths, project.name, force=True)
     project = save_workflows(paths, project, reveal=('publish', 'repo reveal'))
+    if page_mode == 'configured':
+        project = replace(project, release_page=_config.ReleasePageSettings(enabled=True))
+        _config.save_project(paths, project)
+    notes = b'Exact\r\nnotes\n' if page_mode == 'notes' else b''
+    notes_file = tmp_path / 'notes.md'
+    notes_file.write_bytes(notes)
+    host = _ReleaseHost(
+        _host.Destination(
+            project.host,
+            project.owner,
+            project.repo,
+            'https://github.com/anonymous-account/public-repo.git',
+            'anonymous-account',
+            'public',
+        ),
+        record.commit,
+        tag='v1.0.0',
+    )
+    if existing_page:
+        host.page = _host.GitHubRelease(
+            host.tag,
+            host.tag,
+            notes.decode(),
+            'https://example.invalid/page',
+            draft=False,
+            prerelease=False,
+        )
     verified_visibilities: list[str] = []
     revealed: list[str] = []
 
-    class _HostModule:
-        @staticmethod
-        def _ls_remote(*_args: object) -> _host.RemoteRefs:
-            return _host.RemoteRefs(record.commit, {'v1.0.0': record.commit})
-
-        @staticmethod
-        def _verify_destination(
-            _paths: _config.Paths,
-            _global: _config.GlobalConfig,
-            selected: _config.ProjectConfig,
-        ) -> _host.Destination:
-            verified_visibilities.append(selected.visibility)
-            if selected.visibility == 'private':
-                raise PubanonError(
-                    'repository visibility does not match configuration',
-                    fact='repository visibility',
-                    expected='private',
-                    actual='public',
-                )
-            return _host.Destination(
-                adapter=selected.host,
-                owner=selected.owner,
-                repo=selected.repo,
-                url='https://github.com/anonymous-account/public-repo.git',
-                account='anonymous-account',
-                visibility='public',
+    def _verify_destination(
+        _paths: _config.Paths,
+        _global: _config.GlobalConfig,
+        selected: _config.ProjectConfig,
+    ) -> _host.Destination:
+        verified_visibilities.append(selected.visibility)
+        assert _config.load_project(paths, project.name) == project
+        if selected.visibility == 'private':
+            raise PubanonError(
+                'repository visibility does not match configuration',
+                fact='repository visibility',
+                expected='private',
+                actual='public',
             )
+        return host.destination
 
-    class _LifecycleModule:
-        @staticmethod
-        def _reveal(
-            _paths: _config.Paths,
-            _global: _config.GlobalConfig,
-            selected: _config.ProjectConfig,
-        ) -> None:
-            revealed.append(selected.visibility)
+    def _reveal(
+        _paths: _config.Paths,
+        _global: _config.GlobalConfig,
+        selected: _config.ProjectConfig,
+    ) -> None:
+        assert selected == project
+        assert _config.load_project(paths, project.name) == project
+        assert host.page is not None
+        assert host.writes == ([] if existing_page else [(host.tag, host.tag, notes)])
+        revealed.append(selected.visibility)
 
     def _approve(_prompt: str) -> str:
-        return 'yes'
+        return 'y'
 
-    monkeypatch.setattr(_host, 'verify_destination', _HostModule._verify_destination)
-    monkeypatch.setattr(_host, 'ls_remote', _HostModule._ls_remote)
-    monkeypatch.setattr(_lifecycle, 'reveal', _LifecycleModule._reveal)
+    monkeypatch.setattr(_host, 'verify_destination', _verify_destination)
+    monkeypatch.setattr(_host, 'ls_remote', host._refs)
+    monkeypatch.setattr(_host, 'read_release', host._read)
+    monkeypatch.setattr(_host, 'all_releases', host._all)
+    monkeypatch.setattr(_host, 'create_release', host._create)
+    monkeypatch.setattr(_lifecycle, 'reveal', _reveal)
     monkeypatch.setattr('builtins.input', _approve)
 
-    assert _cli.main(['run', 'reveal', '--project', project.name, '--version', '1.0.0']) == 0
+    options = ['--release-page'] if page_mode == 'requested' else []
+    if page_mode == 'notes':
+        options = ['--release-notes-file', str(notes_file)]
+    assert (
+        _cli.main(['run', 'reveal', '--project', project.name, '--version', '1.0.0', *options])
+        == 0
+    )
 
-    assert verified_visibilities == ['private', 'public']
+    assert verified_visibilities[:2] == ['private', 'public']
+    assert len(verified_visibilities) > 2
+    assert set(verified_visibilities[2:]) == {'public'}
     assert revealed == ['private']
 
 
@@ -856,12 +916,12 @@ def test_run_published_resume_names_interactive_reveal_before_stepwise_command(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, project, record = prepare(tmp_path, source, monkeypatch, version='1.0.0')
-    store = _candidate.store_path(paths, project.name)
+    store = _store.store_path(paths, project.name)
     for ref in ('refs/heads/main', 'refs/tags/v1.0.0'):
         subprocess.run(
             ['git', '-C', store, 'update-ref', ref, record.commit], check=True, env=git_env()
         )
-    _candidate.discard(paths, project.name, force=True)
+    _discard.discard(paths, project.name, force=True)
     project = save_workflows(paths, project, reveal=('publish', 'repo reveal'))
     destination = _host.Destination(
         adapter='github',
@@ -888,11 +948,14 @@ def test_run_published_resume_names_interactive_reveal_before_stepwise_command(
     assert error.count('pubanon repo reveal --project=demo') == 1
 
 
+@pytest.mark.parametrize('page_failure', [False, True])
 def test_run_reclassifies_landed_publish_exception_before_stepwise_recovery(
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    *,
+    page_failure: bool,
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, project, record = prepare(tmp_path, source, monkeypatch, version='1.0.0')
@@ -905,49 +968,74 @@ def test_run_reclassifies_landed_publish_exception_before_stepwise_recovery(
         account='anonymous-account',
         visibility=project.visibility,
     )
+    notes = tmp_path / 'notes.md'
+    notes.write_bytes(b'Exact\r\nnotes\n')
     remote_reads = 0
 
-    class _HostModule:
-        @staticmethod
-        def _ls_remote(*_args: object) -> _host.RemoteRefs:
-            nonlocal remote_reads
-            remote_reads += 1
-            if remote_reads == 1:
-                return _host.RemoteRefs(None, {})
-            return _host.RemoteRefs(record.commit, {'v1.0.0': record.commit})
+    def _ls_remote(*_args: object) -> _host.RemoteRefs:
+        nonlocal remote_reads
+        remote_reads += 1
+        if remote_reads == 1:
+            return _host.RemoteRefs(None, {})
+        return _host.RemoteRefs(record.commit, {'v1.0.0': record.commit})
 
-        @staticmethod
-        def _verify_destination(*_args: object) -> _host.Destination:
-            return destination
+    def _verify_destination(*_args: object) -> _host.Destination:
+        return destination
 
     def _publish(ctx: _publish_module.PublishContext) -> None:
-        store = _candidate.store_path(paths, project.name)
+        if page_failure:
+            assert ctx._release_page.notes == b'Exact\r\nnotes\n'
+            assert ctx._release_page.notes_file == notes.absolute()
+        store = _store.store_path(paths, project.name)
         for ref in ('refs/heads/main', 'refs/tags/v1.0.0'):
             subprocess.run(
                 ['git', '-C', store, 'update-ref', ref, ctx._record.commit],
                 check=True,
                 env=git_env(),
             )
-        _candidate.discard(paths, project.name, force=True)
+        _discard.discard(paths, project.name, force=True)
         raise PubanonError(
-            'publication landed and must not be retried',
+            'the release page was not created'
+            if page_failure
+            else 'publication landed and must not be retried',
             fact='remote contains unrelated drift',
-            recovery='pubanon repo verify',
+            recovery=(
+                f'pubanon release create v1.0.0 --project={project.name}'
+                if page_failure
+                else 'pubanon repo verify'
+            ),
         )
 
-    monkeypatch.setattr(_host, 'verify_destination', _HostModule._verify_destination)
-    monkeypatch.setattr(_host, 'ls_remote', _HostModule._ls_remote)
+    monkeypatch.setattr(_host, 'verify_destination', _verify_destination)
+    monkeypatch.setattr(_host, 'ls_remote', _ls_remote)
     monkeypatch.setattr(_publish_module, 'publish', _publish)
     capsys.readouterr()
 
     assert (
-        _cli.main(['run', 'ship', '--project', project.name, '--version', '1.0.0', '--yes']) == 1
+        _cli.main(
+            [
+                'run',
+                'ship',
+                '--project',
+                project.name,
+                '--version',
+                '1.0.0',
+                '--yes',
+                *(['--release-notes-file', str(notes)] if page_failure else []),
+            ]
+        )
+        == 1
     )
 
     error = capsys.readouterr().err
     assert remote_reads == 2
-    assert 'publication landed and must not be retried' in error
-    assert 'Next: pubanon repo verify' in error
+    assert 'The publication itself completed.' in error
+    if page_failure:
+        assert 'the release page was not created' in error
+        assert 'pubanon release create v1.0.0' in error
+    else:
+        assert 'publication landed and must not be retried' in error
+        assert 'Next: pubanon repo verify' in error
     assert 'pubanon publish' not in error
     assert 'Next:' in error
     assert 'pubanon repo watch --project=demo --version 1.0.0\n' in error
@@ -1033,34 +1121,30 @@ def test_run_reloads_public_configuration_after_reveal_before_watch_package(
     save_workflows(paths, project, observe=('repo reveal', 'package watch'))
     watched_visibilities: list[str] = []
 
-    class _LifecycleModule:
-        @staticmethod
-        def _reveal(
-            actual_paths: _config.Paths,
-            _global: _config.GlobalConfig,
-            selected: _config.ProjectConfig,
-        ) -> None:
-            _config.save_project(actual_paths, replace(selected, visibility='public'))
+    def _reveal(
+        actual_paths: _config.Paths,
+        _global: _config.GlobalConfig,
+        selected: _config.ProjectConfig,
+    ) -> None:
+        _config.save_project(actual_paths, replace(selected, visibility='public'))
 
-    class _WatchModule:
-        @staticmethod
-        def _watch_package(
-            _paths: _config.Paths,
-            _global: _config.GlobalConfig,
-            selected: _config.ProjectConfig,
-            *,
-            version: str | None,
-            timeout: int,
-        ) -> None:
-            assert version is None
-            assert timeout == _watch.DEFAULT_TIMEOUT
-            watched_visibilities.append(selected.visibility)
+    def _watch_package(
+        _paths: _config.Paths,
+        _global: _config.GlobalConfig,
+        selected: _config.ProjectConfig,
+        *,
+        version: str | None,
+        timeout: int,
+    ) -> None:
+        assert version is None
+        assert timeout == _watch.DEFAULT_TIMEOUT
+        watched_visibilities.append(selected.visibility)
 
-    monkeypatch.setattr(_lifecycle, 'reveal', _LifecycleModule._reveal)
-    monkeypatch.setattr(_watch, 'watch_package', _WatchModule._watch_package)
+    monkeypatch.setattr(_lifecycle, 'reveal', _reveal)
+    monkeypatch.setattr(_watch, 'watch_package', _watch_package)
 
     def _approve(_prompt: str) -> str:
-        return 'yes'
+        return 'y'
 
     monkeypatch.setattr('builtins.input', _approve)
 
@@ -1077,12 +1161,12 @@ def test_run_rerun_after_publication_executes_only_post_publish_stage(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, project, record = prepare(tmp_path, source, monkeypatch, version='1.0.0')
-    store = _candidate.store_path(paths, project.name)
+    store = _store.store_path(paths, project.name)
     for ref in ('refs/heads/main', 'refs/tags/v1.0.0'):
         subprocess.run(
             ['git', '-C', store, 'update-ref', ref, record.commit], check=True, env=git_env()
         )
-    _candidate.discard(paths, project.name, force=True)
+    _discard.discard(paths, project.name, force=True)
     project = save_workflows(
         paths,
         replace(project, publication_route='staged'),
@@ -1108,14 +1192,12 @@ def test_run_rerun_after_publication_executes_only_post_publish_stage(
     def _unexpected(*_args: object, **_kwargs: object) -> None:
         pytest.fail('published workflow repeated prepare or publish')
 
-    class _WatchModule:
-        @staticmethod
-        def _watch_ci(*_args: object, version: str | None, **_kwargs: object) -> None:
-            watched.append(version)
+    def _watch_ci(*_args: object, version: str | None, **_kwargs: object) -> None:
+        watched.append(version)
 
-    monkeypatch.setattr(_prepare, 'build_candidate', _unexpected)
+    monkeypatch.setattr(_prepare, '_build_candidate', _unexpected)
     monkeypatch.setattr(_publish_module, 'publish', _unexpected)
-    monkeypatch.setattr(_watch, 'watch_ci', _WatchModule._watch_ci)
+    monkeypatch.setattr(_watch, 'watch_ci', _watch_ci)
     capsys.readouterr()
 
     assert (
@@ -1141,20 +1223,18 @@ def test_run_reveal_leaves_both_decisions_to_the_primitive(
     prompts: list[str] = []
     received: list[tuple[str, str]] = []
 
-    class _LifecycleModule:
-        @staticmethod
-        def _reveal(
-            _paths: _config.Paths,
-            _global: _config.GlobalConfig,
-            selected: _config.ProjectConfig,
-        ) -> None:
-            received.append((selected.name, selected.visibility))
+    def _reveal(
+        _paths: _config.Paths,
+        _global: _config.GlobalConfig,
+        selected: _config.ProjectConfig,
+    ) -> None:
+        received.append((selected.name, selected.visibility))
 
     def _approve(prompt: str) -> str:
         prompts.append(prompt)
-        return 'yes'
+        return 'y'
 
-    monkeypatch.setattr(_lifecycle, 'reveal', _LifecycleModule._reveal)
+    monkeypatch.setattr(_lifecycle, 'reveal', _reveal)
     monkeypatch.setattr('builtins.input', _approve)
 
     assert _cli.main(['run', 'reveal', '--project', project.name]) == 0
@@ -1180,19 +1260,16 @@ def test_run_reveal_package_timeout_keeps_already_public_recovery_read_only(
     private = 'private composed timeout detail'
 
     def _timeout(*_args: object) -> _package.PackageRelease | None:
-        raise ObservationTimeoutError(
-            stdout=f'{private} stdout'.encode(),
-            stderr=f'{private} stderr'.encode(),
-        )
+        raise ObservationTimeoutError
 
     def _unexpected_mutation(*_args: object) -> None:
         pytest.fail('already-public package recovery mutated host visibility')
 
     def _approve(_prompt: str) -> str:
-        return 'yes'
+        return 'y'
 
     monkeypatch.setattr(_package, 'release_state', _timeout)
-    monkeypatch.setattr(_lifecycle, 'set_visibility', _unexpected_mutation)
+    monkeypatch.setattr(_host, 'set_visibility', _unexpected_mutation)
     monkeypatch.setattr('builtins.input', _approve)
     capsys.readouterr()
 
@@ -1227,35 +1304,32 @@ def test_run_reveal_partial_absent_tags_preserves_private_verification_error(
     )
     verified_visibilities: list[str] = []
 
-    class _HostModule:
-        @staticmethod
-        def _ls_remote(*_args: object) -> _host.RemoteRefs:
-            return _host.RemoteRefs(None, {})
+    def _ls_remote(*_args: object) -> _host.RemoteRefs:
+        return _host.RemoteRefs(None, {})
 
-        @staticmethod
-        def _verify_destination(
-            _paths: _config.Paths,
-            _global: _config.GlobalConfig,
-            selected: _config.ProjectConfig,
-        ) -> _host.Destination:
-            verified_visibilities.append(selected.visibility)
-            if selected.visibility == 'private':
-                raise PubanonError(
-                    'original private destination mismatch',
-                    fact='destination verification failed',
-                    recovery='pubanon repo verify',
-                )
-            return _host.Destination(
-                adapter=selected.host,
-                owner=selected.owner,
-                repo=selected.repo,
-                url='https://github.com/anonymous-account/public-repo.git',
-                account='anonymous-account',
-                visibility='public',
+    def _verify_destination(
+        _paths: _config.Paths,
+        _global: _config.GlobalConfig,
+        selected: _config.ProjectConfig,
+    ) -> _host.Destination:
+        verified_visibilities.append(selected.visibility)
+        if selected.visibility == 'private':
+            raise PubanonError(
+                'original private destination mismatch',
+                fact='destination verification failed',
+                recovery='pubanon repo verify',
             )
+        return _host.Destination(
+            adapter=selected.host,
+            owner=selected.owner,
+            repo=selected.repo,
+            url='https://github.com/anonymous-account/public-repo.git',
+            account='anonymous-account',
+            visibility='public',
+        )
 
-    monkeypatch.setattr(_host, 'verify_destination', _HostModule._verify_destination)
-    monkeypatch.setattr(_host, 'ls_remote', _HostModule._ls_remote)
+    monkeypatch.setattr(_host, 'verify_destination', _verify_destination)
+    monkeypatch.setattr(_host, 'ls_remote', _ls_remote)
     capsys.readouterr()
 
     assert (
@@ -1284,29 +1358,25 @@ def test_run_stage_push_preflights_creation_and_leaves_approval_to_primitive(
     visibility_reads: list[tuple[str, str]] = []
     received: list[tuple[_config.ProjectConfig, bool]] = []
 
-    class _HostModule:
-        @staticmethod
-        def _repository_visible(owner: str, repo: str) -> bool:
-            visibility_reads.append((owner, repo))
-            return visible
+    def _repository_visible(owner: str, repo: str) -> bool:
+        visibility_reads.append((owner, repo))
+        return visible
 
-    class _StageModule:
-        @staticmethod
-        def _stage_push(
-            _paths: _config.Paths,
-            _global: _config.GlobalConfig,
-            selected: _config.ProjectConfig,
-            *,
-            yes: bool,
-        ) -> None:
-            received.append((selected, yes))
+    def _stage_push(
+        _paths: _config.Paths,
+        _global: _config.GlobalConfig,
+        selected: _config.ProjectConfig,
+        *,
+        yes: bool,
+    ) -> None:
+        received.append((selected, yes))
 
     def _approve(_prompt: str) -> str:
-        return 'yes'
+        return 'y'
 
-    monkeypatch.setattr(_stage, 'require_authenticated_account', _require_test_account)
-    monkeypatch.setattr(_stage, 'repository_visible', _HostModule._repository_visible)
-    monkeypatch.setattr(_stage, 'stage_push', _StageModule._stage_push)
+    monkeypatch.setattr(_host, 'require_authenticated_account', _require_test_account)
+    monkeypatch.setattr(_host, 'repository_visible', _repository_visible)
+    monkeypatch.setattr(_stage, 'stage_push', _stage_push)
     monkeypatch.setattr('builtins.input', _approve)
     capsys.readouterr()
 
@@ -1330,22 +1400,18 @@ def test_run_stage_push_refuses_visibility_drift_before_primitive(
     save_workflows(paths, project, staging=('stage push',))
     visible = iter([False, True])
 
-    class _HostModule:
-        @staticmethod
-        def _repository_visible(_owner: str, _repo: str) -> bool:
-            return next(visible)
+    def _repository_visible(_owner: str, _repo: str) -> bool:
+        return next(visible)
 
-    class _StageModule:
-        @staticmethod
-        def _stage_push(*_args: object, **_kwargs: object) -> None:
-            pytest.fail('visibility drift reached staging mutation')
+    def _stage_push(*_args: object, **_kwargs: object) -> None:
+        pytest.fail('visibility drift reached staging mutation')
 
     def _approve(_prompt: str) -> str:
-        return 'yes'
+        return 'y'
 
-    monkeypatch.setattr(_stage, 'require_authenticated_account', _require_test_account)
-    monkeypatch.setattr(_stage, 'repository_visible', _HostModule._repository_visible)
-    monkeypatch.setattr(_stage, 'stage_push', _StageModule._stage_push)
+    monkeypatch.setattr(_host, 'require_authenticated_account', _require_test_account)
+    monkeypatch.setattr(_host, 'repository_visible', _repository_visible)
+    monkeypatch.setattr(_stage, 'stage_push', _stage_push)
     monkeypatch.setattr('builtins.input', _approve)
     capsys.readouterr()
 
@@ -1414,7 +1480,7 @@ def test_run_staging_preview_checks_account_before_repository_request(
     assert 'Found: different-account' in error
     assert gh_calls(tmp_path) == [['api', 'user', '--jq', '.login']]
     if stages[0] == 'prepare':
-        assert _candidate.load_candidate(paths, project.name) is None
+        assert _records.load_candidate(paths, project.name) is None
 
 
 @pytest.mark.parametrize(
@@ -1462,7 +1528,7 @@ def test_run_staging_preview_gates_coordinates_before_host_access(
     assert f'repo: public-{term}' in error
     assert gh_calls(tmp_path) == []
     if stages[0] == 'prepare':
-        assert _candidate.load_candidate(paths, project.name) is None
+        assert _records.load_candidate(paths, project.name) is None
 
 
 def test_run_staging_recheck_repeats_preflight_before_visibility(
@@ -1606,19 +1672,19 @@ def test_run_staging_watch_and_publish_share_the_exact_candidate_commit(
         )
         == 0
     )
-    first = _candidate.load_candidate(paths, project.name)
+    first = _records.load_candidate(paths, project.name)
     assert first is not None
     assert _git(stage_host, 'show-ref').decode().splitlines() == [
         f'{first.commit} refs/heads/main'
     ]
-    _candidate.discard(paths, project.name, force=True)
+    _discard.discard(paths, project.name, force=True)
     (source / 'README.md').write_text('candidate B\n')
     _git(source, 'add', 'README.md')
     _git(source, 'commit', '-qm', 'candidate B')
     assert (
         _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths', '--yes']) == 0
     )
-    second = _candidate.load_candidate(paths, project.name)
+    second = _records.load_candidate(paths, project.name)
     assert second is not None
     assert second.commit != first.commit
     source_refs = _git(source, 'show-ref', '--heads', '--tags')
@@ -1730,6 +1796,35 @@ def test_run_unknown_outcome_precedes_name_and_version_validation(
     assert 'version must have X.Y.Z form' not in error
 
 
+@pytest.mark.parametrize('option', ['--release-page', '--no-release-page', '--release-notes-file'])
+def test_run_page_options_require_publish_stage(
+    configured_project: tuple[_config.Paths, _config.GlobalConfig, _config.ProjectConfig],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    option: str,
+) -> None:
+    paths, _global, project = configured_project
+    save_workflows(paths, project, checks=('repo watch',))
+    notes = tmp_path / 'notes.md'
+    notes.write_text('Public notes')
+    assert (
+        _cli.main(
+            [
+                'run',
+                'checks',
+                '--project',
+                project.name,
+                option,
+                *([str(notes)] if option == '--release-notes-file' else []),
+            ]
+        )
+        == 1
+    )
+    assert (
+        'release page options require a workflow with a publish stage' in capsys.readouterr().err
+    )
+
+
 def test_run_unknown_outcome_refuses_before_any_declared_stage(
     tmp_path: Path,
     make_repo: Callable[..., Path],
@@ -1825,16 +1920,14 @@ def test_run_watch_package_is_bound_to_invocation_version(
     save_workflows(paths, project, observe=('package watch',))
     received: list[str | None] = []
 
-    class _WatchModule:
-        @staticmethod
-        def _watch_package(
-            *_args: object,
-            version: str | None,
-            **_kwargs: object,
-        ) -> None:
-            received.append(version)
+    def _watch_package(
+        *_args: object,
+        version: str | None,
+        **_kwargs: object,
+    ) -> None:
+        received.append(version)
 
-    monkeypatch.setattr(_watch, 'watch_package', _WatchModule._watch_package)
+    monkeypatch.setattr(_watch, 'watch_package', _watch_package)
 
     assert (
         _cli.main(['run', 'observe', '--project', project.name, '--version', '1.2.3', '--yes'])
@@ -1853,19 +1946,15 @@ def test_run_yes_refuses_first_use_staging_before_any_stage(
     paths, project, _record = prepare(tmp_path, source, monkeypatch)
     save_workflows(paths, project, staging=('stage push',))
 
-    class _HostModule:
-        @staticmethod
-        def _repository_visible(_owner: str, _repo: str) -> bool:
-            return False
+    def _repository_visible(_owner: str, _repo: str) -> bool:
+        return False
 
-    class _StageModule:
-        @staticmethod
-        def _stage_push(*_args: object, **_kwargs: object) -> None:
-            pytest.fail('unattended first-use staging executed')
+    def _stage_push(*_args: object, **_kwargs: object) -> None:
+        pytest.fail('unattended first-use staging executed')
 
-    monkeypatch.setattr(_stage, 'require_authenticated_account', _require_test_account)
-    monkeypatch.setattr(_stage, 'repository_visible', _HostModule._repository_visible)
-    monkeypatch.setattr(_stage, 'stage_push', _StageModule._stage_push)
+    monkeypatch.setattr(_host, 'require_authenticated_account', _require_test_account)
+    monkeypatch.setattr(_host, 'repository_visible', _repository_visible)
+    monkeypatch.setattr(_stage, 'stage_push', _stage_push)
     capsys.readouterr()
 
     assert _cli.main(['run', 'staging', '--project', project.name, '--yes']) == 1
@@ -1886,18 +1975,16 @@ def test_run_yes_still_prints_preview_and_only_declared_stage_runs(
     project = save_workflows(paths, project, checks=('repo watch',))
     received: list[tuple[object, ...]] = []
 
-    class _WatchModule:
-        @staticmethod
-        def _watch_ci(
-            *args: object,
-            staged: bool,
-            version: str | None,
-            timeout: int,
-        ) -> None:
-            received.append((*args, staged, version, timeout))
-            next_step('pubanon package watch')
+    def _watch_ci(
+        *args: object,
+        staged: bool,
+        version: str | None,
+        timeout: int,
+    ) -> None:
+        received.append((*args, staged, version, timeout))
+        next_step('pubanon package watch')
 
-    monkeypatch.setattr(_watch, 'watch_ci', _WatchModule._watch_ci)
+    monkeypatch.setattr(_watch, 'watch_ci', _watch_ci)
 
     assert _cli.main(['run', 'checks', '--project', project.name, '--yes']) == 0
 
@@ -1924,12 +2011,10 @@ def test_run_yes_stops_before_reveal_and_names_interactive_command(
     assert project is not None
     save_workflows(paths, project, reveal=('repo reveal',))
 
-    class _LifecycleModule:
-        @staticmethod
-        def _reveal(*_args: object, **_kwargs: object) -> None:
-            pytest.fail('unattended workflow entered the reveal decision')
+    def _reveal(*_args: object, **_kwargs: object) -> None:
+        pytest.fail('unattended workflow entered the reveal decision')
 
-    monkeypatch.setattr(_lifecycle, 'reveal', _LifecycleModule._reveal)
+    monkeypatch.setattr(_lifecycle, 'reveal', _reveal)
 
     assert _cli.main(['run', 'reveal', '--project', project.name, '--yes']) == 1
 

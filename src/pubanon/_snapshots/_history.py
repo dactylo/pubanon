@@ -12,9 +12,9 @@ from pubanon import _filesystem
 from pubanon._config import Paths, ProjectConfig
 from pubanon._errors import OperationCanceled, PubanonError
 from pubanon._run import OID_HEX, git_failure_fact, run_git
-from pubanon._snapshots import _candidate, _records, _source
+from pubanon._snapshots import _candidate, _inspection, _records, _source, _store, _verification
 from pubanon._snapshots._records import CandidateRecord, PublicationRecord
-from pubanon._terminal import escape, shell_command
+from pubanon._terminal import escape, path_text, project_fallback, shell_command
 from pubanon._terminal import field as display_field
 
 _OID_PREFIX = re.compile(r'[0-9a-fA-F]+')
@@ -34,8 +34,8 @@ class PublicationEntry:
         tags: Known release labels from records and operational tags.
         commit_time: Git committer time, absent when the object is unavailable.
         record: Private confirmation and source provenance, when retained.
-        replaced: Whether absent from the ancestry of the recorded current
-            main.
+        replaced: Whether a local published main exists and the commit is
+            absent from its ancestry.
     """
 
     commit: str
@@ -48,7 +48,7 @@ class PublicationEntry:
 def _archive_publication(paths: Paths, project: str, commit: str) -> None:
     """Create or verify one exact owned archive reference."""
     operation = 'verify' if _candidate.publication_archive(paths, project, commit) else 'create'
-    store = _candidate.store_path(paths, project)
+    store = _store.store_path(paths, project)
     run_git(
         ['--git-dir', str(store.absolute()), 'update-ref', '--no-deref', '--stdin'],
         cwd=store,
@@ -58,7 +58,7 @@ def _archive_publication(paths: Paths, project: str, commit: str) -> None:
 
 def _archive_roots(paths: Paths, project: str) -> set[str]:
     """Read only verified owned publication archives as preserved history roots."""
-    store = _candidate.candidate_store_path(paths, project)
+    store = _store.candidate_store_path(paths, project)
     if not store.exists():
         return set()
     refs = run_git(
@@ -140,30 +140,11 @@ def _delete_source(
         if recovery.status != 'protected' or recovery.source_path is None:
             raise PubanonError(
                 'source repository is unavailable for deleting',
-                fact=escape(str(common)),
+                fact=escape(path_text(common)),
                 recovery=recovery.reason,
             )
         bookmark = _source.describe_bookmark(recovery.source_path, project.name, record.commit)
-    prefix = ['--git-dir', str(bookmark.git_common_dir)]
-    symbolic = run_git(
-        [*prefix, 'symbolic-ref', '--quiet', bookmark.refname], cwd=None, check=False
-    )
-    if symbolic.returncode != 1:
-        raise PubanonError(
-            'source bookmark is not a direct ref', fact=escape(str(bookmark.git_common_dir))
-        )
-    refs = run_git(
-        [*prefix, 'for-each-ref', '--format=%(refname) %(objectname)', bookmark.refname], cwd=None
-    ).stdout.splitlines()
-    for line in refs:
-        name, separator, target = line.partition(b' ')
-        if name == bookmark.refname.encode() and (
-            not separator or target != source_commit.encode()
-        ):
-            raise PubanonError(
-                'source bookmark changed to another commit',
-                fact=escape(str(bookmark.git_common_dir)),
-            )
+    _source.check_bookmark_release(bookmark, source_commit)
     return bookmark
 
 
@@ -270,7 +251,7 @@ def _publication_graph(store: Path, roots: set[str]) -> dict[str, tuple[int, tup
 def _release_archive(paths: Paths, project: str, commit: str) -> None:
     """Remove this archive while retaining other listed ancestors."""
     if _candidate.publication_archive(paths, project, commit):
-        graph = _publication_graph(_candidate.candidate_store_path(paths, project), {commit})
+        graph = _publication_graph(_store.candidate_store_path(paths, project), {commit})
         deleted = _records.deleted_publications(paths, project)
         pending = list(graph.get(commit, (0, ()))[1])
         visited: set[str] = set()
@@ -283,7 +264,7 @@ def _release_archive(paths: Paths, project: str, commit: str) -> None:
                 pending.extend(graph.get(parent, (0, ()))[1])
             else:
                 _archive_publication(paths, project, parent)
-        store = _candidate.candidate_store_path(paths, project)
+        store = _store.candidate_store_path(paths, project)
         run_git(
             ['--git-dir', str(store.absolute()), 'update-ref', '--no-deref', '--stdin'],
             cwd=store,
@@ -309,7 +290,7 @@ def _retained_dependencies(paths: Paths, project: str) -> tuple[set[str], set[st
             if active.replace_scope == 'all' and active.prestate_main is not None:
                 commits.update(
                     _rev_list(
-                        _candidate.candidate_store_path(paths, project),
+                        _store.candidate_store_path(paths, project),
                         {active.prestate_main},
                         parents=False,
                     )
@@ -317,7 +298,7 @@ def _retained_dependencies(paths: Paths, project: str) -> tuple[set[str], set[st
             elif active.replace_scope == 'one' and active.tip is None and progress is None:
                 commits.update(
                     _candidate.replacement_descendants(
-                        _candidate.candidate_store_path(paths, project),
+                        _store.candidate_store_path(paths, project),
                         active.replaces,
                         active.prestate_main,
                     )
@@ -375,7 +356,7 @@ def _worktree_guidance(
     lines = [
         (
             f'{"Source input" if record.derivation else "Source"}: '
-            f'{recovery.status} at {escape(str(source))}'
+            f'{recovery.status} at {escape(path_text(source))}'
         ),
     ]
     if recovery.reason:
@@ -387,18 +368,19 @@ def _worktree_guidance(
         parent_conflict = destination.parent.is_symlink() or (
             destination.parent.exists() and not destination.parent.is_dir()
         )
-    except (OSError, RuntimeError) as exc:
+    except OSError as exc:
         raise PubanonError('cannot inspect suggested source worktree path') from exc
     if parent_conflict:
         lines.append(
-            f'Source worktree parent is occupied or conflicting: {escape(str(destination.parent))}'
+            'Source worktree parent is occupied or conflicting: '
+            f'{escape(path_text(destination.parent))}'
         )
         return tuple(lines)
     if current is not None and occupied and current == (source_commit, True):
-        lines.append(f'Matching detached source worktree: {escape(str(destination))}')
+        lines.append(f'Matching detached source worktree: {escape(path_text(destination))}')
     elif current is not None or occupied:
         lines.append(
-            f'Source worktree path is occupied or conflicting: {escape(str(destination))}'
+            f'Source worktree path is occupied or conflicting: {escape(path_text(destination))}'
         )
         return tuple(lines)
     else:
@@ -453,7 +435,7 @@ def delete_publication(paths: Paths, project: ProjectConfig, entry: PublicationE
         completed: list[str] = []
         remaining = ['review directory', 'local deletion', 'archive bookmark']
         try:
-            _candidate.clean_inspect(paths, project.name, commit=entry.commit)
+            _inspection.clean_inspect(paths, project.name, commit=entry.commit)
             completed.append('review directory removed or absent')
             remaining.pop(0)
             _records.mark_publication_deleted(paths, project.name, entry.commit)
@@ -473,8 +455,7 @@ def delete_publication(paths: Paths, project: ProjectConfig, entry: PublicationE
                     f'Completed: {", ".join(completed) or "none"}. '
                     f'Remaining: {", ".join(remaining)}. {escape(str(exc))}'
                 ),
-                recovery=retry
-                or f'Select project {escape(project.name)}, then retry delete for this snapshot.',
+                recovery=retry or project_fallback(project.name, 'delete', None),
             ) from exc
         return
     if bookmark is not None and bookmark != record.source_bookmark:
@@ -486,7 +467,7 @@ def delete_publication(paths: Paths, project: ProjectConfig, entry: PublicationE
     remaining = ['source bookmark', 'archive bookmark', 'private recovery record']
     path = _records.publication_path(paths, project.name, entry.commit)
     try:
-        _candidate.clean_inspect(paths, project.name, commit=entry.commit)
+        _inspection.clean_inspect(paths, project.name, commit=entry.commit)
         if bookmark is not None and source_commit is not None:
             _source.remove_bookmark(bookmark, source_commit)
         completed.append(
@@ -523,8 +504,7 @@ def delete_publication(paths: Paths, project: ProjectConfig, entry: PublicationE
                 f'Completed: {", ".join(completed) or "none"}. '
                 f'Remaining: {", ".join(remaining)}. {escape(str(exc))}'
             ),
-            recovery=retry
-            or f'Select project {escape(project.name)}, then retry delete for this snapshot.',
+            recovery=retry or project_fallback(project.name, 'delete', None),
         ) from exc
 
 
@@ -555,7 +535,7 @@ def inspect_publication(
     """
     if re.fullmatch(OID_HEX, entry.commit) is None:
         raise PubanonError('invalid published snapshot commit')
-    store = _candidate.candidate_store_path(paths, project)
+    store = _store.candidate_store_path(paths, project)
     if not store.exists():
         raise PubanonError(
             'published commit is unavailable', fact=entry.commit, recovery=_PUBLICATION_REPAIR
@@ -584,7 +564,7 @@ def inspect_publication(
     ):
         raise PubanonError('published files conflict with their record')
     try:
-        return _candidate.materialize_snapshot(
+        return _inspection.materialize_snapshot(
             paths, project, entry.commit, snapshot, refresh=refresh
         )
     except PubanonError as error:
@@ -616,7 +596,7 @@ def publications(
     """
     records = {record.commit: record for record in _records.list_publications(paths, project)}
     main, current_tags = _candidate.published_refs(paths, project)
-    store = _candidate.candidate_store_path(paths, project)
+    store = _store.candidate_store_path(paths, project)
     ref_roots = set(current_tags.values())
     if main is not None:
         ref_roots.add(main)
@@ -653,7 +633,7 @@ def publications(
             tuple(sorted(tags[oid])),
             datetime.fromtimestamp(graph[oid][0], UTC) if oid in graph else None,
             records.get(oid),
-            oid not in current,
+            main is not None and oid not in current,
         )
         for oid in known
     }
@@ -678,7 +658,7 @@ def record_publication(
         PubanonError: A retained publication record conflicts with the
             candidate's provenance.
     """
-    _candidate.verify_publication_objects(paths, project.name, candidate)
+    _verification.verify_publication_objects(paths, project.name, candidate)
     commits = (candidate.commit, *(entry.new for entry in candidate.replayed))
     records: dict[str, PublicationRecord] = {}
     for commit in commits:
@@ -794,7 +774,7 @@ def source_cleanup_guidance(project: ProjectConfig, entry: PublicationEntry) -> 
             continue
         label = 'source input' if record.derivation is not None else 'source'
         lines.append(
-            f'Preserved {label} worktree (can still retain objects): {escape(str(location))}'
+            f'Preserved {label} worktree (can still retain objects): {escape(path_text(location))}'
         )
         command = shell_command(
             'git', '-C', str(recovery.source_path), 'worktree', 'remove', str(location)

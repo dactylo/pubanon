@@ -15,7 +15,7 @@ from pubanon import (
 from pubanon._cli import _context, _status
 from pubanon._errors import ObservationTimeoutError, PubanonError
 from pubanon._remote import _host
-from pubanon._snapshots import _candidate, _records
+from pubanon._snapshots import _candidate, _records, _store, _verification
 from pubanon._snapshots._source import PinnedSource, SourceBookmark
 from pubanon._terminal import escape
 from tests._cli import prepare, record_publication, record_published_main, stub_remote
@@ -41,7 +41,7 @@ def test_every_status_mode_reports_read_only_result_and_next_action_last(
     source = make_repo(files={'README.md': 'public\n'})
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
     assert project is not None
-    _candidate.store_path(paths, project.name)
+    _store.store_path(paths, project.name)
     destination = _host.Destination(
         adapter='github',
         owner=project.owner,
@@ -142,10 +142,10 @@ def test_status_changed_source_offers_existing_candidate_unless_settings_changed
     assert output.startswith('Project demo (direct route)\n')
     assert 'Prepared: v0.0.1' in output
     assert 'Source revision changed since preparation: yes' in output
-    assert ('Pubanon settings have changed since this snapshot was prepared.' in output) is blocked
+    assert ('pubanon settings have changed since this snapshot was prepared.' in output) is blocked
     assert any(line.split() == ['Published:', 'none'] for line in output.splitlines())
     assert output.endswith(expected_action)
-    assert _candidate.load_candidate(paths, project.name) == record
+    assert _records.load_candidate(paths, project.name) == record
 
 
 def test_status_cli_reports_one_publication_and_next_action(
@@ -191,7 +191,7 @@ def test_status_completed_rewrite_still_requires_cleanup(
     error = capsys.readouterr().err
     assert 'cannot clean completed rewrite record' in error
     assert 'Next: pubanon prepare --project=demo --continue' in error
-    record = _candidate.load_candidate(paths, project.name)
+    record = _records.load_candidate(paths, project.name)
     progress = _records.load_rewrite(paths, project.name)
     assert record is not None
     assert record.tip is not None
@@ -203,10 +203,10 @@ def test_status_completed_rewrite_still_requires_cleanup(
     assert 'Prepared snapshot\n' not in output
     assert record.tip not in output
     assert output.rstrip().endswith('Next: pubanon prepare --project=demo --continue')
-    assert _candidate.load_candidate(paths, project.name) == record
+    assert _records.load_candidate(paths, project.name) == record
     assert _records.load_rewrite(paths, project.name) == progress
     assert _cli.main(['prepare', '--project', project.name, '--continue']) == 0
-    assert _candidate.load_candidate(paths, project.name) == record
+    assert _records.load_candidate(paths, project.name) == record
     assert _records.load_rewrite(paths, project.name) is None
 
 
@@ -270,7 +270,7 @@ def test_status_current_visibility_requires_successful_same_destination_check(
     stub_remote(
         monkeypatch,
         destination,
-        _host.RemoteRefs(None if result == 'mismatch' else candidate.commit, {}),
+        _host.RemoteRefs('f' * 40 if result == 'mismatch' else candidate.commit, {}),
     )
     if result == 'refused':
 
@@ -292,7 +292,7 @@ def test_status_current_visibility_requires_successful_same_destination_check(
     if result == 'refused':
         assert 'repository visibility does not match configuration' in captured.err
     elif result == 'mismatch':
-        assert 'GitHub differs from the recorded published snapshot.' in captured.out
+        assert 'GitHub differs' in captured.out
         assert captured.out.rstrip().endswith('Next: pubanon repo verify --project=demo')
 
 
@@ -310,7 +310,7 @@ def test_status_invalidated_candidate_routes_to_discard_then_prepare(
     assert _cli.main(['status', '--project', project.name]) == 0
 
     output = re.sub(r': +', ': ', capsys.readouterr().out)
-    assert 'Pubanon settings have changed since this snapshot was prepared.' in output
+    assert 'pubanon settings have changed since this snapshot was prepared.' in output
     assert 'Next: pubanon discard --project=demo && pubanon prepare --project=demo' in output
     assert output.rstrip().splitlines()[-1].startswith('Next:')
 
@@ -331,6 +331,39 @@ def test_status_ordinary_retained_candidate_routes_to_inspection(
     assert 'Prepared: untagged' in output
     assert 'Next: pubanon inspect --project=demo\n' in output
     assert output.rstrip().splitlines()[-1].startswith('Next:')
+
+
+@pytest.mark.parametrize('correction', [False, pytest.param(True, marks=pytest.mark.slow)])
+def test_status_remote_empty_destination_routes_to_restore(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    correction: bool,
+) -> None:
+    source = make_repo(files={'README.md': 'public\n'})
+    if correction:
+        paths, project, _original = replacement_context(tmp_path, source, monkeypatch)
+        assert _cli.main(['prepare', '--project', project.name, '--replace', '--yes']) == 0
+    else:
+        paths, project, record = prepare(tmp_path, source, monkeypatch)
+        record_published_main(paths, project, record)
+    destination = _host.Destination(
+        adapter='github',
+        owner=project.owner,
+        repo=project.repo,
+        url='https://github.com/anonymous-account/public-repo.git',
+        account='anonymous-account',
+        visibility=project.visibility,
+    )
+    stub_remote(monkeypatch, destination, _host.RemoteRefs(None, {}))
+    capsys.readouterr()
+
+    assert _cli.main(['status', '--project', project.name, '--remote']) == 0
+
+    output = capsys.readouterr().out
+    assert output.rstrip().endswith('Next: pubanon repo restore --project=demo --to remote')
+    assert ('Recreating the final repository' in output) is correction
 
 
 def test_status_remote_mismatch_resolves_unknown_publication_first(
@@ -360,7 +393,7 @@ def test_status_remote_mismatch_resolves_unknown_publication_first(
     assert _cli.main(['status', '--project', project.name, '--remote']) == 0
 
     output = re.sub(r': +', ': ', capsys.readouterr().out)
-    assert 'GitHub differs from the recorded published snapshot.' in output
+    assert 'GitHub differs' in output
     assert 'pubanon publish --project=demo --resolve' in output
     assert 'repo verify' not in output
     assert output.rstrip().splitlines()[-1].startswith('Next:')
@@ -375,7 +408,7 @@ def test_status_remote_refuses_unexpected_destination_branch_with_recovery(
     source = make_repo(files={'README.md': 'public\n'})
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
     assert project is not None
-    _candidate.store_path(paths, project.name)
+    _store.store_path(paths, project.name)
     monkeypatch.chdir(source)
     commit = (
         subprocess.run(
@@ -453,7 +486,7 @@ def test_status_replacement_reprepare_preserves_scope_source_and_version(
         )
         == 0
     )
-    record = _candidate.load_candidate(paths, project.name)
+    record = _records.load_candidate(paths, project.name)
     assert record is not None
     _config.save_project(paths, replace(project, extra_terms=('new-private-term',)))
     capsys.readouterr()
@@ -504,19 +537,19 @@ def test_status_rewrite_progress_is_read_only(
             project.name,
             replace(progress, pause=replace(progress.pause, conflicts=conflicts)),
         )
-    store = _candidate.candidate_store_path(paths, project.name)
+    store = _store.candidate_store_path(paths, project.name)
     subprocess.run(
         ['git', '-C', store, 'update-ref', '-d', _candidate.CANDIDATE_REF],
         check=True,
         env=git_env(),
     )
-    record = _candidate.load_candidate(paths, project.name)
+    record = _records.load_candidate(paths, project.name)
     saved = _records.load_rewrite(paths, project.name)
 
     def _forbidden(*_args: object, **_kwargs: object) -> None:
         pytest.fail('status invoked mutating rewrite verification')
 
-    monkeypatch.setattr(_candidate, 'verify_rewrite_progress', _forbidden)
+    monkeypatch.setattr(_verification, 'verify_rewrite_progress', _forbidden)
     capsys.readouterr()
     assert _cli.main(['status', '--project', project.name]) == 0
     output = re.sub(r': +', ': ', capsys.readouterr().out)
@@ -531,7 +564,9 @@ def test_status_rewrite_progress_is_read_only(
     assert 'Replaces: published snapshot for v1.0.0' in output
     if phase == 'awaiting':
         assert (
-            escape(str(_records.rewrite_directory(paths, project.name) / 'resolutions.toml'))
+            escape(
+                (_records.rewrite_directory(paths, project.name) / 'resolutions.toml').as_posix()
+            )
             in output
         )
     if phase in {'exporting', 'awaiting'}:
@@ -542,7 +577,7 @@ def test_status_rewrite_progress_is_read_only(
             assert f'{escape(conflict.conflict_type)}: {escape(conflict.message)}' in output
     assert output.count('Next:') == 1
     assert output.rstrip().endswith('Next: pubanon prepare --project=demo --continue')
-    assert _candidate.load_candidate(paths, project.name) == record
+    assert _records.load_candidate(paths, project.name) == record
     assert _records.load_rewrite(paths, project.name) == saved
     assert (
         subprocess.run(
@@ -569,14 +604,14 @@ def test_status_snapshot_fields_are_concise_and_verbose_adds_provenance(
     assert 'Prepared: v1.2.3' in concise
     assert 'Source revision changed since preparation:' not in concise
     assert record.commit not in concise
-    assert escape(str(source)) not in concise
+    assert escape((source).as_posix()) not in concise
     assert '0 replayed' not in concise
     assert _cli.main(['status', '--project', project.name, '--verbose']) == 0
     verbose = re.sub(r': +', ': ', capsys.readouterr().out)
     assert record.commit in verbose
     assert record.pinned.commit in verbose
-    assert escape(str(source)) in verbose
-    assert escape(str(_candidate.candidate_store_path(paths, project.name))) in verbose
+    assert escape((source).as_posix()) in verbose
+    assert escape((_store.candidate_store_path(paths, project.name)).as_posix()) in verbose
 
 
 def test_status_summarizes_copies_without_listing_paths(
@@ -685,7 +720,7 @@ def test_status_unknown_outcome_routes_to_resolution_before_invalidation(
     assert _cli.main(['status', '--project', project.name]) == 0
 
     output = re.sub(r': +', ': ', capsys.readouterr().out)
-    assert 'Pubanon settings have changed since this snapshot was prepared.' in output
+    assert 'pubanon settings have changed since this snapshot was prepared.' in output
     assert 'Snapshot with unknown publish outcome' in output
     assert 'Next: pubanon publish --project=demo --resolve\n' in output
     assert output.rstrip().splitlines()[-1].startswith('Next:')

@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.3.0 (2026-10-06)
+
+### Added
+
+- Optional release pages for tagged publications. `init` asks whether to create them; when they are
+  on, `publish` and `run` show the page in the preview and create it after publishing. Otherwise, a
+  tagged publication prints the `release create` command that adds one later.
+- `--release-page`, `--no-release-page`, and `--release-notes-file` on `publish` and `run` choose
+  for one publication without changing the project setting.
+- An optional `[release_page]` table changes a page's title, notes, or changelog file. By default
+  the title is the tag and the notes link to the published `CHANGELOG.md`.
+- `pubanon init --edit` changes a project's visibility, route, source tags, release pages, required
+  checks, or repository settings after setup.
+- Optional `[commit_message]` tables in the global or project configuration set the messages for
+  tagged and untagged publications. `prepare --message` still takes precedence.
+
+### Changed
+
+- `release create` uses your configured or default title and notes when you omit `--notes-file`,
+  and reports an existing matching page instead of failing.
+- With `ci_workflow` set, `repo reveal` requires that workflow's latest push run for the published
+  commit to pass, as `repo watch` does.
+- On Windows, human-readable output shows paths with forward slashes.
+
+### Fixed
+
+- `release create` and `release edit` no longer report an uncertain outcome when GitHub is slow to
+  show the change.
+- `release create` for an older version no longer makes it GitHub's latest release when a newer
+  version already has a page.
+- `clean` no longer deletes current publication records when the local published history is
+  missing; it refuses and suggests `repo restore --to local`.
+- After the final repository is deleted and recreated, `publish`, `status --remote`, and
+  `repo verify` point you to `repo restore --to remote`.
+- `run --verbose` shows the full publication preview, as `publish --verbose` does.
+
+### Security
+
+- `repo reveal` checks the tag, title, and notes of every non-draft release page against your
+  current sensitive terms, and refuses to make the repository public while any page matches.
+
 ## 0.2.1 (2026-09-29)
 
 ### Added

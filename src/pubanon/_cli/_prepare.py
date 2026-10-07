@@ -14,8 +14,8 @@ from pubanon import (
 )
 from pubanon._cli import _context, _selection, _status
 from pubanon._errors import OperationCanceled, PubanonError
-from pubanon._gate import first_match, gate_unit
-from pubanon._snapshots import _candidate, _records, _rewrite, _source
+from pubanon._gate import first_match, gate_unit, match_excerpt
+from pubanon._snapshots import _candidate, _records, _reports, _rewrite, _source, _verification
 from pubanon._terminal import (
     confirm,
     detail,
@@ -61,19 +61,8 @@ class PrepareOptions:
 
 
 @dataclass(frozen=True)
-class PreparePlan:
-    """Retain verified prepare inputs while the caller holds the project lock.
-
-    Attributes:
-        ctx: Project context after applying accepted selection-policy offers.
-        snapshot: Sanitized source entries selected for the candidate.
-        pinned: Pinned source revision supplying the snapshot.
-        new_paths: Selected paths absent from the previous publication.
-        published: Previous published main commit and release-tag mapping.
-        version: Resolved release version, or None for an untagged snapshot.
-        replaces: Published commit being replaced, or None for a new snapshot.
-        replace_scope: Replacement extent, or None for a new snapshot.
-    """
+class _PreparePlan:
+    """Retain verified prepare inputs while the caller holds the project lock."""
 
     ctx: _context.ProjectContext
     snapshot: _source.Snapshot
@@ -85,32 +74,33 @@ class PreparePlan:
     replace_scope: Literal['one', 'all'] | None = None
 
 
-def _continue_rewrite(ctx: _context.ProjectContext) -> _candidate.CandidateRecord:
-    """Resume saved inputs and retain exact replacement advice on invalidation."""
-    try:
-        return _rewrite.continue_rewrite(ctx.paths, ctx.global_config, ctx.project, env=os.environ)
-    except PubanonError as error:
-        if error.recovery == 'pubanon discard, then pubanon prepare':
-            record = _candidate.load_candidate(ctx.paths, ctx.project.name)
-            if record is not None and record.replaces is not None:
-                error.recovery = _candidate.reprepare_advice(record, project=ctx.project.name)
-        raise
-
-
-def _gate_excerpt(data: bytes, start: int, end: int) -> str:
-    """Return bounded, escaped source context around the matching text."""
-    line_start = data.rfind(b'\n', 0, start) + 1
-    line_end = data.find(b'\n', end)
-    if line_end < 0:
-        line_end = len(data)
-    left = max(line_start, start - 60)
-    right = min(line_end, end + 60)
-    excerpt = escape(data[left:right].rstrip(b'\r').decode('utf-8', errors='replace'))
-    if left > line_start:
-        excerpt = '...' + excerpt
-    if right < line_end:
-        excerpt += '...'
-    return excerpt
+def _build_candidate(plan: _PreparePlan, options: PrepareOptions) -> _candidate.CandidateRecord:
+    """Build a snapshot from an unchanged plan while holding its project lock."""
+    record = _candidate.build_candidate(
+        plan.ctx.paths,
+        plan.ctx.global_config,
+        plan.ctx.project,
+        _candidate.CandidateInputs(
+            plan.snapshot,
+            plan.pinned,
+            plan.version,
+            options.message,
+            prestate=plan.published,
+            replaces=plan.replaces,
+            replace_scope=plan.replace_scope,
+        ),
+    )
+    if record.replaces is not None:
+        return record
+    tag = record.tag_intent or 'untagged'
+    count = len(plan.snapshot)
+    print()
+    output(
+        f'Prepared snapshot {escape(tag)} with {count} file{"s" if count != 1 else ""}.',
+        kind='success',
+    )
+    detail_fields([('Operation', 'new')])
+    return record
 
 
 def _file_gate_findings(entry: _source.Entry, rules: Mapping[RuleClass, tuple[str, ...]]) -> str:
@@ -133,7 +123,7 @@ def _file_gate_findings(entry: _source.Entry, rules: Mapping[RuleClass, tuple[st
         line = entry.data[:start].count(b'\n') + 1
         lines.setdefault(line, []).append((start, end, hit.term))
     for line, matches in sorted(lines.items()):
-        excerpt = _gate_excerpt(
+        excerpt, _span = match_excerpt(
             entry.data,
             min(start for start, _end, _term in matches),
             max(end for _start, end, _term in matches),
@@ -141,7 +131,7 @@ def _file_gate_findings(entry: _source.Entry, rules: Mapping[RuleClass, tuple[st
         terms = dict.fromkeys(term for _start, _end, term in matches)
         findings.append(
             f'    {style(f"{escape(entry.path)}:{line}", stream=sys.stderr)}\n'
-            f'      {excerpt}\n'
+            f'      {escape(excerpt)}\n'
             f'      Blocked text: {escape(", ".join(terms))}'
         )
     return '\n\n'.join(findings)
@@ -155,7 +145,7 @@ def _new_paths(
     """Return sanitized paths absent from the last local published state."""
     if main is None:
         return [entry.path for entry in snapshot]
-    old_paths = set(_candidate.tree_paths(ctx.paths, ctx.project.name, main))
+    old_paths = set(_reports.tree_paths(ctx.paths, ctx.project.name, main))
     return [entry.path for entry in snapshot if entry.path not in old_paths]
 
 
@@ -204,7 +194,7 @@ def _publication_version(snapshot: _source.Snapshot, requested: str | None) -> s
 
 def _require_no_prepared_candidate(ctx: _context.ProjectContext) -> None:
     """Keep the saved snapshot available and explain how to continue."""
-    record = _candidate.load_candidate(ctx.paths, ctx.project.name)
+    record = _records.load_candidate(ctx.paths, ctx.project.name)
     selection = f'--project={ctx.project.name}'
     if record is None:
         if _records.load_rewrite(ctx.paths, ctx.project.name) is not None:
@@ -216,11 +206,7 @@ def _require_no_prepared_candidate(ctx: _context.ProjectContext) -> None:
                 ),
             )
         return
-    if record.state == _candidate.STATE_UNKNOWN_OUTCOME:
-        raise PubanonError(
-            'Pubanon could not confirm whether the prepared snapshot was published',
-            recovery=_context.project_command(ctx.project.name, 'publish', selection, '--resolve'),
-        )
+    _candidate.require_known_outcome(record)
     if record.replaces is not None and record.tip is None:
         raise PubanonError(
             'a rewrite is already retained',
@@ -312,39 +298,10 @@ def _show_source_selection(
     detail('Only committed files are selected. Run `git status` for working-change details.')
 
 
-def build_candidate(plan: PreparePlan, options: PrepareOptions) -> _candidate.CandidateRecord:
-    """Build a snapshot from an unchanged plan while holding its project lock."""
-    record = _candidate.build_candidate(
-        plan.ctx.paths,
-        plan.ctx.global_config,
-        plan.ctx.project,
-        _candidate.CandidateInputs(
-            plan.snapshot,
-            plan.pinned,
-            plan.version,
-            options.message,
-            prestate=plan.published,
-            replaces=plan.replaces,
-            replace_scope=plan.replace_scope,
-        ),
-    )
-    if record.replaces is not None:
-        return record
-    tag = record.tag_intent or 'untagged'
-    count = len(plan.snapshot)
-    print()
-    output(
-        f'Prepared snapshot {escape(tag)} with {count} file{"s" if count != 1 else ""}.',
-        kind='success',
-    )
-    detail_fields([('Operation', 'new')])
-    return record
-
-
-def plan_prepare_locked(
+def _plan_prepare_locked(
     ctx: _context.ProjectContext,
     options: PrepareOptions,
-) -> PreparePlan:
+) -> _PreparePlan:
     """Verify and retain snapshot inputs while holding the project lock."""
     _config.gate_host_coordinates(
         ctx.paths,
@@ -389,17 +346,9 @@ def plan_prepare_locked(
     snapshot = _source.read_snapshot(ctx.project.source_path, pinned.commit)
     ctx = _selection.review_selection(ctx, snapshot, yes=options.yes)
     sanitized = _selection.sanitized_snapshot(ctx, snapshot)
-    try:
-        version = _candidate.replacement_version(
-            _publication_version(sanitized, options.version), moved_tags
-        )
-    except PubanonError as error:
-        if str(error) != 'replacement version must match a moved tag':
-            raise
-        raise PubanonError(
-            str(error),
-            recovery='commit the version correction or publish a new version',
-        ) from None
+    version = _candidate.replacement_version(
+        _publication_version(sanitized, options.version), moved_tags
+    )
     inferred_tag = _candidate.tag_intent_for(version)
     if (
         inferred_tag is not None
@@ -426,7 +375,7 @@ def plan_prepare_locked(
     if new_paths:
         _selection.show_new_paths(ctx, new_paths, show=published[0] is not None)
     _run_gates(ctx, sanitized)
-    return PreparePlan(ctx, sanitized, pinned, new_paths, published, version, replaces, scope)
+    return _PreparePlan(ctx, sanitized, pinned, new_paths, published, version, replaces, scope)
 
 
 def prepare_locked(
@@ -434,7 +383,7 @@ def prepare_locked(
     options: PrepareOptions,
 ) -> _candidate.CandidateRecord:
     """Prepare one snapshot while the caller holds the project lock."""
-    plan = plan_prepare_locked(ctx, options)
+    plan = _plan_prepare_locked(ctx, options)
     first_release = plan.published[0] is None
     if plan.new_paths and not first_release and not options.acknowledge_new_paths:
         if options.yes:
@@ -449,7 +398,7 @@ def prepare_locked(
             f'Include these {len(plan.new_paths)} files that were not in the last release?'
         ):
             raise OperationCanceled('Canceled. Nothing was created.')
-    return build_candidate(plan, options)
+    return _build_candidate(plan, options)
 
 
 def command_prepare(args: argparse.Namespace) -> None:
@@ -459,7 +408,9 @@ def command_prepare(args: argparse.Namespace) -> None:
     with _config.project_lock(paths, name):
         ctx = _context.load_context(paths, name)
         if args.continue_rewrite:
-            record = _continue_rewrite(ctx)
+            record = _rewrite.continue_rewrite(
+                ctx.paths, ctx.global_config, ctx.project, env=os.environ
+            )
         else:
             record = prepare_locked(
                 ctx,
@@ -474,10 +425,14 @@ def command_prepare(args: argparse.Namespace) -> None:
             )
             if record.replaces is not None and record.tip is None:
                 ctx = _context.load_context(paths, name)
-                record = _continue_rewrite(ctx)
+                record = _rewrite.continue_rewrite(
+                    ctx.paths, ctx.global_config, ctx.project, env=os.environ
+                )
             elif record.replaces is not None:
+                # The new-paths prompt may allow configuration changes. Reload before
+                # prepare's first proof of replacement structure.
                 ctx = _context.load_context(paths, name)
-                _candidate.verify_retained_candidate(
+                _verification.verify_retained_candidate(
                     paths, ctx.global_config, ctx.project, record, env=os.environ
                 )
         if record.replaces is not None:
@@ -488,7 +443,7 @@ def command_prepare(args: argparse.Namespace) -> None:
             )
             print(terminal_field('Version', escape(record.tag_intent or 'untagged')))
             detail_fields([('Operation', 'replacement')])
-            print('\n'.join(_status.rewrite_status(paths, name, record, verbose=args.verbose)))
+            print('\n'.join(_status.rewrite_status(paths, name, record)))
             if record.tip is None:
                 next_step(
                     _context.project_command(name, 'prepare', f'--project={name}', '--continue')

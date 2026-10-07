@@ -1,4 +1,4 @@
-"""Run Git commands within the Pubanon execution boundary."""
+"""Run Git commands within the pubanon execution boundary."""
 
 import os
 import re
@@ -64,14 +64,13 @@ def _run_git(
             input=input_bytes,
             timeout=timeout,
         )
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout if isinstance(exc.stdout, bytes) else b''
-        stderr = exc.stderr if isinstance(exc.stderr, bytes) else b''
+    except subprocess.TimeoutExpired:
+        pass
     except OSError as exc:
         raise PubanonError('cannot run Git') from exc
     else:
         return GitResult(completed.returncode, completed.stdout, completed.stderr)
-    raise ObservationTimeoutError(stdout=stdout, stderr=stderr)
+    raise ObservationTimeoutError
 
 
 def check_floors() -> None:

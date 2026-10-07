@@ -15,10 +15,10 @@ from pubanon import (
 )
 from pubanon._cli import _arguments, _prepare, _selection, _status
 from pubanon._cli._context import ProjectContext, load_context
-from pubanon._cli._prepare import PrepareOptions, plan_prepare_locked, prepare_locked
+from pubanon._cli._prepare import PrepareOptions, _plan_prepare_locked, prepare_locked
 from pubanon._errors import PubanonError
 from pubanon._run import run_git
-from pubanon._snapshots import _candidate, _records, _source
+from pubanon._snapshots import _candidate, _discard, _records, _rewrite, _source, _store
 from pubanon._terminal import escape
 from tests._cli import prepare
 from tests._git import git_env
@@ -33,12 +33,12 @@ def replacement_context(
     conflict: bool = False,
 ) -> tuple[_config.Paths, _config.ProjectConfig, _candidate.CandidateRecord]:
     paths, project, original = prepare(tmp_path, source, monkeypatch, version='1.0.0')
-    store = _candidate.candidate_store_path(paths, project.name)
+    store = _store.candidate_store_path(paths, project.name)
     for ref in ('refs/heads/main', 'refs/tags/v1.0.0'):
         subprocess.run(
             ['git', '-C', store, 'update-ref', ref, original.commit], check=True, env=git_env()
         )
-    _candidate.discard(paths, project.name, force=False)
+    _discard.discard(paths, project.name, force=False)
     changed = source / ('README.md' if conflict else 'second.txt')
     changed.write_bytes(b'descendant\n')
     subprocess.run(['git', '-C', source, 'add', '.'], check=True, env=git_env())
@@ -57,13 +57,13 @@ def replacement_context(
         )
         == 0
     )
-    descendant = _candidate.load_candidate(paths, project.name)
+    descendant = _records.load_candidate(paths, project.name)
     assert descendant is not None
     for ref in ('refs/heads/main', 'refs/tags/v1.0.1'):
         subprocess.run(
             ['git', '-C', store, 'update-ref', ref, descendant.commit], check=True, env=git_env()
         )
-    _candidate.discard(paths, project.name, force=False)
+    _discard.discard(paths, project.name, force=False)
     if not conflict:
         changed.unlink()
     (source / 'README.md').write_text('correction\n', newline='\n')
@@ -85,14 +85,14 @@ def test_incomplete_prepare_recovery_selects_project(
     assert project is not None
     record = SimpleNamespace(replaces='a' * 40, tip=None, tag_intent='v1.0.0')
 
-    def _paused(*_args: object) -> SimpleNamespace:
+    def _paused(*_args: object, **_kwargs: object) -> SimpleNamespace:
         return record
 
     def _empty_status(*_args: object, **_kwargs: object) -> list[str]:
         return []
 
     monkeypatch.setattr(_prepare, 'prepare_locked', _paused)
-    monkeypatch.setattr(_prepare, '_continue_rewrite', _paused)
+    monkeypatch.setattr(_rewrite, 'continue_rewrite', _paused)
     monkeypatch.setattr(_status, 'rewrite_status', _empty_status)
     assert _cli.main(['prepare', f'--project={name}']) == 0
     output = capsys.readouterr().out
@@ -126,9 +126,9 @@ def test_prepare_excludes_denied_credential_path_with_metacharacters(
     saved = _config.load_project(paths, project.name)
     assert saved.deny == ('keys/id[[]old]_rsa',)
     assert saved.secret_exceptions == ()
-    record = _candidate.load_candidate(paths, project.name)
+    record = _records.load_candidate(paths, project.name)
     assert record is not None
-    snapshot = _source.read_snapshot(_candidate.store_path(paths, project.name), record.commit)
+    snapshot = _source.read_snapshot(_store.store_path(paths, project.name), record.commit)
     assert [entry.path for entry in snapshot] == []
 
 
@@ -157,7 +157,7 @@ def test_prepare_existing_candidate_preserves_the_appropriate_choice(
         assert 'pubanon inspect --project=demo' in error
         assert 'pubanon publish --project=demo' in error
         assert 'to replace it:' in error
-    assert _candidate.load_candidate(paths, project.name) is not None
+    assert _records.load_candidate(paths, project.name) is not None
 
 
 def test_prepare_gates_current_publication_coordinates_before_candidate_build(
@@ -178,7 +178,7 @@ def test_prepare_gates_current_publication_coordinates_before_candidate_build(
     rendered = capsys.readouterr().err
     assert 'repository name did not pass content checks' in rendered
     assert term in rendered
-    assert _candidate.load_candidate(paths, project.name) is None
+    assert _records.load_candidate(paths, project.name) is None
     assert not (tmp_path / 'fake-gh-calls.jsonl').exists()
 
 
@@ -204,7 +204,7 @@ def test_prepare_gates_default_staging_coordinates_before_candidate_build(
     rendered = capsys.readouterr().err
     assert 'repository name did not pass content checks' in rendered
     assert term in rendered
-    assert _candidate.load_candidate(paths, project.name) is None
+    assert _records.load_candidate(paths, project.name) is None
     assert not (tmp_path / 'fake-gh-calls.jsonl').exists()
 
 
@@ -230,7 +230,7 @@ def test_prepare_gates_explicit_staging_coordinates_before_candidate_build(
     rendered = capsys.readouterr().err
     assert 'repository name did not pass content checks' in rendered
     assert term in rendered
-    assert _candidate.load_candidate(paths, project.name) is None
+    assert _records.load_candidate(paths, project.name) is None
     assert not (tmp_path / 'fake-gh-calls.jsonl').exists()
 
 
@@ -328,6 +328,79 @@ def test_prepare_keeps_long_source_excerpts_readable_and_escapes_controls(
     assert '\x1b' not in error
 
 
+def test_prepare_refuses_already_published_tag_early(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_repo(files={'README.md': 'public\n'})
+    paths, project, record = prepare(tmp_path, source, monkeypatch, version='1.0.0')
+    store = _store.candidate_store_path(paths, project.name)
+    for ref in ('refs/tags/v1.0.0', 'refs/heads/main'):
+        subprocess.run(
+            ['git', '-C', store, 'update-ref', ref, record.commit], check=True, env=git_env()
+        )
+    _discard.discard(paths, project.name, force=True)
+    ctx = load_context(paths, project.name)
+
+    def _forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError('snapshot must not be read before tag refusal')
+
+    monkeypatch.setattr(_source, 'read_snapshot', _forbidden)
+    options = PrepareOptions('HEAD', '1.0.0', None, acknowledge_new_paths=False, yes=False)
+    with pytest.raises(PubanonError, match='already published') as exc_info:
+        _plan_prepare_locked(ctx, options)
+    assert 'choose a new version' in (exc_info.value.recovery or '')
+    assert 'pubanon prepare --project=demo --replace v1.0.0' in (exc_info.value.recovery or '')
+
+
+def test_prepare_refuses_intact_utf8_term_in_mixed_blob(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    answers: Callable[[Sequence[tuple[str, str]]], None],
+) -> None:
+    term = 'Privat\u00e9Alias'
+    source = make_repo(files={'mixed.bin': b'\xffPrivat\xc3\xa9Alias\n'})
+    paths, _global_config, project = configure(tmp_path, monkeypatch, source)
+    assert project is not None
+    _config.save_project(paths, replace(project, extra_terms=(term,)))
+
+    answers([])
+    assert (
+        _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths', '--yes']) == 1
+    )
+
+    rendered = capsys.readouterr().err
+    assert 'cannot prepare: blocked text in included files' in rendered
+    assert term in rendered
+    assert _records.load_candidate(paths, project.name) is None
+
+
+@pytest.mark.slow
+def test_prepare_refuses_non_utf8_message_without_traceback(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = make_repo(files={'README.md': 'public\n'})
+    paths, project, _record = prepare(tmp_path, source, monkeypatch)
+    _discard.discard(paths, project.name, force=True)
+    capsys.readouterr()
+
+    assert (
+        _cli.main(['prepare', '--project', project.name, '--message', 'bad\udcffmsg', '--yes'])
+        == 1
+    )
+
+    captured = capsys.readouterr()
+    assert 'must be valid UTF-8' in captured.err
+    assert 'Traceback' not in captured.err
+    assert _records.load_candidate(paths, project.name) is None
+
+
 @pytest.mark.slow
 def test_prepare_latest_refuses_bad_untouched_ancestor_before_reporting_ready(
     tmp_path: Path,
@@ -337,7 +410,7 @@ def test_prepare_latest_refuses_bad_untouched_ancestor_before_reporting_ready(
 ) -> None:
     source = make_repo(files={'README.md': 'original\n'})
     paths, project, original = replacement_context(tmp_path, source, monkeypatch)
-    store = _candidate.candidate_store_path(paths, project.name)
+    store = _store.candidate_store_path(paths, project.name)
     raw = run_git(['cat-file', 'commit', original.commit], cwd=store).stdout
     raw = raw.replace(b'\nauthor ', b'\ngpgsig invalid-signature\nauthor ')
     bad = (
@@ -375,56 +448,6 @@ def test_prepare_latest_refuses_bad_untouched_ancestor_before_reporting_ready(
     assert not (tmp_path / 'fake-gh-calls.jsonl').exists()
 
 
-def test_prepare_refuses_already_published_tag_early(
-    tmp_path: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = make_repo(files={'README.md': 'public\n'})
-    paths, project, record = prepare(tmp_path, source, monkeypatch, version='1.0.0')
-    store = _candidate.candidate_store_path(paths, project.name)
-    for ref in ('refs/tags/v1.0.0', 'refs/heads/main'):
-        subprocess.run(
-            ['git', '-C', store, 'update-ref', ref, record.commit], check=True, env=git_env()
-        )
-    _candidate.discard(paths, project.name, force=True)
-    ctx = load_context(paths, project.name)
-
-    def _forbidden(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError('snapshot must not be read before tag refusal')
-
-    monkeypatch.setattr(_source, 'read_snapshot', _forbidden)
-    options = PrepareOptions('HEAD', '1.0.0', None, acknowledge_new_paths=False, yes=False)
-    with pytest.raises(PubanonError, match='already published') as exc_info:
-        plan_prepare_locked(ctx, options)
-    assert 'choose a new version' in (exc_info.value.recovery or '')
-    assert 'pubanon prepare --project=demo --replace v1.0.0' in (exc_info.value.recovery or '')
-
-
-def test_prepare_refuses_intact_utf8_term_in_mixed_blob(
-    tmp_path: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    answers: Callable[[Sequence[tuple[str, str]]], None],
-) -> None:
-    term = 'Privat\u00e9Alias'
-    source = make_repo(files={'mixed.bin': b'\xffPrivat\xc3\xa9Alias\n'})
-    paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
-    _config.save_project(paths, replace(project, extra_terms=(term,)))
-
-    answers([])
-    assert (
-        _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths', '--yes']) == 1
-    )
-
-    rendered = capsys.readouterr().err
-    assert 'cannot prepare: blocked text in included files' in rendered
-    assert term in rendered
-    assert _candidate.load_candidate(paths, project.name) is None
-
-
 @pytest.mark.slow
 def test_prepare_refuses_reusing_inferred_package_version(
     tmp_path: Path,
@@ -434,14 +457,14 @@ def test_prepare_refuses_reusing_inferred_package_version(
 ) -> None:
     source = make_repo(files={'pyproject.toml': '[project]\nversion = "0.0.1"\n'})
     paths, project, record = prepare(tmp_path, source, monkeypatch)
-    store = _candidate.candidate_store_path(paths, project.name)
+    store = _store.candidate_store_path(paths, project.name)
     for ref in ('refs/tags/v0.0.1', 'refs/heads/main'):
         subprocess.run(
             ['git', '-C', store, 'update-ref', ref, record.commit], check=True, env=git_env()
         )
-    _candidate.discard(paths, project.name, force=True)
+    _discard.discard(paths, project.name, force=True)
     assert _cli.main(['prepare', '--project', project.name, '--yes']) != 0
-    assert _candidate.load_candidate(paths, project.name) is None
+    assert _records.load_candidate(paths, project.name) is None
     error = capsys.readouterr().err
     assert 'already published' in error
     assert 'v0.0.1' in error
@@ -465,7 +488,7 @@ def test_prepare_refuses_sensitive_term_in_path(
     )
 
     assert 'cannot prepare: blocked text in included files' in capsys.readouterr().err
-    assert _candidate.load_candidate(paths, project.name) is None
+    assert _records.load_candidate(paths, project.name) is None
 
 
 @pytest.mark.slow
@@ -477,12 +500,12 @@ def test_prepare_replacement_refuses_inferred_version_outside_moved_tags(
 ) -> None:
     source = make_repo(files={'pyproject.toml': '[project]\nversion = "1.0.0"\n'})
     paths, project, original = prepare(tmp_path, source, monkeypatch)
-    store = _candidate.candidate_store_path(paths, project.name)
+    store = _store.candidate_store_path(paths, project.name)
     for ref in ('refs/heads/main', 'refs/tags/v1.0.0'):
         subprocess.run(
             ['git', '-C', store, 'update-ref', ref, original.commit], check=True, env=git_env()
         )
-    _candidate.discard(paths, project.name, force=False)
+    _discard.discard(paths, project.name, force=False)
     (source / 'pyproject.toml').write_text('[project]\nversion = "2.0.0"\n')
     subprocess.run(['git', '-C', source, 'add', '.'], check=True, env=git_env())
     subprocess.run(
@@ -493,7 +516,7 @@ def test_prepare_replacement_refuses_inferred_version_outside_moved_tags(
     error = capsys.readouterr().err
     assert 'replacement version must match a moved tag' in error
     assert 'commit the version correction or publish a new version' in error
-    assert _candidate.load_candidate(paths, project.name) is None
+    assert _records.load_candidate(paths, project.name) is None
 
 
 @pytest.mark.slow
@@ -523,10 +546,10 @@ def test_prepare_replacement_replays_or_replaces_all_from_current_source(
         )
         == 0
     )
-    record = _candidate.load_candidate(paths, project.name)
+    record = _records.load_candidate(paths, project.name)
     assert record is not None
     assert record.tip is not None
-    store = _candidate.candidate_store_path(paths, project.name)
+    store = _store.candidate_store_path(paths, project.name)
     snapshot = _source.read_snapshot(store, record.tip)
     files = {entry.path: entry.data for entry in snapshot}
     assert files['README.md'] == b'correction\n'
@@ -568,11 +591,11 @@ def test_prepare_replace_latest_preserves_earlier_publications(
 ) -> None:
     source = make_repo(files={'README.md': 'original\n'})
     paths, project, original = replacement_context(tmp_path, source, monkeypatch)
-    store = _candidate.candidate_store_path(paths, project.name)
+    store = _store.candidate_store_path(paths, project.name)
     previous_tip = run_git(['rev-parse', 'refs/heads/main'], cwd=store).stdout.decode().strip()
     capsys.readouterr()
     assert _cli.main(['prepare', '--project', project.name, '--yes', '--replace', *selector]) == 0
-    record = _candidate.load_candidate(paths, project.name)
+    record = _records.load_candidate(paths, project.name)
     assert record is not None
     assert record.replaces == previous_tip
     assert record.tip == record.commit
@@ -610,18 +633,18 @@ def test_prepare_replacement_uses_selected_publication_tags(
     tags, requested, expected, status = case
     source = make_repo(files={'README.md': 'public\n'})
     paths, project, original = prepare(tmp_path, source, monkeypatch)
-    store = _candidate.candidate_store_path(paths, project.name)
+    store = _store.candidate_store_path(paths, project.name)
     for ref in ('refs/heads/main', *(f'refs/tags/{tag}' for tag in tags)):
         subprocess.run(
             ['git', '-C', store, 'update-ref', ref, original.commit], check=True, env=git_env()
         )
-    _candidate.discard(paths, project.name, force=False)
+    _discard.discard(paths, project.name, force=False)
     capsys.readouterr()
     args = ['prepare', '--project', project.name, '--replace', '--yes']
     if requested:
         args.extend(['--version', requested])
     assert _cli.main(args) == status
-    record = _candidate.load_candidate(paths, project.name)
+    record = _records.load_candidate(paths, project.name)
     captured = capsys.readouterr()
     if status:
         assert record is None
@@ -666,7 +689,7 @@ def test_prepare_reports_gate_term_and_escaped_finding_unit(
     assert 'hygiene_terms' not in rendered
     assert separator not in rendered
     assert term in rendered
-    assert _candidate.load_candidate(paths, project.name) is None
+    assert _records.load_candidate(paths, project.name) is None
 
 
 def test_prepare_reports_omitted_working_changes(
@@ -684,7 +707,7 @@ def test_prepare_reports_omitted_working_changes(
     paths, project, record = prepare(tmp_path, source, monkeypatch)
 
     snapshot = _source.read_snapshot(
-        _candidate.candidate_store_path(paths, project.name), record.commit
+        _store.candidate_store_path(paths, project.name), record.commit
     )
     assert {entry.path: entry.data for entry in snapshot} == {
         'README.md': b'committed\n',
@@ -708,7 +731,7 @@ def test_prepare_reports_operator_outcome_before_candidate_details(
         _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths', '--yes']) == 0
     )
 
-    record = _candidate.load_candidate(paths, project.name)
+    record = _records.load_candidate(paths, project.name)
     assert record is not None
     output = capsys.readouterr().out
     assert 'Prepared snapshot' in output
@@ -740,7 +763,7 @@ def test_prepare_review_excludes_included_file_only_after_acceptance(
         expected, reply = next(prompts)
         assert prompt.startswith(expected)
         assert _config.load_project(paths, project.name) == project
-        assert _candidate.load_candidate(paths, project.name) is None
+        assert _records.load_candidate(paths, project.name) is None
         if prompt.startswith('Use this selection?'):
             previews.append(capsys.readouterr().out)
         return reply
@@ -759,9 +782,9 @@ def test_prepare_review_excludes_included_file_only_after_acceptance(
     saved = _config.load_project(paths, project.name)
     assert saved.allow == ('README.md',)
     assert saved.deny == ('docs/draft.md',)
-    record = _candidate.load_candidate(paths, project.name)
+    record = _records.load_candidate(paths, project.name)
     assert record is not None
-    snapshot = _source.read_snapshot(_candidate.store_path(paths, project.name), record.commit)
+    snapshot = _source.read_snapshot(_store.store_path(paths, project.name), record.commit)
     assert [entry.path for entry in snapshot] == ['README.md']
 
 
@@ -784,7 +807,7 @@ def test_prepare_rewrite_invalidated_continuation_preserves_reprepare_inputs(
     source = make_repo(files={'README.md': 'original\n'})
     paths, project, original = replacement_context(tmp_path, source, monkeypatch, conflict=True)
     assert _cli.main(['prepare', '--project', project.name, '--replace', 'v1.0.0', '--yes']) == 0
-    record = _candidate.load_candidate(paths, project.name)
+    record = _records.load_candidate(paths, project.name)
     assert record is not None
     _config.save_project(paths, replace(project, extra_terms=('new-private-term',)))
     capsys.readouterr()
@@ -793,6 +816,33 @@ def test_prepare_rewrite_invalidated_continuation_preserves_reprepare_inputs(
     assert 'the configuration changed after the snapshot was prepared' in error
     assert f'pubanon prepare --project=demo --replace {original.commit}' in error
     assert f'--source {record.pinned.commit} --version 1.0.0' in error
+
+
+@pytest.mark.slow
+def test_prepare_rewrite_gated_continuation_preserves_reprepare_inputs(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = make_repo(files={'README.md': 'original\n'})
+    paths, project, original = replacement_context(tmp_path, source, monkeypatch, conflict=True)
+    assert _cli.main(['prepare', '--project', project.name, '--replace', 'v1.0.0', '--yes']) == 0
+    record = _records.load_candidate(paths, project.name)
+    assert record is not None
+    directory = _records.rewrite_directory(paths, project.name)
+    manifest = directory / 'resolutions.toml'
+    manifest.write_text(manifest.read_text().replace('action = "unresolved"', 'action = "keep"'))
+    (directory / 'tree' / 'README.md').write_text(str(source))
+
+    for _attempt in range(2):
+        capsys.readouterr()
+        assert _cli.main(['prepare', '--project', project.name, '--continue']) == 1
+        error = capsys.readouterr().err
+        assert 'the replayed snapshot did not pass current content checks' in error
+        assert f'pubanon prepare --project=demo --replace {original.commit}' in error
+        assert f'--source {record.pinned.commit} --version 1.0.0' in error
+        assert _records.load_rewrite(paths, project.name) is not None
 
 
 @pytest.mark.slow
@@ -806,7 +856,7 @@ def test_prepare_rewrite_pause_and_continue_uses_saved_source(
     paths, project, _original = replacement_context(tmp_path, source, monkeypatch, conflict=True)
     capsys.readouterr()
     assert _cli.main(['prepare', '--project', project.name, '--replace', 'v1.0.0', '--yes']) == 0
-    record = _candidate.load_candidate(paths, project.name)
+    record = _records.load_candidate(paths, project.name)
     assert record is not None
     assert record.tip is None
     progress = _records.load_rewrite(paths, project.name)
@@ -820,7 +870,7 @@ def test_prepare_rewrite_pause_and_continue_uses_saved_source(
     for conflict in progress.pause.conflicts:
         assert f'{escape(conflict.conflict_type)}: {escape(conflict.message)}' in output
     assert 'Replaces: published snapshot for v1.0.0\n' in output
-    assert escape(str(directory / 'resolutions.toml')) in output
+    assert escape((directory / 'resolutions.toml').as_posix()) in output
     assert output.count('Next:') == 1
     assert output.rstrip().endswith('Next: pubanon prepare --project=demo --continue')
     manifest = directory / 'resolutions.toml'
@@ -832,7 +882,7 @@ def test_prepare_rewrite_pause_and_continue_uses_saved_source(
 
     monkeypatch.setattr(_source, 'pin', _forbidden)
     assert _cli.main(['prepare', '--project', project.name, '--continue']) == 0
-    complete = _candidate.load_candidate(paths, project.name)
+    complete = _records.load_candidate(paths, project.name)
     assert complete is not None
     assert complete.tip is not None
     assert complete.pinned == record.pinned
@@ -840,7 +890,7 @@ def test_prepare_rewrite_pause_and_continue_uses_saved_source(
     assert {
         entry.path: entry.data
         for entry in _source.read_snapshot(
-            _candidate.candidate_store_path(paths, project.name), complete.tip
+            _store.candidate_store_path(paths, project.name), complete.tip
         )
     } == {'README.md': b'resolved\n'}
 
@@ -887,7 +937,7 @@ def test_prepare_shows_included_files_and_committed_source_lines(
         assert bookkeeping not in error
     assert 'commit' in error
     assert 'pubanon prepare' in error
-    assert _candidate.load_candidate(paths, project.name) is None
+    assert _records.load_candidate(paths, project.name) is None
 
 
 def test_prepare_source_older_revision_uses_selected_bytes(
@@ -936,10 +986,10 @@ def test_prepare_source_older_revision_uses_selected_bytes(
         == 0
     )
 
-    record = _candidate.load_candidate(paths, project.name)
+    record = _records.load_candidate(paths, project.name)
     assert record is not None
     snapshot = _source.read_snapshot(
-        _candidate.candidate_store_path(paths, project.name), record.commit
+        _store.candidate_store_path(paths, project.name), record.commit
     )
     assert snapshot[0].data == b'older\n'
     assert record.tag_intent == 'v0.0.1'
@@ -963,7 +1013,7 @@ def test_prepare_uses_committed_package_version_and_rejects_mismatch(
         argv.extend(['--version', requested])
     status = _cli.main(argv)
     captured = capsys.readouterr()
-    record = _candidate.load_candidate(paths, project.name)
+    record = _records.load_candidate(paths, project.name)
     if requested == '0.0.2':
         assert status != 0
         assert record is None
@@ -996,7 +1046,7 @@ def test_prepare_validates_version_before_prompts(
     monkeypatch.setattr(_prepare, 'confirm', _forbidden)
     options = PrepareOptions('HEAD', 'not-a-version', None, acknowledge_new_paths=False, yes=False)
     with pytest.raises(PubanonError, match=r'X\.Y\.Z'):
-        plan_prepare_locked(ctx, options)
+        _plan_prepare_locked(ctx, options)
 
 
 @pytest.mark.parametrize(
@@ -1047,9 +1097,9 @@ def test_prepare_yes_allows_first_release_new_paths_without_stdin(
     assert 'Files not in the last release' not in output
     assert 'Saved list:' not in output
     assert (paths.data_dir / 'projects' / project.name / 'new-paths.json').exists()
-    store = _candidate.candidate_store_path(paths, project.name)
+    store = _store.candidate_store_path(paths, project.name)
     run_git(['update-ref', 'refs/heads/main', record.commit], cwd=store)
-    _candidate.discard(paths, project.name, force=False)
+    _discard.discard(paths, project.name, force=False)
     (source / 'new.txt').write_text('new file\n')
     subprocess.run(['git', '-C', source, 'add', 'new.txt'], check=True, env=git_env())
     subprocess.run(['git', '-C', source, 'commit', '-qm', 'Add file'], check=True, env=git_env())
@@ -1073,8 +1123,8 @@ def test_publication_state_is_refused_before_prepare(
     assert _cli.main(['prepare', '--project', 'demo', '--acknowledge-new-paths', '--yes']) == 1
     error = capsys.readouterr().err
     assert 'publication state' in error
-    assert escape(str(source / selected)) in error
-    assert _candidate.load_candidate(paths, 'demo') is None
+    assert escape((source / selected).as_posix()) in error
+    assert _records.load_candidate(paths, 'demo') is None
 
 
 @pytest.mark.parametrize('reference', ['', 'PRIVATE-MARKER', 'docs/private', 'notes/confidential'])
@@ -1112,7 +1162,7 @@ def test_prepare_ignores_private_directories_but_blocks_references_in_makefile(
         paths.global_config.read_bytes(),
     )
     result = _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths', '--yes'])
-    record = _candidate.load_candidate(paths, project.name)
+    record = _records.load_candidate(paths, project.name)
     if reference:
         assert result == 1
         error = capsys.readouterr().err
@@ -1122,7 +1172,7 @@ def test_prepare_ignores_private_directories_but_blocks_references_in_makefile(
     else:
         assert result == 0
         assert record is not None
-        store = _candidate.candidate_store_path(paths, project.name)
+        store = _store.candidate_store_path(paths, project.name)
         snapshot = _source.read_snapshot(store, record.commit, git_dir=store)
         assert [entry.path for entry in snapshot] == ['Makefile']
 
@@ -1157,7 +1207,7 @@ def test_prepare_ignores_files_but_blocks_references_in_makefile(
         paths.global_config.read_bytes(),
     )
     result = _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths', '--yes'])
-    record = _candidate.load_candidate(paths, project.name)
+    record = _records.load_candidate(paths, project.name)
     if reference:
         assert result == 1
         error = capsys.readouterr().err
@@ -1167,6 +1217,6 @@ def test_prepare_ignores_files_but_blocks_references_in_makefile(
     else:
         assert result == 0
         assert record is not None
-        store = _candidate.candidate_store_path(paths, project.name)
+        store = _store.candidate_store_path(paths, project.name)
         snapshot = _source.read_snapshot(store, record.commit, git_dir=store)
         assert [entry.path for entry in snapshot] == ['Makefile']

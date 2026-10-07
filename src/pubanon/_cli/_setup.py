@@ -49,7 +49,7 @@ def _check_global_readiness(paths: _config.Paths, global_config: _config.GlobalC
     """Check the same global identity and account prerequisites for each command."""
     _check_global_identity(paths, global_config)
     _host.require_authenticated_account(
-        global_config.accounts['github'], authority='configuration'
+        global_config.accounts[_config.DEFAULT_HOST], authority='configuration'
     )
 
 
@@ -63,13 +63,33 @@ def _check_setup_account(expected: str, actual: str) -> None:
         )
 
 
+def _commit_message_summary(settings: _config.CommitMessageSettings | None) -> str:
+    """Describe the global commit message defaults in one summary row."""
+    entries = (
+        ('tagged', settings.tagged if settings is not None else None),
+        ('untagged', settings.untagged if settings is not None else None),
+    )
+    if all(value is None for _key, value in entries):
+        return 'built-in (set [commit_message] in config.toml to change)'
+    parts: list[str] = []
+    for key, value in entries:
+        if value is None:
+            parts.append(f'{key} built-in')
+            continue
+        first, _break, rest = value.partition('\n')
+        line = escape(first.rstrip('\r'))
+        more = '...' if rest.strip('\r\n') else ''
+        parts.append(f'{key} "{line}"{more}')
+    return ', '.join(parts)
+
+
 def _read_setup(paths: _config.Paths) -> tuple[_config.GlobalConfig | None, bytes | None]:
     """Read and validate the original configuration without exposing private keys."""
     try:
         original = paths.global_config.read_bytes()
     except FileNotFoundError:
         return None, None
-    except (OSError, RuntimeError) as exc:
+    except OSError as exc:
         raise _config.configuration_error(paths.global_config, 'global', exc) from exc
     try:
         data = tomllib.loads(original.decode('utf-8'))
@@ -80,10 +100,14 @@ def _read_setup(paths: _config.Paths) -> tuple[_config.GlobalConfig | None, byte
     except PubanonError as error:
         # Unknown keys can themselves contain unrecognized operator text.
         message = str(error)
+        fact = error.fact
         if message.startswith('unknown '):
             message = message.partition(':')[0]
+            fact = None
         raise PubanonError(
-            message, recovery='repair the global configuration and rerun pubanon setup'
+            message,
+            fact=fact,
+            recovery='repair the global configuration and rerun pubanon setup',
         ) from None
 
 
@@ -128,7 +152,7 @@ def _setup_expected_account(
 ) -> _config.GlobalConfig:
     """Adopt a reviewed verified account or check an existing account."""
     actual = _setup_account()
-    expected = config.accounts['github']
+    expected = config.accounts[_config.DEFAULT_HOST]
     if expected and not allow_change:
         _check_setup_account(expected, actual)
         return config
@@ -137,7 +161,7 @@ def _setup_expected_account(
         return config
     if not confirm('Use this GitHub account?', default=True):
         raise OperationCanceled('Canceled. Nothing was saved.', recovery='rerun pubanon setup')
-    return replace(config, accounts={'github': actual})
+    return replace(config, accounts={_config.DEFAULT_HOST: actual})
 
 
 def _setup_field(key: str, label: str) -> str:
@@ -173,8 +197,9 @@ def _setup_review(
     fields(
         [
             ('Identity', f'{escape(config.anon_name)} <{escape(config.anon_email)}>'),
-            ('GitHub account', escape(config.accounts['github'])),
+            ('GitHub account', escape(config.accounts[_config.DEFAULT_HOST])),
             ('Default route', f'{escape(config.default_publication_route)} (new projects only)'),
+            ('Commit messages', _commit_message_summary(config.commit_message)),
             (
                 'Excluded directories',
                 ', '.join(f'{escape(directory)}/' for directory in config.ignored_directories)
@@ -285,17 +310,7 @@ def _setup_terms_from_scratch() -> tuple[str, ...]:
 
 def _setup_validate(config: _config.GlobalConfig) -> _config.GlobalConfig:
     """Apply the existing global shape rules to one in-memory setup snapshot."""
-    return _config.global_from_mapping(
-        {
-            'anon_name': config.anon_name,
-            'anon_email': config.anon_email,
-            'sensitive_terms': list(config.sensitive_terms),
-            'ignored_directories': list(config.ignored_directories),
-            'ignored_files': list(config.ignored_files),
-            'accounts': dict(config.accounts),
-            'default_publication_route': config.default_publication_route,
-        }
-    )
+    return _config.global_from_mapping(_config.global_mapping(config))
 
 
 def _setup_identity(
@@ -423,7 +438,7 @@ def _setup_verify_saved(paths: _config.Paths, config: _config.GlobalConfig) -> N
     """Check saved configuration while preserving completion facts on interruption."""
     try:
         _check_global_identity(paths, config)
-        _check_setup_account(config.accounts['github'], _host.authenticated_account())
+        _check_setup_account(config.accounts[_config.DEFAULT_HOST], _host.authenticated_account())
     except OperationCanceled as error:
         saved = 'configuration was saved; the saved configuration was retained'
         error.fact = f'{error.fact}; {saved}' if error.fact else saved
@@ -453,7 +468,7 @@ def _setup_save_loop(
     """Review, edit, and save one in-memory setup snapshot."""
     account_verified = False
     while True:
-        if not config.accounts['github']:
+        if not config.accounts[_config.DEFAULT_HOST]:
             config = _setup_expected_account(config)
             account_verified = True
         try:
@@ -477,7 +492,7 @@ def _setup_save_loop(
         if not account_verified:
             actual = _setup_account()
             try:
-                _check_setup_account(config.accounts['github'], actual)
+                _check_setup_account(config.accounts[_config.DEFAULT_HOST], actual)
             except PubanonError as error:
                 print(diagnostic(error))
                 output('Edit the expected account before saving.', kind='warning')
@@ -494,7 +509,7 @@ def _setup_locked(paths: _config.Paths, *, edit: bool = False) -> None:
     config, original = _read_setup(paths)
     if config is not None:
         _filesystem.chmod(paths.global_config, 0o600)
-        if not edit and config.accounts['github']:
+        if not edit and config.accounts[_config.DEFAULT_HOST]:
             _check_global_identity(paths, config)
             _setup_expected_account(config)
             print(
@@ -521,7 +536,7 @@ def _setup_locked(paths: _config.Paths, *, edit: bool = False) -> None:
         )
         terms = _setup_terms_from_scratch()
         route = _setup_route('staged')
-        config = _config.GlobalConfig(name, email, {'github': ''}, terms, route)
+        config = _config.GlobalConfig(name, email, {_config.DEFAULT_HOST: ''}, terms, route)
     initial = config
     _setup_save_loop(paths, initial, config, original)
 
@@ -539,18 +554,9 @@ def setup(*, edit: bool = False) -> None:
     try:
         _run.check_floors()
         with _config.setup_lock(paths):
-            if edit:
-                _setup_locked(paths, edit=True)
-            else:
-                _setup_locked(paths)
+            _setup_locked(paths, edit=edit)
     except OperationCanceled as error:
         if error.recovery is None or error.recovery == 'rerun pubanon setup':
-            error.recovery = (
-                'rerun pubanon setup; any completed GitHub authentication remains in effect'
-            )
-        raise
-    except PubanonError as error:
-        if str(error) == 'setup canceled':
             error.recovery = (
                 'rerun pubanon setup; any completed GitHub authentication remains in effect'
             )
@@ -565,6 +571,7 @@ def setup(*, edit: bool = False) -> None:
             'setup canceled',
             recovery='rerun pubanon setup; any completed GitHub authentication remains in effect',
         ) from None
+    # _read_setup can propagate RecursionError from tomllib.loads.
     except (OSError, RuntimeError):
         raise PubanonError(
             'cannot complete global setup', recovery='rerun pubanon setup'

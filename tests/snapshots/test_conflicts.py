@@ -196,6 +196,22 @@ def test_empty_frozen_decisions_and_unrepresentable_conflict_are_refused(tmp_pat
     assert not (tmp_path / 'rewrite').exists()
 
 
+def test_export_directory_sync_failure_reports_possible_save(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, pause = _merge(tmp_path, {'f': b'base'}, {'f': b'ours'}, {'f': b'theirs'})
+    directory = tmp_path / 'rewrite'
+
+    def _fail_directory(_path: Path) -> None:
+        raise OSError('directory sync failed')
+
+    monkeypatch.setattr(_filesystem, 'sync_directory', _fail_directory)
+    with pytest.raises(PubanonError, match='merge conflict export may have been saved'):
+        export_conflicts(store, directory, pause)
+    assert tomllib.loads((directory / 'resolutions.toml').read_text())['tree'] == pause.tree
+    assert not list(directory.glob('*.tmp'))
+
+
 def test_export_installs_flushed_manifest_through_durable_replace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -221,7 +237,7 @@ def test_export_installs_flushed_manifest_through_durable_replace(
     monkeypatch.setattr(_filesystem, 'replace', _install)
     export_conflicts(store, directory, pause)
     assert installed == [directory / 'resolutions.toml']
-    assert not (directory / 'resolutions.toml.tmp').exists()
+    assert not list(directory.glob('*.tmp'))
 
 
 @pytest.mark.parametrize(
@@ -628,7 +644,7 @@ def test_windows_resolution_preserves_frozen_executable_mode(
     def _check_directory(_path: Path) -> None:
         pass
 
-    monkeypatch.setattr(_conflicts, 'sys', SimpleNamespace(platform='win32'), raising=False)
+    monkeypatch.setattr(_conflicts, 'sys', SimpleNamespace(platform='win32'))
     monkeypatch.setattr(_windows_fs, 'check_directory', _check_directory)
     monkeypatch.setattr(_windows_fs, 'read_entry', _read_entry)
     tree, _ = read_resolutions(store, directory, pause)
@@ -664,7 +680,7 @@ def test_windows_resolution_recovers_executable_mode_from_missing_leaf_stage(
     def _read_entry(path: Path) -> tuple[int, bytes]:
         return stat.S_IFREG, path.read_bytes()
 
-    monkeypatch.setattr(_conflicts, 'sys', SimpleNamespace(platform='win32'), raising=False)
+    monkeypatch.setattr(_conflicts, 'sys', SimpleNamespace(platform='win32'))
     monkeypatch.setattr(_windows_fs, 'check_directory', _check_directory)
     monkeypatch.setattr(_windows_fs, 'read_entry', _read_entry)
     tree, _ = read_resolutions(store, directory, pause)

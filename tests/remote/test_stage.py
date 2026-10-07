@@ -24,7 +24,7 @@ from pubanon._errors import OperationCanceled, PubanonError
 from pubanon._remote import _host, _stage
 from pubanon._remote._stage import _clear_stage, _save_stage
 from pubanon._run import GitResult
-from pubanon._snapshots import _candidate, _records
+from pubanon._snapshots import _candidate, _discard, _records, _reports, _store
 from pubanon._snapshots._source import (
     PinnedSource,
     Snapshot,
@@ -36,8 +36,7 @@ from pubanon._terminal import verbose_context
 from tests._cli import gh_calls as _calls
 from tests._git import git_env
 from tests._permissions import assert_private_mode
-from tests._setup import configure
-from tests.snapshots.test_candidate import _complete_replacement
+from tests.snapshots.test_verification import _complete_replacement
 
 _CI_WORKFLOW = """on:
   workflow_dispatch:
@@ -132,6 +131,24 @@ def _git(repo: Path, *args: str) -> bytes:
     ).stdout
 
 
+def _literal_candidate(g: GlobalConfig, p: ProjectConfig) -> _candidate.CandidateRecord:
+    return _candidate.CandidateRecord(
+        commit='a' * 40,
+        tree='b' * 40,
+        snapshot_digest='c' * 64,
+        tag_intent=None,
+        fingerprint=fingerprint(g, p),
+        pinned=PinnedSource('d' * 40, 'ref', 'refs/heads/main', 'd' * 40),
+        destination=_records.RecordedDestination(
+            p.host, p.owner, p.repo, p.visibility, g.accounts[p.host]
+        ),
+        prestate_main=None,
+        prestate_tags={},
+        state=_candidate.STATE_RETAINED,
+        message='Public snapshot',
+    )
+
+
 def _new_host(tmp_path: Path) -> Path:
     host = tmp_path / 'stage.git'
     subprocess.run(['git', 'init', '--bare', '-q', host], check=True, env=git_env())
@@ -142,6 +159,37 @@ def _paths(tmp_path: Path) -> Paths:
     config_dir = tmp_path / 'config' / 'pubanon'
     data_dir = tmp_path / 'data' / 'pubanon'
     return Paths(config_dir, data_dir, config_dir / 'config.toml', data_dir / 'registry.json')
+
+
+def _delete_scenario(tmp_path: Path) -> tuple[Paths, GlobalConfig, ProjectConfig]:
+    paths = _paths(tmp_path)
+    g, p = _configs(tmp_path / 'source')
+    _save_stage(paths, p.name, _stage.StageRecord('a' * 40, p.owner, stage_repository(p)))
+    return paths, g, p
+
+
+def _integrated_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checks: tuple[str, ...],
+) -> tuple[Paths, GlobalConfig, ProjectConfig, _candidate.CandidateRecord]:
+    paths = _paths(tmp_path)
+    g, configured = _configs(tmp_path / 'source')
+    p = replace(
+        configured, ci_workflow='ci.yml', publication_route='staged', required_checks=checks
+    )
+    candidate = _literal_candidate(g, p)
+    _save_stage(paths, p.name, _stage.StageRecord(candidate.commit, p.owner, stage_repository(p)))
+
+    def _read_candidate(_paths: Paths, _project: str) -> _candidate.CandidateRecord:
+        return candidate
+
+    def _refs(_dest: _host.Destination) -> _host.RemoteRefs:
+        return _host.RemoteRefs(candidate.commit, {})
+
+    monkeypatch.setattr(_stage, 'load_candidate', _read_candidate)
+    monkeypatch.setattr(_host, 'read_remote_refs', _refs)
+    return paths, g, p, candidate
 
 
 def _status_responses(
@@ -256,8 +304,8 @@ def test_added_sensitive_term_matching_candidate_refuses_stale_candidate_locally
         transport_calls.append('push')
         return GitResult(0, b'', b'')
 
-    monkeypatch.setattr(_stage, 'read_remote_refs', _record_refs)
-    monkeypatch.setattr(_stage, 'push', _record_push)
+    monkeypatch.setattr(_host, 'read_remote_refs', _record_refs)
+    monkeypatch.setattr(_host, 'push', _record_push)
 
     with pytest.raises(PubanonError, match='configuration changed') as exc_info:
         _stage.stage_push(paths, changed_config, project, yes=True)
@@ -265,19 +313,16 @@ def test_added_sensitive_term_matching_candidate_refuses_stale_candidate_locally
     assert exc_info.value.recovery == 'pubanon discard, then pubanon prepare'
     assert _calls(tmp_path) == []
     assert transport_calls == []
-    assert _candidate.load_candidate(paths, project.name) == record
+    assert _records.load_candidate(paths, project.name) == record
 
 
 def test_candidate_next_action_prioritizes_snapshot_recovery_and_missing_candidate(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = make_repo(files={'README.md': 'public\n'})
-    paths, g, configured = configure(tmp_path, monkeypatch, source)
-    assert configured is not None
+    paths = _paths(tmp_path)
+    g, configured = _configs(tmp_path / 'source')
     p = replace(configured, publication_route='staged')
-    record = _build_candidate(paths, g, p)
+    record = _literal_candidate(g, p)
     assert _stage.candidate_next_action(paths, g, p, None) == 'pubanon prepare'
     assert (
         _stage.candidate_next_action(
@@ -287,7 +332,7 @@ def test_candidate_next_action_prioritizes_snapshot_recovery_and_missing_candida
     )
     changed = replace(p, extra_terms=('new-sensitive-term',))
     assert _stage.candidate_next_action(paths, g, changed, record) == (
-        _candidate.inspect_next_action(record, g, changed)
+        _reports.inspect_next_action(record, g, changed)
     )
 
 
@@ -348,8 +393,8 @@ def test_candidate_next_action_uses_local_route_and_exact_checked_tip(
     def _unexpected_host(*_args: object, **_kwargs: object) -> Never:
         pytest.fail('network read')
 
-    monkeypatch.setattr(_stage, 'repository_facts', _unexpected_host)
-    monkeypatch.setattr(_stage, 'read_remote_refs', _unexpected_host)
+    monkeypatch.setattr(_host, 'repository_facts', _unexpected_host)
+    monkeypatch.setattr(_host, 'read_remote_refs', _unexpected_host)
 
     assert (
         _stage.candidate_next_action(
@@ -574,12 +619,19 @@ def _prepare_stage(
 
 
 def test_candidate_next_action_uses_replacement_resulting_tip(tmp_path: Path) -> None:
-    paths, g, configured, record = _complete_replacement(tmp_path, stage=True)
+    paths = _paths(tmp_path)
+    g, configured = _configs(tmp_path / 'source')
+    p = replace(configured, publication_route='staged', required_checks=('build',))
+    record = replace(
+        _literal_candidate(g, p),
+        replaces='e' * 40,
+        replace_scope='all',
+        tip='f' * 40,
+        poststate_tags={},
+    )
     tip = record.tip
     assert tip is not None
     assert tip != record.commit
-    p = replace(configured, publication_route='staged', required_checks=('build',))
-    record = replace(record, fingerprint=_candidate.fingerprint(g, p))
     _save_stage(
         paths,
         p.name,
@@ -598,6 +650,18 @@ def test_candidate_next_action_uses_replacement_resulting_tip(tmp_path: Path) ->
     )
 
 
+def test_candidate_next_action_watches_integrated_project_without_required_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, g, p, candidate = _integrated_status(tmp_path, monkeypatch, ())
+    assert _stage.candidate_next_action(paths, g, p, candidate) == 'pubanon stage watch'
+    assert (
+        _stage.candidate_next_action(paths, g, p, candidate, checked_commit=candidate.commit)
+        == 'pubanon publish'
+    )
+
+
 @pytest.mark.parametrize(
     ('candidate_state', 'error'),
     [
@@ -611,7 +675,9 @@ def test_candidate_state_refuses_before_host_access_with_named_recovery(
     tmp_path: Path,
     make_repo: Callable[..., Path],
 ) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
+    source = tmp_path / 'source'
+    if candidate_state == 'unknown':
+        source = make_repo(files={'README.md': 'first\n'})
     paths = _paths(tmp_path)
     global_config, project = _configs(source)
     if candidate_state == 'unknown':
@@ -701,14 +767,14 @@ def test_creation_failure_after_not_visible_retains_candidate_and_stage_evidence
     )
 
     def _approve(_prompt: str) -> str:
-        return 'yes'
+        return 'y'
 
     monkeypatch.setattr('builtins.input', _approve)
 
     with pytest.raises(PubanonError, match='repository already exists'):
         _stage.stage_push(paths, global_config, project, yes=True)
 
-    assert _candidate.load_candidate(paths, project.name) == candidate
+    assert _records.load_candidate(paths, project.name) == candidate
     assert _stage.load_stage(paths, project.name) == stage
     assert create_args in _calls(tmp_path)
 
@@ -732,7 +798,7 @@ def test_delete_readback_cancellation_preserves_record(
             raise OperationCanceled('operator interrupted deletion read-back')
         return True
 
-    monkeypatch.setattr(_stage, 'repository_visible', _visible)
+    monkeypatch.setattr(_host, 'repository_visible', _visible)
 
     with pytest.raises(OperationCanceled, match='operator interrupted deletion read-back'):
         _stage.stage_delete(paths, global_config, project, yes=True)
@@ -759,8 +825,8 @@ def test_failed_readback_does_not_write_stage_record(
     def _successful_push(*_args: object) -> GitResult:
         return GitResult(0, b'', b'')
 
-    monkeypatch.setattr(_stage, 'read_remote_refs', _staged_refs)
-    monkeypatch.setattr(_stage, 'push', _successful_push)
+    monkeypatch.setattr(_host, 'read_remote_refs', _staged_refs)
+    monkeypatch.setattr(_host, 'push', _successful_push)
 
     with pytest.raises(PubanonError, match='read-back') as exc_info:
         _stage.stage_push(paths, global_config, project, yes=True)
@@ -831,8 +897,8 @@ def test_post_push_ref_read_failure_names_repair_and_preserves_records(
     def _successful_push(*_args: object) -> GitResult:
         return GitResult(0, b'', b'')
 
-    monkeypatch.setattr(_stage, 'read_remote_refs', _staged_refs)
-    monkeypatch.setattr(_stage, 'push', _successful_push)
+    monkeypatch.setattr(_host, 'read_remote_refs', _staged_refs)
+    monkeypatch.setattr(_host, 'push', _successful_push)
 
     with pytest.raises(PubanonError, match='staging push read-back') as exc_info:
         _stage.stage_push(paths, global_config, project, yes=True)
@@ -840,7 +906,7 @@ def test_post_push_ref_read_failure_names_repair_and_preserves_records(
     assert exc_info.value.recovery == 'pubanon stage repair'
     assert canary in exc_info.value.render()
     assert exc_info.value.fact == f'error: {canary}'
-    assert _candidate.load_candidate(paths, project.name) == record
+    assert _records.load_candidate(paths, project.name) == record
     assert _stage.load_stage(paths, project.name) == old_stage
 
 
@@ -909,8 +975,8 @@ def test_publication_coordinate_drift_refuses_stale_candidate_locally(
         transport_calls.append('push')
         return GitResult(0, b'', b'')
 
-    monkeypatch.setattr(_stage, 'read_remote_refs', _record_refs)
-    monkeypatch.setattr(_stage, 'push', _record_push)
+    monkeypatch.setattr(_host, 'read_remote_refs', _record_refs)
+    monkeypatch.setattr(_host, 'push', _record_push)
 
     with pytest.raises(PubanonError, match='configuration changed') as exc_info:
         _stage.stage_push(paths, global_config, changed_project, yes=True)
@@ -918,7 +984,7 @@ def test_publication_coordinate_drift_refuses_stale_candidate_locally(
     assert exc_info.value.recovery == 'pubanon discard, then pubanon prepare'
     assert _calls(tmp_path) == []
     assert transport_calls == []
-    assert _candidate.load_candidate(paths, project.name) == record
+    assert _records.load_candidate(paths, project.name) == record
 
 
 def test_publication_owner_drift_refuses_before_host_access(
@@ -953,7 +1019,7 @@ def test_repair_unreadable_tracking_stops_before_host_access(
     def _unexpected(*_args: object, **_kwargs: object) -> Never:
         pytest.fail('repair ignored unreadable tracking')
 
-    monkeypatch.setattr(_stage, 'require_authenticated_account', _unexpected)
+    monkeypatch.setattr(_host, 'require_authenticated_account', _unexpected)
     with pytest.raises(PubanonError, match='cannot read stage record'):
         _stage.stage_repair(paths, global_config, project, yes=True)
     assert path.is_dir()
@@ -1033,7 +1099,7 @@ def test_save_stage_replacement_failure_preserves_previous_bytes(
     with pytest.raises(PubanonError, match='cannot save stage record'):
         _save_stage(paths, 'example', _stage.StageRecord('b' * 40, 'stage-owner', 'staging-repo'))
     assert stage_path.read_bytes() == previous
-    assert list(stage_path.parent.glob('stage.toml.tmp*')) == []
+    assert list(stage_path.parent.glob('.pubanon-write-*.tmp')) == []
 
 
 def test_save_stage_temporary_sync_failure_preserves_previous_bytes(
@@ -1053,7 +1119,7 @@ def test_save_stage_temporary_sync_failure_preserves_previous_bytes(
     with pytest.raises(PubanonError, match='cannot save stage record'):
         _save_stage(paths, 'example', _stage.StageRecord('b' * 40, 'stage-owner', 'staging-repo'))
     assert stage_path.read_bytes() == previous
-    assert list(stage_path.parent.glob('stage.toml.tmp*')) == []
+    assert list(stage_path.parent.glob('.pubanon-write-*.tmp')) == []
 
 
 def test_save_stage_valid_replacement_makes_no_backup(tmp_path: Path) -> None:
@@ -1112,7 +1178,7 @@ def test_stage_create_settings_failure_stops_before_push(
     monkeypatch.setattr(_host, '_URL_TEMPLATE', host.as_uri())
 
     def _approve(_prompt: str) -> str:
-        return 'yes'
+        return 'y'
 
     monkeypatch.setattr('builtins.input', _approve)
 
@@ -1129,13 +1195,13 @@ def test_stage_create_settings_failure_stops_before_push(
     assert error.value.actual is None
     if failure == 'mismatch':
         assert 'settings do not match' in str(error.value)
-        assert 'pull_requests: declared false, observed true' in (error.value.fact or '')
+        assert 'pull_requests: expected false; actual true' in (error.value.fact or '')
     else:
         assert 'could not be verified' in str(error.value)
         assert 'settings transport failed' in (error.value.fact or '')
         assert 'observed' not in (error.value.fact or '')
     assert _git(host, 'for-each-ref') == b''
-    assert _candidate.load_candidate(paths, project.name) == candidate
+    assert _records.load_candidate(paths, project.name) == candidate
     assert _stage.load_stage(paths, project.name) is None
 
 
@@ -1157,7 +1223,7 @@ def test_first_use_creation_decline_leaves_host_refs_empty(
 
     def _decline(_prompt: str) -> str:
         assert _git(host, 'for-each-ref') == b''
-        return 'no'
+        return 'n'
 
     monkeypatch.setattr('builtins.input', _decline)
 
@@ -1170,16 +1236,11 @@ def test_first_use_creation_decline_leaves_host_refs_empty(
 def test_stage_delete_authorization_failure_keeps_record_and_names_possible_cause(
     tmp_path: Path,
     fake_gh: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _host_path, paths, global_config, project, _record = _prepare_stage(
-        tmp_path, fake_gh, make_repo, monkeypatch
-    )
+    paths, global_config, project = _delete_scenario(tmp_path)
     assert project._stage_repo is not None
     stage = _stage.load_stage(paths, project.name)
     assert stage is not None
-    (tmp_path / 'fake-gh-calls.jsonl').unlink()
     _clean_responses(
         fake_gh,
         (project.owner, project._stage_repo),
@@ -1201,10 +1262,9 @@ def test_stage_delete_authorization_failure_keeps_record_and_names_possible_caus
 def test_stage_delete_does_not_gate_extra_branches_or_tags(
     tmp_path: Path,
     fake_gh: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
+    source = tmp_path / 'source'
     paths = _paths(tmp_path)
     global_config, project = _configs(source)
     assert project._stage_repo is not None
@@ -1213,17 +1273,16 @@ def test_stage_delete_does_not_gate_extra_branches_or_tags(
     def _unexpected_refs(*_args: object, **_kwargs: object) -> Never:
         pytest.fail('explicit whole-repository deletion checked branch or tag inventory')
 
-    monkeypatch.setattr(_stage, 'read_remote_refs', _unexpected_refs)
+    monkeypatch.setattr(_host, 'read_remote_refs', _unexpected_refs)
     _stage.stage_delete(paths, global_config, project, yes=True)
     assert any('DELETE' in call for call in _calls(tmp_path))
 
 
 def test_stage_delete_failed_readback_preserves_tracking(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
+    source = tmp_path / 'source'
     paths = _paths(tmp_path)
     global_config, project = _configs(source)
     record = _stage.StageRecord('a' * 40, project.owner, 'staging-repo')
@@ -1249,10 +1308,10 @@ def test_stage_delete_failed_readback_preserves_tracking(
     def _delete(_owner: str, _repo: str) -> None:
         pass
 
-    monkeypatch.setattr(_stage, 'require_authenticated_account', _require_account)
-    monkeypatch.setattr(_stage, 'repository_visible', _visible)
+    monkeypatch.setattr(_host, 'require_authenticated_account', _require_account)
+    monkeypatch.setattr(_host, 'repository_visible', _visible)
     monkeypatch.setattr(_stage, '_verify_stage_facts', _verify_facts)
-    monkeypatch.setattr(_stage, 'delete_repository', _delete)
+    monkeypatch.setattr(_host, 'delete_repository', _delete)
 
     with pytest.raises(PubanonError, match='cannot verify staging deletion') as exc_info:
         _stage.stage_delete(paths, global_config, project, yes=True)
@@ -1263,9 +1322,8 @@ def test_stage_delete_failed_readback_preserves_tracking(
 def test_stage_delete_malformed_record_keeps_bytes_when_delete_fails(
     tmp_path: Path,
     fake_gh: Path,
-    make_repo: Callable[..., Path],
 ) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
+    source = tmp_path / 'source'
     paths = _paths(tmp_path)
     global_config, project = _configs(source)
     assert project._stage_repo is not None
@@ -1282,11 +1340,10 @@ def test_stage_delete_malformed_record_keeps_bytes_when_delete_fails(
 def test_stage_delete_malformed_record_uses_verified_configured_destination(
     tmp_path: Path,
     fake_gh: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
+    source = tmp_path / 'source'
     paths = _paths(tmp_path)
     global_config, project = _configs(source)
     assert project._stage_repo is not None
@@ -1297,7 +1354,7 @@ def test_stage_delete_malformed_record_uses_verified_configured_destination(
 
     def _confirm(_prompt: str) -> str:
         assert stage_path.read_bytes() == b'\xffbad coordinate bytes'
-        return 'yes'
+        return 'y'
 
     monkeypatch.setattr('builtins.input', _confirm)
     _stage.stage_delete(paths, global_config, project, yes=False)
@@ -1312,11 +1369,10 @@ def test_stage_delete_malformed_record_uses_verified_configured_destination(
 def test_stage_delete_no_record_and_not_visible_preserves_host_uncertainty(
     tmp_path: Path,
     fake_gh: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
+    source = tmp_path / 'source'
     paths = _paths(tmp_path)
     global_config, project = _configs(source)
     assert project._stage_repo is not None
@@ -1339,11 +1395,10 @@ def test_stage_delete_no_record_and_not_visible_preserves_host_uncertainty(
 def test_stage_delete_no_record_previews_configured_fallback_before_deletion(
     tmp_path: Path,
     fake_gh: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    source = make_repo(files={'README.md': 'public\n'})
+    source = tmp_path / 'source'
     paths = _paths(tmp_path)
     global_config, project = _configs(source)
     assert project._stage_repo is not None
@@ -1354,7 +1409,7 @@ def test_stage_delete_no_record_previews_configured_fallback_before_deletion(
         assert f'{project.owner}/{project._stage_repo}' in preview
         assert 'Delete staging repository' in preview
         assert not any('DELETE' in call for call in _calls(tmp_path))
-        return 'yes'
+        return 'y'
 
     monkeypatch.setattr('builtins.input', _approve)
     _stage.stage_delete(paths, global_config, project, yes=False)
@@ -1367,10 +1422,9 @@ def test_stage_delete_no_record_previews_configured_fallback_before_deletion(
 
 def test_stage_delete_propagates_unrelated_pubanon_error_with_invalid_record_message(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
+    source = tmp_path / 'source'
     paths = _paths(tmp_path)
     global_config, project = _configs(source)
     stage = _stage.StageRecord('a' * 40, project.owner, 'staging-repo')
@@ -1395,10 +1449,9 @@ def test_stage_delete_propagates_unrelated_pubanon_error_with_invalid_record_mes
 
 def test_stage_delete_refuses_configured_final_repository_alias_before_host_access(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
+    source = tmp_path / 'source'
     paths = _paths(tmp_path)
     global_config, project = _configs(source)
     project = replace(project, _stage_repo=project.repo.upper())
@@ -1406,17 +1459,16 @@ def test_stage_delete_refuses_configured_final_repository_alias_before_host_acce
     def _unexpected(*_args: object, **_kwargs: object) -> Never:
         pytest.fail('final repository alias reached the host')
 
-    monkeypatch.setattr(_stage, 'require_authenticated_account', _unexpected)
+    monkeypatch.setattr(_host, 'require_authenticated_account', _unexpected)
     with pytest.raises(PubanonError, match='staging repository must differ'):
         _stage.stage_delete(paths, global_config, project, yes=True)
 
 
 def test_stage_delete_routes_account_requirement_with_staging_authority(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = make_repo()
+    source = tmp_path / 'source'
     paths = _paths(tmp_path)
     global_config, project = _configs(source)
     requirements: list[tuple[str, str]] = []
@@ -1428,8 +1480,8 @@ def test_stage_delete_routes_account_requirement_with_staging_authority(
     def _repository_visible(_owner: str, _repo: str) -> bool:
         return False
 
-    monkeypatch.setattr(_stage, 'require_authenticated_account', _require_account)
-    monkeypatch.setattr(_stage, 'repository_visible', _repository_visible)
+    monkeypatch.setattr(_host, 'require_authenticated_account', _require_account)
+    monkeypatch.setattr(_host, 'repository_visible', _repository_visible)
 
     with pytest.raises(PubanonError, match='absent or inaccessible before deletion'):
         _stage.stage_delete(paths, global_config, project, yes=True)
@@ -1439,10 +1491,9 @@ def test_stage_delete_routes_account_requirement_with_staging_authority(
 
 def test_stage_destination_reports_gate_term_and_coordinate_field(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
 ) -> None:
     term = 'hygiene-canary'
-    source = make_repo(files={'README.md': 'first\n'})
+    source = tmp_path / 'source'
     paths = _paths(tmp_path)
     global_config, project = _configs(source)
     project = replace(
@@ -1492,7 +1543,7 @@ def test_stage_push_decline_keeps_created_repository_and_snapshot(
     if not existing:
         assert 'repository was created and is kept' in (error.value.fact or '')
     assert _git(host, 'for-each-ref') == b''
-    assert _candidate.load_candidate(paths, project.name) == candidate
+    assert _records.load_candidate(paths, project.name) == candidate
     assert _stage.load_stage(paths, project.name) is None
 
 
@@ -1515,7 +1566,7 @@ def test_first_use_creation_requires_interactive_yes_then_reads_facts_and_pushes
 
     def _approve(prompt: str) -> str:
         prompts.append(prompt)
-        return 'yes'
+        return 'y'
 
     monkeypatch.setattr('builtins.input', _approve)
 
@@ -1627,7 +1678,7 @@ def test_nonprivate_or_redirected_stage_repository_refuses_before_push(
     def _unexpected_push(*_args: object, **_kwargs: object) -> GitResult:
         pytest.fail('unverified staging facts reached push')
 
-    monkeypatch.setattr(_stage, 'push', _unexpected_push)
+    monkeypatch.setattr(_host, 'push', _unexpected_push)
 
     with pytest.raises(PubanonError, match='staging repository facts') as exc_info:
         _stage.stage_push(paths, global_config, project, yes=True)
@@ -1645,7 +1696,7 @@ def test_replacement_push_uses_observed_lease_and_candidate_only_refspec(
     _host_path, paths, global_config, project, first = _prepare_stage(
         tmp_path, fake_gh, make_repo, monkeypatch
     )
-    _candidate.discard(paths, project.name, force=True)
+    _discard.discard(paths, project.name, force=True)
     (project.source_path / 'README.md').write_text('second\n')
     _git(project.source_path, 'add', 'README.md')
     _git(
@@ -1660,7 +1711,7 @@ def test_replacement_push_uses_observed_lease_and_candidate_only_refspec(
     )
     second = _build_candidate(paths, global_config, project)
     pushed: list[list[str]] = []
-    real_push = _stage.push
+    real_push = _host.push
 
     def _record_push(
         dest: _host.Destination,
@@ -1670,7 +1721,7 @@ def test_replacement_push_uses_observed_lease_and_candidate_only_refspec(
         pushed.append(list(args))
         return real_push(dest, cwd, args)
 
-    monkeypatch.setattr(_stage, 'push', _record_push)
+    monkeypatch.setattr(_host, 'push', _record_push)
 
     _stage.stage_push(paths, global_config, project, yes=True)
 
@@ -1695,7 +1746,7 @@ def test_replacement_stages_resulting_tip_with_distinct_tree(
     paths, global_config, project, candidate = _complete_replacement(tmp_path, stage=True)
     assert candidate.tip is not None
     assert candidate.tip != candidate.commit
-    store = _candidate.store_path(paths, project.name)
+    store = _store.store_path(paths, project.name)
     correction_tree = _git(store, 'rev-parse', f'{candidate.commit}^{{tree}}').strip()
     tip_tree = _git(store, 'rev-parse', f'{candidate.tip}^{{tree}}').strip()
     assert correction_tree != tip_tree
@@ -1715,20 +1766,16 @@ def test_replacement_stages_resulting_tip_with_distinct_tree(
 def test_stage_delete_declined_confirmation_keeps_repository_and_record(
     tmp_path: Path,
     fake_gh: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _host_path, paths, global_config, project, _record = _prepare_stage(
-        tmp_path, fake_gh, make_repo, monkeypatch
-    )
+    paths, global_config, project = _delete_scenario(tmp_path)
     assert project._stage_repo is not None
     stage = _stage.load_stage(paths, project.name)
-    (tmp_path / 'fake-gh-calls.jsonl').unlink()
     _clean_responses(fake_gh, (project.owner, project._stage_repo))
 
     def _decline(prompt: str) -> str:
         assert prompt == 'Delete the staging repository stage-owner/staging-repo? [y/n] '
-        return 'no'
+        return 'n'
 
     monkeypatch.setattr('builtins.input', _decline)
 
@@ -1743,15 +1790,10 @@ def test_stage_delete_declined_confirmation_keeps_repository_and_record(
 def test_stage_delete_deletes_private_repository_verifies_absence_and_clears_record(
     tmp_path: Path,
     fake_gh: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _host_path, paths, global_config, project, _record = _prepare_stage(
-        tmp_path, fake_gh, make_repo, monkeypatch
-    )
+    paths, global_config, project = _delete_scenario(tmp_path)
     assert project._stage_repo is not None
-    (tmp_path / 'fake-gh-calls.jsonl').unlink()
     _clean_responses(fake_gh, (project.owner, project._stage_repo))
     capsys.readouterr()
 
@@ -1786,15 +1828,10 @@ def test_stage_delete_deletes_private_repository_verifies_absence_and_clears_rec
 def test_stage_delete_incomplete_deletion_keeps_record_with_rerun_recovery(
     tmp_path: Path,
     fake_gh: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _host_path, paths, global_config, project, _record = _prepare_stage(
-        tmp_path, fake_gh, make_repo, monkeypatch
-    )
+    paths, global_config, project = _delete_scenario(tmp_path)
     assert project._stage_repo is not None
     stage = _stage.load_stage(paths, project.name)
-    (tmp_path / 'fake-gh-calls.jsonl').unlink()
     _clean_responses(
         fake_gh,
         (project.owner, project._stage_repo),
@@ -1812,15 +1849,10 @@ def test_stage_delete_incomplete_deletion_keeps_record_with_rerun_recovery(
 def test_stage_delete_refuses_public_repository_without_deleting(
     tmp_path: Path,
     fake_gh: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _host_path, paths, global_config, project, _record = _prepare_stage(
-        tmp_path, fake_gh, make_repo, monkeypatch
-    )
+    paths, global_config, project = _delete_scenario(tmp_path)
     assert project._stage_repo is not None
     stage = _stage.load_stage(paths, project.name)
-    (tmp_path / 'fake-gh-calls.jsonl').unlink()
     _clean_responses(
         fake_gh,
         (project.owner, project._stage_repo),
@@ -1839,14 +1871,10 @@ def test_stage_delete_refuses_public_repository_without_deleting(
 def test_stage_delete_yes_skips_confirmation(
     tmp_path: Path,
     fake_gh: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _host_path, paths, global_config, project, _record = _prepare_stage(
-        tmp_path, fake_gh, make_repo, monkeypatch
-    )
+    paths, global_config, project = _delete_scenario(tmp_path)
     assert project._stage_repo is not None
-    (tmp_path / 'fake-gh-calls.jsonl').unlink()
     _clean_responses(fake_gh, (project.owner, project._stage_repo))
 
     def _unexpected_prompt(_prompt: str) -> str:
@@ -1891,14 +1919,14 @@ def test_stage_forget_only_removes_local_tracking(
     def _unexpected(*_args: object, **_kwargs: object) -> Never:
         pytest.fail('forget accessed the host')
 
-    monkeypatch.setattr(_stage, 'require_authenticated_account', _unexpected)
-    monkeypatch.setattr(_stage, 'repository_visible', _unexpected)
-    monkeypatch.setattr(_stage, 'delete_repository', _unexpected)
-    _stage.stage_forget(paths, global_config, project, yes=True)
+    monkeypatch.setattr(_host, 'require_authenticated_account', _unexpected)
+    monkeypatch.setattr(_host, 'repository_visible', _unexpected)
+    monkeypatch.setattr(_host, 'delete_repository', _unexpected)
+    _stage.stage_forget(paths, project, yes=True)
 
     assert not stage_path.exists()
     assert sentinel.read_bytes() == b'unchanged'
-    assert _candidate.load_candidate(paths, project.name) == candidate
+    assert _records.load_candidate(paths, project.name) == candidate
     assert _git(source, 'count-objects', '-v') == git_objects_before
     assert (global_config, project) == config_before
     assert _calls(tmp_path) == []
@@ -1911,16 +1939,15 @@ def test_stage_forget_only_removes_local_tracking(
         assert 'pubanon init --publication-route direct' in output
 
 
-@pytest.mark.parametrize('answer', ['no', 'yes'])
+@pytest.mark.parametrize('answer', ['n', 'y'])
 def test_stage_forget_confirmation_controls_tracking_removal(
     answer: str,
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
+    source = tmp_path / 'source'
     paths = _paths(tmp_path)
-    global_config, project = _configs(source)
+    _global_config, project = _configs(source)
     record = _stage.StageRecord('a' * 40, project.owner, 'staging-repo')
     _save_stage(paths, project.name, record)
 
@@ -1929,12 +1956,12 @@ def test_stage_forget_confirmation_controls_tracking_removal(
 
     monkeypatch.setattr('builtins.input', _respond)
 
-    if answer == 'no':
+    if answer == 'n':
         with pytest.raises(OperationCanceled, match=r'Canceled\. Nothing was removed.'):
-            _stage.stage_forget(paths, global_config, project, yes=False)
+            _stage.stage_forget(paths, project, yes=False)
         assert _stage.load_stage(paths, project.name) == record
     else:
-        _stage.stage_forget(paths, global_config, project, yes=False)
+        _stage.stage_forget(paths, project, yes=False)
         assert _stage.load_stage(paths, project.name) is None
     assert _calls(tmp_path) == []
 
@@ -1945,10 +1972,9 @@ def test_stage_delete_refuses_recorded_final_destination_before_host_access(
     yes: bool,
     case_only: bool,
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
+    source = tmp_path / 'source'
     paths = _paths(tmp_path)
     global_config, project = _configs(source)
     stage = _stage.StageRecord('a' * 40, project.owner, 'staging-repo')
@@ -1966,10 +1992,10 @@ def test_stage_delete_refuses_recorded_final_destination_before_host_access(
         pytest.fail('final staging cleanup target reached confirmation or host access')
 
     monkeypatch.setattr('builtins.input', _unexpected)
-    monkeypatch.setattr(_stage, 'require_authenticated_account', _unexpected)
-    monkeypatch.setattr(_stage, 'repository_visible', _unexpected)
-    monkeypatch.setattr(_stage, 'repository_facts', _unexpected)
-    monkeypatch.setattr(_stage, 'delete_repository', _unexpected)
+    monkeypatch.setattr(_host, 'require_authenticated_account', _unexpected)
+    monkeypatch.setattr(_host, 'repository_visible', _unexpected)
+    monkeypatch.setattr(_host, 'repository_facts', _unexpected)
+    monkeypatch.setattr(_host, 'delete_repository', _unexpected)
 
     with pytest.raises(
         PubanonError,
@@ -2010,12 +2036,12 @@ def test_stage_push_reproves_dynamic_candidate_gates_before_every_host_access(
     def _unexpected_host(*_args: object, **_kwargs: object) -> Never:
         pytest.fail('host access occurred before retained-candidate proof')
 
-    monkeypatch.setattr(_stage, 'require_authenticated_account', _unexpected_host)
-    monkeypatch.setattr(_stage, 'create_repository', _unexpected_host)
-    monkeypatch.setattr(_stage, 'repository_facts', _unexpected_host)
-    monkeypatch.setattr(_stage, 'repository_visible', _unexpected_host)
-    monkeypatch.setattr(_stage, 'read_remote_refs', _unexpected_host)
-    monkeypatch.setattr(_stage, 'push', _unexpected_host)
+    monkeypatch.setattr(_host, 'require_authenticated_account', _unexpected_host)
+    monkeypatch.setattr(_host, 'create_repository', _unexpected_host)
+    monkeypatch.setattr(_host, 'repository_facts', _unexpected_host)
+    monkeypatch.setattr(_host, 'repository_visible', _unexpected_host)
+    monkeypatch.setattr(_host, 'read_remote_refs', _unexpected_host)
+    monkeypatch.setattr(_host, 'push', _unexpected_host)
 
     with pytest.raises(
         PubanonError, match='the snapshot did not pass current content checks'
@@ -2023,7 +2049,7 @@ def test_stage_push_reproves_dynamic_candidate_gates_before_every_host_access(
         _stage.stage_push(paths, global_config, project, yes=True)
 
     assert exc_info.value.recovery == 'pubanon discard, then pubanon prepare'
-    assert _candidate.load_candidate(paths, project.name) == candidate
+    assert _records.load_candidate(paths, project.name) == candidate
     assert _stage.load_stage(paths, project.name) == stage
 
 
@@ -2051,7 +2077,7 @@ def test_stage_push_routes_account_requirement_after_retained_proof(
         raise PubanonError('account authority observed')
 
     monkeypatch.setattr(_stage, 'verify_retained_candidate', _verify_candidate)
-    monkeypatch.setattr(_stage, 'require_authenticated_account', _require_account)
+    monkeypatch.setattr(_host, 'require_authenticated_account', _require_account)
 
     with pytest.raises(PubanonError, match='account authority observed'):
         _stage.stage_push(paths, global_config, project, yes=True)
@@ -2097,8 +2123,8 @@ def test_stage_record_failure_names_repair_and_preserves_records(
     def _successful_push(*_args: object) -> GitResult:
         return GitResult(0, b'', b'')
 
-    monkeypatch.setattr(_stage, 'read_remote_refs', _staged_refs)
-    monkeypatch.setattr(_stage, 'push', _successful_push)
+    monkeypatch.setattr(_host, 'read_remote_refs', _staged_refs)
+    monkeypatch.setattr(_host, 'push', _successful_push)
     monkeypatch.setattr(_stage, '_save_stage', _fail_save)
 
     with pytest.raises(PubanonError, match='cannot confirm staging push recording') as exc_info:
@@ -2106,7 +2132,7 @@ def test_stage_record_failure_names_repair_and_preserves_records(
 
     assert exc_info.value.recovery == 'pubanon stage repair'
     assert canary in exc_info.value.render()
-    assert _candidate.load_candidate(paths, project.name) == record
+    assert _records.load_candidate(paths, project.name) == record
     assert _stage.load_stage(paths, project.name) == old_stage
 
 
@@ -2135,10 +2161,9 @@ def test_stage_record_refuses_unsafe_recorded_host_segments(
 
 def test_stage_status_gates_current_coordinates_before_host_access(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
 ) -> None:
     term = 'private-stage'
-    source = make_repo(files={'README.md': 'first\n'})
+    source = tmp_path / 'source'
     paths = _paths(tmp_path)
     global_config, project = _configs(source)
     project = replace(
@@ -2317,10 +2342,9 @@ def test_stage_status_refuses_every_non_success_check_state(
 
 def test_stage_status_routes_account_requirement_with_staging_authority(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
+    source = tmp_path / 'source'
     paths = _paths(tmp_path)
     global_config, project = _configs(source)
     project = replace(project, required_checks=('CI',))
@@ -2330,14 +2354,13 @@ def test_stage_status_routes_account_requirement_with_staging_authority(
         project.name,
         _stage.StageRecord('a' * 40, project.owner, project._stage_repo),
     )
-    _candidate.store_path(paths, project.name)
     requirements: list[tuple[str, str]] = []
 
     def _require_account(expected: str, *, authority: str) -> str:
         requirements.append((expected, authority))
         raise PubanonError('account authority observed')
 
-    monkeypatch.setattr(_stage, 'require_authenticated_account', _require_account)
+    monkeypatch.setattr(_host, 'require_authenticated_account', _require_account)
 
     with pytest.raises(PubanonError, match='account authority observed'):
         _stage.stage_status(paths, global_config, project)
@@ -2386,7 +2409,7 @@ def test_unexpected_remote_ref_refuses_before_push(
         host,
         'fetch',
         '-q',
-        _candidate.store_path(paths, project.name).as_posix(),
+        _store.store_path(paths, project.name).as_posix(),
         f'{record.commit}:refs/heads/other',
     )
     _host_responses(fake_gh, project)
@@ -2395,7 +2418,7 @@ def test_unexpected_remote_ref_refuses_before_push(
     def _unexpected_push(*_args: object, **_kwargs: object) -> GitResult:
         pytest.fail('unexpected staging ref reached push')
 
-    monkeypatch.setattr(_stage, 'push', _unexpected_push)
+    monkeypatch.setattr(_host, 'push', _unexpected_push)
 
     with pytest.raises(PubanonError, match='unexpected staging reference') as exc_info:
         _stage.stage_push(paths, global_config, project, yes=True)
@@ -2438,15 +2461,14 @@ def test_verify_stage_facts_preserves_staging_recovery_on_404(fake_gh: Path) -> 
 
 def test_verify_staged_target_propagates_timeout_to_ordered_host_reads(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
+    source = tmp_path / 'source'
     paths = _paths(tmp_path)
     global_config, project = _configs(source)
     record = _stage.StageRecord('a' * 40, project.owner, 'staging-repo')
     _save_stage(paths, project.name, record)
-    _candidate.store_path(paths, project.name)
+    _store.candidate_store_path(paths, project.name).mkdir(parents=True)
     destination = _host.Destination(
         adapter='github',
         owner=project.owner,
@@ -2494,9 +2516,9 @@ def test_verify_staged_target_propagates_timeout_to_ordered_host_reads(
         calls.append(('refs', timeout))
         return _host.RemoteRefs(record.commit, {}, ())
 
-    monkeypatch.setattr(_stage, 'require_authenticated_account', _require_account)
+    monkeypatch.setattr(_host, 'require_authenticated_account', _require_account)
     monkeypatch.setattr(_stage, '_verify_stage_facts', _verify_facts)
-    monkeypatch.setattr(_stage, 'read_remote_refs', _refs)
+    monkeypatch.setattr(_host, 'read_remote_refs', _refs)
 
     def _settings(owner: str, repo: str, *, timeout: float | None = None) -> _host.SettingsFacts:
         assert (owner, repo) == (destination.owner, destination.repo)
@@ -2511,7 +2533,7 @@ def test_verify_staged_target_propagates_timeout_to_ordered_host_reads(
             discussions=False,
         )
 
-    monkeypatch.setattr(_stage, 'repository_settings', _settings)
+    monkeypatch.setattr(_host, 'repository_settings', _settings)
     times = iter([0.0, 0.0, 1.0, 2.0, 3.0])
     monkeypatch.setattr(_stage, '_monotonic', lambda: next(times))
 
@@ -2527,14 +2549,8 @@ def test_verify_staged_target_propagates_timeout_to_ordered_host_reads(
 def test_verify_staged_target_refuses_coordinate_drift_before_host_access(
     drift: str,
     tmp_path: Path,
-    fake_gh: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _host_path, paths, global_config, project, _record = _prepare_stage(
-        tmp_path, fake_gh, make_repo, monkeypatch
-    )
-    (tmp_path / 'fake-gh-calls.jsonl').unlink()
+    paths, global_config, project = _delete_scenario(tmp_path)
     changed = replace(
         project,
         required_checks=('CI',),
@@ -2578,7 +2594,7 @@ def test_push_reconnects_tracking_using_observed_main_without_adopting_unknown_t
     _host_responses(fake_gh, project)
     monkeypatch.setattr(_host, '_URL_TEMPLATE', host.as_uri())
     before_source = _git(source, 'for-each-ref')
-    before_local = _git(_candidate.store_path(paths, project.name), 'for-each-ref')
+    before_local = _git(_store.store_path(paths, project.name), 'for-each-ref')
 
     capture = StringIO()
     with redirect_stdout(capture):
@@ -2589,10 +2605,10 @@ def test_push_reconnects_tracking_using_observed_main_without_adopting_unknown_t
         candidate.commit, project.owner, 'staging-repo'
     )
     assert _git(source, 'for-each-ref') == before_source
-    assert _git(_candidate.store_path(paths, project.name), 'for-each-ref') == before_local
+    assert _git(_store.store_path(paths, project.name), 'for-each-ref') == before_local
     objects = (
         _git(
-            _candidate.store_path(paths, project.name),
+            _store.store_path(paths, project.name),
             'cat-file',
             '--batch-all-objects',
             '--batch-check=%(objectname)',
@@ -2632,7 +2648,7 @@ def test_observed_main_lease_preserves_concurrent_remote_change(
             host,
             'fetch',
             '-q',
-            _candidate.store_path(paths, project.name).as_posix(),
+            _store.store_path(paths, project.name).as_posix(),
             f'{candidate.commit}:refs/heads/main',
         )
     concurrent = _git(source, 'rev-parse', 'HEAD').decode().strip()
@@ -2640,7 +2656,7 @@ def test_observed_main_lease_preserves_concurrent_remote_change(
     _save_stage(paths, project.name, old)
     _host_responses(fake_gh, project)
     monkeypatch.setattr(_host, '_URL_TEMPLATE', host.as_uri())
-    actual_push = _stage.push
+    actual_push = _host.push
 
     def _race(dest: _host.Destination, cwd: Path, args: Sequence[str]) -> GitResult:
         expected = '' if empty else candidate.commit
@@ -2648,7 +2664,7 @@ def test_observed_main_lease_preserves_concurrent_remote_change(
         _git(host, 'fetch', '-q', source.as_posix(), f'+{concurrent}:refs/heads/main')
         return actual_push(dest, cwd, args)
 
-    monkeypatch.setattr(_stage, 'push', _race)
+    monkeypatch.setattr(_host, 'push', _race)
 
     with pytest.raises(PubanonError, match='staging push failed') as raised:
         _stage.stage_push(paths, global_config, project, yes=True)
@@ -2657,7 +2673,7 @@ def test_observed_main_lease_preserves_concurrent_remote_change(
     assert 'inspect' in (raised.value.recovery or '')
     assert _git(host, 'rev-parse', 'refs/heads/main').decode().strip() == concurrent
     assert _stage.load_stage(paths, project.name) == old
-    assert _candidate.load_candidate(paths, project.name) == candidate
+    assert _records.load_candidate(paths, project.name) == candidate
 
 
 @pytest.mark.slow
@@ -2728,10 +2744,10 @@ def test_empty_stage_selects_default_after_main_exists_and_preserves_creation_se
     monkeypatch.setattr(_host, '_URL_TEMPLATE', host.as_uri())
 
     def _approve(_prompt: str) -> str:
-        return 'yes'
+        return 'y'
 
     monkeypatch.setattr('builtins.input', _approve)
-    set_default = _stage.set_default_branch
+    set_default = _host.set_default_branch
 
     def _select_default(owner: str, repo: str, branch: str) -> None:
         assert _git(host, 'for-each-ref', '--format=%(refname)') == b'refs/heads/main\n'
@@ -2739,7 +2755,7 @@ def test_empty_stage_selects_default_after_main_exists_and_preserves_creation_se
         assert _stage.load_stage(paths, project.name) is None
         set_default(owner, repo, branch)
 
-    monkeypatch.setattr(_stage, 'set_default_branch', _select_default)
+    monkeypatch.setattr(_host, 'set_default_branch', _select_default)
 
     capture = StringIO()
     with redirect_stdout(capture):
@@ -2786,7 +2802,7 @@ def test_push_refuses_unsupported_layout_without_mutation(
             host,
             'fetch',
             '-q',
-            _candidate.store_path(paths, project.name).as_posix(),
+            _store.store_path(paths, project.name).as_posix(),
             f'{candidate.commit}:{ref}',
         )
     before_refs = _git(host, 'for-each-ref')
@@ -2849,8 +2865,8 @@ def test_default_failure_after_successful_push_preserves_tracking_and_candidate(
         if failure == 'default-update':
             raise PubanonError('default update failed')
 
-    monkeypatch.setattr(_stage, 'repository_settings', _settings)
-    monkeypatch.setattr(_stage, 'set_default_branch', _default)
+    monkeypatch.setattr(_host, 'repository_settings', _settings)
+    monkeypatch.setattr(_host, 'set_default_branch', _default)
 
     with pytest.raises(PubanonError, match='remote update succeeded') as raised:
         _stage.stage_push(paths, global_config, project, yes=True)
@@ -2858,7 +2874,7 @@ def test_default_failure_after_successful_push_preserves_tracking_and_candidate(
     assert raised.value.recovery == 'pubanon stage repair'
     assert _git(host, 'rev-parse', 'refs/heads/main').decode().strip() == candidate.commit
     assert _stage.load_stage(paths, project.name) == old
-    assert _candidate.load_candidate(paths, project.name) == candidate
+    assert _records.load_candidate(paths, project.name) == candidate
 
 
 @pytest.mark.slow
@@ -2875,7 +2891,7 @@ def test_cancelled_push_or_readback_preserves_cancellation_and_tracking(
     )
     old = _stage.load_stage(paths, project.name)
     reads = 0
-    actual_refs = _stage.read_remote_refs
+    actual_refs = _host.read_remote_refs
 
     def _cancel(*_args: object, **_kwargs: object) -> Never:
         raise OperationCanceled('operator interrupted staging')
@@ -2888,11 +2904,11 @@ def test_cancelled_push_or_readback_preserves_cancellation_and_tracking(
         return actual_refs(dest)
 
     if operation == 'push':
-        monkeypatch.setattr(_stage, 'push', _cancel)
+        monkeypatch.setattr(_host, 'push', _cancel)
     elif operation == 'save':
         monkeypatch.setattr(_stage, '_save_stage', _cancel)
     else:
-        monkeypatch.setattr(_stage, 'read_remote_refs', _refs)
+        monkeypatch.setattr(_host, 'read_remote_refs', _refs)
 
     with pytest.raises(OperationCanceled, match='operator interrupted staging'):
         _stage.stage_push(paths, global_config, project, yes=True)
@@ -2937,9 +2953,9 @@ def test_repair_reconnects_recognized_main_without_remote_mutation(
         pytest.fail('local repair mutated the remote')
 
     monkeypatch.setattr(_stage, '_save_stage', _save)
-    monkeypatch.setattr(_stage, 'push', _forbidden)
-    monkeypatch.setattr(_stage, 'set_default_branch', _forbidden)
-    monkeypatch.setattr(_stage, 'delete_repository', _forbidden)
+    monkeypatch.setattr(_host, 'push', _forbidden)
+    monkeypatch.setattr(_host, 'set_default_branch', _forbidden)
+    monkeypatch.setattr(_host, 'delete_repository', _forbidden)
     rendered = StringIO()
     with redirect_stdout(rendered):
         _stage.stage_repair(paths, global_config, project, yes=True)
@@ -2975,7 +2991,7 @@ def test_repair_recognizes_independent_retained_evidence_without_new_candidate_g
     path = _stage._stage_path(paths, project.name)
     if evidence != 'record':
         path.unlink()
-    store = _candidate.candidate_store_path(paths, project.name)
+    store = _store.candidate_store_path(paths, project.name)
     if evidence in {'publication', 'missing-archive', 'conflicting-archive'}:
         publication = _candidate.publication_record(
             paths, project.name, candidate, candidate.commit, datetime.now(UTC)
@@ -2990,7 +3006,7 @@ def test_repair_recognizes_independent_retained_evidence_without_new_candidate_g
             if evidence == 'conflicting-archive':
                 _git(store, 'fetch', str(project.source_path), candidate.pinned.commit)
             _git(store, 'update-ref', _records.publication_ref(candidate.commit), target)
-    _candidate.record_path(paths, project.name).unlink()
+    _records.candidate_path(paths, project.name).unlink()
     if evidence == 'record':
         (project.source_path / 'README.md').write_text('new snapshot\n')
         _git(project.source_path, 'commit', '-am', 'change')
@@ -3039,7 +3055,7 @@ def test_repair_unresolved_observations_preserve_tracking(
     path = _stage._stage_path(paths, project.name)
     path.write_bytes(b'prior malformed evidence')
     if state == 'unknown':
-        _candidate.record_path(paths, project.name).unlink()
+        _records.candidate_path(paths, project.name).unlink()
     elif state == 'legacy':
         _git(host, 'branch', '-m', 'main', 'stage')
     elif state == 'empty':
@@ -3061,7 +3077,7 @@ def test_repair_unresolved_observations_preserve_tracking(
                 )
         fake_gh.write_text(json.dumps(responses))
     elif state == 'read-failure':
-        monkeypatch.setattr(_stage, 'read_remote_refs', _fail_stage_refs_read)
+        monkeypatch.setattr(_host, 'read_remote_refs', _fail_stage_refs_read)
     refs = _git(host, 'show-ref') if state != 'empty' else b''
     with pytest.raises(PubanonError) as exc_info:
         _stage.stage_repair(paths, global_config, project, yes=True)
@@ -3102,7 +3118,7 @@ def test_repair_recovers_successful_push_without_repeating_it(
     host = _new_host(tmp_path)
     _host_responses(fake_gh, project)
     monkeypatch.setattr(_host, '_URL_TEMPLATE', host.as_uri())
-    real_push = _stage.push
+    real_push = _host.push
     pushes = 0
 
     def _push(dest: _host.Destination, store: Path, refspec: Sequence[str]) -> GitResult:
@@ -3116,7 +3132,7 @@ def test_repair_recovers_successful_push_without_repeating_it(
     def _fail_save(*_args: object) -> Never:
         raise PubanonError('disk full')
 
-    monkeypatch.setattr(_stage, 'push', _push)
+    monkeypatch.setattr(_host, 'push', _push)
     with monkeypatch.context() as fault:
         if failure == 'local-save':
             fault.setattr(_stage, '_save_stage', _fail_save)
@@ -3283,7 +3299,7 @@ def test_repair_default_failure_preserves_tracking_and_fresh_retry_observes_main
     path = _stage._stage_path(paths, project.name)
     path.write_bytes(b'prior tracking evidence')
     patch_args = _default_repair_responses(fake_gh, project, outcome=outcome)
-    original_default = _stage.set_default_branch
+    original_default = _host.set_default_branch
 
     def _default(owner: str, repo: str, branch: str) -> None:
         original_default(owner, repo, branch)
@@ -3305,7 +3321,7 @@ def test_repair_default_failure_preserves_tracking_and_fresh_retry_observes_main
     def _save_failed(*_args: object) -> Never:
         raise PubanonError('disk full')
 
-    monkeypatch.setattr(_stage, 'set_default_branch', _default)
+    monkeypatch.setattr(_host, 'set_default_branch', _default)
     with monkeypatch.context() as fault:
         if outcome == 'save-failure':
             fault.setattr(_stage, '_save_stage', _save_failed)
@@ -3363,9 +3379,11 @@ def test_status_reports_available_facts_without_a_store_or_mutation(
     def _forbidden(*_args: object, **_kwargs: object) -> Never:
         pytest.fail('status attempted a mutation')
 
-    monkeypatch.setattr(_stage, 'read_remote_refs', _refs)
-    for name in ('store_path', '_save_stage', 'push', 'set_default_branch', 'delete_repository'):
+    monkeypatch.setattr(_host, 'read_remote_refs', _refs)
+    for name in ('store_path', '_save_stage'):
         monkeypatch.setattr(_stage, name, _forbidden)
+    for name in ('push', 'set_default_branch', 'delete_repository'):
+        monkeypatch.setattr(_host, name, _forbidden)
     before = {
         p.relative_to(paths.data_dir): p.read_bytes()
         for p in paths.data_dir.rglob('*')
@@ -3399,7 +3417,7 @@ def test_status_reports_available_facts_without_a_store_or_mutation(
     else:
         assert 'Next: pubanon publish' not in rendered
     assert reads == ['refs']
-    assert not _candidate.candidate_store_path(paths, project.name).exists()
+    assert not _store.candidate_store_path(paths, project.name).exists()
     assert before == {
         p.relative_to(paths.data_dir): p.read_bytes()
         for p in paths.data_dir.rglob('*')
@@ -3454,7 +3472,7 @@ def test_status_failure_does_not_repeat_prepared_commit_already_shown(
     def _refs(_dest: _host.Destination) -> _host.RemoteRefs:
         return _host.RemoteRefs(remote, {})
 
-    monkeypatch.setattr(_stage, 'read_remote_refs', _refs)
+    monkeypatch.setattr(_host, 'read_remote_refs', _refs)
     if state == 'observed':
 
         def _gate_failure(*_args: object) -> Never:
@@ -3515,7 +3533,7 @@ def test_status_reports_observed_facts_before_actionable_errors(
             None if state == 'empty' else 'b' * 40 if state == 'unknown' else commit, {}
         )
 
-    monkeypatch.setattr(_stage, 'read_remote_refs', _refs)
+    monkeypatch.setattr(_host, 'read_remote_refs', _refs)
     with verbose_context(enabled=True), pytest.raises(PubanonError) as raised:
         _stage.stage_status(paths, global_config, project)
     rendered = capsys.readouterr().out
@@ -3751,41 +3769,6 @@ def _ci_responses(
     ]
 
 
-def _integrated_status(
-    tmp_path: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-    checks: tuple[str, ...],
-) -> tuple[Paths, GlobalConfig, ProjectConfig, _candidate.CandidateRecord]:
-    _host_path, paths, g, p, candidate = _ci_candidate(tmp_path, make_repo, monkeypatch)
-    p = replace(p, publication_route='staged', required_checks=checks)
-    candidate = replace(candidate, fingerprint=fingerprint(g, p))
-    _save_stage(paths, p.name, _stage.StageRecord(candidate.commit, p.owner, stage_repository(p)))
-
-    def _read_candidate(_paths: Paths, _project: str) -> _candidate.CandidateRecord:
-        return candidate
-
-    def _refs(_dest: _host.Destination) -> _host.RemoteRefs:
-        return _host.RemoteRefs(candidate.commit, {})
-
-    monkeypatch.setattr(_stage, 'load_candidate', _read_candidate)
-    monkeypatch.setattr(_stage, 'read_remote_refs', _refs)
-    return paths, g, p, candidate
-
-
-def test_candidate_next_action_watches_integrated_project_without_required_checks(
-    tmp_path: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    paths, g, p, candidate = _integrated_status(tmp_path, make_repo, monkeypatch, ())
-    assert _stage.candidate_next_action(paths, g, p, candidate) == 'pubanon stage watch'
-    assert (
-        _stage.candidate_next_action(paths, g, p, candidate, checked_commit=candidate.commit)
-        == 'pubanon publish'
-    )
-
-
 @pytest.mark.parametrize(('full_tests', 'hosted'), [(True, False), (False, True), (True, True)])
 def test_stage_push_ci_options_require_ci_workflow_before_host_access(
     tmp_path: Path,
@@ -3824,13 +3807,13 @@ def test_stage_push_creates_variable_pushes_then_requests_ci(
     fake_gh.write_text(json.dumps(responses + actions))
     before = set(paths.data_dir.rglob('*'))
     calls_at_push: list[list[str]] = []
-    original_push = _stage.push
+    original_push = _host.push
 
     def _push(dest: _host.Destination, store: Path, args: Sequence[str]) -> GitResult:
         calls_at_push.extend(_calls(tmp_path))
         return original_push(dest, store, args)
 
-    monkeypatch.setattr(_stage, 'push', _push)
+    monkeypatch.setattr(_host, 'push', _push)
 
     def _confirm(_question: str) -> bool:
         return True
@@ -3940,7 +3923,7 @@ def test_stage_push_never_requests_ci_before_verified_stage_record(
     def _fail(*_args: object, **_kwargs: object) -> Never:
         raise PubanonError('injected boundary failure')
 
-    monkeypatch.setattr(_stage, boundary, _fail)
+    monkeypatch.setattr(_host if boundary == 'push' else _stage, boundary, _fail)
     with pytest.raises(PubanonError):
         _stage.stage_push(paths, g, p, yes=True)
     assert _stage.load_stage(paths, p.name) is None
@@ -3982,7 +3965,7 @@ def test_stage_push_refuses_snapshot_without_dispatch_inputs_before_host_access(
     _, paths, g, p, _ = _ci_candidate(
         tmp_path, make_repo, monkeypatch, workflow='on: push\njobs: {}\n'
     )
-    with pytest.raises(PubanonError, match=r'ci\.yml cannot receive Pubanon CI requests'):
+    with pytest.raises(PubanonError, match=r'ci\.yml cannot receive pubanon CI requests'):
         _stage.stage_push(paths, g, p, yes=True)
     assert _calls(tmp_path) == []
 
@@ -4030,11 +4013,10 @@ def test_stage_push_same_commit_requests_another_run(
 def test_stage_status_reports_latest_requested_run(
     tmp_path: Path,
     fake_gh: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
     checks: tuple[str, ...],
 ) -> None:
-    paths, g, p, candidate = _integrated_status(tmp_path, make_repo, monkeypatch, checks)
+    paths, g, p, candidate = _integrated_status(tmp_path, monkeypatch, checks)
     _status_responses(fake_gh, p, candidate.commit, {})
     coordinates = (p.owner, stage_repository(p))
     run = _ci_run(candidate.commit) | {
@@ -4069,11 +4051,10 @@ def test_stage_status_reports_latest_requested_run(
 def test_stage_status_fails_without_suggesting_publish_when_latest_run_is_not_acceptable(
     tmp_path: Path,
     fake_gh: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
     state: str,
 ) -> None:
-    paths, g, p, candidate = _integrated_status(tmp_path, make_repo, monkeypatch, ('quality',))
+    paths, g, p, candidate = _integrated_status(tmp_path, monkeypatch, ('quality',))
     _status_responses(fake_gh, p, candidate.commit, {})
     coordinates = (p.owner, stage_repository(p))
     run = _ci_run(candidate.commit) | {'conclusion': 'failure'}
@@ -4112,10 +4093,9 @@ def test_stage_status_fails_without_suggesting_publish_when_latest_run_is_not_ac
 
 def test_verify_staged_target_refuses_malformed_record_before_host_access(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
+    source = tmp_path / 'source'
     paths = _paths(tmp_path)
     global_config, project = _configs(source)
     stage_path = paths.data_dir / 'projects' / project.name / 'stage.toml'
@@ -4125,8 +4105,8 @@ def test_verify_staged_target_refuses_malformed_record_before_host_access(
     def _unexpected(*_args: object) -> object:
         pytest.fail('malformed staging evidence reached host access')
 
-    monkeypatch.setattr(_stage, 'repository_facts', _unexpected)
-    monkeypatch.setattr(_stage, 'read_remote_refs', _unexpected)
+    monkeypatch.setattr(_host, 'repository_facts', _unexpected)
+    monkeypatch.setattr(_host, 'read_remote_refs', _unexpected)
 
     with pytest.raises(PubanonError, match='invalid stage record') as exc_info:
         _stage.verify_staged_target(paths, global_config, project)
@@ -4137,9 +4117,8 @@ def test_verify_staged_target_refuses_malformed_record_before_host_access(
 
 def test_verify_staged_target_refuses_missing_stage_record_with_push_recovery(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
 ) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
+    source = tmp_path / 'source'
     paths = _paths(tmp_path)
     global_config, project = _configs(source)
     project = replace(project, required_checks=('CI',))
@@ -4154,10 +4133,9 @@ def test_verify_staged_target_refuses_missing_stage_record_with_push_recovery(
 def test_verify_staged_target_refuses_missing_store_without_creating_it_or_reading_refs(
     tmp_path: Path,
     fake_gh: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
+    source = tmp_path / 'source'
     paths = _paths(tmp_path)
     global_config, project = _configs(source)
     project = replace(project, required_checks=('CI',))
@@ -4168,13 +4146,13 @@ def test_verify_staged_target_refuses_missing_store_without_creating_it_or_readi
         _stage.StageRecord('a' * 40, project.owner, project._stage_repo),
     )
     _host_responses(fake_gh, project)
-    store = _candidate.candidate_store_path(paths, project.name)
+    store = _store.candidate_store_path(paths, project.name)
     assert not store.exists()
 
     def _unexpected_refs(*_args: object) -> _host.RemoteRefs:
         pytest.fail('missing store reached staging ref read')
 
-    monkeypatch.setattr(_stage, 'read_remote_refs', _unexpected_refs)
+    monkeypatch.setattr(_host, 'read_remote_refs', _unexpected_refs)
 
     with pytest.raises(PubanonError, match='snapshot store') as exc_info:
         _stage.verify_staged_target(paths, global_config, project)
@@ -4200,7 +4178,7 @@ def test_verify_staged_target_refuses_publication_repository_alias_before_host_r
     def _unexpected(*_args: object) -> None:
         pytest.fail('host read occurred before the staging-alias precheck')
 
-    monkeypatch.setattr(_stage, 'repository_facts', _unexpected)
+    monkeypatch.setattr(_host, 'repository_facts', _unexpected)
 
     with pytest.raises(PubanonError, match='must differ'):
         _stage.verify_staged_target(paths, global_config, project, timeout=30)
@@ -4228,9 +4206,9 @@ def test_verify_staged_target_refuses_unexpected_remote_refs(
         assert timeout > 0
         return _host.RemoteRefs('a' * 40, {'v1': 'b' * 40}, ())
 
-    _candidate.store_path(paths, project.name)
+    _store.store_path(paths, project.name)
     _host_responses(fake_gh, project)
-    monkeypatch.setattr(_stage, 'read_remote_refs', _refs)
+    monkeypatch.setattr(_host, 'read_remote_refs', _refs)
 
     with pytest.raises(PubanonError, match='unexpected staging reference') as raised:
         _stage.verify_staged_target(paths, global_config, project, timeout=30)
@@ -4250,13 +4228,13 @@ def test_verify_staged_target_requires_private_visibility_before_refs(
         project.name,
         _stage.StageRecord('a' * 40, project.owner, 'staging-repo'),
     )
-    _candidate.store_path(paths, project.name)
+    _store.store_path(paths, project.name)
     _host_responses(fake_gh, project, actual=(project.owner, 'staging-repo', 'public'))
 
     def _unexpected(*_args: object) -> _host.RemoteRefs:
         pytest.fail('reference read occurred before private-visibility verification')
 
-    monkeypatch.setattr(_stage, 'read_remote_refs', _unexpected)
+    monkeypatch.setattr(_host, 'read_remote_refs', _unexpected)
 
     with pytest.raises(PubanonError, match='staging repository facts') as exc_info:
         _stage.verify_staged_target(paths, global_config, project, timeout=30)

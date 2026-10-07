@@ -5,7 +5,7 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
@@ -24,12 +24,46 @@ from pubanon._cli import _history as cli_history
 from pubanon._cli import _remote as cli_remote
 from pubanon._cli import _status as cli_status
 from pubanon._cli._arguments import build_parser
+from pubanon._cli._downstream import _ClosableTextOutput
 from pubanon._errors import PubanonError
 from pubanon._remote import _host, _watch
-from pubanon._snapshots import _candidate
+from pubanon._snapshots import _store
 from pubanon._terminal import ask, confirm, next_step
 from tests._git import git_env
+from tests._process import process_transcript, run_closing_after_first_line, run_with_closed_output
 from tests._setup import configure
+
+_REFUSE_AFTER_OUTPUT = (
+    'from pubanon import _cli\n'
+    'from pubanon._errors import PubanonError\n'
+    'def _command(_args):\n'
+    '    print("partial output")\n'
+    '    raise PubanonError("refused")\n'
+    '_cli._dispatch = _command\n'
+    'raise SystemExit(_cli.main(["setup"]))\n'
+)
+
+
+def _help_entries(
+    parser: argparse.ArgumentParser, prefix: str
+) -> Iterator[tuple[str, str | None]]:
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            subparsers = cast('argparse._SubParsersAction[argparse.ArgumentParser]', action)
+            visible = [choice.dest for choice in subparsers._choices_actions]
+            for choice in subparsers._choices_actions:
+                yield f'{prefix} {choice.dest}', choice.help
+            for name in visible:
+                yield from _help_entries(subparsers.choices[name], f'{prefix} {name}')
+        elif action.help is not argparse.SUPPRESS:
+            label = '/'.join(action.option_strings) or action.dest
+            yield f'{prefix} {label}', action.help
+
+
+def _starts_in_lowercase_style(text: str) -> bool:
+    first = text.split(maxsplit=1)[0]
+    is_acronym = first.upper() == first and any(character.isalpha() for character in first)
+    return text[0].islower() or is_acronym
 
 
 def test_abbreviated_color_after_separator_does_not_change_help_policy(
@@ -117,6 +151,30 @@ def test_cli_restores_supplied_stream_error_policies(
     assert b'caf\\xe9 diagnostic' in stderr_bytes.getvalue()
 
 
+@pytest.mark.parametrize('argv', [['--help'], ['--version']], ids=['help', 'version'])
+def test_closed_stdout_before_output_is_quiet(argv: list[str]) -> None:
+    result = run_with_closed_output(
+        ['-m', 'pubanon', *argv], env={**os.environ, 'PYTHON_COLORS': '0'}
+    )
+    assert (result.returncode, result.stderr) == (0, b''), process_transcript(result)
+
+
+def test_closed_stdout_keeps_a_refusal_status() -> None:
+    result = run_with_closed_output(['-c', _REFUSE_AFTER_OUTPUT])
+    assert result.returncode == 1, process_transcript(result)
+    assert result.stderr.splitlines() == [b'error: refused'], process_transcript(result)
+
+
+def test_closed_stdout_keeps_the_status_result(
+    configured_project: tuple[_config.Paths, _config.GlobalConfig, _config.ProjectConfig],
+) -> None:
+    _paths, _global_config, project = configured_project
+    result = run_with_closed_output(
+        ['-m', 'pubanon', 'status', '--project', project.name], env=git_env()
+    )
+    assert (result.returncode, result.stderr) == (0, b''), process_transcript(result)
+
+
 def test_color_operand_after_separator_does_not_change_help_policy(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -124,21 +182,65 @@ def test_color_operand_after_separator_does_not_change_help_policy(
     assert '\x1b[' not in capsys.readouterr().err
 
 
-@pytest.mark.parametrize('mode', ['always', 'never'])
-def test_explicit_color_applies_to_usage_errors(
-    mode: str,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
+def test_commands_see_the_terminal_and_error_policy_through_the_stdout_wrapper(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    original_color = '0' if mode == 'always' else '1'
-    monkeypatch.setenv('PYTHON_COLORS', original_color)
-    assert _cli.main(['--color', mode, 'unknown-command']) == 2
-    assert os.environ['PYTHON_COLORS'] == original_color
-    rendered = capsys.readouterr().err
-    assert ('\x1b[' in rendered) == (mode == 'always')
-    assert ('\x1b[' in rendered.splitlines()[0]) == (
-        mode == 'always' and sys.version_info >= (3, 14)
-    )
+    observed: list[object] = []
+
+    def _command(_args: argparse.Namespace) -> None:
+        observed.extend((sys.stdout, sys.stdout.errors, _terminal.color_enabled()))
+        print('caf\xe9')
+
+    original = sys.stdout
+    monkeypatch.setattr(sys.stdout, 'isatty', lambda: True)
+    monkeypatch.delenv('NO_COLOR', raising=False)
+    monkeypatch.setattr(_cli, '_dispatch', _command)
+    assert _cli.main(['setup']) == 0
+    stream, errors, color = observed
+    assert isinstance(stream, _ClosableTextOutput)
+    assert (errors, color) == ('backslashreplace', True)
+    assert sys.stdout is original
+    assert capsys.readouterr().out == 'caf\xe9\n'
+
+
+def test_create_help_describes_optional_page_defaults(capsys: pytest.CaptureFixture[str]) -> None:
+    assert _cli.main(['release', 'create', '--help']) == 0
+    help_text = capsys.readouterr().out
+    normalized_help = ' '.join(help_text.split())
+    assert '[--notes-file FILE]' in help_text
+    assert 'UTF-8 Markdown notes file (default: release_page notes)' in normalized_help
+    assert 'page title (default: release_page title, normally TAG)' in normalized_help
+
+
+def test_every_visible_option_and_command_has_lowercase_help() -> None:
+    problems = [
+        f'{name}: {text!r}'
+        for name, text in _help_entries(build_parser(), 'pubanon')
+        if not text or not _starts_in_lowercase_style(text) or text.endswith('.')
+    ]
+    assert problems == []
+
+
+@pytest.mark.parametrize(
+    'option',
+    [
+        ['--yes'],
+        ['--relocate'],
+        ['--self-publication'],
+        ['--source-tags'],
+        ['--no-source-tags'],
+        ['--publication-route', 'direct'],
+    ],
+)
+def test_init_edit_rejects_other_init_options(
+    option: list[str], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def _unexpected(_args: argparse.Namespace) -> None:
+        pytest.fail('invalid init dispatched')
+
+    monkeypatch.setattr(_cli, '_dispatch', _unexpected)
+    assert _cli.main(['init', '--edit', *option]) == 2
+    assert '--edit cannot be combined with other init options' in capsys.readouterr().err
 
 
 def test_init_parser_accepts_mutually_exclusive_source_tags_flags() -> None:
@@ -189,7 +291,8 @@ def test_main_returns_usage_and_refusal_exit_codes(
 
     assert _cli.main(['not-a-command']) == 2
 
-    def _refuse() -> None:
+    def _refuse(*, edit: bool = False) -> None:
+        assert not edit
         raise PubanonError('safe refusal', recovery='fix it')
 
     monkeypatch.setattr(_setup, 'setup', _refuse)
@@ -197,6 +300,226 @@ def test_main_returns_usage_and_refusal_exit_codes(
 
     assert _cli.main(['setup']) == 1
     assert 'error: safe refusal\n\nNext: fix it' in capsys.readouterr().err
+
+
+def test_parser_construction_error_is_reported(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def _broken_parser() -> argparse.ArgumentParser:
+        raise PubanonError('parser setup failed')
+
+    monkeypatch.setattr(_arguments, 'build_parser', _broken_parser)
+    assert _cli.main(['--help']) == 1
+    assert 'parser setup failed' in capsys.readouterr().err
+
+
+def test_prepare_rewrite_continue_reaches_handler(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[bool] = []
+
+    def _handler(args: argparse.Namespace) -> None:
+        seen.append(args.continue_rewrite)
+
+    monkeypatch.setattr(_prepare, 'command_prepare', _handler)
+    assert _cli.main(['prepare', '--project', 'demo', '--continue', '--yes']) == 0
+    assert seen == [True]
+
+
+def test_prepare_without_replacement_keeps_new_publication_mode() -> None:
+    assert build_parser().parse_args(['prepare']).replace is None
+
+
+def test_project_command_guidance_matches_registered_commands() -> None:
+    pending: list[argparse.ArgumentParser] = [build_parser()]
+    commands: set[str] = set()
+    while pending:
+        parser = pending.pop()
+        groups = [
+            cast('argparse._SubParsersAction[argparse.ArgumentParser]', action)
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        ]
+        if groups:
+            for group in groups:
+                pending.extend(group.choices.values())
+        elif any('--project' in action.option_strings for action in parser._actions):
+            commands.add(parser.prog.removeprefix('pubanon '))
+    assert commands == set(_terminal.PROJECT_COMMANDS)
+    with _terminal.guidance_context(project='chosen'):
+        for command in commands:
+            assert _terminal.guidance(f'pubanon {command}') == (
+                f'pubanon {command} --project=chosen'
+            )
+
+
+def test_publish_help_lists_page_options(capsys: pytest.CaptureFixture[str]) -> None:
+    assert _cli.main(['publish', '--help']) == 0
+    out = ' '.join(capsys.readouterr().out.split())
+    assert '--no-release-page' in out
+    assert '--release-notes-file FILE' in out
+    assert 'publish without creating or looking up a release page' in out
+
+
+def test_reader_closing_after_the_first_help_line_is_quiet() -> None:
+    result = run_closing_after_first_line(
+        ['-m', 'pubanon', '--help'], env={**os.environ, 'PYTHON_COLORS': '0'}
+    )
+    assert (result.returncode, result.stderr) == (0, b''), process_transcript(result)
+
+
+def test_release_parser_accepts_explicit_tag_and_positive_limit() -> None:
+    parser = build_parser()
+    create = parser.parse_args(['release', 'create', 'v1.2.3'])
+    assert create.notes_file is None
+    assert create.title is None
+    assert parser.parse_args(['release', 'show', 'v1.2.3']).tag == 'v1.2.3'
+    assert parser.parse_args(['release', 'list']).limit == 30
+    assert parser.parse_args(['release', 'list', '--limit', '2']).limit == 2
+
+
+def test_repo_restore_requires_destination(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _cli.main(['repo', 'restore']) == 2
+    assert 'required: --to' in capsys.readouterr().err
+
+
+def test_repo_reveal_has_no_yes_option(capsys: pytest.CaptureFixture[str]) -> None:
+    assert _cli.main(['repo', 'reveal', '--project', 'demo', '--yes']) == 2
+    assert 'unrecognized arguments: --yes' in capsys.readouterr().err
+
+
+def test_repo_reveal_help_exits_successfully() -> None:
+    assert _cli.main(['repo', 'reveal', '--help']) == 0
+
+
+def test_root_help_describes_version_as_the_standard_action(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _cli.main(['--help']) == 0
+    text = capsys.readouterr().out
+    assert re.search(r'^  --version +show the version and exit$', text, re.MULTILINE), text
+
+
+def test_root_help_groups_every_command_once(capsys: pytest.CaptureFixture[str]) -> None:
+    assert _cli.main(['--help']) == 0
+    text = capsys.readouterr().out
+    assert 'Initial workflow: setup -> init\n' in text
+    assert ('Staged route: prepare -> inspect -> stage push -> stage watch -> publish\n') in text
+    assert 'Direct route: prepare -> inspect -> publish\n' in text
+    groups = {
+        'publish': ('prepare', 'inspect', 'publish', 'discard', 'status', 'run'),
+        'local snapshots': ('list', 'show', 'delete', 'clean', 'audit'),
+        'remote repositories': ('stage', 'repo', 'release', 'package'),
+        'setup': ('setup', 'init', 'forget', 'doctor'),
+    }
+    previous = 0
+    for title, commands in groups.items():
+        start = text.index(f'\n{title}:\n')
+        assert start > previous
+        previous = start
+        section = text[start:].split('\n\n', 1)[0]
+        for command in commands:
+            assert any(line.split()[:1] == [command] for line in section.splitlines()[1:])
+            assert sum(line.startswith(f'  {command} ') for line in text.splitlines()) == 1
+    assert 'common options:\n  -h, --help' in text
+
+
+def test_root_version_reports_missing_distribution_metadata(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def _missing(_name: str) -> str:
+        raise importlib.metadata.PackageNotFoundError('pubanon')
+
+    monkeypatch.setattr(importlib.metadata, 'version', _missing)
+    assert _cli.main(['--version']) == 1
+    assert 'installed distribution metadata' in capsys.readouterr().err
+
+
+def test_run_page_options_are_mutually_exclusive(capsys: pytest.CaptureFixture[str]) -> None:
+    assert _cli.main(['run', 'ship', '--no-release-page', '--release-notes-file', 'notes.md']) == 2
+    assert 'not allowed with argument' in capsys.readouterr().err
+
+
+def test_run_parser_exposes_declared_workflow_options() -> None:
+    args = build_parser().parse_args(
+        [
+            'run',
+            'ship',
+            '--project',
+            'demo',
+            '--version',
+            '1.2.3',
+            '--acknowledge-new-paths',
+            '--yes',
+        ]
+    )
+
+    assert args.command == 'run'
+    assert args.name == 'ship'
+    assert args.project == 'demo'
+    assert args.version == '1.2.3'
+    assert args.acknowledge_new_paths is True
+    assert args.yes is True
+
+
+def test_setup_edit_parser_sets_edit_flag() -> None:
+    args = build_parser().parse_args(['setup', '--edit'])
+
+    assert args.command == 'setup'
+    assert args.edit is True
+
+
+def test_stage_metavar_matches_registered_subcommands() -> None:
+    parser = build_parser()
+    commands = next(
+        cast('argparse._SubParsersAction[argparse.ArgumentParser]', action)
+        for action in parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    )
+    stage = commands.choices['stage']
+    subcommands = next(
+        cast('argparse._SubParsersAction[argparse.ArgumentParser]', action)
+        for action in stage._actions
+        if isinstance(action, argparse._SubParsersAction)
+    )
+    expected = '{' + ','.join(subcommands.choices) + '}'
+    assert subcommands.metavar == expected
+    assert expected in stage.format_usage()
+
+
+@pytest.mark.parametrize(
+    'argv', [['--help'], ['--version'], [], ['setup']], ids=['help', 'version', 'usage', 'command']
+)
+def test_unavailable_stdout_is_an_error(
+    argv: list[str], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def _command(_args: argparse.Namespace) -> None:
+        print('partial output')
+
+    monkeypatch.setattr(_cli, '_dispatch', _command)
+    # Restore stdout before capsys finalizes, so its capture stream is not reinstated.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(sys, 'stdout', None)
+        status = _cli.main(argv)
+
+    assert (status, capsys.readouterr().err) == (1, 'error: standard output is unavailable\n')
+
+
+@pytest.mark.parametrize('mode', ['always', 'never'])
+def test_explicit_color_applies_to_usage_errors(
+    mode: str,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_color = '0' if mode == 'always' else '1'
+    monkeypatch.setenv('PYTHON_COLORS', original_color)
+    assert _cli.main(['--color', mode, 'unknown-command']) == 2
+    assert os.environ['PYTHON_COLORS'] == original_color
+    rendered = capsys.readouterr().err
+    assert ('\x1b[' in rendered) == (mode == 'always')
+    assert ('\x1b[' in rendered.splitlines()[0]) == (
+        mode == 'always' and sys.version_info >= (3, 14)
+    )
 
 
 @pytest.mark.parametrize('arguments', [['status', '--verbose'], ['status'], ['setup']])
@@ -325,7 +648,7 @@ def test_cli_ref_diagnostics_preserve_effective_terms(
         .stdout.decode()
         .strip()
     )
-    store = _candidate.store_path(paths, project.name)
+    store = _store.store_path(paths, project.name)
     subprocess.run(
         [
             'git',
@@ -515,7 +838,7 @@ def test_command_surface_dispatches(
 ) -> None:
     seen: list[tuple[object, ...]] = []
 
-    def _handler(*args: object) -> None:
+    def _handler(*args: object, **_kwargs: object) -> None:
         seen.append(args)
 
     monkeypatch.setattr(handler_module, handler_name, _handler)
@@ -549,7 +872,7 @@ def test_configuration_readers_refuse_while_initialization_holds_project_lock(
     with _config.project_lock(paths, project.name):
         assert _cli.main(argv) == 1
 
-    assert 'another Pubanon command is running for this project' in capsys.readouterr().err
+    assert 'another pubanon command is running for this project' in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -576,6 +899,7 @@ def test_configuration_readers_refuse_while_initialization_holds_project_lock(
                 'register a project',
                 'destination',
                 '--relocate',
+                'also enables it for an existing project',
                 '--yes',
                 'verify existing configuration without prompts',
                 'relocation requires interactive approval',
@@ -698,44 +1022,10 @@ def test_history_and_inspect_usage_errors_precede_side_effects(
     assert 'error:' in capsys.readouterr().err
 
 
-def test_parser_construction_error_is_reported(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    def _broken_parser() -> argparse.ArgumentParser:
-        raise PubanonError('parser setup failed')
-
-    monkeypatch.setattr(_arguments, 'build_parser', _broken_parser)
-    assert _cli.main(['--help']) == 1
-    assert 'parser setup failed' in capsys.readouterr().err
-
-
-def test_prepare_rewrite_continue_reaches_handler(monkeypatch: pytest.MonkeyPatch) -> None:
-    seen: list[bool] = []
-
-    def _handler(args: argparse.Namespace) -> None:
-        seen.append(args.continue_rewrite)
-
-    monkeypatch.setattr(_prepare, 'command_prepare', _handler)
-    assert _cli.main(['prepare', '--project', 'demo', '--continue', '--yes']) == 0
-    assert seen == [True]
-
-
-def test_prepare_without_replacement_keeps_new_publication_mode() -> None:
-    assert build_parser().parse_args(['prepare']).replace is None
-
-
-def test_release_parser_accepts_explicit_tag_and_positive_limit() -> None:
-    parser = build_parser()
-    assert parser.parse_args(['release', 'show', 'v1.2.3']).tag == 'v1.2.3'
-    assert parser.parse_args(['release', 'list']).limit == 30
-    assert parser.parse_args(['release', 'list', '--limit', '2']).limit == 2
-
-
 @pytest.mark.parametrize(
     'argv',
     [
         ['release'],
-        ['release', 'create', 'v1.2.3'],
         ['release', 'create', 'v1.2.3', '--notes-file', 'notes', '--title', ''],
         ['release', 'edit', 'v1.2.3'],
         ['release', 'edit', 'v1.2.3', '--title', ''],
@@ -857,7 +1147,7 @@ def test_remote_read_commands_gate_current_coordinates_before_host_access(
     term = 'private-coordinate'
     paths, _global_config, project = configured_project
     assert project is not None
-    _candidate.store_path(paths, project.name)
+    _store.store_path(paths, project.name)
     _config.save_project(
         paths,
         replace(project, repo=f'public-{term}', extra_terms=(term,)),
@@ -908,7 +1198,7 @@ def test_remote_read_only_commands_refuse_missing_store_without_creating_it(
         return destination
 
     monkeypatch.setattr(_host, 'verify_destination', _verified_destination)
-    store = _candidate.candidate_store_path(paths, project.name)
+    store = _store.candidate_store_path(paths, project.name)
     assert not store.exists()
 
     assert _cli.main(argv) == 1
@@ -917,62 +1207,6 @@ def test_remote_read_only_commands_refuse_missing_store_without_creating_it(
     assert 'no saved published history was found' in error
     assert 'pubanon repo restore --project=demo --to local' in error
     assert not store.exists()
-
-
-def test_repo_publicize_is_an_unknown_command(capsys: pytest.CaptureFixture[str]) -> None:
-    assert _cli.main(['repo', 'publicize']) == 2
-    assert "invalid choice: 'publicize'" in capsys.readouterr().err
-
-
-def test_repo_restore_requires_destination(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    assert _cli.main(['repo', 'restore']) == 2
-    assert 'required: --to' in capsys.readouterr().err
-
-
-def test_repo_reveal_has_no_yes_option(capsys: pytest.CaptureFixture[str]) -> None:
-    assert _cli.main(['repo', 'reveal', '--project', 'demo', '--yes']) == 2
-    assert 'unrecognized arguments: --yes' in capsys.readouterr().err
-
-
-def test_repo_reveal_help_exits_successfully() -> None:
-    assert _cli.main(['repo', 'reveal', '--help']) == 0
-
-
-def test_root_help_groups_every_command_once(capsys: pytest.CaptureFixture[str]) -> None:
-    assert _cli.main(['--help']) == 0
-    text = capsys.readouterr().out
-    assert 'Initial workflow: setup -> init\n' in text
-    assert ('Staged route: prepare -> inspect -> stage push -> stage watch -> publish\n') in text
-    assert 'Direct route: prepare -> inspect -> publish\n' in text
-    groups = {
-        'publish': ('prepare', 'inspect', 'publish', 'discard', 'status', 'run'),
-        'local snapshots': ('list', 'show', 'delete', 'clean', 'audit'),
-        'remote repositories': ('stage', 'repo', 'release', 'package'),
-        'setup': ('setup', 'init', 'forget', 'doctor'),
-    }
-    previous = 0
-    for title, commands in groups.items():
-        start = text.index(f'\n{title}:\n')
-        assert start > previous
-        previous = start
-        section = text[start:].split('\n\n', 1)[0]
-        for command in commands:
-            assert any(line.split()[:1] == [command] for line in section.splitlines()[1:])
-            assert sum(line.startswith(f'  {command} ') for line in text.splitlines()) == 1
-    assert 'common options:\n  -h, --help' in text
-
-
-def test_root_version_reports_missing_distribution_metadata(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    def _missing(_name: str) -> str:
-        raise importlib.metadata.PackageNotFoundError('pubanon')
-
-    monkeypatch.setattr(importlib.metadata, 'version', _missing)
-    assert _cli.main(['--version']) == 1
-    assert 'installed distribution metadata' in capsys.readouterr().err
 
 
 @pytest.mark.parametrize('trailing_command', [[], ['doctor']])
@@ -1004,28 +1238,6 @@ def test_global_commands_refuse_explicit_project(
     assert '--project' in capsys.readouterr().err
 
 
-def test_run_parser_exposes_declared_workflow_options() -> None:
-    args = build_parser().parse_args(
-        [
-            'run',
-            'ship',
-            '--project',
-            'demo',
-            '--version',
-            '1.2.3',
-            '--acknowledge-new-paths',
-            '--yes',
-        ]
-    )
-
-    assert args.command == 'run'
-    assert args.name == 'ship'
-    assert args.project == 'demo'
-    assert args.version == '1.2.3'
-    assert args.acknowledge_new_paths is True
-    assert args.yes is True
-
-
 @pytest.mark.parametrize(
     ('argv', 'handler_module', 'handler_name'),
     [
@@ -1049,13 +1261,6 @@ def test_runtime_floor_refusal_prevents_repository_handler(
     monkeypatch.setattr(handler_module, handler_name, _unexpected_handler)
 
     assert _cli.main(argv) == 1
-
-
-def test_setup_edit_parser_sets_edit_flag() -> None:
-    args = build_parser().parse_args(['setup', '--edit'])
-
-    assert args.command == 'setup'
-    assert args.edit is True
 
 
 @pytest.mark.parametrize(
@@ -1149,3 +1354,43 @@ def test_watch_timeout_refuses_non_positive_integer(
 ) -> None:
     assert _cli.main(['repo', 'watch', '--timeout', timeout]) == 2
     assert '--timeout must be a positive integer number of seconds' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    'argv',
+    [
+        ['publish', '--no-release-page', '--release-notes-file', 'notes'],
+        ['publish', '--release-page', '--no-release-page'],
+        ['publish', '--release-page', '--release-notes-file', 'notes'],
+        ['publish', '--resolve', '--release-page'],
+        ['publish', '--resolve', '--no-release-page'],
+        ['publish', '--resolve', '--release-notes-file', 'notes'],
+    ],
+)
+def test_publish_page_usage_errors_precede_dispatch(
+    argv: list[str], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def _unexpected(_args: argparse.Namespace) -> None:
+        pytest.fail('invalid publish dispatched')
+
+    monkeypatch.setattr(_cli, '_dispatch', _unexpected)
+    assert _cli.main(argv) == 2
+    assert 'error:' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    'argv',
+    [
+        ['run', 'ship', '--release-page', '--no-release-page'],
+        ['run', 'ship', '--release-page', '--release-notes-file', 'notes'],
+    ],
+)
+def test_run_page_usage_errors_precede_dispatch(
+    argv: list[str], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def _unexpected(_args: argparse.Namespace) -> None:
+        pytest.fail('invalid run dispatched')
+
+    monkeypatch.setattr(_cli, '_dispatch', _unexpected)
+    assert _cli.main(argv) == 2
+    assert 'error:' in capsys.readouterr().err

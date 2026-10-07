@@ -50,7 +50,7 @@ def test_doctor_missing_configuration_reports_setup_recovery(
     assert _cli.main(['doctor']) == 1
     output = capsys.readouterr()
     assert 'missing' in output.err
-    assert escape(str(paths.global_config)) in output.err
+    assert escape((paths.global_config).as_posix()) in output.err
 
 
 def test_doctor_refuses_identity_containing_machine_path(

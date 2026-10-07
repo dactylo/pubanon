@@ -11,7 +11,7 @@ def candidate_store_path(paths: Paths, project: str) -> Path:
     """Return one project's advisory bare-store path without creating it.
 
     Args:
-        paths: Derived Pubanon configuration and data paths.
+        paths: Derived pubanon configuration and data paths.
         project: Registered project name.
 
     Returns:
@@ -28,7 +28,7 @@ def store_path(paths: Paths, project: str) -> Path:
     """Create and return one project's advisory bare store.
 
     Args:
-        paths: Derived Pubanon configuration and data paths.
+        paths: Derived pubanon configuration and data paths.
         project: Registered project name.
 
     Returns:

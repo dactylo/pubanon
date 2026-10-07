@@ -161,7 +161,8 @@ def test_setup_checks_runtime_floors(
     def _floors() -> None:
         seen.append('floors')
 
-    def _setup(_paths: _config.Paths) -> None:
+    def _setup(_paths: _config.Paths, *, edit: bool = False) -> None:
+        assert not edit
         seen.append('setup')
 
     monkeypatch.setattr('pubanon._run.check_floors', _floors)
@@ -385,6 +386,41 @@ def test_setup_edit_corrects_identity_before_save(
     assert 'No history will be rewritten' in output
 
 
+def test_setup_edit_preserves_commit_messages_when_route_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_gh: Path,
+    answers: _Script,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paths, _, _ = configure(tmp_path, monkeypatch)
+    paths.global_config.write_text(
+        paths.global_config.read_text()
+        + '\n[commit_message]\n'
+        + 'tagged = """Release {tag}\n\nBody"""\n'
+        + 'untagged = "Update published files"\n'
+    )
+    fake_gh.write_text(
+        json.dumps([{'args': ['api', 'user', '--jq', '.login'], 'stdout': 'anonymous-account\n'}])
+    )
+    answers(
+        [
+            ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 'e'),
+            'r',
+            ('Default publication route (staged/direct) [staged]: ', 'direct'),
+            ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
+        ]
+    )
+
+    assert _cli.main(['setup', '--edit']) == 0
+    saved = _config.load_global(paths)
+    assert saved.default_publication_route == 'direct'
+    assert saved.commit_message == _config.CommitMessageSettings(
+        tagged='Release {tag}\n\nBody', untagged='Update published files'
+    )
+    assert 'Commit messages:' in capsys.readouterr().out
+
+
 def test_setup_edit_save_preserves_direct_default(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -416,14 +452,14 @@ def test_setup_edits_global_ignored_directories(
     monkeypatch.setattr(_host, 'authenticated_account', lambda: 'anonymous-account')
     answers = iter(
         [
-            'edit',
-            'directories',
-            'add',
+            'e',
+            'd',
+            'a',
             'docs/private/',
-            'add',
+            'a',
             'notes/confidential',
-            'done',
-            'save',
+            'd',
+            's',
         ]
     )
 
@@ -447,14 +483,14 @@ def test_setup_edits_global_ignored_files(
     monkeypatch.setattr(_host, 'authenticated_account', lambda: 'anonymous-account')
     answers = iter(
         [
-            'edit',
-            'files',
-            'add',
+            'e',
+            'f',
+            'a',
             'LOCAL.md',
-            'add',
+            'a',
             'notes/private.txt',
-            'done',
-            'save',
+            'd',
+            's',
         ]
     )
 
@@ -466,91 +502,6 @@ def test_setup_edits_global_ignored_files(
     saved = _config.load_global(paths)
     assert saved == replace(original, ignored_files=('LOCAL.md', 'notes/private.txt'))
     assert 'Excluded files:' in capsys.readouterr().out
-
-
-@pytest.mark.parametrize('action', ['s', 'c'])
-def test_setup_incomplete_account_requires_save_decision(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    answers: _Script,
-    action: str,
-) -> None:
-    paths, _, _ = configure(tmp_path, monkeypatch)
-    paths.global_config.write_text(
-        'anon_name = "Anonymous Publisher"\n'
-        'anon_email = "anonymous@example.invalid"\n'
-        'sensitive_terms = ["Private Person"]\n'
-        'default_publication_route = "staged"\n'
-        '\n[accounts]\n'
-        'github = ""\n'
-    )
-    original = paths.global_config.read_bytes()
-    Path(os.environ['PUBANON_FAKE_GH_RESPONSES']).write_text(
-        json.dumps([{'args': ['api', 'user', '--jq', '.login'], 'stdout': 'public-account\n'}])
-    )
-    answers(
-        [
-            ('Use this GitHub account? [Y/n] ', ''),
-            ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', action),
-        ]
-    )
-
-    assert _cli.main(['setup']) == (0 if action == 's' else 130)
-    output = capsys.readouterr()
-    assert 'Configuration to save' in output.out
-    if action == 's':
-        assert _config.load_global(paths).accounts == {'github': 'public-account'}
-        assert paths.global_config.read_bytes() != original
-        assert 'Saved your configuration.' in output.out
-    else:
-        assert paths.global_config.read_bytes() == original
-        assert 'ready' not in output.out
-
-
-@pytest.mark.parametrize('action', ['retry', 'login', 'cancel'])
-def test_setup_failed_authentication_offers_explicit_actions(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    action: str,
-    answers: _Script,
-) -> None:
-    paths, _, _ = configure(tmp_path, monkeypatch)
-    original = paths.global_config.read_bytes()
-    Path(os.environ['PUBANON_FAKE_GH_RESPONSES']).write_text(
-        json.dumps(
-            [
-                {
-                    'args': ['api', 'user', '--jq', '.login'],
-                    'returncode': 1,
-                    'stderr': 'ghp_PRIVATE_CREDENTIAL',
-                    'once': True,
-                },
-                {'args': ['api', 'user', '--jq', '.login'], 'stdout': 'anonymous-account\n'},
-            ]
-        )
-    )
-    answers([('Authentication: [r]etry / [l]ogin / [c]ancel: ', action)])
-    logins: list[bool] = []
-    before_login: list[str] = []
-
-    def _login() -> None:
-        before_login.append(capsys.readouterr().out)
-        logins.append(True)
-
-    monkeypatch.setattr(_host, 'login', _login)
-    assert _cli.main(['setup']) == (130 if action == 'cancel' else 0)
-    assert paths.global_config.read_bytes() == original
-    output = capsys.readouterr()
-    combined = ''.join(before_login) + output.out + output.err
-    assert 'ghp_PRIVATE_CREDENTIAL' in combined
-    assert 'could not be verified' in combined
-    assert logins == ([True] if action == 'login' else [])
-    if action == 'login':
-        assert 'Handing this terminal to gh auth login.' in before_login[0]
-        assert 'Completed authentication stays in effect' in before_login[0]
-    assert len(gh_calls(tmp_path)) >= (1 if action == 'cancel' else 2)
 
 
 def test_setup_interrupt_after_save_retains_configuration_and_facts(
@@ -598,58 +549,6 @@ def test_setup_interrupt_after_save_retains_configuration_and_facts(
     assert 'saved configuration was retained' in captured.err
     assert 'rerun pubanon setup' in captured.err
     assert 'ready' not in captured.out
-
-
-@pytest.mark.parametrize('login_result', ['failed', 'still-unverified', 'wrong-account'])
-def test_setup_login_never_saves_without_verified_matching_account(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    login_result: str,
-    answers: _Script,
-) -> None:
-    paths, _, _ = configure(tmp_path, monkeypatch)
-    original = paths.global_config.read_bytes()
-    responses = [
-        {'args': ['api', 'user', '--jq', '.login'], 'returncode': 1, 'once': True},
-        {'args': ['api', 'user', '--jq', '.login'], 'returncode': 1}
-        if login_result == 'still-unverified'
-        else {'args': ['api', 'user', '--jq', '.login'], 'stdout': 'another-account\n'},
-    ]
-    Path(os.environ['PUBANON_FAKE_GH_RESPONSES']).write_text(json.dumps(responses))
-    answers(
-        [
-            ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
-            ('Authentication: [r]etry / [l]ogin / [c]ancel: ', 'l'),
-            *(
-                [('Authentication: [r]etry / [l]ogin / [c]ancel: ', 'c')]
-                if login_result == 'still-unverified'
-                else []
-            ),
-            *(
-                [('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 'c')]
-                if login_result == 'wrong-account'
-                else []
-            ),
-        ]
-    )
-    logins: list[bool] = []
-
-    def _login() -> None:
-        logins.append(True)
-        if login_result == 'failed':
-            raise PubanonError('GitHub login did not complete')
-
-    monkeypatch.setattr(_host, 'login', _login)
-    assert _cli.main(['setup', '--edit']) == (
-        130 if login_result in {'still-unverified', 'wrong-account'} else 1
-    )
-    assert paths.global_config.read_bytes() == original
-    assert logins == [True]
-    output = capsys.readouterr()
-    assert 'ready' not in output.out
-    if login_result in {'still-unverified', 'wrong-account'}:
-        assert len(gh_calls(tmp_path)) == 2
 
 
 def test_setup_missing_configuration_requires_interactive_terminal(
@@ -771,36 +670,6 @@ def test_setup_refuses_existing_identity_collision_with_machine_paths(
     assert str(tmp_path) not in output.out + output.err
 
 
-@pytest.mark.parametrize(
-    ('content', 'diagnostic'),
-    [
-        ('anon_name = "private-canary', 'malformed'),
-        ('"private-canary" = "secret"', 'unknown global configuration key'),
-        (
-            (
-                'anon_name = "bad<private-canary>"\nanon_email = "public@example.com"\n'
-                'sensitive_terms = ["private-canary"]\n'
-                'default_publication_route = "staged"\n[accounts]\ngithub = "account"'
-            ),
-            'anon_name',
-        ),
-    ],
-)
-def test_setup_refuses_invalid_existing_configuration_without_overwriting_it(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    content: str,
-    diagnostic: str,
-) -> None:
-    paths, _, _ = configure(tmp_path, monkeypatch)
-    paths.global_config.write_text(content)
-    assert _cli.main(['setup']) == 1
-    assert paths.global_config.read_text() == content
-    output = capsys.readouterr()
-    assert diagnostic in output.err
-
-
 def test_setup_retries_colliding_new_identity_without_removing_terms(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -836,36 +705,6 @@ def test_setup_retries_colliding_new_identity_without_removing_terms(
     assert 'Private Person' in output.out + output.err
 
 
-def test_setup_retries_invalid_name_without_losing_other_answers(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    fake_gh: Path,
-    answers: _Script,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    paths, _, _ = configure(tmp_path, monkeypatch)
-    paths.global_config.unlink()
-    fake_gh.write_text(
-        json.dumps([{'args': ['api', 'user', '--jq', '.login'], 'stdout': 'public-account\n'}])
-    )
-    monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
-    answers(
-        [
-            ('Publication name: ', 'Bad<Name'),
-            ('Publication name: ', 'Public Publisher'),
-            ('Publication email: ', 'public@example.invalid'),
-            ('Sensitive term: ', 'first-canary'),
-            ('Sensitive term: ', ''),
-            ('Default publication route (staged/direct) [staged]: ', ''),
-            ('Use this GitHub account? [Y/n] ', ''),
-            ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
-        ]
-    )
-    assert _cli.main(['setup']) == 0
-    assert 'anon_name must be a nonempty value' in capsys.readouterr().out
-    assert _config.load_global(paths).anon_name == 'Public Publisher'
-
-
 def test_setup_retries_invalid_new_fields_and_terms(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -896,7 +735,242 @@ def test_setup_retries_invalid_new_fields_and_terms(
     assert config.anon_name == 'Public Publisher'
     assert config.sensitive_terms == ('private-canary',)
     output = capsys.readouterr()
+    assert 'anon_name must be a nonempty value' in output.out
     assert 'private-canary' in output.out + output.err
+
+
+@pytest.mark.parametrize(
+    ('settings', 'summary'),
+    [
+        (None, 'built-in (set [commit_message] in config.toml to change)'),
+        (
+            _config.CommitMessageSettings(tagged='Release {tag}\n\nBody'),
+            'tagged "Release {tag}"..., untagged built-in',
+        ),
+        (
+            _config.CommitMessageSettings(tagged='Release \x1b{tag}'),
+            r'tagged "Release \x1b{tag}", untagged built-in',
+        ),
+    ],
+)
+def test_setup_review_summarizes_commit_messages_safely(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    settings: _config.CommitMessageSettings | None,
+    summary: str,
+) -> None:
+    _, original, _ = configure(tmp_path, monkeypatch)
+    cli_setup._setup_review(replace(original, commit_message=settings), original)
+
+    output = capsys.readouterr().out
+    row = next(line for line in output.splitlines() if line.startswith('Commit messages:'))
+    assert row.partition(':')[2].strip() == summary
+    assert '\x1b' not in output
+
+
+@pytest.mark.parametrize(
+    ('table', 'expected'),
+    [
+        (
+            'tagged = "{project}"',
+            'commit_message.tagged in the global configuration',
+        ),
+        (
+            'private_text = "x"',
+            'unknown commit_message key in the global configuration',
+        ),
+    ],
+)
+def test_setup_edit_reports_commit_message_errors_without_overwriting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    table: str,
+    expected: str,
+) -> None:
+    paths, _, _ = configure(tmp_path, monkeypatch)
+    paths.global_config.write_text(
+        paths.global_config.read_text() + f'\n[commit_message]\n{table}\n'
+    )
+    original = paths.global_config.read_bytes()
+
+    assert _cli.main(['setup', '--edit']) == 1
+    assert paths.global_config.read_bytes() == original
+    output = capsys.readouterr()
+    assert expected in output.err
+    assert 'private_text' not in output.out + output.err
+    if table.startswith('tagged'):
+        assert 'Supported fields: tag, version' in output.err
+    else:
+        assert 'Supported fields:' not in output.err
+
+
+@pytest.mark.parametrize('action', ['s', 'c'])
+def test_setup_incomplete_account_requires_save_decision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    answers: _Script,
+    action: str,
+) -> None:
+    paths, _, _ = configure(tmp_path, monkeypatch)
+    paths.global_config.write_text(
+        'anon_name = "Anonymous Publisher"\n'
+        'anon_email = "anonymous@example.invalid"\n'
+        'sensitive_terms = ["Private Person"]\n'
+        'default_publication_route = "staged"\n'
+        '\n[accounts]\n'
+        'github = ""\n'
+    )
+    original = paths.global_config.read_bytes()
+    Path(os.environ['PUBANON_FAKE_GH_RESPONSES']).write_text(
+        json.dumps([{'args': ['api', 'user', '--jq', '.login'], 'stdout': 'public-account\n'}])
+    )
+    answers(
+        [
+            ('Use this GitHub account? [Y/n] ', ''),
+            ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', action),
+        ]
+    )
+
+    assert _cli.main(['setup']) == (0 if action == 's' else 130)
+    output = capsys.readouterr()
+    assert 'Configuration to save' in output.out
+    if action == 's':
+        assert _config.load_global(paths).accounts == {'github': 'public-account'}
+        assert paths.global_config.read_bytes() != original
+        assert 'Saved your configuration.' in output.out
+    else:
+        assert paths.global_config.read_bytes() == original
+        assert 'ready' not in output.out
+
+
+@pytest.mark.parametrize('action', ['retry', 'login', 'cancel'])
+def test_setup_failed_authentication_offers_explicit_actions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    action: str,
+    answers: _Script,
+) -> None:
+    paths, _, _ = configure(tmp_path, monkeypatch)
+    original = paths.global_config.read_bytes()
+    Path(os.environ['PUBANON_FAKE_GH_RESPONSES']).write_text(
+        json.dumps(
+            [
+                {
+                    'args': ['api', 'user', '--jq', '.login'],
+                    'returncode': 1,
+                    'stderr': 'ghp_PRIVATE_CREDENTIAL',
+                    'once': True,
+                },
+                {'args': ['api', 'user', '--jq', '.login'], 'stdout': 'anonymous-account\n'},
+            ]
+        )
+    )
+    answers([('Authentication: [r]etry / [l]ogin / [c]ancel: ', action[0])])
+    logins: list[bool] = []
+    before_login: list[str] = []
+
+    def _login() -> None:
+        before_login.append(capsys.readouterr().out)
+        logins.append(True)
+
+    monkeypatch.setattr(_host, 'login', _login)
+    assert _cli.main(['setup']) == (130 if action == 'cancel' else 0)
+    assert paths.global_config.read_bytes() == original
+    output = capsys.readouterr()
+    combined = ''.join(before_login) + output.out + output.err
+    assert 'ghp_PRIVATE_CREDENTIAL' in combined
+    assert 'could not be verified' in combined
+    assert logins == ([True] if action == 'login' else [])
+    if action == 'login':
+        assert 'Handing this terminal to gh auth login.' in before_login[0]
+        assert 'Completed authentication stays in effect' in before_login[0]
+    assert len(gh_calls(tmp_path)) >= (1 if action == 'cancel' else 2)
+
+
+@pytest.mark.parametrize('login_result', ['failed', 'still-unverified', 'wrong-account'])
+def test_setup_login_never_saves_without_verified_matching_account(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    login_result: str,
+    answers: _Script,
+) -> None:
+    paths, _, _ = configure(tmp_path, monkeypatch)
+    original = paths.global_config.read_bytes()
+    responses = [
+        {'args': ['api', 'user', '--jq', '.login'], 'returncode': 1, 'once': True},
+        {'args': ['api', 'user', '--jq', '.login'], 'returncode': 1}
+        if login_result == 'still-unverified'
+        else {'args': ['api', 'user', '--jq', '.login'], 'stdout': 'another-account\n'},
+    ]
+    Path(os.environ['PUBANON_FAKE_GH_RESPONSES']).write_text(json.dumps(responses))
+    answers(
+        [
+            ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
+            ('Authentication: [r]etry / [l]ogin / [c]ancel: ', 'l'),
+            *(
+                [('Authentication: [r]etry / [l]ogin / [c]ancel: ', 'c')]
+                if login_result == 'still-unverified'
+                else []
+            ),
+            *(
+                [('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 'c')]
+                if login_result == 'wrong-account'
+                else []
+            ),
+        ]
+    )
+    logins: list[bool] = []
+
+    def _login() -> None:
+        logins.append(True)
+        if login_result == 'failed':
+            raise PubanonError('GitHub login did not complete')
+
+    monkeypatch.setattr(_host, 'login', _login)
+    assert _cli.main(['setup', '--edit']) == (
+        130 if login_result in {'still-unverified', 'wrong-account'} else 1
+    )
+    assert paths.global_config.read_bytes() == original
+    assert logins == [True]
+    output = capsys.readouterr()
+    assert 'ready' not in output.out
+    if login_result in {'still-unverified', 'wrong-account'}:
+        assert len(gh_calls(tmp_path)) == 2
+
+
+@pytest.mark.parametrize(
+    ('content', 'diagnostic'),
+    [
+        ('anon_name = "private-canary', 'malformed'),
+        ('"private-canary" = "secret"', 'unknown global configuration key'),
+        (
+            (
+                'anon_name = "bad<private-canary>"\nanon_email = "public@example.com"\n'
+                'sensitive_terms = ["private-canary"]\n'
+                'default_publication_route = "staged"\n[accounts]\ngithub = "account"'
+            ),
+            'anon_name',
+        ),
+    ],
+)
+def test_setup_refuses_invalid_existing_configuration_without_overwriting_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    content: str,
+    diagnostic: str,
+) -> None:
+    paths, _, _ = configure(tmp_path, monkeypatch)
+    paths.global_config.write_text(content)
+    assert _cli.main(['setup']) == 1
+    assert paths.global_config.read_text() == content
+    output = capsys.readouterr()
+    assert diagnostic in output.err
 
 
 def test_setup_save_decline_leaves_original_bytes(

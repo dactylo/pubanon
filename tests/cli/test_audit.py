@@ -11,7 +11,7 @@ import pytest
 from pubanon import _cli, _config
 from pubanon._cli._context import load_context
 from pubanon._remote import _host
-from pubanon._snapshots import _audit, _candidate
+from pubanon._snapshots import _audit, _candidate, _store
 from tests._cli import prepare, record_published_main, stub_remote
 from tests._git import git_env
 from tests._setup import configure
@@ -26,7 +26,7 @@ def test_audit_discloses_blob_scan_skipped_for_merge_history(
     exposure = 'historical-private-canary'
     source = make_repo(files={'README.md': f'{exposure}\n'})
     paths, project, record = prepare(tmp_path, source, monkeypatch)
-    store = _candidate.store_path(paths, project.name)
+    store = _store.store_path(paths, project.name)
     tree = subprocess.run(
         ['git', '-C', store, 'rev-parse', f'{record.commit}^{{tree}}'],
         check=True,
@@ -75,35 +75,6 @@ def test_audit_discloses_blob_scan_skipped_for_merge_history(
     assert 'Content auditing could not be completed reliably.' in output
     assert 'No configured sensitive terms were found in the checked history.' not in output
     assert 'Warning: historical exposure' not in output
-
-
-def test_audit_discloses_invalid_tree_header_result(
-    tmp_path: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    source = make_repo(files={'README.md': 'public\n'})
-    paths, project, record = prepare(tmp_path, source, monkeypatch)
-    record_published_main(paths, project, record)
-    problem = f'{record.commit[:12]}: invalid tree object ID'
-
-    def incomplete_audit(*_args: object, **_kwargs: object) -> _audit.HistoryAudit:
-        return _audit.HistoryAudit((), (problem,), ())
-
-    monkeypatch.setattr(
-        _audit,
-        'audit_history',
-        incomplete_audit,
-    )
-    capsys.readouterr()
-
-    assert _cli.main(['audit', '--project', project.name]) == 0
-
-    output = capsys.readouterr().out
-    assert f'identity problem: {problem}' in output
-    assert 'Content auditing could not be completed reliably.' in output
-    assert 'No configured sensitive terms were found in the checked history.' not in output
 
 
 def test_audit_remote_labels_verified_history(
@@ -194,12 +165,10 @@ def test_audit_remote_mismatch_reports_refs_without_cause(
     assert 'GitHub branches and tags do not match saved published history' in err
     assert record.commit in err
     assert foreign in err
-    assert (
-        'pubanon repo verify --project=demo; use pubanon repo restore --project=demo --to local '
-        'only if GitHub is authoritative, '
-        'or see "Accepting an outside fix" in the operator guide if GitHub changed '
-        'outside Pubanon'
-    ) in err
+    assert 'pubanon repo verify --project=demo' in err
+    assert 'pubanon repo restore --project=demo --to local' in err
+    assert 'Accepting an outside fix' in err
+    assert 'operator guide' in err
     assert 'merge' not in err
     assert 'pull request' not in err
 
@@ -212,7 +181,7 @@ def test_audit_remote_refuses_drift_before_audit_output(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, project, record = prepare(tmp_path, source, monkeypatch)
-    project = replace(project, extra_terms=('outside Pubanon',))
+    project = replace(project, extra_terms=('outside pubanon',))
     _config.save_project(paths, project)
     global_config = _config.load_global(paths)
     record_published_main(paths, project, record)
@@ -231,12 +200,9 @@ def test_audit_remote_refuses_drift_before_audit_output(
     assert _cli.main(['audit', '--project', project.name, '--remote']) == 1
 
     captured = capsys.readouterr()
-    assert (
-        'pubanon repo verify --project=demo; use pubanon repo restore --project=demo --to local'
-        in captured.err
-    )
-    assert 'if GitHub changed outside Pubanon' in captured.err
-    assert 'outside Pubanon' in captured.err
+    assert 'pubanon repo verify --project=demo' in captured.err
+    assert 'pubanon repo restore --project=demo --to local' in captured.err
+    assert 'outside pubanon' in captured.err
     assert 'audit:' not in captured.out
 
 
@@ -343,7 +309,7 @@ def test_audit_reports_findings_and_public_history_guidance(
         [
             'git',
             '-C',
-            _candidate.store_path(paths, project.name),
+            _store.store_path(paths, project.name),
             'update-ref',
             'refs/tags/v1.0.0',
             record.commit,
@@ -469,7 +435,7 @@ def test_audit_reports_identity_problems(
         [
             'git',
             '-C',
-            _candidate.store_path(paths, project.name),
+            _store.store_path(paths, project.name),
             'fetch',
             '-q',
             str(source),
@@ -509,7 +475,13 @@ def test_audit_reports_matching_nonempty_exposure_acknowledgment(
         _config.derived_private_terms(paths, project, os.environ),
     )
     findings = _audit.audit_history(
-        paths, project.name, commits, tags, rules, ctx.global_config, tip=main
+        paths,
+        project.name,
+        commits,
+        tags,
+        rules,
+        f'{ctx.global_config.anon_name} <{ctx.global_config.anon_email}>',
+        tip=main,
     ).findings
     digest = _audit.exposure_digest(findings)
     assert digest

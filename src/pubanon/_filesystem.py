@@ -10,6 +10,24 @@ from pathlib import Path
 from pubanon import _windows_fs
 
 
+class DurableWriteError(Exception):
+    """Report the phase and interruption state of a failed private write.
+
+    Attributes:
+        replaced: Whether replacement returned successfully.
+        replacement_attempted: Whether replacement started; an interrupt can
+            leave its outcome uncertain even when `replaced` is false.
+        interrupted: Whether a keyboard interrupt caused the failure.
+    """
+
+    def __init__(self, *, replaced: bool, replacement_attempted: bool, interrupted: bool) -> None:
+        """Record the failure phase for caller-specific recovery messages."""
+        super().__init__('durable write failed')
+        self.replaced = replaced
+        self.replacement_attempted = replacement_attempted
+        self.interrupted = interrupted
+
+
 def chmod(path: Path, mode: int, *, follow_symlinks: bool = True) -> None:
     """Set read-only attributes on Windows and mode bits on POSIX.
 
@@ -20,12 +38,7 @@ def chmod(path: Path, mode: int, *, follow_symlinks: bool = True) -> None:
         follow_symlinks: Whether to modify the leaf target rather than the link
             itself.
     """
-    if os.name == 'nt':
-        _windows_fs.chmod(path, mode, follow_symlinks=follow_symlinks)
-    elif follow_symlinks:
-        path.chmod(mode)
-    else:
-        path.chmod(mode, follow_symlinks=False)
+    path.chmod(mode, follow_symlinks=follow_symlinks)
 
 
 def _restore_tree_access(root: Path) -> None:
@@ -58,10 +71,7 @@ def fchmod(fd: int, mode: int) -> None:
         mode: POSIX mode; Windows uses only owner-write to select its read-only
             attribute.
     """
-    if os.name == 'nt':
-        _windows_fs.fchmod(fd, mode)
-    else:
-        os.fchmod(fd, mode)
+    os.fchmod(fd, mode)
 
 
 def remove_tree(path: Path) -> bool:
@@ -114,7 +124,7 @@ def sync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         if descriptor is not None:
-            with suppress(OSError, RuntimeError):
+            with suppress(OSError):
                 os.close(descriptor)
 
 
@@ -137,3 +147,54 @@ def durable_unlink(path: Path) -> None:
         _windows_fs.replace(path, temporary)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def write_private(path: Path, payload: bytes) -> None:
+    """Durably replace a file with owner-only content.
+
+    Write a unique temporary in the existing parent directory with mode 0600,
+    fsync it, replace the target, and sync the directory. Remove the owned
+    temporary on failure without disturbing unrelated files.
+
+    Raises:
+        DurableWriteError: A write step failed; the original error is chained.
+            An interrupted replacement attempt can have an unknown outcome.
+    """
+    descriptor: int | None = None
+    temporary: Path | None = None
+    replaced = False
+    replacement_attempted = False
+    try:
+        descriptor, name = tempfile.mkstemp(
+            prefix='.pubanon-write-', suffix='.tmp', dir=path.parent
+        )
+        temporary = Path(name)
+        fchmod(descriptor, 0o600)
+        handle = os.fdopen(descriptor, 'wb')
+        descriptor = None
+        try:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        except (OSError, KeyboardInterrupt):
+            with suppress(OSError):
+                handle.close()
+            raise
+        handle.close()
+        replacement_attempted = True
+        replace(temporary, path)
+        replaced = True
+        sync_directory(path.parent)
+    except (OSError, KeyboardInterrupt) as exc:
+        raise DurableWriteError(
+            replaced=replaced,
+            replacement_attempted=replacement_attempted,
+            interrupted=isinstance(exc, KeyboardInterrupt),
+        ) from exc
+    finally:
+        if descriptor is not None:
+            with suppress(OSError):
+                os.close(descriptor)
+        if temporary is not None:
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)

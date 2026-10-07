@@ -7,7 +7,7 @@ from pathlib import Path
 from pubanon import _config, _filesystem
 from pubanon._cli import _context
 from pubanon._errors import OperationCanceled, PubanonError
-from pubanon._snapshots import _candidate
+from pubanon._snapshots import _discard
 from pubanon._terminal import confirm, display_path, escape, field, heading, output, shell_command
 
 
@@ -83,7 +83,7 @@ def command_forget(args: argparse.Namespace) -> None:
             ):
                 output('Nothing to remove.')
                 return
-            _candidate.check_recovery_state(paths, name, force=args.force)
+            _discard.check_recovery_state(paths, name, force=args.force)
             try:
                 project = _config.load_project(paths, name)
             except PubanonError:
@@ -121,6 +121,7 @@ def command_forget(args: argparse.Namespace) -> None:
             _config.registry_remove(paths, name)
             configuration.unlink(missing_ok=True)
             _remove_entries(entries)
+    # remove_tree can raise NotImplementedError for no-follow chmod.
     except (OSError, RuntimeError) as exc:
         raise PubanonError(
             'cannot finish removing local project data',

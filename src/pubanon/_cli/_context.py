@@ -10,9 +10,11 @@ from pubanon import (
 )
 from pubanon._errors import PubanonError
 from pubanon._remote import _host
-from pubanon._snapshots import _candidate, _records
+from pubanon._snapshots import _candidate, _records, _store
 from pubanon._terminal import (
+    PROJECT_COMMANDS,
     escape,
+    project_fallback,
     shell_command,
 )
 
@@ -39,26 +41,15 @@ def load_context(paths: _config.Paths, name: str) -> ProjectContext:
     return ProjectContext(paths, global_config, project)
 
 
-def local_refs(ctx: ProjectContext) -> tuple[str | None, dict[str, str]]:
-    """Read main and tags from the advisory store without creating it."""
-    return _candidate.published_refs(ctx.paths, ctx.project.name)
-
-
 def project_command(name: str, *args: str) -> str:
     """Render a project command or direct recovery to the selected project."""
     command = shell_command('pubanon', *args)
     if command is None:
-        action = (
-            ' '.join(args[:2])
-            if args[0] in {'repo', 'stage', 'package', 'review', 'release'}
-            else args[0]
-        )
-        modes = ' '.join(arg for arg in args if arg in {'--continue', '--resolve'})
-        suffix = f' {modes}' if modes else ''
-        return (
-            f'Choose project {escape(name)} from its registered directory, '
-            f'then rerun {action}{suffix}.'
-        )
+        action = ' '.join(args[:2])
+        if action not in PROJECT_COMMANDS:
+            action = args[0]
+        modes = ' '.join(arg for arg in args if arg in {'--clean', '--continue', '--resolve'})
+        return project_fallback(name, action, modes or None)
     return command
 
 
@@ -104,7 +95,7 @@ def refuse_unexpected_branches(refs: _host.RemoteRefs) -> None:
 
 def require_advisory_store(paths: _config.Paths, project: str) -> None:
     """Refuse a read-only remote comparison without local published state."""
-    store = _candidate.candidate_store_path(paths, project)
+    store = _store.candidate_store_path(paths, project)
     if not store.is_dir():
         raise PubanonError(
             'no saved published history was found',

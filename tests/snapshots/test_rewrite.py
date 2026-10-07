@@ -1,3 +1,4 @@
+import os
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -5,9 +6,19 @@ from pathlib import Path
 
 import pytest
 
+from pubanon import _filesystem
 from pubanon._config import GlobalConfig, Paths, ProjectConfig
 from pubanon._errors import PubanonError
-from pubanon._snapshots import _candidate, _records, _rewrite, _source
+from pubanon._snapshots import (
+    _candidate,
+    _discard,
+    _inspection,
+    _records,
+    _rewrite,
+    _source,
+    _store,
+    _verification,
+)
 from pubanon._snapshots._candidate import CandidateInputs
 from pubanon._snapshots._records import CandidateRecord
 from pubanon._snapshots._source import Entry, read_snapshot
@@ -52,7 +63,7 @@ def _history(
             ),
         )
         commits.append(record.commit)
-        store = _candidate.store_path(paths, project.name)
+        store = _store.store_path(paths, project.name)
         _git(store, 'update-ref', 'refs/heads/main', record.commit)
         _git(store, 'update-ref', f'refs/tags/v1.0.{index}', record.commit)
         _records.candidate_path(paths, project.name).unlink()
@@ -140,7 +151,7 @@ def test_awaiting_refusal_preserves_edits_and_progress(tmp_path: Path) -> None:
 
 def test_clear_pause_deletes_symbolic_private_ref_without_changing_main(tmp_path: Path) -> None:
     paths, _, project, commits = _history(tmp_path)
-    store = _candidate.store_path(paths, project.name)
+    store = _store.store_path(paths, project.name)
     _git(store, 'symbolic-ref', _candidate.REWRITE_MERGED_REF, 'refs/heads/main')
 
     _rewrite._clear_pause(paths, project.name, store)
@@ -164,7 +175,7 @@ def test_completion_gate_refusal_retains_complete_provenance(tmp_path: Path) -> 
     assert complete.tip is not None
     assert complete.replayed[-1].resolutions
     assert _records.load_rewrite(paths, project.name) is not None
-    assert _candidate.discard(paths, project.name, force=False)
+    assert _discard.discard(paths, project.name, force=False)
 
 
 @pytest.mark.slow
@@ -173,26 +184,51 @@ def test_discard_removes_paused_rewrite_without_published_refs_or_inspection(
 ) -> None:
     paths, g, project, old, correction = _prepare(tmp_path, conflict=True)
     _rewrite.continue_rewrite(paths, g, project, env={})
-    inspect = _candidate.materialize_snapshot(
+    inspect = _inspection.materialize_snapshot(
         paths,
         project.name,
         correction.commit,
-        read_snapshot(_candidate.store_path(paths, project.name), correction.commit),
+        read_snapshot(_store.store_path(paths, project.name), correction.commit),
     )
-    _candidate.discard(paths, project.name, force=False)
+    _discard.discard(paths, project.name, force=False)
     assert not _records.rewrite_path(paths, project.name).exists()
     assert not _records.rewrite_directory(paths, project.name).exists()
     assert not inspect.exists()
     assert _candidate.published_refs(paths, project.name)[0] == old[-1]
     assert (
         _git(
-            _candidate.store_path(paths, project.name),
+            _store.store_path(paths, project.name),
             'for-each-ref',
             '--format=%(refname)',
             'refs/pubanon',
         ).strip()
         == b''
     )
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX directory permissions')
+def test_discard_removes_read_only_conflict_export(tmp_path: Path) -> None:
+    paths, g, project, _, _ = _prepare(tmp_path, conflict=True)
+    _rewrite.continue_rewrite(paths, g, project, env={})
+    directory = _records.rewrite_directory(paths, project.name)
+    tree = directory / 'tree'
+    _filesystem.chmod(tree / 'base.txt', 0o400)
+    _filesystem.chmod(tree, 0o500)
+    try:
+        try:
+            (tree / '.permission-probe').touch(exist_ok=False)
+        except PermissionError:
+            pass
+        else:
+            (tree / '.permission-probe').unlink()
+            pytest.skip('filesystem does not enforce read-only directory permissions')
+        assert _discard.discard(paths, project.name, force=False)
+        assert not directory.exists()
+        assert not _records.rewrite_path(paths, project.name).exists()
+    finally:
+        if directory.exists():
+            _filesystem.remove_tree(directory)
 
 
 @pytest.mark.slow
@@ -220,11 +256,11 @@ def test_every_durable_boundary_resumes_without_losing_decisions(
     if boundary in {'advanced-ref', 'resolved-entry'}:
         assert (directory / 'tree' / 'base.txt').read_bytes() == b'resolved\n'
     if boundary == 'pause-record':
-        store = _candidate.store_path(paths, project.name)
+        store = _store.store_path(paths, project.name)
         _git(store, 'reflog', 'expire', '--expire=now', '--all')
         _git(store, 'gc', '--prune=now')
     if boundary == 'initial-record':
-        store = _candidate.store_path(paths, project.name)
+        store = _store.store_path(paths, project.name)
         _git(store, 'update-ref', '-d', _candidate.CANDIDATE_REF, correction.commit)
     if boundary in {'partial-export', 'manifest-export'}:
         # Exporting never treats these apparent user decisions as resolutions.
@@ -309,7 +345,7 @@ def test_latest_and_all_are_complete_without_replay(tmp_path: Path, scope: str) 
         }
     else:
         assert record.poststate_tags == {}
-    _candidate.verify_retained_candidate(paths, g, project, record, env={})
+    _verification.verify_retained_candidate(paths, g, project, record, env={})
     with pytest.raises(PubanonError, match='no rewrite'):
         _rewrite.continue_rewrite(paths, g, project, env={})
 
@@ -322,7 +358,7 @@ def test_pause_retains_partial_chain_through_gc_and_preserves_edits(tmp_path: Pa
     assert progress is not None
     assert progress.pause is not None
     assert len(progress.replayed) == 1
-    store = _candidate.store_path(paths, project.name)
+    store = _store.store_path(paths, project.name)
     _git(store, 'reflog', 'expire', '--expire=now', '--all')
     _git(store, 'gc', '--prune=now')
     _resolve(paths, project)
@@ -346,7 +382,7 @@ def test_replay_configuration_change_refuses_before_merge(tmp_path: Path) -> Non
 @pytest.mark.slow
 def test_replay_preserves_each_release_including_empty_descendant(tmp_path: Path) -> None:
     paths, g, project, old, correction = _prepare(tmp_path, empty=True)
-    store = _candidate.store_path(paths, project.name)
+    store = _store.store_path(paths, project.name)
     result = _rewrite.continue_rewrite(paths, g, project, env={})
     assert tuple(entry.old for entry in result.replayed) == old[1:]
     assert result.tip is not None
@@ -432,7 +468,7 @@ def test_resolve_replacement_preserves_ambiguous_prefix_refusal(
     ) -> tuple[_rewrite._history.PublicationEntry, ...]:
         return entries
 
-    store = _candidate.store_path(paths, project.name)
+    store = _store.store_path(paths, project.name)
     refs = _git(store, 'for-each-ref', '--format=%(refname) %(objectname)')
     source_entries = tuple(project.source_path.iterdir())
     monkeypatch.setattr(_rewrite._history, 'publications', _publications)
@@ -448,7 +484,7 @@ def test_resolve_replacement_preserves_ambiguous_prefix_refusal(
 
 def test_resolve_replacement_rejects_unknown_and_archived_nonancestor(tmp_path: Path) -> None:
     paths, _, project, old = _history(tmp_path)
-    store = _candidate.store_path(paths, project.name)
+    store = _store.store_path(paths, project.name)
     refs = _git(store, 'for-each-ref', '--format=%(refname) %(objectname)')
     source_entries = tuple(project.source_path.iterdir())
     with pytest.raises(PubanonError, match='unknown') as error:
@@ -494,7 +530,7 @@ def test_resume_rejects_conflicting_frozen_sequence(tmp_path: Path) -> None:
 
 def test_update_ref_replaces_symbolic_private_ref_without_changing_main(tmp_path: Path) -> None:
     paths, _, project, commits = _history(tmp_path)
-    store = _candidate.store_path(paths, project.name)
+    store = _store.store_path(paths, project.name)
     _git(store, 'update-ref', 'refs/heads/main', commits[0], commits[-1])
     _git(store, 'symbolic-ref', _candidate.CANDIDATE_REF, 'refs/heads/main')
 

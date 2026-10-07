@@ -11,7 +11,17 @@ from pubanon import (
 )
 from pubanon._cli import _context
 from pubanon._errors import OperationCanceled, PubanonError
-from pubanon._snapshots import _candidate, _history, _records, _source
+from pubanon._snapshots import (
+    _candidate,
+    _discard,
+    _history,
+    _inspection,
+    _records,
+    _reports,
+    _source,
+    _store,
+    _verification,
+)
 from pubanon._terminal import (
     confirm,
     display_path,
@@ -22,6 +32,7 @@ from pubanon._terminal import (
     next_step,
     output,
     style,
+    verbose_enabled,
 )
 
 if TYPE_CHECKING:
@@ -95,7 +106,6 @@ def _history_entry(
     entry: _history.PublicationEntry,
     candidate: _candidate.CandidateRecord | None,
     *,
-    verbose: bool,
     match: _source.SourceMatches | None = None,
 ) -> tuple[tuple[str, str, str, str], list[str | tuple[str, str]]]:
     """Describe one published row and its optional provenance."""
@@ -104,13 +114,13 @@ def _history_entry(
         and entry.commit in {candidate.commit, *(item.new for item in candidate.replayed)}
         and candidate.state == _candidate.STATE_UNKNOWN_OUTCOME
     )
-    snapshot = entry.commit if verbose else entry.commit[:12]
+    snapshot = entry.commit if verbose_enabled() else entry.commit[:12]
     state = 'published' if pending else 'superseded' if entry.replaced else 'published'
     published = display_time(entry.record.confirmed_at) if entry.record is not None else '-'
     details: list[str | tuple[str, str]] = []
     if pending:
         details.append(('Local recording', style('incomplete', 'warning')))
-    if verbose:
+    if verbose_enabled():
         details.extend(['', ('Snapshot', snapshot)])
         details.append(('Source', _history_source_status(ctx.project, entry)))
         if entry.record is not None and entry.record.pinned is not None:
@@ -133,14 +143,14 @@ def _pending_history(
     ctx: _context.ProjectContext,
     record: _candidate.CandidateRecord,
     entries: tuple[_history.PublicationEntry, ...],
-    *,
-    verbose: bool,
 ) -> tuple[list[tuple[str, str, str, str]], list[str | tuple[str, str]], str]:
     """List each retained snapshot under its own identity and return its recovery action."""
     progress = _records.load_rewrite(ctx.paths, ctx.project.name)
     incomplete = record.replaces is not None and (record.tip is None or progress is not None)
     unknown = record.state == _candidate.STATE_UNKNOWN_OUTCOME
-    confirmed = unknown and _candidate.confirmed_publication(ctx.paths, ctx.project.name, record)
+    confirmed = unknown and _verification.confirmed_publication(
+        ctx.paths, ctx.project.name, record
+    )
     state = (
         'published'
         if confirmed
@@ -151,11 +161,12 @@ def _pending_history(
         else 'prepared'
     )
     replayed = record.replayed or (progress.replayed if progress is not None else ())
-    rewritten = {record.replaces: record.commit, **{entry.old: entry.new for entry in replayed}}
     tags = (
         record.poststate_tags
         if record.poststate_tags is not None
-        else {tag: rewritten.get(commit, commit) for tag, commit in record.prestate_tags.items()}
+        else _records.replacement_poststate_tags(record, replayed)
+        if record.replaces is not None
+        else record.prestate_tags
     )
     snapshots: list[tuple[str, str | None, str | None, str]] = [
         (record.commit, record.tag_intent, record.pinned.commit, 'Source commit')
@@ -172,11 +183,11 @@ def _pending_history(
         version = (
             ', '.join(tag for tag, oid in tags.items() if oid == commit) or intended or 'untagged'
         )
-        snapshot = commit if verbose else commit[:12]
+        snapshot = commit if verbose_enabled() else commit[:12]
         rows.append((snapshot, escape(version), state, '-'))
         if confirmed:
             details.append(('Local recording', style('incomplete', 'warning')))
-        if verbose:
+        if verbose_enabled():
             details.extend(
                 [
                     '',
@@ -188,7 +199,7 @@ def _pending_history(
                 details.append((source_label, source))
     if unknown:
         if not confirmed:
-            details.append('Pubanon could not confirm whether publication completed.')
+            details.append('pubanon could not confirm whether publication completed.')
         return rows, details, 'pubanon publish --resolve'
     if incomplete:
         details.append('Preparation stopped before the replacement was ready.')
@@ -199,11 +210,9 @@ def _pending_history(
 def _refresh_source_matches(
     ctx: _context.ProjectContext,
     entries: tuple[_history.PublicationEntry, ...],
-    *,
-    verbose: bool,
 ) -> dict[str, _source.SourceMatches]:
     """Read source history once for display and refresh opted-in source tags."""
-    if not verbose and not ctx.project.source_tags:
+    if not verbose_enabled() and not ctx.project.source_tags:
         return {}
     try:
         matches = _history.source_matches(ctx.project, entries)
@@ -222,7 +231,7 @@ def _selected_prepared(
     paths: _config.Paths, name: str, selector: str
 ) -> _candidate.CandidateRecord | None:
     """Select a prepared candidate by its explicit name or unambiguous commit prefix."""
-    candidate = _candidate.load_candidate(paths, name)
+    candidate = _records.load_candidate(paths, name)
     if candidate is None:
         return None
     if selector == 'prepared':
@@ -302,13 +311,12 @@ def _show_publication(
     ctx: _context.ProjectContext,
     entry: _history.PublicationEntry,
     *,
-    verbose: bool = False,
     match: _source.SourceMatches | None = None,
 ) -> None:
     """Show recorded provenance, bounded Git changes, and source recovery advice."""
     heading('Superseded snapshot' if entry.replaced else 'Published snapshot')
     rows = [
-        ('Snapshot commit', entry.commit if verbose else entry.commit[:12]),
+        ('Snapshot commit', entry.commit if verbose_enabled() else entry.commit[:12]),
         ('Version', escape(', '.join(entry.tags) or 'untagged')),
     ]
     record = entry.record
@@ -321,12 +329,12 @@ def _show_publication(
                 ('Published', display_time(record.confirmed_at)),
             ]
         )
-        if verbose and record.pinned is not None:
+        if verbose_enabled() and record.pinned is not None:
             rows.append(('Original source', record.pinned.commit))
     elif entry.commit_time is not None:
         rows.append(('Commit time', display_time(entry.commit_time)))
     fields(rows)
-    store = _candidate.candidate_store_path(ctx.paths, ctx.project.name)
+    store = _store.candidate_store_path(ctx.paths, ctx.project.name)
     summary = (
         _run.run_git(
             [
@@ -362,10 +370,10 @@ def _show_publication(
         )
     source_lines = (
         _history.source_guidance(ctx.paths, ctx.project, entry)
-        if verbose
+        if verbose_enabled()
         else [f'Source: {_history_source_status(ctx.project, entry)}']
     )
-    if verbose:
+    if verbose_enabled():
         fields(
             [
                 (f'Latest match on {escape(match.branch)}', match.latest or 'none')
@@ -384,7 +392,7 @@ def _show_publication(
     _show_source_lines(source_lines, source_rows)
     print()
     next_step(
-        f'pubanon inspect --published {entry.commit if verbose else entry.commit[:12]}'
+        f'pubanon inspect --published {entry.commit if verbose_enabled() else entry.commit[:12]}'
         if available
         else 'pubanon repo restore --to local'
     )
@@ -396,8 +404,14 @@ def command_clean(args: argparse.Namespace) -> None:
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
         ctx = _context.load_context(paths, name)
-        entries = tuple(entry for entry in _history.publications(paths, name) if entry.replaced)
-        copies = _candidate.inspection_paths(paths, name)
+        all_entries = _history.publications(paths, name)
+        if all_entries and _candidate.published_refs(paths, name)[0] is None:
+            raise PubanonError(
+                'cannot tell which snapshots are superseded without the local published history',
+                recovery='pubanon repo restore --to local',
+            )
+        entries = tuple(entry for entry in all_entries if entry.replaced)
+        copies = _inspection.inspection_paths(paths, name)
         if not entries and not copies:
             output('Nothing to remove.')
             return
@@ -405,7 +419,7 @@ def command_clean(args: argparse.Namespace) -> None:
             _history.delete_guidance(paths, ctx.project, entry)
         if entries:
             heading('Superseded snapshots to remove')
-            rows = [_history_entry(ctx, entry, None, verbose=args.verbose)[0] for entry in entries]
+            rows = [_history_entry(ctx, entry, None)[0] for entry in entries]
             _show_history_table(rows, [])
         if copies:
             heading('Review copies to remove', separate=bool(entries))
@@ -428,7 +442,7 @@ def command_clean(args: argparse.Namespace) -> None:
         for entry in entries:
             _history.delete_publication(paths, ctx.project, entry)
             output(f'Deleted local snapshot {entry.commit[:12]}.', kind='success')
-        _candidate.clean_inspect(paths, name)
+        _inspection.clean_inspect(paths, name)
         output('Cleanup complete.', kind='success')
 
 
@@ -451,8 +465,8 @@ def command_discard(args: argparse.Namespace) -> None:
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
-        removed = _candidate.discard(paths, name, force=args.force)
-        copies = _candidate.inspection_paths(paths, name)
+        removed = _discard.discard(paths, name, force=args.force)
+        copies = _inspection.inspection_paths(paths, name)
     if removed:
         output('Discarded the prepared snapshot.', kind='success')
     else:
@@ -471,35 +485,33 @@ def command_list(args: argparse.Namespace) -> None:
     with _config.project_lock(paths, name):
         ctx = _context.load_context(paths, name)
         entries = _history.publications(paths, name)
-        candidate = _candidate.load_candidate(paths, name)
+        candidate = _records.load_candidate(paths, name)
         if not entries and candidate is None:
             output('No recorded snapshot history.')
             print()
             next_step('pubanon prepare')
             return
-        matches = _refresh_source_matches(ctx, entries, verbose=args.verbose)
+        matches = _refresh_source_matches(ctx, entries)
         print(style('Snapshots', 'heading'))
         rows, details, action = (
-            _pending_history(ctx, candidate, entries, verbose=args.verbose)
-            if candidate
-            else ([], [], '')
+            _pending_history(ctx, candidate, entries) if candidate else ([], [], '')
         )
         for entry in entries:
             row, provenance = _history_entry(
-                ctx, entry, candidate, verbose=args.verbose, match=matches.get(entry.commit)
+                ctx, entry, candidate, match=matches.get(entry.commit)
             )
             rows.append(row)
             details.extend(provenance)
-        if args.verbose:
+        if verbose_enabled():
             details.extend(
                 [
                     ('Source repository', display_path(ctx.project.source_path)),
-                    ('Local store', display_path(_candidate.candidate_store_path(paths, name))),
+                    ('Local store', display_path(_store.candidate_store_path(paths, name))),
                 ]
             )
         _show_history_table(rows, details)
         if not action:
-            main, _tags = _context.local_refs(ctx)
+            main, _tags = _candidate.published_refs(ctx.paths, ctx.project.name)
             selector = (
                 'latest'
                 if any(entry.commit == main for entry in entries)
@@ -520,8 +532,11 @@ def command_show(args: argparse.Namespace) -> None:
         if candidate is not None:
             heading('Prepared snapshot')
             print(
-                _candidate.inspect_report(
-                    paths, candidate, ctx.global_config, ctx.project, verbose=args.verbose
+                _reports.inspect_report(
+                    paths,
+                    _verification.prove_objects(paths, name, candidate),
+                    ctx.global_config,
+                    ctx.project,
                 )
             )
             print()
@@ -531,5 +546,5 @@ def command_show(args: argparse.Namespace) -> None:
         entry = _history.select_publication(paths, name, args.selector, entries=entries)
         if not ctx.project.source_tags:
             entries = (entry,)
-        matches = _refresh_source_matches(ctx, entries, verbose=args.verbose)
-        _show_publication(ctx, entry, verbose=args.verbose, match=matches.get(entry.commit))
+        matches = _refresh_source_matches(ctx, entries)
+        _show_publication(ctx, entry, match=matches.get(entry.commit))

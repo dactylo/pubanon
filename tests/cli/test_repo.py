@@ -10,14 +10,19 @@ from pubanon import (
     _cli,
     _config,
 )
-from pubanon._cli import _context
 from pubanon._errors import ObservationTimeoutError, PubanonError
 from pubanon._gate import RuleClass
-from pubanon._remote import _host, _lifecycle, _package, _publish
-from pubanon._snapshots import _audit, _candidate
-from tests._cli import prepare, published_package_reveal_context, stub_remote
+from pubanon._remote import _host, _lifecycle, _package, _repair
+from pubanon._snapshots import _audit, _candidate, _store
+from tests._cli import (
+    prepare,
+    published_package_reveal_context,
+    record_published_main,
+    stub_remote,
+)
 from tests._git import git_env
 from tests._setup import configure
+from tests.cli.test_prepare import replacement_context
 
 
 @pytest.mark.parametrize(
@@ -37,30 +42,27 @@ def test_repo_create_uses_concrete_operation_and_holds_project_lock(
     _config.save_project(paths, project)
     received: list[tuple[object, ...]] = []
 
-    class _LifecycleModule:
-        @staticmethod
-        def _repo_create(*args: object, **kwargs: object) -> None:
-            actual_paths, actual_global, actual_project = args
+    def _repo_create(*args: object, **kwargs: object) -> None:
+        actual_paths, actual_global, actual_project = args
 
-            with (
-                pytest.raises(PubanonError, match='another Pubanon command is running'),
-                _config.project_lock(paths, project.name),
-            ):
-                pytest.fail('repo create did not hold its project lock')
-            received.append(
-                (
-                    actual_paths,
-                    actual_global,
-                    actual_project,
-                    kwargs['visibility'],
-                    kwargs['yes'],
-                )
+        with (
+            pytest.raises(PubanonError, match='another pubanon command is running'),
+            _config.project_lock(paths, project.name),
+        ):
+            pytest.fail('repo create did not hold its project lock')
+        received.append(
+            (
+                actual_paths,
+                actual_global,
+                actual_project,
+                kwargs['yes'],
             )
+        )
 
-    monkeypatch.setattr(_lifecycle, 'repo_create', _LifecycleModule._repo_create)
+    monkeypatch.setattr(_lifecycle, 'repo_create', _repo_create)
 
     assert _cli.main(['repo', 'create', '--project', project.name, '--yes']) == 0
-    assert received == [(paths, global_config, project, selection, True)]
+    assert received == [(paths, global_config, project, True)]
 
 
 def test_repo_restore_local_prioritizes_unknown_candidate_recovery(
@@ -133,7 +135,7 @@ def test_repo_restore_local_refuses_absent_host_main_before_rebuild(
 
     monkeypatch.setattr(_host, 'verify_destination', _verified_destination)
     monkeypatch.setattr(_host, 'ls_remote', _absent_main)
-    monkeypatch.setattr(_publish, 'rebuild_store', _unexpected_rebuild)
+    monkeypatch.setattr(_repair, 'rebuild_store', _unexpected_rebuild)
 
     assert _cli.main(['repo', 'restore', '--to', 'local', '--project', project.name]) == 1
     error = capsys.readouterr().err
@@ -190,9 +192,9 @@ def test_repo_restore_local_reports_findings_and_late_settings_failure(
         _dest: _host.Destination,
         *,
         yes: bool,
-    ) -> _publish.RepairResult:
+    ) -> _repair.RepairResult:
         assert not yes
-        return _publish.RepairResult(
+        return _repair.RepairResult(
             _host.RemoteRefs('c' * 40, {}), _audit.HistoryAudit(findings, (), evidence)
         )
 
@@ -210,7 +212,7 @@ def test_repo_restore_local_reports_findings_and_late_settings_failure(
             discussions=False,
         )
 
-    monkeypatch.setattr(_publish, 'rebuild_store', _rebuild)
+    monkeypatch.setattr(_repair, 'rebuild_store', _rebuild)
     monkeypatch.setattr(_host, 'repository_settings', _settings)
     assert _cli.main(['repo', 'restore', '--to', 'local', '--project', project.name]) == (
         0 if settings_result == 'match' else 1
@@ -274,18 +276,18 @@ def test_repo_restore_local_reports_local_rebuild_without_claiming_host_change(
         _destination: _host.Destination,
         *,
         yes: bool,
-    ) -> _publish.RepairResult:
+    ) -> _repair.RepairResult:
         assert yes
         rebuilt.append(None)
-        return _publish.RepairResult(
+        return _repair.RepairResult(
             _host.RemoteRefs('c' * 40, {}), _audit.HistoryAudit((), (), ())
         )
 
-    def _local_refs(_ctx: _context.ProjectContext) -> tuple[str | None, dict[str, str]]:
+    def _local_refs(_paths: _config.Paths, _project: str) -> tuple[str | None, dict[str, str]]:
         return ('c' * 40 if noop else None), {}
 
-    monkeypatch.setattr(_context, 'local_refs', _local_refs)
-    monkeypatch.setattr(_publish, 'rebuild_store', _rebuild_store)
+    monkeypatch.setattr(_candidate, 'published_refs', _local_refs)
+    monkeypatch.setattr(_repair, 'rebuild_store', _rebuild_store)
 
     assert _cli.main(['repo', 'restore', '--to', 'local', '--project', project.name, '--yes']) == 0
 
@@ -320,16 +322,13 @@ def test_repo_reveal_renders_package_timeout(
     private = 'private package timeout detail'
 
     def _timeout(*_args: object) -> _package.PackageRelease | None:
-        raise ObservationTimeoutError(
-            stdout=f'{private} stdout'.encode(),
-            stderr=f'{private} stderr'.encode(),
-        )
+        raise ObservationTimeoutError
 
     def _unexpected_mutation(*_args: object) -> None:
         pytest.fail('package timeout reached the visibility mutation')
 
     monkeypatch.setattr(_package, 'release_state', _timeout)
-    monkeypatch.setattr(_lifecycle, 'set_visibility', _unexpected_mutation)
+    monkeypatch.setattr(_host, 'set_visibility', _unexpected_mutation)
     capsys.readouterr()
 
     assert _cli.main(['repo', 'reveal', '--project', project.name]) == 1
@@ -354,28 +353,61 @@ def test_repo_reveal_uses_concrete_operation_and_holds_project_lock(
     assert project is not None
     received: list[tuple[object, ...]] = []
 
-    class _LifecycleModule:
-        @staticmethod
-        def _reveal(*args: object) -> None:
-            actual_paths, actual_global, actual_project = args
+    def _reveal(*args: object) -> None:
+        actual_paths, actual_global, actual_project = args
 
-            with (
-                pytest.raises(PubanonError, match='another Pubanon command is running'),
-                _config.project_lock(paths, project.name),
-            ):
-                pytest.fail('repo reveal did not hold its project lock')
-            received.append(
-                (
-                    actual_paths,
-                    actual_global,
-                    actual_project,
-                )
+        with (
+            pytest.raises(PubanonError, match='another pubanon command is running'),
+            _config.project_lock(paths, project.name),
+        ):
+            pytest.fail('repo reveal did not hold its project lock')
+        received.append(
+            (
+                actual_paths,
+                actual_global,
+                actual_project,
             )
+        )
 
-    monkeypatch.setattr(_lifecycle, 'reveal', _LifecycleModule._reveal)
+    monkeypatch.setattr(_lifecycle, 'reveal', _reveal)
 
     assert _cli.main(['repo', 'reveal', '--project', project.name]) == 0
     assert received == [(paths, global_config, project)]
+
+
+@pytest.mark.parametrize('correction', [False, pytest.param(True, marks=pytest.mark.slow)])
+def test_repo_verify_empty_destination_routes_to_restore(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    correction: bool,
+) -> None:
+    source = make_repo(files={'README.md': 'public\n'})
+    if correction:
+        paths, project, _original = replacement_context(tmp_path, source, monkeypatch)
+        assert _cli.main(['prepare', '--project', project.name, '--replace', '--yes']) == 0
+    else:
+        paths, project, record = prepare(tmp_path, source, monkeypatch)
+        record_published_main(paths, project, record)
+    destination = _host.Destination(
+        adapter='github',
+        owner=project.owner,
+        repo=project.repo,
+        url=f'https://github.com/{project.owner}/{project.repo}.git',
+        account='anonymous-account',
+        visibility=project.visibility,
+    )
+    stub_remote(monkeypatch, destination, _host.RemoteRefs(None, {}))
+    capsys.readouterr()
+
+    assert _cli.main(['repo', 'verify', '--project', project.name]) == 1
+
+    error = capsys.readouterr().err
+    assert 'final repository is empty' in error
+    assert 'pubanon repo restore --project=demo --to remote' in error
+    assert '--to local' not in error
+    assert ('Recreating the final repository' in error) is correction
 
 
 def test_repo_verify_mismatch_offers_both_recovery_directions(
@@ -387,7 +419,7 @@ def test_repo_verify_mismatch_offers_both_recovery_directions(
     source = make_repo(files={'README.md': 'public\n'})
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
     assert project is not None
-    _candidate.store_path(paths, project.name)
+    _store.store_path(paths, project.name)
     destination = _host.Destination(
         adapter='github',
         owner=project.owner,
@@ -404,12 +436,10 @@ def test_repo_verify_mismatch_offers_both_recovery_directions(
     monkeypatch.setattr(_candidate, 'published_refs', _published_refs)
     assert _cli.main(['repo', 'verify', '--project', project.name]) == 1
     error = capsys.readouterr().err
-    assert 'Saved snapshot history differs from GitHub.' in error
-    assert 'If local saved publication history is correct' in error
+    assert 'history differs from GitHub' in error
     assert 'pubanon repo restore --project=demo --to remote' in error
-    assert 'If GitHub history is correct' in error
     assert 'pubanon repo restore --project=demo --to local' in error
-    assert 'outside-fix' in error
+    assert 'docs/guide.md#accepting-an-outside-fix' in error
     assert not paths.global_config.with_suffix('.tmp').exists()
 
 
@@ -433,7 +463,7 @@ def test_repo_verify_refuses_only_drifted_declared_setting(
     )
     project = replace(project, settings=settings)
     _config.save_project(paths, project)
-    _candidate.store_path(paths, project.name)
+    _store.store_path(paths, project.name)
     destination = _host.Destination(
         adapter='github',
         owner=project.owner,
@@ -477,7 +507,7 @@ def test_repo_verify_refuses_unexpected_destination_branch(
     source = make_repo(files={'README.md': 'public\n'})
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
     assert project is not None
-    _candidate.store_path(paths, project.name)
+    _store.store_path(paths, project.name)
     commit = (
         subprocess.run(
             ['git', '-C', source, 'rev-parse', 'HEAD'],
@@ -546,7 +576,7 @@ def test_repo_verify_reports_matching_declared_settings(
     )
     project = replace(project, settings=settings)
     _config.save_project(paths, project)
-    _candidate.store_path(paths, project.name)
+    _store.store_path(paths, project.name)
     destination = _host.Destination(
         adapter='github',
         owner=project.owner,

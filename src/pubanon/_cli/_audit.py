@@ -10,7 +10,7 @@ from pubanon._cli import _context
 from pubanon._errors import PubanonError
 from pubanon._gate import RuleClass
 from pubanon._remote import _host
-from pubanon._snapshots import _audit, _candidate
+from pubanon._snapshots import _audit, _candidate, _records
 from pubanon._terminal import escape
 
 if TYPE_CHECKING:
@@ -33,7 +33,13 @@ def _audit_report(
     derived = _config.derived_private_terms(ctx.paths, ctx.project, os.environ)
     rules = _config.assemble_rules(ctx.global_config, ctx.project, derived)
     result = _audit.audit_history(
-        ctx.paths, ctx.project.name, commits, tags, rules, ctx.global_config, tip=main
+        ctx.paths,
+        ctx.project.name,
+        commits,
+        tags,
+        rules,
+        f'{ctx.global_config.anon_name} <{ctx.global_config.anon_email}>',
+        tip=main,
     )
     label = 'audit: local copy of published history'
     if verified_against_host:
@@ -72,15 +78,11 @@ def command_audit(args: argparse.Namespace) -> None:
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
         ctx = _context.load_context(paths, name)
-        record = _candidate.load_candidate(paths, name)
-        if getattr(record, 'state', None) == _candidate.STATE_UNKNOWN_OUTCOME:
-            raise PubanonError(
-                'the outcome of the last publication is unknown',
-                recovery='pubanon publish --resolve',
-            )
+        record = _records.load_candidate(paths, name)
+        _candidate.require_known_outcome(record)
         if args.remote:
             _context.require_advisory_store(paths, name)
-        main, tags = _context.local_refs(ctx)
+        main, tags = _candidate.published_refs(ctx.paths, ctx.project.name)
         if args.remote:
             destination = _host.verify_destination(ctx.paths, ctx.global_config, ctx.project)
             remote = _host.ls_remote(destination, paths, name)
@@ -92,6 +94,6 @@ def command_audit(args: argparse.Namespace) -> None:
                     actual=escape(_host.remote_refs_text(remote)),
                     recovery='pubanon repo verify; use pubanon repo restore --to local '
                     'only if GitHub is authoritative, or see "Accepting an outside fix" '
-                    'in the operator guide if GitHub changed outside Pubanon',
+                    'in the operator guide if GitHub changed outside pubanon',
                 )
         print('\n'.join(_audit_report(ctx, main, tags, verified_against_host=args.remote)))

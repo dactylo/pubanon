@@ -220,8 +220,8 @@ def test_credential_child_timeout_discards_both_streams(
         run_credential_child(['ls-remote', 'example'], cwd=None, timeout=3.25)
 
     assert type(exc_info.value).__name__ == 'ObservationTimeoutError'
-    assert exc_info.value.stdout == b''
-    assert exc_info.value.stderr == b''
+    assert 'stdout' not in vars(exc_info.value)
+    assert 'stderr' not in vars(exc_info.value)
     graph = _exception_graph(exc_info.value)
     assert graph == (exc_info.value,)
     assert 'private-canary' not in repr([vars(error) for error in graph])
@@ -421,8 +421,8 @@ def test_run_git_timeout_discards_streams_and_context(
         run_git(['ls-remote', 'example'], cwd=None, timeout=4.5)
 
     assert type(exc_info.value).__name__ == 'ObservationTimeoutError'
-    assert exc_info.value.stdout == b''
-    assert exc_info.value.stderr == b''
+    assert 'stdout' not in vars(exc_info.value)
+    assert 'stderr' not in vars(exc_info.value)
     graph = _exception_graph(exc_info.value)
     assert graph == (exc_info.value,)
     assert 'private-canary' not in repr([vars(error) for error in graph])

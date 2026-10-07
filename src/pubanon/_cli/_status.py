@@ -13,8 +13,8 @@ from pubanon import (
 )
 from pubanon._cli import _context
 from pubanon._errors import ObservationTimeoutError, PubanonError
-from pubanon._remote import _host
-from pubanon._snapshots import _candidate, _records
+from pubanon._remote import _host, _publish
+from pubanon._snapshots import _candidate, _inspection, _records, _reports, _store, _verification
 from pubanon._terminal import (
     display_path,
     display_time,
@@ -23,6 +23,7 @@ from pubanon._terminal import (
     heading,
     next_step,
     style,
+    verbose_enabled,
 )
 from pubanon._terminal import (
     field as terminal_field,
@@ -30,6 +31,11 @@ from pubanon._terminal import (
 
 if TYPE_CHECKING:
     import argparse
+
+_REMOTE_RECOVERY = {
+    'empty': 'pubanon repo restore --to remote',
+    'mismatch': 'pubanon repo verify',
+}
 
 
 def _head_has_static_version(ctx: _context.ProjectContext) -> bool:
@@ -76,13 +82,43 @@ def _ordinary_reprepare_advice(
     return f'pubanon discard && pubanon prepare{suffix}'
 
 
+def _next_action(
+    ctx: _context.ProjectContext,
+    record: _candidate.CandidateRecord | None,
+    causes: list[str],
+    comparison: str | None,
+    *,
+    source_available: bool,
+) -> str:
+    """Select recovery before preparation or inspection in established priority order."""
+    if _candidate.outcome_unknown(record):
+        return 'pubanon publish --resolve'
+    if comparison in _REMOTE_RECOVERY:
+        return _REMOTE_RECOVERY[comparison]
+    if record is None:
+        return 'pubanon prepare'
+    if causes:
+        if record.replaces is None:
+            action = _ordinary_reprepare_advice(ctx, record)
+        elif source_available:
+            action = _reports.reprepare_advice(record, project=ctx.project.name)
+        else:
+            action = 'pubanon discard && pubanon prepare'
+        return action
+    if record.replaces is not None and (
+        record.tip is None or _records.load_rewrite(ctx.paths, ctx.project.name) is not None
+    ):
+        return _context.project_command(
+            ctx.project.name, 'prepare', f'--project={ctx.project.name}', '--continue'
+        )
+    return 'pubanon inspect'
+
+
 def _publication_status(
     ctx: _context.ProjectContext,
     main: str | None,
     tags: dict[str, str],
     verified: _host.Destination | None,
-    *,
-    verbose: bool = False,
 ) -> list[tuple[str, str]]:
     """Summarize publication while retaining differing configuration and observed facts."""
     if main is None:
@@ -124,9 +160,35 @@ def _publication_status(
             )
     else:
         rows.extend([('Published', label), ('Source', 'not recorded')])
-    if verbose:
+    if verbose_enabled():
         rows.append(('Snapshot commit', main))
     return rows
+
+
+def _remote_comparison(
+    main: str | None,
+    tags: dict[str, str],
+    remote: _host.RemoteRefs,
+    destination: _host.Destination,
+    record: _candidate.CandidateRecord | None,
+) -> tuple[str, list[str]]:
+    """Classify GitHub against saved published history and explain the result."""
+    if (remote.main, remote.tags) == (main, tags):
+        return 'match', ['GitHub matches the recorded published snapshot.']
+    if main is not None and remote.main is None and not remote.tags:
+        details = [_publish.empty_destination_fact(destination.owner, destination.repo)]
+        if record is not None and record.replaces is not None:
+            details.append(_publish.CORRECTION_RESTORE_NOTE)
+        return 'empty', details
+    details = ['GitHub differs from the recorded published snapshot.']
+    differing_tags = [
+        tag
+        for tag in sorted(tags.keys() | remote.tags.keys())
+        if tags.get(tag) != remote.tags.get(tag)
+    ]
+    if differing_tags:
+        details.append(f'{style("Tags that differ:")} {escape(", ".join(differing_tags))}')
+    return 'mismatch', details
 
 
 def _replacement_summary(record: _candidate.CandidateRecord) -> str:
@@ -152,7 +214,7 @@ def _snapshot_provenance(
         terminal_field('Source repository', display_path(ctx.project.source_path)),
         terminal_field(
             'Local store',
-            display_path(_candidate.candidate_store_path(ctx.paths, ctx.project.name)),
+            display_path(_store.candidate_store_path(ctx.paths, ctx.project.name)),
         ),
         terminal_field(
             'Source selector', escape(record.pinned.selector_name or record.pinned.commit)
@@ -164,7 +226,7 @@ def _snapshot_provenance(
 
 
 def rewrite_status(
-    paths: _config.Paths, name: str, record: _candidate.CandidateRecord, *, verbose: bool = False
+    paths: _config.Paths, name: str, record: _candidate.CandidateRecord
 ) -> list[str]:
     """Summarize replacement preparation and actionable incomplete progress."""
     progress = _records.load_rewrite(paths, name)
@@ -180,7 +242,7 @@ def rewrite_status(
     if count:
         details.append(terminal_field('Later snapshots rebuilt', str(count)))
     if record.tip is not None and progress is None:
-        if verbose:
+        if verbose_enabled():
             details.append(terminal_field('Resulting tip', record.tip))
         return details
     details.append(terminal_field('Preparation', 'incomplete', kind='warning'))
@@ -215,7 +277,7 @@ def rewrite_status(
             f'  {escape(conflict.conflict_type)}: {escape(conflict.message)}'
             for conflict in progress.pause.conflicts
         )
-    if verbose and record.tip is not None:
+    if verbose_enabled() and record.tip is not None:
         details.append(terminal_field('Resulting tip', record.tip))
     return details
 
@@ -223,8 +285,6 @@ def rewrite_status(
 def _status_candidate(
     ctx: _context.ProjectContext,
     record: _candidate.CandidateRecord | None,
-    *,
-    verbose: bool = False,
 ) -> tuple[list[str], list[str], bool, bool]:
     """Report snapshot recovery before considering publication or remote status."""
     paths, name = ctx.paths, ctx.project.name
@@ -234,7 +294,7 @@ def _status_candidate(
     source_available = False
     if record is None:
         pass
-    elif record.state == _candidate.STATE_UNKNOWN_OUTCOME and _candidate.confirmed_publication(
+    elif record.state == _candidate.STATE_UNKNOWN_OUTCOME and _verification.confirmed_publication(
         paths, name, record
     ):
         details.append(style('Snapshot published; local recording needs completion.', 'warning'))
@@ -251,11 +311,11 @@ def _status_candidate(
         )
         details.extend([style(title, 'warning')] if title != 'Prepared snapshot' else [])
         if record.replaces is not None and record.state != _candidate.STATE_UNKNOWN_OUTCOME:
-            details.extend(rewrite_status(paths, name, record, verbose=verbose))
-        if verbose:
+            details.extend(rewrite_status(paths, name, record))
+        if verbose_enabled():
             details.extend(_snapshot_provenance(ctx, record))
         if _config.fingerprint(ctx.global_config, ctx.project) != record.fingerprint:
-            causes.append('Pubanon settings have changed since this snapshot was prepared.')
+            causes.append('pubanon settings have changed since this snapshot was prepared.')
         if record.pinned.selector_kind == 'ref' and record.pinned.selector_name is not None:
             current = _run.run_git(
                 ['rev-parse', '--verify', record.pinned.selector_name],
@@ -275,7 +335,7 @@ def _status_candidate(
             causes.append(
                 'The source commit used to prepare this snapshot is no longer available.'
             )
-        if source_changed or verbose:
+        if source_changed or verbose_enabled():
             details.append(
                 terminal_field(
                     'Source revision changed since preparation',
@@ -293,77 +353,28 @@ def command_status(args: argparse.Namespace) -> None:
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
         ctx = _context.load_context(paths, name)
-        record = _candidate.load_candidate(paths, name)
-        details, causes, source_changed, source_available = _status_candidate(
-            ctx, record, verbose=args.verbose
-        )
+        record = _records.load_candidate(paths, name)
+        details, causes, _source_changed, source_available = _status_candidate(ctx, record)
         if args.remote:
             _context.require_advisory_store(paths, name)
-        main, tags = _context.local_refs(ctx)
+        main, tags = _candidate.published_refs(ctx.paths, ctx.project.name)
         verified_against_host = False
         destination = None
-        unresolved = getattr(record, 'state', None) == _candidate.STATE_UNKNOWN_OUTCOME
         comparison: str | None = None
         if args.remote:
             destination = _host.verify_destination(ctx.paths, ctx.global_config, ctx.project)
             remote = _host.ls_remote(destination, paths, name)
             _context.refuse_unexpected_branches(remote)
-            comparison = 'match' if (remote.main, remote.tags) == (main, tags) else 'mismatch'
-            details.append(
-                'GitHub matches the recorded published snapshot.'
-                if comparison == 'match'
-                else 'GitHub differs from the recorded published snapshot.'
+            comparison, remote_details = _remote_comparison(
+                main, tags, remote, destination, record
             )
-            differing_tags = [
-                tag
-                for tag in sorted(tags.keys() | remote.tags.keys())
-                if tags.get(tag) != remote.tags.get(tag)
-            ]
-            if differing_tags:
-                details.append(f'{style("Tags that differ:")} {escape(", ".join(differing_tags))}')
+            details.extend(remote_details)
             verified_against_host = comparison == 'match'
         published = _publication_status(
-            ctx, main, tags, destination if verified_against_host else None, verbose=args.verbose
+            ctx, main, tags, destination if verified_against_host else None
         )
-        action_index = (
-            unresolved,
-            comparison == 'mismatch',
-            record is None,
-            bool(causes),
-            source_changed,
-            True,
-        ).index(True)
-        next_actions = (
-            'pubanon publish --resolve',
-            'pubanon repo verify',
-            'pubanon prepare',
-            _candidate.reprepare_advice(record, project=name)
-            if source_available and record is not None and record.replaces is not None
-            else 'pubanon discard && pubanon prepare',
-            'pubanon inspect',
-            'pubanon inspect',
-        )
-        action = next_actions[action_index]
-        if (
-            action == 'pubanon discard && pubanon prepare'
-            and record is not None
-            and record.replaces is None
-        ):
-            action = _ordinary_reprepare_advice(ctx, record)
-        if (
-            record is not None
-            and record.replaces is not None
-            and not unresolved
-            and comparison != 'mismatch'
-            and not causes
-        ):
-            if record.tip is None or _records.load_rewrite(paths, name) is not None:
-                action = _context.project_command(
-                    name, 'prepare', f'--project={name}', '--continue'
-                )
-            else:
-                action = 'pubanon inspect'
-        copies = _candidate.inspection_paths(paths, name)
+        action = _next_action(ctx, record, causes, comparison, source_available=source_available)
+        copies = _inspection.inspection_paths(paths, name)
         heading(f'Project {escape(name)} ({escape(ctx.project.publication_route)} route)')
         fields(
             [
@@ -377,7 +388,7 @@ def command_status(args: argparse.Namespace) -> None:
         )
         if details:
             print('\n'.join(details))
-        if args.verbose and copies:
+        if verbose_enabled() and copies:
             for copy in copies:
                 print(terminal_field('Review copy', display_path(copy)))
         print()

@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 
 from pubanon._errors import ObservationTimeoutError, OperationCanceled, PubanonError
-from pubanon._remote import _ci
-from pubanon._remote._host import CheckVerdict, WorkflowRun
+from pubanon._remote import _ci, _host
+from pubanon._remote._host import CheckState, CheckVerdict, WorkflowRun
 from tests._git import git_env
 
 _COMMIT = 'a' * 40
@@ -315,7 +315,7 @@ def test_ensure_run_on_push_variable_reports_created_when_readback_is_canceled(
     def canceled(_coordinates: tuple[str, str], _name: str) -> str | None:
         raise OperationCanceled('Canceled.')
 
-    monkeypatch.setattr(_ci, 'repository_variable', canceled)
+    monkeypatch.setattr(_host, 'repository_variable', canceled)
     with pytest.raises(OperationCanceled, match='Canceled after creating CI_RUN_ON_PUSH') as error:
         _ci.ensure_run_on_push_variable(('owner', 'repo'), plan)
     assert error.value.fact == 'The variable was created. Nothing was pushed.'
@@ -471,7 +471,7 @@ def test_require_ci_contract_reads_snapshot_workflow(
         'on:\n  workflow_dispatch:\n    inputs:\n      hosted: {type: boolean}\n',
         name='invalid',
     )
-    with pytest.raises(PubanonError, match='cannot receive Pubanon CI requests') as invalid:
+    with pytest.raises(PubanonError, match='cannot receive pubanon CI requests') as invalid:
         _ci.require_ci_contract(invalid_store, invalid_commit, 'ci.yml')
     assert invalid.value.fact == 'does not declare the boolean input full_tests'
 
@@ -488,12 +488,12 @@ def test_start_stage_ci_bounds_stalled_registration_request(
 ) -> None:
     now = [0.0]
     timeouts: list[float] = []
-    monkeypatch.setattr(_ci, '_monotonic', lambda: now[0], raising=False)
+    monkeypatch.setattr(_ci, '_monotonic', lambda: now[0])
 
     def sleep(seconds: float) -> None:
         now[0] += seconds
 
-    monkeypatch.setattr(_ci, '_sleep', sleep, raising=False)
+    monkeypatch.setattr(_ci, '_sleep', sleep)
 
     def stalled(_coordinates: tuple[str, str], _workflow: str, *, timeout: float) -> bool:
         timeouts.append(timeout)
@@ -501,7 +501,7 @@ def test_start_stage_ci_bounds_stalled_registration_request(
         now[0] += timeout
         raise ObservationTimeoutError
 
-    monkeypatch.setattr(_ci, 'workflow_registered', stalled)
+    monkeypatch.setattr(_host, 'workflow_registered', stalled)
     with pytest.raises(PubanonError, match='not registered'):
         _ci.start_stage_ci(('owner', 'repo'), 'ci.yml', _COMMIT, hosted=False, full_tests=False)
     assert timeouts == [60]
@@ -513,12 +513,12 @@ def test_start_stage_ci_never_dispatches_when_registration_times_out(
     fake_gh: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     now = [0.0]
-    monkeypatch.setattr(_ci, '_monotonic', lambda: now[0], raising=False)
+    monkeypatch.setattr(_ci, '_monotonic', lambda: now[0])
 
     def sleep(seconds: float) -> None:
         now[0] += seconds
 
-    monkeypatch.setattr(_ci, '_sleep', sleep, raising=False)
+    monkeypatch.setattr(_ci, '_sleep', sleep)
     _script(fake_gh, {'args': _registered()['args'], 'returncode': 1, 'stderr': 'HTTP 404'})
     with pytest.raises(PubanonError, match='not registered') as error:
         _ci.start_stage_ci(('owner', 'repo'), 'ci.yml', _COMMIT, hosted=False, full_tests=False)
@@ -532,7 +532,7 @@ def test_start_stage_ci_rejects_registration_reply_after_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     now = [0.0]
-    monkeypatch.setattr(_ci, '_monotonic', lambda: now[0], raising=False)
+    monkeypatch.setattr(_ci, '_monotonic', lambda: now[0])
 
     def late_registration(
         _coordinates: tuple[str, str], _workflow: str, *, timeout: float
@@ -540,7 +540,7 @@ def test_start_stage_ci_rejects_registration_reply_after_deadline(
         now[0] += timeout + 1
         return True
 
-    monkeypatch.setattr(_ci, 'workflow_registered', late_registration)
+    monkeypatch.setattr(_host, 'workflow_registered', late_registration)
     with pytest.raises(PubanonError, match='not registered'):
         _ci.start_stage_ci(('owner', 'repo'), 'ci.yml', _COMMIT, hosted=False, full_tests=False)
     assert now[0] == 61
@@ -786,7 +786,7 @@ def test_listing_change_between_pages_is_pending(fake_gh: Path, second: bool) ->
         ('unacceptable', False, r'https://example.invalid/\x0arun'),
     ],
 )
-def test_recovery_explains_remaining_states(state: str, staged: bool, phrase: str) -> None:
+def test_recovery_explains_remaining_states(state: CheckState, staged: bool, phrase: str) -> None:
     evidence = _ci.RunEvidence(state, None if state == 'missing' else _display_run(), (), '')
     recovery = _ci.evidence_recovery(evidence, staged=staged, retry='retry status')
     assert phrase in recovery
@@ -817,13 +817,13 @@ def test_start_stage_ci_waits_for_registration_then_dispatches_once(
 ) -> None:
     now = [0.0]
     sleeps: list[float] = []
-    monkeypatch.setattr(_ci, '_monotonic', lambda: now[0], raising=False)
+    monkeypatch.setattr(_ci, '_monotonic', lambda: now[0])
 
     def sleep(seconds: float) -> None:
         sleeps.append(seconds)
         now[0] += seconds
 
-    monkeypatch.setattr(_ci, '_sleep', sleep, raising=False)
+    monkeypatch.setattr(_ci, '_sleep', sleep)
     _script(
         fake_gh,
         {'args': _registered()['args'], 'returncode': 1, 'stderr': 'HTTP 404', 'once': True},

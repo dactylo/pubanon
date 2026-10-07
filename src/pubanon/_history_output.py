@@ -7,6 +7,11 @@ from pubanon._gate import GateHit, RuleClass
 from pubanon._snapshots import _audit
 from pubanon._terminal import color_enabled, escape, style, verbose_enabled
 
+HISTORY_LABELS = {
+    RuleClass.IDENTITY_CRITICAL: 'historical exposure',
+    RuleClass.HYGIENE: 'policy mismatch',
+}
+
 
 def _finding_lines(evidence: _audit.HistoryEvidence, origins: tuple[str, ...]) -> list[str]:
     """Render one escaped finding with its location before its supporting evidence."""
@@ -74,10 +79,7 @@ def finding_groups(
     """
     global_config, project = configs
     lines: list[str] = []
-    for rule_class, heading in (
-        (RuleClass.IDENTITY_CRITICAL, 'historical exposure'),
-        (RuleClass.HYGIENE, 'policy mismatch'),
-    ):
+    for rule_class, heading in HISTORY_LABELS.items():
         groups: dict[str | None, list[_audit.HistoryEvidence]] = {}
         for item in result.evidence:
             if item.finding.rule_class is rule_class:

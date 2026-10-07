@@ -58,6 +58,10 @@ def _identity_hit(term: str, rule_class: RuleClass = RuleClass.IDENTITY_CRITICAL
     return GateHit('publication identity', rule_class, term)
 
 
+def _load_config(paths: _config.Paths, scope: str) -> _config.GlobalConfig | _config.ProjectConfig:
+    return _config.load_global(paths) if scope == 'global' else _config.load_project(paths, 'proj')
+
+
 def _project_config(
     tmp_path: Path,
     *,
@@ -186,6 +190,22 @@ def test_assemble_rules_self_publication_lifts_only_builtin_branding(tmp_path: P
     }
 
 
+def test_commit_message_template_uses_global_key_when_project_sets_other_key(
+    tmp_path: Path,
+) -> None:
+    global_config = replace(
+        _global_config(),
+        commit_message=_config.CommitMessageSettings(tagged='Global {tag}', untagged='Global'),
+    )
+    project = replace(
+        _project_config(tmp_path),
+        commit_message=_config.CommitMessageSettings(tagged='Project {tag}'),
+    )
+
+    assert _config.commit_message_template(global_config, project, tagged=True) == 'Project {tag}'
+    assert _config.commit_message_template(global_config, project, tagged=False) == 'Global'
+
+
 @pytest.mark.parametrize('role', ['global', 'project'])
 @pytest.mark.parametrize('failure', ['missing', 'permission denied', 'malformed TOML'])
 def test_config_failure_identifies_file_role_and_cause(
@@ -212,7 +232,7 @@ def test_config_failure_identifies_file_role_and_cause(
     with pytest.raises(PubanonError) as error:
         _load()
     rendered = error.value.render()
-    assert escape(str(location)) in rendered
+    assert escape((location).as_posix()) in rendered
     assert f'{role} configuration' in rendered
     assert failure in rendered
     assert 'private-parser-canary' not in rendered
@@ -381,14 +401,14 @@ def test_derived_private_terms_resolution_failure_is_path_free(
     project = _project_config(tmp_path, source_path=private_source)
 
     def _fail_resolve(path: Path, *_args: object, **_kwargs: object) -> Never:
-        raise RuntimeError(f'cannot resolve {path}')
+        raise OSError(f'cannot resolve {path}')
 
     monkeypatch.setattr(Path, 'resolve', _fail_resolve)
 
     with pytest.raises(PubanonError) as exc_info:
         _config.derived_private_terms(paths, project, {'HOME': str(tmp_path / 'home')})
 
-    assert escape(str(private_source)) not in exc_info.value.render()
+    assert escape((private_source).as_posix()) not in exc_info.value.render()
 
 
 def test_fingerprint_changes_with_ci_workflow(tmp_path: Path) -> None:
@@ -463,7 +483,7 @@ def test_fingerprint_excludes_new_non_governing_project_fields(tmp_path: Path) -
         project,
         _stage_repo='custom-stage',
         settings=_config.Settings(
-            description='Published project',
+            description='Changed published project',
             default_branch='main',
             issues=True,
             wiki=False,
@@ -494,6 +514,28 @@ def test_fingerprint_excludes_non_governing_project_name(tmp_path: Path) -> None
 
     assert _config.fingerprint(_global_config(), project) == _config.fingerprint(
         _global_config(), replace(project, name='renamed-registration')
+    )
+
+
+def test_fingerprint_ignores_commit_message_in_both_files(tmp_path: Path) -> None:
+    global_config = _global_config()
+    project = _project_config(tmp_path)
+    original = _config.fingerprint(global_config, project)
+    messages = _config.CommitMessageSettings(tagged='Version {version}')
+
+    assert (
+        _config.fingerprint(replace(global_config, commit_message=messages), project) == original
+    )
+    assert (
+        _config.fingerprint(global_config, replace(project, commit_message=messages)) == original
+    )
+
+
+def test_fingerprint_ignores_release_page(tmp_path: Path) -> None:
+    project = _project_config(tmp_path)
+
+    assert _config.fingerprint(_global_config(), project) == _config.fingerprint(
+        _global_config(), replace(project, release_page=_config.ReleasePageSettings(enabled=False))
     )
 
 
@@ -621,6 +663,16 @@ def test_global_ignored_files_match_names_and_exact_paths(tmp_path: Path) -> Non
     assert _config.fingerprint(original, project) != _config.fingerprint(config, project)
 
 
+def test_global_mapping_preserves_commit_message() -> None:
+    original = replace(
+        _global_config(),
+        commit_message=_config.CommitMessageSettings(tagged='Release {tag}'),
+    )
+
+    assert _config.global_from_mapping(_config.global_mapping(original)) == original
+    assert 'commit_message' not in _config.global_mapping(_global_config())
+
+
 @pytest.mark.parametrize('route', ['direct', 'staged'])
 def test_global_publication_route_round_trips(tmp_path: Path, route: str) -> None:
     paths = _config.derive_paths({'HOME': str(tmp_path)})
@@ -661,7 +713,7 @@ def test_held_project_lock_filesystem_failure_is_path_free(
     with pytest.raises(PubanonError) as exc_info, _config.project_lock(paths, 'demo'):
         pytest.fail('project lock unexpectedly acquired')
 
-    assert escape(str(private_lock)) not in exc_info.value.render()
+    assert escape((private_lock).as_posix()) not in exc_info.value.render()
 
 
 def test_held_project_lock_refuses_with_exact_recovery(tmp_path: Path) -> None:
@@ -825,7 +877,7 @@ def test_load_global_refuses_invalid_utf8_with_usable_path(tmp_path: Path) -> No
         _config.load_global(paths)
 
     assert 'invalid UTF-8' in error.value.render()
-    assert escape(str(paths.global_config)) in error.value.render()
+    assert escape((paths.global_config).as_posix()) in error.value.render()
 
 
 def test_load_global_refuses_unknown_adapter(tmp_path: Path) -> None:
@@ -904,6 +956,21 @@ def test_load_global_requires_publication_route(tmp_path: Path) -> None:
         _config.load_global(paths)
 
 
+def test_load_project_accepts_literal_braces_and_notes_changelog_url(tmp_path: Path) -> None:
+    paths = _write_project_config(tmp_path)
+    project_file = paths.config_dir / 'projects' / 'proj.toml'
+    project_file.write_text(
+        project_file.read_text()
+        + '[release_page]\ntitle = "{{{tag}}}"\nnotes = "{{}} {changelog_url}"\n'
+    )
+
+    page = _config.load_project(paths, 'proj').release_page
+
+    assert page is not None
+    assert page.title == '{{{tag}}}'
+    assert page.notes == '{{}} {changelog_url}'
+
+
 def test_load_project_defaults_missing_source_tags_to_false(tmp_path: Path) -> None:
     paths = _config.derive_paths({'HOME': str(tmp_path)})
     project_file = paths.config_dir / 'projects' / 'demo.toml'
@@ -925,6 +992,28 @@ def test_load_project_defaults_other_optional_fields(tmp_path: Path) -> None:
     assert project.acknowledged_exposure == ''
     assert project.package is None
     assert project.workflows == {}
+
+
+@pytest.mark.parametrize(
+    ('line', 'expected'),
+    [
+        ('enabled = false', {'enabled': False}),
+        ('title = "Version {version}"', {'title': 'Version {version}'}),
+        ('changelog = "docs/CHANGES.md"', {'changelog': 'docs/CHANGES.md'}),
+        ('notes = "See {changelog_url}"', {'notes': 'See {changelog_url}'}),
+    ],
+)
+def test_load_project_reads_each_release_page_key_alone(
+    tmp_path: Path, line: str, expected: dict[str, object]
+) -> None:
+    paths = _write_project_config(tmp_path)
+    project_file = paths.config_dir / 'projects' / 'proj.toml'
+    project_file.write_text(project_file.read_text() + f'[release_page]\n{line}\n')
+
+    page = _config.load_project(paths, 'proj').release_page
+
+    assert page is not None
+    assert {key: value for key, value in vars(page).items() if value is not None} == expected
 
 
 def test_load_project_reads_exact_schema(tmp_path: Path) -> None:
@@ -1140,6 +1229,15 @@ def test_load_project_refuses_unknown_key_and_names_it(tmp_path: Path) -> None:
         _config.load_project(paths, 'demo')
 
 
+def test_load_project_refuses_unknown_release_page_key(tmp_path: Path) -> None:
+    paths = _write_project_config(tmp_path)
+    project_file = paths.config_dir / 'projects' / 'proj.toml'
+    project_file.write_text(project_file.read_text() + '[release_page]\nother = true\n')
+
+    with pytest.raises(PubanonError, match='unknown release_page key: other'):
+        _config.load_project(paths, 'proj')
+
+
 def test_load_project_refuses_unknown_settings_key_and_names_it(tmp_path: Path) -> None:
     paths = _config.derive_paths({'HOME': str(tmp_path)})
     project_file = paths.config_dir / 'projects' / 'demo.toml'
@@ -1175,6 +1273,248 @@ def test_load_project_refuses_unsupported_package_index(tmp_path: Path) -> None:
         _config.load_project(paths, 'demo')
 
 
+@pytest.mark.parametrize(
+    'line', ['enabled = "false"', 'title = true', 'changelog = 1', 'notes = []']
+)
+@pytest.mark.parametrize('disabled', [False, True])
+def test_load_project_refuses_wrong_release_page_types(
+    tmp_path: Path, line: str, disabled: bool
+) -> None:
+    paths = _write_project_config(tmp_path)
+    project_file = paths.config_dir / 'projects' / 'proj.toml'
+    prefix = 'enabled = false\n' if disabled and not line.startswith('enabled') else ''
+    project_file.write_text(project_file.read_text() + f'[release_page]\n{prefix}{line}\n')
+
+    with pytest.raises(PubanonError):
+        _config.load_project(paths, 'proj')
+
+
+@pytest.mark.parametrize(
+    ('key', 'value'),
+    [
+        ('title', '{name}'),
+        ('title', '{tag.upper}'),
+        ('title', '{tag[0]}'),
+        ('title', '{tag!r}'),
+        ('title', '{tag:>9}'),
+        ('title', '{}'),
+        ('title', '{0}'),
+        ('title', '{'),
+        ('title', '}'),
+        ('title', '{changelog_url}'),
+        ('notes', '{name}'),
+        ('notes', '{tag.upper}'),
+        ('notes', '{tag[0]}'),
+        ('notes', '{tag!r}'),
+        ('notes', '{tag:>9}'),
+        ('notes', '{}'),
+        ('notes', '{0}'),
+        ('notes', '{'),
+        ('notes', '}'),
+        ('title', ''),
+        ('title', 'a\nb'),
+        ('title', 'a\rb'),
+    ],
+)
+@pytest.mark.parametrize('disabled', [False, True])
+def test_load_project_refuses_invalid_release_page_templates(
+    tmp_path: Path, key: str, value: str, disabled: bool
+) -> None:
+    paths = _write_project_config(tmp_path)
+    project_file = paths.config_dir / 'projects' / 'proj.toml'
+    prefix = 'enabled = false\n' if disabled else ''
+    project_file.write_text(
+        project_file.read_text() + f'[release_page]\n{prefix}{key} = {toml_string(value)}\n'
+    )
+
+    with pytest.raises(PubanonError):
+        _config.load_project(paths, 'proj')
+
+
+@pytest.mark.parametrize(
+    'value', ['', '/x', 'a\\b', 'a//b', './x', 'a/../b', 'x/', 'a\x01b', 'a\u0085b']
+)
+@pytest.mark.parametrize('disabled', [False, True])
+def test_load_project_refuses_invalid_release_page_changelog(
+    tmp_path: Path, value: str, disabled: bool
+) -> None:
+    paths = _write_project_config(tmp_path)
+    project_file = paths.config_dir / 'projects' / 'proj.toml'
+    prefix = 'enabled = false\n' if disabled else ''
+    project_file.write_text(
+        project_file.read_text(encoding='utf-8')
+        + f'[release_page]\n{prefix}changelog = {toml_string(value)}\n',
+        encoding='utf-8',
+    )
+
+    with pytest.raises(PubanonError):
+        _config.load_project(paths, 'proj')
+
+
+@pytest.mark.parametrize('scope', ['global', 'project'])
+@pytest.mark.parametrize(
+    ('line', 'expected'),
+    [
+        ('tagged = "Release {tag}"', {'tagged': 'Release {tag}'}),
+        ('untagged = "Update {{files}}"', {'untagged': 'Update {{files}}'}),
+        ('tagged = "{tag:} {version}"', {'tagged': '{tag:} {version}'}),
+    ],
+)
+def test_load_commit_message_keys_alone(
+    tmp_path: Path, scope: str, line: str, expected: dict[str, str]
+) -> None:
+    paths = (
+        _write_global_config(tmp_path) if scope == 'global' else _write_project_config(tmp_path)
+    )
+    config_file = (
+        paths.global_config if scope == 'global' else paths.config_dir / 'projects' / 'proj.toml'
+    )
+    config_file.write_text(config_file.read_text() + f'[commit_message]\n{line}\n')
+
+    config = _load_config(paths, scope)
+
+    assert config.commit_message is not None
+    assert {
+        key: value for key, value in vars(config.commit_message).items() if value is not None
+    } == expected
+
+
+@pytest.mark.parametrize('scope', ['global', 'project'])
+def test_load_commit_message_preserves_absent_and_empty_tables(tmp_path: Path, scope: str) -> None:
+    paths = (
+        _write_global_config(tmp_path) if scope == 'global' else _write_project_config(tmp_path)
+    )
+    config_file = (
+        paths.global_config if scope == 'global' else paths.config_dir / 'projects' / 'proj.toml'
+    )
+    assert _load_config(paths, scope).commit_message is None
+
+    config_file.write_text(config_file.read_text() + '[commit_message]\n')
+    assert _load_config(paths, scope).commit_message == _config.CommitMessageSettings()
+
+
+@pytest.mark.parametrize('scope', ['global', 'project'])
+def test_load_commit_message_refuses_unknown_key(tmp_path: Path, scope: str) -> None:
+    paths = (
+        _write_global_config(tmp_path) if scope == 'global' else _write_project_config(tmp_path)
+    )
+    config_file = (
+        paths.global_config if scope == 'global' else paths.config_dir / 'projects' / 'proj.toml'
+    )
+    config_file.write_text(config_file.read_text() + '[commit_message]\nother = true\n')
+
+    with pytest.raises(
+        PubanonError,
+        match=f'unknown commit_message key in the {scope} configuration: other',
+    ):
+        _load_config(paths, scope)
+
+
+@pytest.mark.parametrize('scope', ['global', 'project'])
+@pytest.mark.parametrize('key', ['tagged', 'untagged'])
+@pytest.mark.parametrize('value', ['true', '1', '[]'])
+def test_load_commit_message_refuses_wrong_types(
+    tmp_path: Path, scope: str, key: str, value: str
+) -> None:
+    paths = (
+        _write_global_config(tmp_path) if scope == 'global' else _write_project_config(tmp_path)
+    )
+    config_file = (
+        paths.global_config if scope == 'global' else paths.config_dir / 'projects' / 'proj.toml'
+    )
+    config_file.write_text(config_file.read_text() + f'[commit_message]\n{key} = {value}\n')
+
+    with pytest.raises(PubanonError, match=rf'commit_message\.{key} in the {scope} configuration'):
+        _load_config(paths, scope)
+
+
+@pytest.mark.parametrize('scope', ['global', 'project'])
+@pytest.mark.parametrize(
+    ('key', 'value'),
+    [
+        ('tagged', '{name}'),
+        ('tagged', '{tag.x}'),
+        ('tagged', '{tag[0]}'),
+        ('tagged', '{tag!r}'),
+        ('tagged', '{tag:>9}'),
+        ('tagged', '{}'),
+        ('tagged', '{'),
+        ('untagged', '{tag}'),
+        ('tagged', ''),
+        ('untagged', '   '),
+        ('tagged', '\n\n'),
+    ],
+)
+def test_load_commit_message_refuses_invalid_templates(
+    tmp_path: Path, scope: str, key: str, value: str
+) -> None:
+    paths = (
+        _write_global_config(tmp_path) if scope == 'global' else _write_project_config(tmp_path)
+    )
+    config_file = (
+        paths.global_config if scope == 'global' else paths.config_dir / 'projects' / 'proj.toml'
+    )
+    config_file.write_text(
+        config_file.read_text() + f'[commit_message]\n{key} = {toml_string(value)}\n'
+    )
+
+    with pytest.raises(
+        PubanonError, match=rf'commit_message\.{key} in the {scope} configuration'
+    ) as exc_info:
+        _load_config(paths, scope)
+    if key == 'untagged' and value == '{tag}':
+        assert 'accepts no fields' in exc_info.value.render()
+
+
+@pytest.mark.parametrize('scope', ['global', 'project'])
+@pytest.mark.parametrize(
+    ('key', 'fact'),
+    [
+        ('tagged', 'Supported fields: tag, version'),
+        ('untagged', 'This key accepts no fields; write {{ and }} for literal braces.'),
+    ],
+)
+@pytest.mark.parametrize('value', ['{', '}'])
+def test_load_commit_message_unbalanced_braces_include_field_guidance(
+    tmp_path: Path, scope: str, key: str, fact: str, value: str
+) -> None:
+    paths = (
+        _write_global_config(tmp_path) if scope == 'global' else _write_project_config(tmp_path)
+    )
+    config_file = (
+        paths.global_config if scope == 'global' else paths.config_dir / 'projects' / 'proj.toml'
+    )
+    config_file.write_text(
+        config_file.read_text() + f'[commit_message]\n{key} = {toml_string(value)}\n'
+    )
+
+    with pytest.raises(
+        PubanonError,
+        match=rf'commit_message\.{key} in the {scope} configuration has unbalanced braces',
+    ) as exc_info:
+        _load_config(paths, scope)
+    assert exc_info.value.fact == fact
+
+
+@pytest.mark.parametrize('scope', ['global', 'project'])
+def test_load_commit_message_refuses_non_table(tmp_path: Path, scope: str) -> None:
+    paths = (
+        _write_global_config(tmp_path) if scope == 'global' else _write_project_config(tmp_path)
+    )
+    config_file = (
+        paths.global_config if scope == 'global' else paths.config_dir / 'projects' / 'proj.toml'
+    )
+    original = config_file.read_text()
+    config_file.write_text(
+        original.replace('[accounts]\n', 'commit_message = true\n[accounts]\n')
+        if scope == 'global'
+        else 'commit_message = true\n' + original
+    )
+
+    with pytest.raises(PubanonError, match=f'commit_message in the {scope} configuration'):
+        _load_config(paths, scope)
+
+
 def test_load_project_rejects_non_boolean_source_tags(tmp_path: Path) -> None:
     paths = _config.derive_paths({'HOME': str(tmp_path)})
     project_file = paths.config_dir / 'projects' / 'demo.toml'
@@ -1195,6 +1535,12 @@ def test_load_project_requires_publication_route(tmp_path: Path) -> None:
 
     with pytest.raises(PubanonError, match='missing project configuration key: publication_route'):
         _config.load_project(paths, 'demo')
+
+
+def test_load_project_without_release_page_preserves_absence(tmp_path: Path) -> None:
+    paths = _write_project_config(tmp_path)
+
+    assert _config.load_project(paths, 'proj').release_page is None
 
 
 @pytest.mark.parametrize('name', ['ci.yml', 'build.yaml', 'my_ci-2.yml'])
@@ -1589,7 +1935,7 @@ def test_publication_state_paths_guard_only_configured_subtree(
     selected = f'state/pubanon/projects/demo/{directory}/private.txt'
     with pytest.raises(PubanonError, match='publication state') as error:
         _config.check_publication_state_paths(paths, project, [selected])
-    assert escape(str(tmp_path / selected)) in error.value.render()
+    assert escape((tmp_path / selected).as_posix()) in error.value.render()
     _config.check_publication_state_paths(
         paths,
         project,
@@ -1632,7 +1978,7 @@ def test_registry_directory_sync_failure_reports_possible_save(
         _config.registry_set(paths, source, 'demo')
 
     assert _config.registry_lookup(paths, source) == 'demo'
-    assert list(paths.registry.parent.glob('.registry-*.tmp')) == []
+    assert list(paths.registry.parent.glob('.pubanon-write-*.tmp')) == []
 
 
 def test_registry_file_sync_failure_preserves_prior_registry_and_cleans_temp(
@@ -1656,7 +2002,7 @@ def test_registry_file_sync_failure_preserves_prior_registry_and_cleans_temp(
 
     assert paths.registry.read_bytes() == original
     assert _config.registry_lookup(paths, first) == 'first-project'
-    assert list(paths.registry.parent.glob('.registry-*.tmp')) == []
+    assert list(paths.registry.parent.glob('.pubanon-write-*.tmp')) == []
 
 
 def test_registry_lookup_existing_registry_uses_lock(tmp_path: Path) -> None:
@@ -1698,7 +2044,7 @@ def test_registry_lookup_rejects_corrupt_existing_registry(tmp_path: Path) -> No
     with pytest.raises(PubanonError, match='invalid project registry') as exc_info:
         _config.registry_lookup(paths, tmp_path)
 
-    assert escape(str(paths.registry)) in exc_info.value.render()
+    assert escape((paths.registry).as_posix()) in exc_info.value.render()
     assert '--project NAME' in exc_info.value.render()
     assert lock_path.is_file()
     assert_private_mode(lock_path, 0o600)
@@ -1791,6 +2137,26 @@ def test_registry_remove_keeps_other_projects_and_removes_all_matching_sources(
     assert not _config.registry_remove(paths, 'demo')
 
 
+def test_registry_replace_then_interrupt_reports_possible_save(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    source = tmp_path / 'source'
+    source.mkdir()
+    original_replace = _filesystem.replace
+
+    def _replace_then_interrupt(temporary: Path, destination: Path) -> None:
+        original_replace(temporary, destination)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(_filesystem, 'replace', _replace_then_interrupt)
+    with pytest.raises(PubanonError, match='project registry may have been saved'):
+        _config.registry_set(paths, source, 'demo')
+
+    assert _config.registry_lookup(paths, source) == 'demo'
+    assert not list(paths.registry.parent.glob('*.tmp'))
+
+
 def test_registry_save_syncs_file_replaces_and_syncs_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1831,7 +2197,7 @@ def test_registry_save_syncs_file_replaces_and_syncs_directory(
         *([] if os.name == 'nt' else ['file sync']),
     ]
     assert _config.registry_lookup(paths, source) == 'demo'
-    assert list(paths.registry.parent.glob('.registry-*.tmp')) == []
+    assert list(paths.registry.parent.glob('.pubanon-write-*.tmp')) == []
 
 
 def test_registry_set_filesystem_failure_identifies_registry(
@@ -1850,7 +2216,7 @@ def test_registry_set_filesystem_failure_identifies_registry(
     with pytest.raises(PubanonError) as exc_info:
         _config.registry_set(paths, source, 'demo')
 
-    assert escape(str(paths.registry)) in exc_info.value.render()
+    assert escape((paths.registry).as_posix()) in exc_info.value.render()
 
 
 def test_registry_set_refuses_conflicting_owner_hidden_by_same_project_alias(
@@ -1887,7 +2253,7 @@ def test_registry_set_refuses_source_owned_by_another_project(tmp_path: Path) ->
     with pytest.raises(PubanonError, match='another project') as exc_info:
         _config.registry_set(paths, source, 'second-project')
 
-    assert escape(str(source)) not in exc_info.value.render()
+    assert escape((source).as_posix()) not in exc_info.value.render()
     assert _config.registry_lookup(paths, source) == 'first-project'
 
 
@@ -1970,6 +2336,18 @@ def test_registry_write_uses_explicit_utf8(tmp_path: Path) -> None:
     assert json.loads(paths.registry.read_bytes().decode('utf-8')) == {
         str(source.resolve()): 'demo'
     }
+
+
+def test_release_page_template_errors_name_project_configuration(tmp_path: Path) -> None:
+    paths = _write_project_config(tmp_path)
+    project_file = paths.config_dir / 'projects' / 'proj.toml'
+    project_file.write_text(project_file.read_text() + '[release_page]\nnotes = "{name}"\n')
+
+    with pytest.raises(
+        PubanonError,
+        match=r'release_page\.notes in the project configuration has an unsupported field',
+    ):
+        _config.load_project(paths, 'proj')
 
 
 def test_repository_name_gate_explains_self_publication(tmp_path: Path) -> None:
@@ -2097,7 +2475,8 @@ def test_save_global_keyboard_interrupt_after_replace_reports_possible_save(
     original = paths.global_config.read_bytes()
     updated = replace(config, anon_name='Updated Name')
 
-    def _cancel_directory_sync(_path: Path) -> Never:
+    def _cancel_directory_sync(path: Path) -> Never:
+        assert path is paths.config_dir
         raise KeyboardInterrupt
 
     def _save_after_replace() -> None:
@@ -2108,7 +2487,7 @@ def test_save_global_keyboard_interrupt_after_replace_reports_possible_save(
                 'post-replace cancellation did not report the possible save'
             ) from exc
 
-    monkeypatch.setattr(_config, '_sync_directory', _cancel_directory_sync)
+    monkeypatch.setattr(_filesystem, 'sync_directory', _cancel_directory_sync)
 
     with pytest.raises(PubanonError) as exc_info:
         _save_after_replace()
@@ -2285,7 +2664,7 @@ def test_save_project_close_failure_is_primary_after_successful_body(
     assert isinstance(exc_info.value.__cause__, OSError)
     assert str(exc_info.value.__cause__) == 'injected close failure'
     assert project_file.read_bytes() == original
-    assert not project_file.with_suffix('.toml.tmp').exists()
+    assert not list(project_file.parent.glob('*.tmp'))
 
 
 @pytest.mark.skipif(os.name == 'nt', reason='Windows commits through write-through replacement')
@@ -2308,7 +2687,7 @@ def test_save_project_directory_fsync_failure_occurs_after_replace(
 
     monkeypatch.setattr(os, 'fsync', _fail_directory_fsync)
 
-    with pytest.raises(PubanonError, match='cannot save project configuration'):
+    with pytest.raises(PubanonError, match='project configuration may have been saved'):
         _config.save_project(paths, updated)
 
     assert fsync_calls == 2
@@ -2333,7 +2712,7 @@ def test_save_project_file_fsync_failure_preserves_prior_bytes(
         _config.save_project(paths, replace(project, visibility='public'))
 
     assert project_file.read_bytes() == original
-    assert not project_file.with_suffix('.toml.tmp').exists()
+    assert not list(project_file.parent.glob('*.tmp'))
 
 
 def test_save_project_filesystem_failure_is_path_free(
@@ -2359,10 +2738,50 @@ def test_save_project_filesystem_failure_is_path_free(
     with pytest.raises(PubanonError) as exc_info:
         _config.save_project(paths, updated)
 
-    assert escape(str(project_file)) not in exc_info.value.render()
+    assert escape((project_file).as_posix()) not in exc_info.value.render()
     assert isinstance(exc_info.value.__cause__, OSError)
     assert str(exc_info.value.__cause__) == f'cannot open {project_file}'
     assert project_file.read_bytes() == original
+
+
+def test_save_project_orders_commit_message_between_release_page_and_workflow(
+    tmp_path: Path,
+) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    project = replace(
+        _project_config(tmp_path),
+        release_page=_config.ReleasePageSettings(enabled=False),
+        commit_message=_config.CommitMessageSettings(tagged='Release {tag}'),
+        workflows={'default': ('prepare',)},
+    )
+
+    _config.save_project(paths, project)
+
+    saved = (paths.config_dir / 'projects' / 'demo.toml').read_text()
+    assert (
+        saved.index('[release_page]') < saved.index('[commit_message]') < saved.index('[workflow.')
+    )
+
+
+def test_save_project_orders_release_page_after_package_before_workflow(tmp_path: Path) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    project = replace(
+        _project_config(tmp_path),
+        package=_config.PackageObservation('pypi', 'example', ('test',)),
+        release_page=_config.ReleasePageSettings(
+            enabled=False, title='{tag}', changelog='docs/CHANGES.md', notes='Notes'
+        ),
+        workflows={'default': ('prepare',)},
+    )
+
+    _config.save_project(paths, project)
+
+    saved = (paths.config_dir / 'projects' / 'demo.toml').read_text()
+    assert saved.index('[package]') < saved.index('[release_page]') < saved.index('[workflow.')
+    page = saved.split('[release_page]\n', 1)[1].split('[workflow.', 1)[0]
+    assert page == (
+        'enabled = false\ntitle = "{tag}"\nchangelog = "docs/CHANGES.md"\nnotes = "Notes"\n'
+    )
 
 
 @pytest.mark.parametrize('field', ['extra_terms', 'hygiene_terms'])
@@ -2481,6 +2900,22 @@ def test_save_project_refuses_unsafe_host_segments(
     assert not (paths.config_dir / 'projects' / 'demo.toml').exists()
 
 
+@pytest.mark.parametrize(
+    ('page', 'expected'),
+    [
+        (None, False),
+        (_config.ReleasePageSettings(), False),
+        (_config.ReleasePageSettings(enabled=False), False),
+        (_config.ReleasePageSettings(enabled=True), True),
+    ],
+)
+def test_release_pages_are_off_unless_enabled(
+    tmp_path: Path, page: _config.ReleasePageSettings | None, *, expected: bool
+) -> None:
+    project = replace(_project_config(tmp_path), release_page=page)
+    assert _config.release_pages_enabled(project) is expected
+
+
 def test_save_project_rejects_invalid_publication_route(tmp_path: Path) -> None:
     paths = _config.derive_paths({'HOME': str(tmp_path)})
     project = replace(_project_config(tmp_path), publication_route='other')
@@ -2509,7 +2944,7 @@ def test_save_project_replace_failure_preserves_prior_bytes(
         _config.save_project(paths, replace(project, visibility='public'))
 
     assert project_file.read_bytes() == original
-    assert not project_file.with_suffix('.toml.tmp').exists()
+    assert not list(project_file.parent.glob('*.tmp'))
 
 
 def test_save_project_round_trips_ci_workflow(tmp_path: Path) -> None:
@@ -2526,6 +2961,25 @@ def test_save_project_round_trips_ci_workflow(tmp_path: Path) -> None:
 
     assert 'ci_workflow' not in project_file.read_text()
     assert _config.load_project(paths, project.name).ci_workflow is None
+
+
+def test_save_project_round_trips_long_accepted_name(tmp_path: Path) -> None:
+    if os.name == 'nt':
+        # Test the filename-component limit without requiring the machine-wide long-path opt-in.
+        tmp_path = Path('\\\\?\\' + str(tmp_path))
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    name = 'p' * 240
+    assert _config.require_project_name(name) == name
+    project = replace(_project_config(tmp_path), name=name)
+
+    _config.save_project(paths, project)
+    updated = replace(project, visibility='public')
+    _config.save_project(paths, updated)
+
+    assert _config.load_project(paths, name) == updated
+    assert sorted(path.name for path in (paths.config_dir / 'projects').iterdir()) == [
+        f'{name}.toml'
+    ]
 
 
 def test_save_project_round_trips_new_optional_fields(tmp_path: Path) -> None:
@@ -2582,6 +3036,155 @@ def test_save_project_round_trips_non_bmp_and_del(tmp_path: Path) -> None:
     _config.save_project(paths, project)
 
     assert _config.load_project(paths, project.name) == project
+
+
+@pytest.mark.parametrize(
+    'page',
+    [
+        None,
+        _config.ReleasePageSettings(),
+        _config.ReleasePageSettings(enabled=False),
+        _config.ReleasePageSettings(title='Version {version}'),
+        _config.ReleasePageSettings(changelog='docs/CHANGES.md'),
+        _config.ReleasePageSettings(notes='See {changelog_url}'),
+        _config.ReleasePageSettings(
+            enabled=True,
+            title='Version {version}',
+            changelog='docs/CHANGES.md',
+            notes='See {changelog_url}.\nNext line.\n',
+        ),
+    ],
+)
+def test_save_project_round_trips_release_page(
+    tmp_path: Path, page: _config.ReleasePageSettings | None
+) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    project = replace(_project_config(tmp_path), release_page=page)
+    project_file = paths.config_dir / 'projects' / 'demo.toml'
+
+    _config.save_project(paths, project)
+
+    saved = project_file.read_text()
+    assert ('[release_page]' in saved) is (page is not None)
+    assert _config.load_project(paths, project.name) == project
+    if page is not None and page.notes is not None and '\n' in page.notes:
+        assert 'notes = """\n' in saved
+
+
+@pytest.mark.parametrize(
+    'messages',
+    [
+        None,
+        _config.CommitMessageSettings(),
+        _config.CommitMessageSettings(tagged='Release {tag}'),
+        _config.CommitMessageSettings(untagged='Update files'),
+        _config.CommitMessageSettings(
+            tagged='Release {version}\nDetails', untagged='Update files'
+        ),
+    ],
+)
+@pytest.mark.parametrize('scope', ['global', 'project'])
+def test_save_commit_message_round_trips(
+    tmp_path: Path, scope: str, messages: _config.CommitMessageSettings | None
+) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    if scope == 'global':
+        original = replace(_global_config(), commit_message=messages)
+        _config.save_global(paths, original, None)
+        saved = paths.global_config.read_text()
+        loaded = _config.load_global(paths)
+        if messages is not None:
+            assert saved.index('[accounts]') < saved.index('[commit_message]')
+    else:
+        original = replace(_project_config(tmp_path), commit_message=messages)
+        _config.save_project(paths, original)
+        saved = (paths.config_dir / 'projects' / 'demo.toml').read_text()
+        loaded = _config.load_project(paths, 'demo')
+    assert loaded == original
+    assert ('[commit_message]' in saved) is (messages is not None)
+    if messages is not None:
+        table = saved.split('[commit_message]\n', 1)[1]
+        lines = table.splitlines()
+        assert any(line.startswith('tagged =') for line in lines) is (messages.tagged is not None)
+        assert any(line.startswith('untagged =') for line in lines) is (
+            messages.untagged is not None
+        )
+        if messages.tagged is not None and messages.untagged is not None:
+            assert table.index('tagged =') < table.index('untagged =')
+        if messages.tagged is not None and '\n' in messages.tagged:
+            assert 'tagged = """\n' in table
+
+
+@pytest.mark.parametrize('tagged', [True, False])
+@pytest.mark.parametrize('project_present', [True, False])
+@pytest.mark.parametrize('global_present', [True, False])
+def test_commit_message_template_resolves_each_key(
+    tmp_path: Path, tagged: bool, project_present: bool, global_present: bool
+) -> None:
+    key = 'tagged' if tagged else 'untagged'
+    project_message = _config.CommitMessageSettings(
+        **{key: 'Project {tag}' if tagged else 'Project'}
+    )
+    global_message = _config.CommitMessageSettings(**{key: 'Global {tag}' if tagged else 'Global'})
+    global_config = replace(
+        _global_config(), commit_message=global_message if global_present else None
+    )
+    project = replace(
+        _project_config(tmp_path), commit_message=project_message if project_present else None
+    )
+
+    assert _config.commit_message_template(global_config, project, tagged=tagged) == (
+        ('Project {tag}' if tagged else 'Project')
+        if project_present
+        else ('Global {tag}' if tagged else 'Global')
+        if global_present
+        else ('release: {tag}' if tagged else 'publication update')
+    )
+
+
+@pytest.mark.parametrize('scope', ['global', 'project'])
+@pytest.mark.parametrize(
+    'messages',
+    [
+        _config.CommitMessageSettings(tagged=''),
+        _config.CommitMessageSettings(untagged='{tag}'),
+    ],
+)
+def test_save_commit_message_refuses_invalid_settings_before_writing(
+    tmp_path: Path, scope: str, messages: _config.CommitMessageSettings
+) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    if scope == 'global':
+        with pytest.raises(PubanonError, match='commit_message'):
+            _config.save_global(paths, replace(_global_config(), commit_message=messages), None)
+        assert not paths.global_config.exists()
+    else:
+        with pytest.raises(PubanonError, match='commit_message'):
+            _config.save_project(
+                paths, replace(_project_config(tmp_path), commit_message=messages)
+            )
+        assert not (paths.config_dir / 'projects' / 'demo.toml').exists()
+
+
+@pytest.mark.parametrize(
+    'page',
+    [
+        _config.ReleasePageSettings(enabled=False, title='{name}'),
+        _config.ReleasePageSettings(enabled=False, changelog='a/../b'),
+        _config.ReleasePageSettings(enabled=False, notes='{tag!r}'),
+    ],
+)
+def test_save_project_refuses_invalid_release_page_before_writing(
+    tmp_path: Path, page: _config.ReleasePageSettings
+) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    project = replace(_project_config(tmp_path), release_page=page)
+    project_file = paths.config_dir / 'projects' / 'demo.toml'
+
+    with pytest.raises(PubanonError):
+        _config.save_project(paths, project)
+
+    assert not project_file.exists()
 
 
 @pytest.mark.parametrize('field', ['extra_terms', 'hygiene_terms'])
@@ -2641,7 +3244,6 @@ def test_save_project_uses_owner_only_temp_and_durable_replace_order(
     paths = _config.derive_paths({'HOME': str(tmp_path)})
     project = _project_config(tmp_path)
     project_file = paths.config_dir / 'projects' / 'demo.toml'
-    temporary = project_file.with_suffix('.toml.tmp')
     events: list[str] = []
     descriptors: dict[int, str] = {}
     original_fchmod = _filesystem.fchmod
@@ -2649,11 +3251,14 @@ def test_save_project_uses_owner_only_temp_and_durable_replace_order(
     original_open = os.open
     original_replace = _filesystem.replace
 
-    def _tracked_open(path: Path, flags: int, mode: int = 0o777) -> int:
+    def _tracked_open(path: str | Path, flags: int, mode: int = 0o777) -> int:
         descriptor = original_open(path, flags, mode)
-        label = 'temporary' if Path(path) == temporary else 'directory'
+        label = 'directory' if Path(path) == project_file.parent else 'temporary'
         descriptors[descriptor] = label
-        events.append(f'open {label} {flags} {mode:o}')
+        if label == 'temporary':
+            assert flags & os.O_EXCL
+            assert not flags & os.O_TRUNC
+        events.append(f'open {label} {mode:o}')
         return descriptor
 
     def _tracked_fchmod(descriptor: int, mode: int) -> None:
@@ -2665,7 +3270,8 @@ def test_save_project_uses_owner_only_temp_and_durable_replace_order(
         original_fsync(descriptor)
 
     def _tracked_replace(path: Path, target: Path) -> None:
-        assert path == temporary
+        assert path.parent == target.parent
+        assert path != target
         assert target == project_file
         assert_private_mode(path, 0o600)
         events.append('replace')
@@ -2679,11 +3285,11 @@ def test_save_project_uses_owner_only_temp_and_durable_replace_order(
     _config.save_project(paths, project)
 
     assert events == [
-        f'open temporary {os.O_WRONLY | os.O_CREAT | os.O_TRUNC} 600',
+        'open temporary 600',
         'fchmod temporary 600',
         'fsync temporary',
         'replace',
-        *([] if os.name == 'nt' else [f'open directory {os.O_RDONLY} 777', 'fsync directory']),
+        *([] if os.name == 'nt' else ['open directory 777', 'fsync directory']),
     ]
     assert _config.load_project(paths, project.name) == project
 
@@ -2723,7 +3329,7 @@ def test_save_project_write_and_close_failures_preserve_operation_error(
     assert isinstance(exc_info.value.__cause__, OSError)
     assert str(exc_info.value.__cause__) == 'injected write failure'
     assert project_file.read_bytes() == original
-    assert not project_file.with_suffix('.toml.tmp').exists()
+    assert not list(project_file.parent.glob('*.tmp'))
 
 
 def test_settings_load_refuses_non_main_default_branch(tmp_path: Path) -> None:
@@ -2748,7 +3354,7 @@ def test_settings_load_refuses_non_main_default_branch(tmp_path: Path) -> None:
         _config.load_project(paths, 'demo')
 
     assert exc_info.value.recovery == (
-        f'set settings.default_branch = "main" in {escape(str(project_file))}'
+        f'set settings.default_branch = "main" in {escape((project_file).as_posix())}'
     )
 
 
@@ -2880,3 +3486,38 @@ def test_global_ignored_files_reject_invalid_paths(tmp_path: Path, value: str) -
     config = replace(_global_config(), ignored_files=(value,))
     with pytest.raises(PubanonError, match='ignored_files'):
         _config.save_global(_config.derive_paths({'HOME': str(tmp_path)}), config, None)
+
+
+@pytest.mark.parametrize('phase', ['file_sync', 'replace', 'directory_sync'])
+def test_save_project_interrupt_preserves_save_uncertainty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    original = _project_config(tmp_path)
+    _config.save_project(paths, original)
+    updated = replace(original, visibility='public')
+    original_replace = _filesystem.replace
+
+    def _interrupt(*_args: object) -> Never:
+        raise KeyboardInterrupt
+
+    def _replace_then_interrupt(source: Path, destination: Path) -> None:
+        original_replace(source, destination)
+        raise KeyboardInterrupt
+
+    if phase == 'file_sync':
+        monkeypatch.setattr(os, 'fsync', _interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            _config.save_project(paths, updated)
+    else:
+        if phase == 'replace':
+            monkeypatch.setattr(_filesystem, 'replace', _replace_then_interrupt)
+        else:
+            monkeypatch.setattr(_filesystem, 'sync_directory', _interrupt)
+        with pytest.raises(PubanonError, match='project configuration may have been saved'):
+            _config.save_project(paths, updated)
+
+    assert _config.load_project(paths, original.name) == (
+        original if phase == 'file_sync' else updated
+    )
+    assert not list((paths.config_dir / 'projects').glob('*.tmp'))

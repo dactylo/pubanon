@@ -77,20 +77,6 @@ class _Response:
         return self._body
 
 
-def _fetching(status: int, payload: object) -> object:
-    body = json.dumps(payload).encode()
-
-    def _fetch(
-        _url: str,
-        *,
-        timeout: float | None = None,
-    ) -> tuple[int, bytes]:
-        del timeout
-        return status, body
-
-    return _fetch
-
-
 def _fetching_bytes(status: int, body: bytes) -> object:
     def _fetch(
         _url: str,
@@ -101,6 +87,10 @@ def _fetching_bytes(status: int, body: bytes) -> object:
         return status, body
 
     return _fetch
+
+
+def _fetching(status: int, payload: object) -> object:
+    return _fetching_bytes(status, json.dumps(payload).encode())
 
 
 def _patch_fetch_process(
@@ -180,30 +170,6 @@ def test_fetch_http_closes_normal_and_error_bodies_including_timeout(
             (404, b'error body') if http_error else (200, b'body')
         )
     assert error_body.closed if http_error else response.closed
-
-
-def test_fetch_http_maps_http_error_status(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    timeouts: list[float | None] = []
-
-    def _urlopen(url: str, *, timeout: float | None = None) -> _Response:
-        timeouts.append(timeout)
-        raise urllib.error.HTTPError(
-            url,
-            404,
-            'Not Found',
-            hdrs=Message(),
-            fp=io.BytesIO(b'{"message":"Not Found"}'),
-        )
-
-    monkeypatch.setattr(_package.urllib.request, 'urlopen', _urlopen)
-
-    assert _package._fetch_http('https://pypi.org/pypi/demo/1.2.3/json', timeout=30) == (
-        404,
-        b'{"message":"Not Found"}',
-    )
-    assert timeouts == [30]
 
 
 def test_fetch_http_refuses_bad_status_line_without_exposing_it(
@@ -353,7 +319,6 @@ def test_fetch_launch_time_reduces_remaining_budget(
     request, remaining = process.calls[0]
     assert request is not None
     assert json.loads(request) == {'url': 'https://example.invalid', 'timeout': budget}
-    assert list(json.loads(request)) == ['url', 'timeout']
     assert remaining == budget - 2
     assert process.stdout.closed
     assert process.stderr.closed

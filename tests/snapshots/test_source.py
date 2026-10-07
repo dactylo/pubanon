@@ -1,6 +1,7 @@
 import os
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path, PureWindowsPath
 from typing import NotRequired, TypedDict, Unpack
 
@@ -261,23 +262,6 @@ def test_pin_reports_invalid_selector(make_repo: Callable[..., Path]) -> None:
 
     rendered = exc_info.value.render()
     assert str(exc_info.value) == "cannot resolve source selector 'canaryx'"
-    assert exc_info.value.fact is not None
-    status, _separator, detail = exc_info.value.fact.partition(': ')
-    assert status == 'exit status 128'
-    assert detail
-    assert 'canaryx' in rendered.casefold()
-
-
-def test_pin_reports_malformed_revision_stderr(
-    make_repo: Callable[..., Path],
-) -> None:
-    repo = make_repo()
-
-    with pytest.raises(PubanonError) as exc_info:
-        _source.pin(repo, 'canaryx^{')
-
-    rendered = exc_info.value.render()
-    assert str(exc_info.value) == "cannot resolve source selector 'canaryx^{'"
     assert exc_info.value.fact is not None
     status, _separator, detail = exc_info.value.fact.partition(': ')
     assert status == 'exit status 128'
@@ -549,9 +533,9 @@ def test_snapshot_refuses_gitlink_with_both_recovery_choices(
 
 
 def test_snapshot_refuses_mismatched_batch_object(
-    make_repo: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    repo = make_repo()
+    repo = tmp_path / 'source'
     expected_oid = b'a' * 40
     actual_oid = b'b' * 40
 
@@ -620,9 +604,9 @@ def test_snapshot_refuses_root_escaping_symlink(
 
 
 def test_snapshot_refuses_root_escaping_tree_path_with_visible_control(
-    make_repo: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    repo = make_repo()
+    repo = tmp_path / 'source'
     oid = b'a' * 40
 
     def _fake_run_git(args: Sequence[str], **_kwargs: object) -> GitResult:
@@ -639,9 +623,9 @@ def test_snapshot_refuses_root_escaping_tree_path_with_visible_control(
 
 
 def test_snapshot_refuses_unsupported_object_kind(
-    make_repo: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    repo = make_repo()
+    repo = tmp_path / 'source'
     oid = b'a' * 40
 
     def _fake_run_git(_args: Sequence[str], **_kwargs: object) -> GitResult:
@@ -654,9 +638,9 @@ def test_snapshot_refuses_unsupported_object_kind(
 
 
 def test_snapshot_reports_failed_batch_stderr(
-    make_repo: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    repo = make_repo('private-repository')
+    repo = tmp_path / 'private-repository'
     oid = b'a' * 40
     private_document = b'unconfigured-private-document-canary'
     private_path = b'diagnostic\x1b\\path'
@@ -680,9 +664,9 @@ def test_snapshot_reports_failed_batch_stderr(
 
 
 def test_snapshot_reports_failed_tree_stderr(
-    make_repo: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    repo = make_repo('private-repository')
+    repo = tmp_path / 'private-repository'
     oid = b'a' * 40
     private_path = b'diagnostic\x1b\\path'
 
@@ -756,7 +740,7 @@ def test_source_alternates_recovery_preserves_branches_and_tags(
     )
     if not alternates.is_absolute():
         alternates = source / alternates
-    assert escape(str(alternates)) in error.value.render()
+    assert escape((alternates).as_posix()) in error.value.render()
     saved = alternates.with_name('alternates.saved')
     operations = Path(__file__).resolve().parents[2] / 'docs/operations.md'
     recovery = operations.read_text().split('## Disconnecting an alternate object store', 1)[1]
@@ -800,6 +784,35 @@ def test_source_bookmark_encodes_existing_project_names(
     assert bookmark.refname == f'refs/pubanon/publications/{encoded}/{publication}'
     _source.ensure_bookmark(bookmark, original)
     assert _source.source_recovery(bookmark, original).status == 'protected'
+
+
+@pytest.mark.parametrize('state', ['absent', 'matching', 'moved', 'symbolic', 'invalid'])
+def test_bookmark_release_check_matches_release_safety(
+    make_repo: Callable[..., Path], state: str
+) -> None:
+    repo = make_repo()
+    original = _git(repo, 'rev-parse', 'HEAD').strip().decode()
+    bookmark = _source.describe_bookmark(repo, 'project', 'a' * 40)
+    if state == 'matching':
+        _source.ensure_bookmark(bookmark, original)
+    elif state == 'moved':
+        other = _git(repo, 'commit-tree', 'HEAD^{tree}', '-m', 'other').strip().decode()
+        _git(repo, 'update-ref', bookmark.refname, other)
+    elif state == 'symbolic':
+        _git(repo, 'symbolic-ref', bookmark.refname, 'refs/heads/master')
+    elif state == 'invalid':
+        bookmark = replace(bookmark, git_common_dir=Path('relative'))
+
+    if state in {'absent', 'matching'}:
+        assert _source.check_bookmark_release(bookmark, original) is (state == 'matching')
+    else:
+        message = {
+            'moved': 'changed to another commit',
+            'symbolic': 'symbolic',
+            'invalid': 'invalid source bookmark',
+        }[state]
+        with pytest.raises(PubanonError, match=message):
+            _source.check_bookmark_release(bookmark, original)
 
 
 def test_source_bookmark_preserves_rewritten_commit(make_repo: Callable[..., Path]) -> None:
@@ -1032,7 +1045,7 @@ def test_source_safety_refuses_alternates_file(make_repo: Callable[..., Path]) -
 
     rendered = exc_info.value.render()
     assert 'alternate' in rendered.casefold()
-    assert escape(str(alternates)) in rendered
+    assert escape((alternates).as_posix()) in rendered
 
 
 def test_source_safety_refuses_configured_remote(

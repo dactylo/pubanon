@@ -2,7 +2,7 @@ import tomllib
 
 import pytest
 
-from pubanon._toml import toml_array, toml_string
+from pubanon._toml import toml_array, toml_multiline_string, toml_string
 
 _SURROGATE_MAX = '\udfff'
 _SURROGATE_MIN = '\ud800'
@@ -25,3 +25,32 @@ def test_toml_string_round_trips_unicode_scalar(value: str) -> None:
     encoded = toml_string(value)
 
     assert tomllib.loads(f'value = {encoded}\n')['value'] == value
+
+
+@pytest.mark.parametrize(
+    'value',
+    [
+        'a\nb',
+        'a\n',
+        'say "hi"',
+        '"""',
+        'ends with "',
+        'back\\slash',
+        'tab\there',
+        'cr\rlf\r\n',
+        '\x7f',
+        '\U0001f600',
+        '',
+    ],
+)
+def test_toml_multiline_string_round_trips_unicode_scalar(value: str) -> None:
+    encoded = toml_multiline_string(value)
+
+    assert encoded.startswith('"""\n')
+    assert tomllib.loads(f'value = {encoded}\n')['value'] == value
+
+
+@pytest.mark.parametrize('value', [_SURROGATE_MIN, _SURROGATE_MAX])
+def test_toml_multiline_string_refuses_surrogate(value: str) -> None:
+    with pytest.raises(ValueError, match='Unicode scalar'):
+        toml_multiline_string(value)

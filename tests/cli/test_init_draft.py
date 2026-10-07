@@ -34,6 +34,7 @@ def _draft(tmp_path: Path, *, commit: str = 'a' * 40) -> _init_draft.Draft:
         projects=True,
         pull_requests=False,
         discussions=True,
+        release_pages=True,
     )
 
 
@@ -62,7 +63,7 @@ def test_directory_sync_failure_reports_possible_save(
 
     assert sync_calls == 1
     assert _init_draft.load(paths, 'demo') == draft
-    assert list(draft_path.parent.glob('.init-draft-*.tmp')) == []
+    assert list(draft_path.parent.glob('.pubanon-write-*.tmp')) == []
 
 
 @pytest.mark.parametrize(
@@ -74,6 +75,8 @@ def test_directory_sync_failure_reports_possible_save(
         ('publication_route', 3),
         ('source_tags', _MISSING),
         ('source_tags', 'yes'),
+        ('release_pages', 'yes'),
+        ('release_pages', _MISSING),
         ('phase', _MISSING),
         ('phase', 'done'),
         ('pending', ['selection', 1]),
@@ -171,7 +174,7 @@ def test_replace_failure_preserves_prior_draft(
 
     assert isinstance(exc_info.value.__cause__, OSError)
     assert _init_draft.load(paths, 'demo') == original
-    assert list(_init_draft._path(paths, 'demo').parent.glob('.init-draft-*.tmp')) == []
+    assert list(_init_draft._path(paths, 'demo').parent.glob('.pubanon-write-*.tmp')) == []
 
 
 def test_round_trip_preserves_complete_draft_owner_only(tmp_path: Path) -> None:

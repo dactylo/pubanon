@@ -14,37 +14,39 @@ from pubanon import (
 from pubanon._cli import _selection
 from pubanon._cli._context import ProjectContext
 from pubanon._cli._selection import (
-    apply_policy_offers,
+    _apply_policy_offers,
     policy_decision,
     sanitized_snapshot,
     show_selection,
 )
 from pubanon._errors import OperationCanceled, PubanonError
 from pubanon._snapshots import _source
-from pubanon._terminal import escape
+from pubanon._terminal import escape, verbose_context
 from tests._permissions import assert_private_mode
 from tests._setup import configure
 
 
 def test_adjust_reoffers_unmatched_remainder(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = make_repo(files={'pkg/a.py': 'a', 'pkg/b.py': 'b'})
+    source = tmp_path / 'source'
+    source.mkdir()
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
     assert project is not None
     project = replace(project, allow=())
     ctx = ProjectContext(paths, global_config, project)
-    pinned = _source.pin(source, 'HEAD')
-    snapshot = _source.read_snapshot(source, pinned.commit)
-    answers = iter(['customize', 'pkg/a.py', 'include'])  # narrow to one file, then accept rest
+    snapshot = (
+        _source.Entry('pkg/a.py', 0o100644, 'blob', b'a'),
+        _source.Entry('pkg/b.py', 0o100644, 'blob', b'b'),
+    )
+    answers = iter(['c', 'pkg/a.py', 'i'])  # narrow to one file, then accept rest
 
     def _answer(_prompt: str) -> str:
         return next(answers)
 
     monkeypatch.setattr('builtins.input', _answer)
-    updated = apply_policy_offers(ctx, snapshot, persist=False, yes=False)
+    updated = _apply_policy_offers(ctx, snapshot, persist=False, yes=False)
     membership = _policy.evaluate_membership(
         ['pkg/a.py', 'pkg/b.py'], updated.project.allow, updated.project.deny
     )
@@ -53,22 +55,24 @@ def test_adjust_reoffers_unmatched_remainder(
 
 def test_first_policy_pass_owns_new_credential_like_paths(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = make_repo(files={'README.md': 'public\n', 'sub/KEY.PEM': 'k'})
+    source = tmp_path / 'source'
+    source.mkdir()
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
     assert project is not None
     ctx = ProjectContext(paths, global_config, project)
-    pinned = _source.pin(source, 'HEAD')
-    snapshot = _source.read_snapshot(source, pinned.commit)
-    answers = iter(['exclude'])
+    snapshot = (
+        _source.Entry('README.md', 0o100644, 'blob', b'public\n'),
+        _source.Entry('sub/KEY.PEM', 0o100644, 'blob', b'k'),
+    )
+    answers = iter(['e'])
 
     def _answer(_prompt: str) -> str:
         return next(answers)
 
     monkeypatch.setattr('builtins.input', _answer)
-    updated = apply_policy_offers(ctx, snapshot, persist=False, yes=False)
+    updated = _apply_policy_offers(ctx, snapshot, persist=False, yes=False)
     membership = _policy.evaluate_membership(
         [entry.path for entry in snapshot], updated.project.allow, updated.project.deny
     )
@@ -111,6 +115,7 @@ def test_guided_policy_exposes_nested_internal_groups(
             'Publication route (staged/direct) [staged]: ',
             'Create local tags marking the source of each publication? [y/N] ',
             'Required CI checks (comma separated, blank for none): ',
+            'Create a release page for each published version? [y/N] ',
             'Repository description (blank for none): ',
             'Enable issues? [Y/n] ',
             'Enable wiki? [y/N] ',
@@ -171,7 +176,7 @@ def test_new_path_batch_json_preserves_controls_and_terminal_output_escapes_them
     assert raw_path not in output
     assert escape(raw_path) not in output
     assert str(batch_path) not in output
-    assert escape(str(batch_path)) in output
+    assert escape((batch_path).as_posix()) in output
 
     _selection.show_new_paths(ProjectContext(paths, global_config, project), [raw_path])
     later_release = capsys.readouterr().out
@@ -215,23 +220,22 @@ def test_policy_decision_quit_refuses_run(monkeypatch: pytest.MonkeyPatch) -> No
 
 def test_policy_offers_explain_selection_rules_once_by_default(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    source = make_repo(files={'KEY.PEM': 'key'})
+    source = tmp_path / 'source'
+    source.mkdir()
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
     assert project is not None
     ctx = ProjectContext(paths, global_config, project)
-    pinned = _source.pin(source, 'HEAD')
-    snapshot = _source.read_snapshot(source, pinned.commit)
+    snapshot = (_source.Entry('KEY.PEM', 0o100644, 'blob', b'key'),)
 
     def _exclude_decision(_prompt: str) -> str:
         return 'e'
 
     monkeypatch.setattr('builtins.input', _exclude_decision)
 
-    updated = apply_policy_offers(
+    updated = _apply_policy_offers(
         ctx,
         snapshot,
         persist=False,
@@ -249,15 +253,14 @@ def test_policy_offers_explain_selection_rules_once_by_default(
 
 def test_policy_offers_yes_still_refuses_credential_warning_without_input(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = make_repo(files={'KEY.PEM': 'key'})
+    source = tmp_path / 'source'
+    source.mkdir()
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
     assert project is not None
     ctx = ProjectContext(paths, global_config, project)
-    pinned = _source.pin(source, 'HEAD')
-    snapshot = _source.read_snapshot(source, pinned.commit)
+    snapshot = (_source.Entry('KEY.PEM', 0o100644, 'blob', b'key'),)
 
     def _unexpected_input(_prompt: str) -> str:
         pytest.fail('--yes requested a credential-like path decision')
@@ -265,7 +268,7 @@ def test_policy_offers_yes_still_refuses_credential_warning_without_input(
     monkeypatch.setattr('builtins.input', _unexpected_input)
 
     with pytest.raises(PubanonError, match='--yes cannot answer credential-like path warnings'):
-        apply_policy_offers(ctx, snapshot, persist=False, yes=True)
+        _apply_policy_offers(ctx, snapshot, persist=False, yes=True)
 
 
 @pytest.mark.parametrize('decision', ['continue', 'quit'])
@@ -285,7 +288,7 @@ def test_selection_review_preserves_saved_choices(
         _source.Entry('README.md', 0o100644, 'blob', b'public'),
         _source.Entry('notes/draft.md', 0o100644, 'blob', b'draft'),
     )
-    replies = iter([decision])
+    replies = iter([decision[0]])
 
     def _answer(_prompt: str) -> str:
         return next(replies)
@@ -316,7 +319,7 @@ def test_selection_review_applies_edited_groups_only_on_acceptance(
         _source.Entry(path, 0o100644, 'blob', b'content')
         for path in ('README.md', 'notes/draft.md', 'private/key.pem')
     )
-    replies = iter(['review', 'exclude', 'back', 'customize', 'README.md', 'exclude', decision])
+    replies = iter(['r', 'e', 'b', 'c', 'README.md', 'e', decision[0]])
 
     def _answer(_prompt: str) -> str:
         return next(replies)
@@ -338,19 +341,12 @@ def test_selection_review_applies_edited_groups_only_on_acceptance(
 @pytest.mark.parametrize('allow', [('**',), ('README.md',)])
 def test_global_directory_exclusions_override_includes_and_skip_proposals(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     allow: tuple[str, ...],
 ) -> None:
-    source = make_repo(
-        files={
-            'README.md': 'public',
-            'docs/private/private.key': 'private',
-            'notes/confidential/nested/notes.md': 'private',
-            'docs/private-copy/guide.md': 'public',
-        }
-    )
+    source = tmp_path / 'source'
+    source.mkdir()
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
     assert project is not None
     global_config = replace(
@@ -358,13 +354,18 @@ def test_global_directory_exclusions_override_includes_and_skip_proposals(
     )
     project = replace(project, allow=(*allow, 'docs/private-copy/**'))
     ctx = ProjectContext(paths, global_config, project)
-    pinned = _source.pin(source, 'HEAD')
-    snapshot = _source.read_snapshot(source, pinned.commit)
-    updated = apply_policy_offers(ctx, snapshot, persist=False, yes=True)
+    snapshot = (
+        _source.Entry('README.md', 0o100644, 'blob', b'public'),
+        _source.Entry('docs/private-copy/guide.md', 0o100644, 'blob', b'public'),
+        _source.Entry('docs/private/private.key', 0o100644, 'blob', b'private'),
+        _source.Entry('notes/confidential/nested/notes.md', 0o100644, 'blob', b'private'),
+    )
+    updated = _apply_policy_offers(ctx, snapshot, persist=False, yes=True)
     assert [entry.path for entry in sanitized_snapshot(updated, snapshot)] == [
         'README.md',
         'docs/private-copy/guide.md',
     ]
     assert updated.project.deny == ()
-    show_selection(updated, [entry.path for entry in snapshot], verbose=True)
+    with verbose_context(enabled=True):
+        show_selection(updated, [entry.path for entry in snapshot])
     assert 'globally ignored directory' in capsys.readouterr().out

@@ -20,6 +20,7 @@ from pubanon._terminal import (
     heading,
     output,
     style,
+    verbose_enabled,
 )
 
 if TYPE_CHECKING:
@@ -85,7 +86,7 @@ def _save_new_path_list(
             encoding='utf-8',
         )
         _filesystem.chmod(path, 0o600)
-    except (OSError, RuntimeError, UnicodeError) as exc:
+    except (OSError, UnicodeError) as exc:
         raise PubanonError('cannot write complete path list') from exc
     return path
 
@@ -109,56 +110,14 @@ def policy_decision(pattern: str, admitted: list[str], *, back: bool = False) ->
     raise OperationCanceled('Canceled. Nothing was saved.')
 
 
-def _review_groups(ctx: _context.ProjectContext, paths: list[str]) -> _context.ProjectContext:
-    """Reconsider the selected tree's groups without changing saved configuration."""
-    global_deny = _config.global_deny(ctx.global_config)
-    eligible = _policy.evaluate_membership(paths, ('**',), (), global_deny=global_deny).allowed
-    project = replace(ctx.project, allow=(), deny=())
-    previous: list[_config.ProjectConfig] = []
-    while unmatched := _policy.evaluate_membership(
-        eligible, project.allow, project.deny, global_deny=global_deny
-    ).unmatched:
-        pattern, admitted = _policy.narrowest_offer(unmatched, guided=True)[0]
-        action, selected = policy_decision(pattern, admitted, back=True)
-        if action == 'back':
-            if previous:
-                project = previous.pop()
-            else:
-                output('There is no earlier file choice.', kind='note')
-            continue
-        previous.append(project)
-        project = (
-            replace(project, allow=(*project.allow, selected))
-            if action == 'publish'
-            else replace(project, deny=(*project.deny, selected))
-        )
-    return _context.ProjectContext(ctx.paths, ctx.global_config, project)
-
-
-def apply_policy_offers(
+def _apply_policy_offers(
     ctx: _context.ProjectContext,
     snapshot: _source.Snapshot,
     *,
     persist: bool = True,
     yes: bool,
 ) -> _context.ProjectContext:
-    """Interactively resolve unmatched and credential-like path decisions.
-
-    Args:
-        ctx: Project configuration to refine.
-        snapshot: Source entries whose selection needs review.
-        persist: Save changed project configuration when true.
-        yes: Refuse proposals that require interactive answers.
-
-    Returns:
-        A context containing the resulting selection rules.
-
-    Raises:
-        PubanonError: Unattended mode needs a path decision, or paths remain
-            unmatched.
-        OperationCanceled: The user quits a policy or credential-like path
-            decision.
-    """
+    """Resolve unmatched and credential-like path decisions."""
     project = ctx.project
     paths = [entry.path for entry in snapshot]
     global_deny = _config.global_deny(ctx.global_config)
@@ -206,6 +165,32 @@ def apply_policy_offers(
     return _context.ProjectContext(ctx.paths, ctx.global_config, project)
 
 
+def _review_groups(ctx: _context.ProjectContext, paths: list[str]) -> _context.ProjectContext:
+    """Reconsider the selected tree's groups without changing saved configuration."""
+    global_deny = _config.global_deny(ctx.global_config)
+    eligible = _policy.evaluate_membership(paths, ('**',), (), global_deny=global_deny).allowed
+    project = replace(ctx.project, allow=(), deny=())
+    previous: list[_config.ProjectConfig] = []
+    while unmatched := _policy.evaluate_membership(
+        eligible, project.allow, project.deny, global_deny=global_deny
+    ).unmatched:
+        pattern, admitted = _policy.narrowest_offer(unmatched, guided=True)[0]
+        action, selected = policy_decision(pattern, admitted, back=True)
+        if action == 'back':
+            if previous:
+                project = previous.pop()
+            else:
+                output('There is no earlier file choice.', kind='note')
+            continue
+        previous.append(project)
+        project = (
+            replace(project, allow=(*project.allow, selected))
+            if action == 'publish'
+            else replace(project, deny=(*project.deny, selected))
+        )
+    return _context.ProjectContext(ctx.paths, ctx.global_config, project)
+
+
 def sanitized_snapshot(
     ctx: _context.ProjectContext, snapshot: _source.Snapshot
 ) -> _source.Snapshot:
@@ -235,7 +220,7 @@ def show_new_paths(
     detail(f'Saved list: {display_path(saved)}')
 
 
-def show_selection(ctx: _context.ProjectContext, paths: list[str], *, verbose: bool) -> None:
+def show_selection(ctx: _context.ProjectContext, paths: list[str]) -> None:
     """Display and save the exact proposed selection with exclusion reasons."""
     membership = _policy.evaluate_membership(
         paths,
@@ -248,7 +233,7 @@ def show_selection(ctx: _context.ProjectContext, paths: list[str], *, verbose: b
     _print_grouped_files(membership.allowed)
     heading('Excluded files:', separate=True)
     for path in membership.reserved:
-        print(f'  {escape(path)} - Pubanon configuration (always excluded)')
+        print(f'  {escape(path)} - pubanon configuration (always excluded)')
     globally_denied = set(
         _policy.evaluate_membership(
             paths, (), (), global_deny=_config.global_deny(ctx.global_config)
@@ -262,7 +247,7 @@ def show_selection(ctx: _context.ProjectContext, paths: list[str], *, verbose: b
         output('  Exclusions override included directories.', kind='note')
     else:
         print('  None.')
-    if verbose:
+    if verbose_enabled():
         _print_policy_offers(
             [
                 (
@@ -300,18 +285,18 @@ def review_selection(
     interactive cancellation leaves the saved project configuration unchanged.
     """
     original = ctx.project
-    ctx = apply_policy_offers(ctx, snapshot, persist=False, yes=yes)
+    ctx = _apply_policy_offers(ctx, snapshot, persist=False, yes=yes)
     if not yes:
         paths = [entry.path for entry in snapshot]
         while True:
-            show_selection(ctx, paths, verbose=False)
+            show_selection(ctx, paths)
             choice = ask('Use this selection?', choices=['continue', 'review', 'quit'])
             if choice == 'quit':
                 raise OperationCanceled('Canceled. Nothing was saved.')
             if choice == 'continue':
                 break
             print('Review each group below. Customize lets you edit its filename pattern.')
-            ctx = apply_policy_offers(
+            ctx = _apply_policy_offers(
                 _review_groups(ctx, paths), snapshot, persist=False, yes=False
             )
     if ctx.project != original:

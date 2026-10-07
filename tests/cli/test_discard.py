@@ -12,7 +12,7 @@ from pubanon import (
     _filesystem,
 )
 from pubanon._cli import _arguments
-from pubanon._snapshots import _candidate, _records, _source
+from pubanon._snapshots import _candidate, _inspection, _records, _source, _store, _verification
 from pubanon._terminal import escape
 from tests._cli import prepare
 from tests._setup import configure
@@ -26,16 +26,18 @@ def test_discard_copy_failure_keeps_record_for_retry(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     paths, project, record = prepare(tmp_path, make_repo(), monkeypatch)
-    inspection = _candidate.materialize_inspect(paths, project.name, record)
+    inspection = _verification.materialize_inspect(
+        paths, project.name, _verification.prove_objects(paths, project.name, record)
+    )
     with patch.object(_filesystem, 'remove_tree', side_effect=PermissionError('injected')):
         assert _cli.main(['discard', '--project', project.name]) == 1
     assert 'cannot clean review copy' in capsys.readouterr().err
     assert inspection.exists()
-    assert _candidate.load_candidate(paths, project.name) == record
+    assert _records.load_candidate(paths, project.name) == record
 
     assert _cli.main(['discard', '--project', project.name]) == 0
     assert not inspection.exists()
-    assert _candidate.load_candidate(paths, project.name) is None
+    assert _records.load_candidate(paths, project.name) is None
 
 
 @pytest.mark.skipif(os.name != 'nt', reason='requires native Windows path aliases')
@@ -48,8 +50,8 @@ def test_discard_refuses_windows_project_aliases_without_mutating_candidate(
     source = make_repo(files={'README.md': 'public\n'})
     paths, project, record = prepare(tmp_path, source, monkeypatch)
     assert record.source_bookmark is None
-    record_path = _candidate.record_path(paths, project.name)
-    ref_path = _candidate.store_path(paths, project.name) / _candidate.CANDIDATE_REF
+    record_path = _records.candidate_path(paths, project.name)
+    ref_path = _store.store_path(paths, project.name) / _candidate.CANDIDATE_REF
     retained = record_path.read_bytes(), ref_path.read_bytes()
     capsys.readouterr()
 
@@ -97,7 +99,7 @@ def test_discard_recovery_shows_unrenderable_project(
     assert _cli.main(['discard', f'--project={name}']) == 0
     output = capsys.readouterr().out
     assert 'Choose project line\\x0abreak' in output
-    assert 'rerun clean' in output
+    assert 'rerun the clean action' in output
     assert '--project=line' not in output
 
 
@@ -109,7 +111,9 @@ def test_discard_removes_prepared_review_copies(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, project, record = prepare(tmp_path, source, monkeypatch)
-    inspection = _candidate.materialize_inspect(paths, project.name, record)
+    inspection = _verification.materialize_inspect(
+        paths, project.name, _verification.prove_objects(paths, project.name, record)
+    )
     capsys.readouterr()
     assert _cli.main(['discard', '--project', project.name]) == 0
     output = capsys.readouterr().out
@@ -119,7 +123,7 @@ def test_discard_removes_prepared_review_copies(
     status = capsys.readouterr().out
     assert any(line.split() == ['Prepared:', 'none'] for line in status.splitlines())
     assert 'Snapshot directories:' not in status
-    assert escape(str(inspection)) not in status
+    assert escape((inspection).as_posix()) not in status
 
 
 @pytest.mark.slow
@@ -166,13 +170,11 @@ def test_discard_rewrite_removes_private_progress_and_keeps_publication_copy(
 ) -> None:
     source = make_repo(files={'README.md': 'original\n'})
     paths, project, original = replacement_context(tmp_path, source, monkeypatch, conflict=True)
-    inspection = _candidate.materialize_snapshot(
+    inspection = _inspection.materialize_snapshot(
         paths,
         project.name,
         original.commit,
-        _source.read_snapshot(
-            _candidate.candidate_store_path(paths, project.name), original.commit
-        ),
+        _source.read_snapshot(_store.candidate_store_path(paths, project.name), original.commit),
     )
     assert _cli.main(['prepare', '--project', project.name, '--replace', 'v1.0.0', '--yes']) == 0
     assert _records.rewrite_path(paths, project.name).exists()
@@ -181,7 +183,7 @@ def test_discard_rewrite_removes_private_progress_and_keeps_publication_copy(
     assert _cli.main(['discard', '--project', project.name]) == 0
     output = capsys.readouterr().out
     assert 'Discarded the prepared snapshot.' in output
-    assert _candidate.load_candidate(paths, project.name) is None
+    assert _records.load_candidate(paths, project.name) is None
     assert not _records.rewrite_path(paths, project.name).exists()
     assert not _records.rewrite_directory(paths, project.name).exists()
     assert inspection.exists()
@@ -194,11 +196,13 @@ def test_discard_unknown_outcome_keeps_record_and_review_copy(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     paths, project, record = prepare(tmp_path, make_repo(), monkeypatch)
-    inspection = _candidate.materialize_inspect(paths, project.name, record)
+    inspection = _verification.materialize_inspect(
+        paths, project.name, _verification.prove_objects(paths, project.name, record)
+    )
     pending = replace(record, state=_candidate.STATE_UNKNOWN_OUTCOME)
     _candidate.save_candidate(paths, project.name, pending)
 
     assert _cli.main(['discard', '--project', project.name]) == 1
     assert 'pubanon publish --project=demo --resolve' in capsys.readouterr().err
     assert inspection.exists()
-    assert _candidate.load_candidate(paths, project.name) == pending
+    assert _records.load_candidate(paths, project.name) == pending

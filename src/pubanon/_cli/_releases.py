@@ -17,21 +17,6 @@ if TYPE_CHECKING:
     import argparse
 
 
-def _notes(path: str | None) -> bytes | None:
-    """Read supplied UTF-8 notes exactly once without normalizing newlines."""
-    if path is None:
-        return None
-    try:
-        data = Path(path).read_bytes()
-    except OSError as exc:
-        raise PubanonError('cannot read release notes file', fact=escape(str(exc))) from exc
-    try:
-        data.decode('utf-8')
-    except UnicodeError as exc:
-        raise PubanonError('release notes file must be valid UTF-8') from exc
-    return data
-
-
 def _print_notes(notes: str) -> None:
     """Print every notes line while visibly escaping control characters."""
     print(terminal_field('Notes', ''))
@@ -63,6 +48,10 @@ def _preview(change: _releases.ReleaseChange) -> None:
         ]
     )
     _print_notes(change.notes.decode('utf-8'))
+    if change.changelog_missing:
+        output(
+            'No CHANGELOG.md in the published snapshot; set release_page.changelog to link one.'
+        )
     if change.operation == 'create':
         output('Confirmation creates a published, non-prerelease release page.')
     else:
@@ -70,33 +59,6 @@ def _preview(change: _releases.ReleaseChange) -> None:
         if previous is not None:
             print(terminal_field('Existing status', _status(previous)))
         output('Confirmation updates this page title and notes.')
-
-
-def _write(args: argparse.Namespace, operation: Literal['create', 'edit']) -> None:
-    """Keep the project lock through preparation, confirmation, and read-back."""
-    notes = _notes(args.notes_file)
-    paths = _config.derive_paths(os.environ)
-    name = _context.project_name(paths, args.project)
-    with _config.project_lock(paths, name):
-        ctx = _context.load_context(paths, name)
-        request = _releases.ReleaseRequest(operation, args.tag, args.title, notes)
-        change = _releases.prepare_change(ctx.paths, ctx.global_config, ctx.project, request)
-        _preview(change)
-        if not args.yes and not confirm(f'{operation.capitalize()} this release page?'):
-            raise OperationCanceled('Canceled. Nothing was changed.')
-        result = _releases.apply_change(ctx.paths, ctx.global_config, ctx.project, change)
-    past = 'created' if operation == 'create' else 'edited'
-    output(f'Release page {past}: {escape(result.url)}', kind='success')
-
-
-def command_create(args: argparse.Namespace) -> None:
-    """Create a page for an already published tag after confirmation."""
-    _write(args, 'create')
-
-
-def command_edit(args: argparse.Namespace) -> None:
-    """Edit a page's title or notes after confirmation."""
-    _write(args, 'edit')
 
 
 def command_list(args: argparse.Namespace) -> None:
@@ -137,3 +99,90 @@ def command_show(args: argparse.Namespace) -> None:
         ]
     )
     _print_notes(page.notes)
+
+
+def create_page(
+    ctx: _context.ProjectContext, request: _releases.ReleaseRequest, *, yes: bool
+) -> None:
+    """Create or reuse the requested page while the caller holds its project lock.
+
+    Args:
+        ctx: Loaded project context under the caller's project lock.
+        request: Tag and optional creation overrides.
+        yes: Skip confirmation for a new page.
+
+    Raises:
+        OperationCanceled: The operator declines creation.
+        PubanonError: Publication, policy, or host facts prevent creation.
+    """
+    change = _releases.prepare_change(ctx.paths, ctx.global_config, ctx.project, request)
+    if change.operation == 'existing':
+        page = change.previous
+        if page is None:
+            raise ValueError('existing release change has no page')
+        output(f'Release page already exists: {escape(page.url)}', kind='success')
+        return
+    _preview(change)
+    if not yes and not confirm('Create this release page?'):
+        raise OperationCanceled('Canceled. Nothing was changed.')
+    result = _releases.apply_change(ctx.paths, ctx.global_config, ctx.project, change)
+    message = 'created' if result.written else 'already exists'
+    output(f'Release page {message}: {escape(result.page.url)}', kind='success')
+
+
+def read_notes_file(path: str) -> bytes:
+    """Read supplied UTF-8 notes exactly once without normalizing newlines.
+
+    Args:
+        path: Path to a UTF-8 Markdown file.
+
+    Returns:
+        Exact file bytes for preview, policy checks, and host write.
+
+    Raises:
+        PubanonError: The file cannot be read or is not valid UTF-8.
+    """
+    try:
+        data = Path(path).read_bytes()
+    except OSError as exc:
+        raise PubanonError('cannot read release notes file', fact=escape(str(exc))) from exc
+    try:
+        data.decode('utf-8')
+    except UnicodeError as exc:
+        raise PubanonError('release notes file must be valid UTF-8') from exc
+    return data
+
+
+def _write(args: argparse.Namespace, operation: Literal['create', 'edit']) -> None:
+    """Keep the project lock through preparation, confirmation, and read-back."""
+    notes = read_notes_file(args.notes_file) if args.notes_file is not None else None
+    paths = _config.derive_paths(os.environ)
+    name = _context.project_name(paths, args.project)
+    with _config.project_lock(paths, name):
+        ctx = _context.load_context(paths, name)
+        request = _releases.ReleaseRequest(
+            operation,
+            args.tag,
+            args.title,
+            notes,
+            Path(args.notes_file).absolute() if args.notes_file is not None else None,
+        )
+        if operation == 'create':
+            create_page(ctx, request, yes=args.yes)
+            return
+        change = _releases.prepare_change(ctx.paths, ctx.global_config, ctx.project, request)
+        _preview(change)
+        if not args.yes and not confirm(f'{operation.capitalize()} this release page?'):
+            raise OperationCanceled('Canceled. Nothing was changed.')
+        result = _releases.apply_change(ctx.paths, ctx.global_config, ctx.project, change)
+    output(f'Release page edited: {escape(result.page.url)}', kind='success')
+
+
+def command_create(args: argparse.Namespace) -> None:
+    """Create a page for an already published tag after confirmation."""
+    _write(args, 'create')
+
+
+def command_edit(args: argparse.Namespace) -> None:
+    """Edit a page's title or notes after confirmation."""
+    _write(args, 'edit')

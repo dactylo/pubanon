@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shlex
 import subprocess
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, redirect_stdout
@@ -15,11 +16,12 @@ from pubanon import (
     _cli,
     _config,
     _filesystem,
+    _terminal,
 )
 from pubanon._config import GlobalConfig, Paths, ProjectConfig, Settings
 from pubanon._errors import OperationCanceled, PubanonError
 from pubanon._gate import RuleClass
-from pubanon._remote import _host, _publish, _stage, _watch
+from pubanon._remote import _host, _publish, _releases, _stage, _watch
 from pubanon._remote._publish import (
     _acknowledge_exposure,
     _verify_for_publish,
@@ -28,13 +30,56 @@ from pubanon._remote._publish import (
 )
 from pubanon._remote._stage import _save_stage
 from pubanon._run import GitResult
-from pubanon._snapshots import _audit, _candidate, _history, _records, _rewrite, _source
-from pubanon._snapshots._source import Snapshot, pin, read_snapshot
+from pubanon._snapshots import (
+    _audit,
+    _candidate,
+    _discard,
+    _history,
+    _records,
+    _rewrite,
+    _source,
+    _store,
+    _verification,
+)
+from pubanon._snapshots._source import PinnedSource, Snapshot, pin, read_snapshot
 from pubanon._terminal import color_context, escape, verbose_context
 from tests._cli import gh_calls
 from tests._git import git_env, remove_tree
 from tests._permissions import assert_private_mode
+from tests.remote.test_releases import _Host as _ReleaseHost
 from tests.snapshots.test_rewrite import _install_faults
+
+
+def _assert_page_completion_report(
+    captured: tuple[str, str], outcome: str, host: _ReleaseHost, notes_file: Path
+) -> None:
+    out, error = captured
+    if outcome in {'created', 'existing'}:
+        assert host.page is not None
+        result = out[out.index('Published v1.2.3') :]
+        assert (
+            f'Release page{" already exists" if outcome == "existing" else ""}: {host.page.url}'
+            in result
+        )
+        assert result.index(host.page.url) < result.index('Next:')
+    else:
+        message = (
+            'may not have been created'
+            if outcome in {'unknown', 'interrupt'}
+            else 'was not created'
+        )
+        assert f'the release page {message}' in error
+        assert 'code was published' in error
+        assert '--project=example' in error
+        assert 'Nothing was published' not in error
+        if outcome == 'different':
+            # Creating again would refuse the different page, so only inspection or editing helps.
+            assert 'release show v1.2.3' in error
+            assert 'release edit v1.2.3' in error
+            assert 'release create' not in error
+        else:
+            assert f'--notes-file {shlex.quote(str(notes_file))}' in error
+            assert 'release create v1.2.3' in error
 
 
 def _configs(source: Path) -> tuple[GlobalConfig, ProjectConfig]:
@@ -60,6 +105,7 @@ def _configs(source: Path) -> tuple[GlobalConfig, ProjectConfig]:
             self_publication=True,
             required_checks=(),
             publication_route='direct',
+            release_page=_config.ReleasePageSettings(enabled=False),
             settings=Settings(
                 '',
                 'main',
@@ -77,6 +123,12 @@ def _new_host(tmp_path: Path) -> Path:
     host = tmp_path / 'host.git'
     subprocess.run(['git', 'init', '--bare', '-q', host], check=True, env=git_env())
     return host
+
+
+def _page_plan(ctx: _publish.PublishContext) -> _releases.PagePlan:
+    return _releases.plan_publication_page(
+        ctx._paths, ctx._global_config, ctx._project, ctx._record, ctx._release_page
+    )
 
 
 def _paths(tmp_path: Path) -> Paths:
@@ -105,9 +157,7 @@ def _ci_context(
         project,
         _candidate.CandidateInputs(read_snapshot(source, pinned.commit), pinned, None, None),
     )
-    return _publish.PublishContext(
-        paths, global_config, project, record, _yes=True, _unattended=True
-    )
+    return _publish.PublishContext(paths, global_config, project, record, _yes=True)
 
 
 def _configure_ci_evidence(
@@ -178,7 +228,7 @@ def _configure_ci_evidence(
 
 @contextmanager
 def _failed_readback(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
-    real_ls_remote = _publish.ls_remote
+    real_ls_remote = _host.ls_remote
     calls = 0
 
     def _fail_after_push(
@@ -192,11 +242,11 @@ def _failed_readback(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
             raise PubanonError('simulated remote read failure')
         return real_ls_remote(dest, paths, project)
 
-    monkeypatch.setattr(_publish, 'ls_remote', _fail_after_push)
+    monkeypatch.setattr(_host, 'ls_remote', _fail_after_push)
     try:
         yield
     finally:
-        monkeypatch.setattr(_publish, 'ls_remote', real_ls_remote)
+        monkeypatch.setattr(_host, 'ls_remote', real_ls_remote)
 
 
 def _git_command(
@@ -276,15 +326,42 @@ def _context(
         project_config,
         record,
         _yes=True,
-        _unattended=True,
     )
+
+
+def _literal_context(
+    tmp_path: Path, *, extra_terms: tuple[str, ...] = (), version: str | None = None
+) -> _publish.PublishContext:
+    paths = _paths(tmp_path)
+    global_config, project = _configs(tmp_path / 'source')
+    project = replace(project, extra_terms=extra_terms)
+    record = _records.CandidateRecord(
+        commit='5' * 40,
+        tree='b' * 40,
+        snapshot_digest='c' * 64,
+        tag_intent=f'v{version}' if version is not None else None,
+        fingerprint=_config.fingerprint(global_config, project),
+        pinned=PinnedSource('d' * 40, 'ref', 'refs/heads/main', 'd' * 40),
+        destination=_records.RecordedDestination(
+            project.host,
+            project.owner,
+            project.repo,
+            project.visibility,
+            global_config.accounts[project.host],
+        ),
+        prestate_main=None,
+        prestate_tags={},
+        state=_candidate.STATE_RETAINED,
+        message='Public snapshot',
+    )
+    return _publish.PublishContext(paths, global_config, project, record, _yes=True)
 
 
 def _publish_mode(
     ctx: _publish.PublishContext, mode: Literal['interactive', 'unattended']
 ) -> _publish.PublishContext:
     unattended = mode == 'unattended'
-    return replace(ctx, _yes=unattended, _unattended=unattended)
+    return replace(ctx, _yes=unattended)
 
 
 def _record_path(ctx: _publish.PublishContext) -> Path:
@@ -357,7 +434,7 @@ def _assert_offline_replacement_history(
 
 
 def _assert_provisional_bookmark(ctx: _publish.PublishContext) -> None:
-    retained = _candidate.load_candidate(ctx._paths, ctx._project.name)
+    retained = _records.load_candidate(ctx._paths, ctx._project.name)
     assert retained is not None
     bookmark = retained.source_bookmark
     assert bookmark is not None
@@ -406,6 +483,25 @@ def _resume_offline_conflict(
     return completed
 
 
+def _with_source_tags(ctx: _publish.PublishContext) -> _publish.PublishContext:
+    return replace(ctx, _project=replace(ctx._project, source_tags=True))
+
+
+@pytest.fixture
+def page_context(
+    tmp_path: Path, make_repo: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
+) -> tuple[_publish.PublishContext, _ReleaseHost]:
+    ctx = _context(tmp_path, make_repo(), version='1.2.3')
+    ctx = replace(
+        ctx,
+        _project=replace(ctx._project, release_page=_config.ReleasePageSettings(enabled=True)),
+    )
+    host = _ReleaseHost(_publish._destination_from_record(ctx._record), ctx._record.commit)
+    monkeypatch.setattr(_host, 'all_releases', host._all)
+    monkeypatch.setattr(_host, 'create_release', host._create)
+    return ctx, host
+
+
 def _second_source_commit(source: Path, content: str = 'second\n') -> None:
     (source / 'README.md').write_text(content, encoding='utf-8', newline='\n')
     _git_command(source, 'add', 'README.md')
@@ -427,15 +523,9 @@ def _sync_context(
     mode: Literal['interactive', 'unattended'] = 'unattended',
 ) -> _publish.SyncContext:
     unattended = mode == 'unattended'
-    context = _publish.SyncContext(
-        ctx._paths, ctx._global_config, ctx._project, unattended, unattended
-    )
+    context = _publish.SyncContext(ctx._paths, ctx._global_config, ctx._project, unattended)
     assert_type(context, _publish.SyncContext)
     return context
-
-
-def _with_source_tags(ctx: _publish.PublishContext) -> _publish.PublishContext:
-    return replace(ctx, _project=replace(ctx._project, source_tags=True))
 
 
 def _write_host_responses(path: Path, visibility: str = 'public') -> None:
@@ -490,7 +580,7 @@ def _configure_staged_candidate(
     _git_command(
         stage_host,
         'fetch',
-        str(_candidate.store_path(ctx._paths, ctx._project.name)),
+        str(_store.store_path(ctx._paths, ctx._project.name)),
         f'{commit}:refs/heads/main',
     )
     repo = _config.stage_repository(ctx._project)
@@ -649,18 +739,6 @@ def _published_history(
     return source, host, first, second
 
 
-def _published_repair_context(
-    fake_gh: Path, make_repo: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
-) -> tuple[_publish.PublishContext, _host.Destination, Path]:
-    source = make_repo(files={'README.md': 'public\n'})
-    host = _new_host(source.parent)
-    _configure_host(host, fake_gh, monkeypatch)
-    ctx = _context(source.parent, source)
-    _publish.publish(ctx)
-    destination = _host.verify_destination(ctx._paths, ctx._global_config, ctx._project)
-    return ctx, destination, host
-
-
 def _replacement_fixture(
     tmp_path: Path,
     source: Path,
@@ -688,7 +766,6 @@ def _replacement_fixture(
             project,
             first,
             _yes=True,
-            _unattended=True,
         )
     )
     _second_source_commit(source, 'corrected publication\n')
@@ -715,7 +792,6 @@ def _replacement_fixture(
             project,
             record,
             _yes=True,
-            _unattended=True,
         ),
     )
 
@@ -733,7 +809,7 @@ def _rewrite_fixture(
     host = _new_host(tmp_path)
     _configure_host(host, fake_gh, monkeypatch)
     originals: list[_records.CandidateRecord] = []
-    store = _candidate.store_path(paths, project.name)
+    store = _store.store_path(paths, project.name)
     for index in range(3):
         if index:
             (source / f'addition-{index}.txt').write_bytes(f'addition {index}\n'.encode())
@@ -752,7 +828,7 @@ def _rewrite_fixture(
         record = replace(record, source_bookmark=_bookmark)
         _source.ensure_bookmark(_bookmark, pinned.commit)
         _history.record_publication(paths, project, record)
-        store = _candidate.store_path(paths, project.name)
+        store = _store.store_path(paths, project.name)
         _git_command(store, 'update-ref', 'refs/heads/main', record.commit)
         _git_command(store, 'update-ref', f'refs/tags/v1.0.{index}', record.commit)
         _records.candidate_path(paths, project.name).unlink()
@@ -782,7 +858,7 @@ def _rewrite_fixture(
         record = _rewrite.continue_rewrite(paths, g, project, env={})
     return (
         host,
-        _publish.PublishContext(paths, g, project, record, _yes=True, _unattended=True),
+        _publish.PublishContext(paths, g, project, record, _yes=True),
         tuple(originals),
     )
 
@@ -802,13 +878,11 @@ def advanced_source_context(
 
 def test_acknowledged_digest_skips_matching_findings_and_changes_for_new_exposure(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     first = 'first-private-canary'
     second = 'second-private-canary'
-    source = make_repo(files={'README.md': 'public\n'})
-    ctx = _context(tmp_path, source, extra_terms=(first, second))
+    ctx = _literal_context(tmp_path, extra_terms=(first, second))
     _config.save_project(ctx._paths, ctx._project)
     findings = (
         _audit.AuditFinding('path:first.txt', RuleClass.IDENTITY_CRITICAL, first),
@@ -820,7 +894,7 @@ def test_acknowledged_digest_skips_matching_findings_and_changes_for_new_exposur
     def _accept(prompt: str) -> str:
         assert prompts
         assert prompts.pop(0) == prompt
-        return 'yes'
+        return 'y'
 
     monkeypatch.setattr('builtins.input', _accept)
     acknowledged = _acknowledge_exposure(
@@ -867,7 +941,7 @@ def test_acknowledged_digest_skips_matching_findings_and_changes_for_new_exposur
     def _decline(prompt: str) -> str:
         assert prompts
         assert prompts.pop(0) == prompt
-        return 'no'
+        return 'n'
 
     monkeypatch.setattr('builtins.input', _decline)
     with pytest.raises(OperationCanceled, match=r'Canceled\. Nothing was published.'):
@@ -906,7 +980,7 @@ def test_changed_source_tag_is_named_without_claiming_branch_movement(
     with redirect_stdout(captured):
         _verify_for_publish(ctx)
     assert captured.getvalue() == 'Warning: source has changed since snapshot was prepared.\n'
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) == ctx._record
+    assert _records.load_candidate(ctx._paths, ctx._project.name) == ctx._record
 
 
 @pytest.mark.slow
@@ -952,12 +1026,12 @@ def test_clean_push_rejection_restores_retained_state(
     def _reject(_dest: _host.Destination, _cwd: Path, _args: list[str]) -> GitResult:
         raise PubanonError('credential-bearing command failed')
 
-    monkeypatch.setattr(_publish, 'push', _reject)
+    monkeypatch.setattr(_host, 'push', _reject)
 
     with pytest.raises(PubanonError, match='credential-bearing command failed'):
         _publish.publish(ctx)
 
-    retained = _candidate.load_candidate(ctx._paths, ctx._project.name)
+    retained = _records.load_candidate(ctx._paths, ctx._project.name)
     assert retained is not None
     assert retained.state == _candidate.STATE_RETAINED
 
@@ -965,15 +1039,13 @@ def test_clean_push_rejection_restores_retained_state(
 @pytest.mark.parametrize('presentation', [(False, 'never'), (True, 'always')])
 def test_exposure_review_shows_rule_and_location_before_acknowledgment(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     presentation: tuple[bool, str],
 ) -> None:
     accept, color = presentation
     term = 'private-canary'
-    source = make_repo(files={'README.md': 'public\n'})
-    ctx = _context(tmp_path, source, extra_terms=(term,))
+    ctx = _literal_context(tmp_path, extra_terms=(term,))
     _config.save_project(ctx._paths, ctx._project)
     finding = _audit.AuditFinding('path:private-canary.txt', RuleClass.IDENTITY_CRITICAL, term)
     audit = _audit.HistoryAudit(
@@ -990,7 +1062,7 @@ def test_exposure_review_shows_rule_and_location_before_acknowledgment(
             ),
         ),
     )
-    prompts = [('Continue despite this earlier exposure? [y/n] ', 'yes' if accept else 'no')]
+    prompts = [('Continue despite this earlier exposure? [y/n] ', 'y' if accept else 'n')]
 
     def _answer(prompt: str) -> str:
         assert prompts, f'unexpected prompt: {prompt}'
@@ -1089,15 +1161,24 @@ def test_indeterminate_diagnostic_separates_managed_refs_from_unrelated_drift(
     with pytest.raises(PubanonError, match='indeterminate') as excinfo:
         _publish.resolve(replace(ctx, _record=unknown))
 
-    assert excinfo.value.expected == (
-        f'prestate: main={first._record.commit}; tags=none; branches=none; '
-        f'pushed: main={unknown.commit}; tags=v2.0.0={unknown.commit}; branches=none'
-    )
-    assert excinfo.value.actual == f'main={source_commit}; tags=none; branches=none'
-    assert excinfo.value.fact == (
-        f'unrelated remote drift: branches: private-backup={source_commit}'
-    )
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) == unknown
+    expected = excinfo.value.expected
+    assert expected is not None
+    assert first._record.commit in expected
+    assert unknown.commit in expected
+    assert 'v2.0.0' in expected
+    assert 'private-backup' not in expected
+    actual = excinfo.value.actual
+    assert actual is not None
+    assert f'main={source_commit}' in actual
+    assert 'private-backup' not in actual
+    assert 'v1.0.0' not in actual
+    assert 'v2.0.0' not in actual
+    fact = excinfo.value.fact
+    assert fact is not None
+    assert 'unrelated remote drift' in fact
+    assert f'private-backup={source_commit}' in fact
+    assert 'main=' not in fact
+    assert _records.load_candidate(ctx._paths, ctx._project.name) == unknown
 
 
 @pytest.mark.slow
@@ -1119,8 +1200,12 @@ def test_landed_publication_finalization_failure_is_resolvable(
 ) -> None:
     host, ctx = publication_cli
     command, boundary = case
-    store = _candidate.store_path(ctx._paths, ctx._project.name)
-    inspection = _candidate.materialize_inspect(ctx._paths, ctx._project.name, ctx._record)
+    store = _store.store_path(ctx._paths, ctx._project.name)
+    inspection = _verification.materialize_inspect(
+        ctx._paths,
+        ctx._project.name,
+        _verification.prove_objects(ctx._paths, ctx._project.name, ctx._record),
+    )
     reviewed = (inspection / 'README.md').read_bytes()
     real_git = _publish.run_git
     real_unlink = Path.unlink
@@ -1187,7 +1272,7 @@ def test_landed_publication_finalization_failure_is_resolvable(
     assert 'Do not publish a new snapshot' in error
     assert f'pubanon publish --project={ctx._project.name} --resolve' in error
     assert 'Traceback' not in error
-    retained = _candidate.load_candidate(ctx._paths, ctx._project.name)
+    retained = _records.load_candidate(ctx._paths, ctx._project.name)
     assert retained is not None
     assert retained.state == _candidate.STATE_UNKNOWN_OUTCOME
     assert _remote_ref(host, 'refs/heads/main') == ctx._record.commit
@@ -1198,7 +1283,7 @@ def test_landed_publication_finalization_failure_is_resolvable(
     assert _cli.main(['publish', '--project', ctx._project.name, '--resolve']) == 0
     for ref in ('refs/heads/main', 'refs/tags/v1.0.0'):
         assert _remote_ref(store, ref) == _remote_ref(host, ref) == ctx._record.commit
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) is None
+    assert _records.load_candidate(ctx._paths, ctx._project.name) is None
     assert _remote_ref(store, _candidate.CANDIDATE_REF) is None
     assert (inspection / 'README.md').read_bytes() == reviewed
 
@@ -1239,7 +1324,7 @@ def test_direct_publication_ignores_incidental_staging_tracking(
     )
 
 
-def test_landed_push_reports_effective_term_in_unrelated_tag_diagnostic(
+def test_landed_push_with_unrelated_tag_records_published(
     tmp_path: Path,
     fake_gh: Path,
     make_repo: Callable[..., Path],
@@ -1250,7 +1335,7 @@ def test_landed_push_reports_effective_term_in_unrelated_tag_diagnostic(
     host = _new_host(tmp_path)
     _configure_host(host, fake_gh, monkeypatch)
     ctx = _context(tmp_path, source, extra_terms=(term,))
-    real_push = _publish.push
+    real_push = _host.push
 
     def _push_then_drift(
         dest: _host.Destination,
@@ -1261,43 +1346,14 @@ def test_landed_push_reports_effective_term_in_unrelated_tag_diagnostic(
         _git_command(host, 'update-ref', f'refs/tags/{term}', ctx._record.commit)
         return result
 
-    monkeypatch.setattr(_publish, 'push', _push_then_drift)
+    monkeypatch.setattr(_host, 'push', _push_then_drift)
 
     with pytest.raises(PubanonError, match='snapshot landed') as error:
         _publish.publish(ctx)
 
-    rendered = error.value.render()
-    assert term in rendered
-
-
-def test_landed_push_with_unrelated_tag_records_published(
-    tmp_path: Path,
-    fake_gh: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    ctx = _context(tmp_path, source)
-    real_push = _publish.push
-
-    def _push_then_drift(
-        dest: _host.Destination,
-        cwd: Path,
-        args: list[str],
-    ) -> GitResult:
-        result = real_push(dest, cwd, args)
-        _git_command(host, 'update-ref', 'refs/tags/unrelated', ctx._record.commit)
-        return result
-
-    monkeypatch.setattr(_publish, 'push', _push_then_drift)
-
-    with pytest.raises(PubanonError, match='snapshot landed'):
-        _publish.publish(ctx)
-
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) is None
-    store = _candidate.store_path(ctx._paths, ctx._project.name)
+    assert term in error.value.render()
+    assert _records.load_candidate(ctx._paths, ctx._project.name) is None
+    store = _store.store_path(ctx._paths, ctx._project.name)
     assert _remote_ref(store, 'refs/heads/main') == ctx._record.commit
 
 
@@ -1308,7 +1364,7 @@ def test_landed_resolution_failure_reports_current_private_term(
 ) -> None:
     host, ctx = publication_cli
     ctx = _publish._preserve_source(ctx)
-    store = _candidate.store_path(ctx._paths, ctx._project.name)
+    store = _store.store_path(ctx._paths, ctx._project.name)
     _git_command(
         host,
         'fetch',
@@ -1341,7 +1397,7 @@ def test_landed_resolution_failure_reports_current_private_term(
         ctx._record.commit,
         {'v1.0.0': ctx._record.commit},
     )
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) is None
+    assert _records.load_candidate(ctx._paths, ctx._project.name) is None
 
 
 def test_mixed_managed_state_is_indeterminate(
@@ -1354,7 +1410,7 @@ def test_mixed_managed_state_is_indeterminate(
     host = _new_host(tmp_path)
     _configure_host(host, fake_gh, monkeypatch)
     ctx = _context(tmp_path, source, version='1.0.0')
-    real_push = _publish.push
+    real_push = _host.push
 
     def _push_then_delete_tag(
         dest: _host.Destination,
@@ -1365,12 +1421,12 @@ def test_mixed_managed_state_is_indeterminate(
         _git_command(host, 'update-ref', '-d', 'refs/tags/v1.0.0')
         return result
 
-    monkeypatch.setattr(_publish, 'push', _push_then_delete_tag)
+    monkeypatch.setattr(_host, 'push', _push_then_delete_tag)
 
     with pytest.raises(PubanonError, match='indeterminate'):
         _publish.publish(ctx)
 
-    record = _candidate.load_candidate(ctx._paths, ctx._project.name)
+    record = _records.load_candidate(ctx._paths, ctx._project.name)
     assert record is not None
     assert record.state == _candidate.STATE_UNKNOWN_OUTCOME
 
@@ -1469,21 +1525,25 @@ def test_offline_replacement_recovers_conflict_export_and_lost_readback(
     completed = _resume_offline_conflict(ctx, old_b.commit, monkeypatch)
     assert _candidate.published_refs(paths, project.name)[0] == old_c.commit
     assert _remote_ref(host, 'refs/heads/main') == old_c.commit
-    tip_copy = _candidate.materialize_inspect(paths, project.name, completed)
-    b2_copy = _candidate.inspect_rewritten(paths, project.name, completed, 'v1.0.1')
+    tip_copy = _verification.materialize_inspect(
+        paths, project.name, _verification.prove_objects(paths, project.name, completed)
+    )
+    b2_copy = _verification.inspect_rewritten(
+        paths, project.name, _verification.prove_objects(paths, project.name, completed), 'v1.0.1'
+    )
     assert tip_copy != b2_copy
     assert (tip_copy / 'third.txt').read_text() == 'third release\n'
     assert not (b2_copy / 'third.txt').exists()
     assert (b2_copy / 'README.md').read_text() == 'corrected and later edit\n'
 
     calls: list[list[str]] = []
-    real_push = _publish.push
+    real_push = _host.push
 
     def _push(dest: _host.Destination, store: Path, args: list[str]) -> None:
         calls.append(args)
         real_push(dest, store, args)
 
-    monkeypatch.setattr(_publish, 'push', _push)
+    monkeypatch.setattr(_host, 'push', _push)
     ctx = replace(ctx, _record=completed)
     with (
         _failed_readback(monkeypatch),
@@ -1522,6 +1582,120 @@ def test_ordinary_publication_preview_and_result_are_compact(
     ) in output
 
 
+def test_page_ambiguity_is_reported_after_publication(
+    page_context: tuple[_publish.PublishContext, _ReleaseHost],
+    fake_gh: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ctx, host = page_context
+    _configure_host(_new_host(ctx._paths.data_dir.parent), fake_gh, monkeypatch)
+    plan = _releases.PagePlan(
+        'none', 'ambiguous', candidates=('v1.0.0', 'v2.0.0'), project=ctx._project.name
+    )
+
+    def _plan(*_args: object) -> _releases.PagePlan:
+        return plan
+
+    monkeypatch.setattr(_releases, 'plan_publication_page', _plan)
+    capsys.readouterr()
+    _publish.publish(ctx)
+    result = capsys.readouterr().out.split('Published v1.2.3', 1)[1]
+    assert 'Release page: not created: v1.0.0 and v2.0.0 point here' in result
+    for tag in plan.candidates:
+        assert result.count(f'pubanon release create {tag} --project=example') == 1
+    assert host.writes == []
+    assert host.scans == 0
+
+
+def test_page_replacement_question_creates_page(
+    page_context: tuple[_publish.PublishContext, _ReleaseHost], capsys: pytest.CaptureFixture[str]
+) -> None:
+    ctx, host = page_context
+    ctx = replace(
+        ctx,
+        _record=replace(
+            ctx._record,
+            replaces='a' * 40,
+            prestate_main='a' * 40,
+            replace_scope='one',
+            tip=ctx._record.commit,
+            poststate_tags={'v1.2.3': ctx._record.commit},
+        ),
+    )
+    plan = _page_plan(ctx)
+    verified = _publish._Verified(host.destination, _host.RemoteRefs(None, {}))
+    assert (
+        _publish._replacement_review(ctx, verified, plan)
+        == 'Publish this replacement and create its release page?'
+    )
+    assert 'Release page' in capsys.readouterr().out
+
+
+def test_publication_finalization_checks_old_values_atomically(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_repo(files={'README.md': 'original\n'})
+    ctx = _context(tmp_path, source, version='1.0.0')
+    store = _store.store_path(ctx._paths, ctx._project.name)
+    real_git = _publish.run_git
+
+    def _git(
+        args: list[str], *, cwd: Path, input_bytes: bytes | None = None, check: bool = True
+    ) -> GitResult:
+        if args[2] == 'update-ref':
+            _git_command(store, 'update-ref', 'refs/tags/v1.0.0', ctx._record.commit)
+        return real_git(args, cwd=cwd, input_bytes=input_bytes, check=check)
+
+    monkeypatch.setattr(_publish, 'run_git', _git)
+    with pytest.raises(PubanonError, match='cannot record published refs locally'):
+        _publish._finalize(ctx)
+    assert _remote_ref(store, 'refs/heads/main') is None
+    assert _remote_ref(store, _candidate.CANDIDATE_REF) == ctx._record.commit
+    assert _records.load_candidate(ctx._paths, ctx._project.name) == ctx._record
+    with pytest.raises(PubanonError, match='saved published history matches neither'):
+        _publish._finalize(ctx)
+    assert _remote_ref(store, 'refs/heads/main') is None
+    assert _remote_ref(store, _candidate.CANDIDATE_REF) == ctx._record.commit
+    assert _records.load_candidate(ctx._paths, ctx._project.name) == ctx._record
+
+
+def test_publication_next_action_watches_integrated_project(tmp_path: Path) -> None:
+    _global_config, project = _configs(tmp_path)
+    assert (
+        _publish.publication_next_action(replace(project, ci_workflow='ci.yml'))
+        == 'pubanon repo watch'
+    )
+
+
+@pytest.mark.parametrize('skip', [False, True])
+def test_publication_without_page_shows_later_create_command(
+    page_context: tuple[_publish.PublishContext, _ReleaseHost],
+    fake_gh: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    skip: bool,
+) -> None:
+    ctx, host = page_context
+    _configure_host(_new_host(ctx._paths.data_dir.parent), fake_gh, monkeypatch)
+    ctx = replace(
+        ctx,
+        _project=replace(ctx._project, release_page=None),
+        _release_page=_releases.PageRequest(skip=skip),
+    )
+    capsys.readouterr()
+    _publish.publish(ctx)
+    review, finished = capsys.readouterr().out.split('Published v1.2.3', 1)
+    assert 'Add one later with:' not in review
+    assert 'Release page: not created' in finished
+    assert 'Add one later with: pubanon release create v1.2.3 --project=example' in finished
+    assert host.scans == 0
+    assert host.writes == []
+
+
 @pytest.mark.slow
 @pytest.mark.parametrize('boundary', ['intent', 'bookmark', 'unknown', 'unknown-saved'])
 def test_publication_bookmark_failure_prevents_push(
@@ -1552,53 +1726,22 @@ def test_publication_bookmark_failure_prevents_push(
             _publish.publish(ctx)
     rendered = error.value.render()
     assert rendered.count('Nothing was published') == 1
-    assert escape(str(ctx._project.source_path)) in rendered
+    assert escape((ctx._project.source_path).as_posix()) in rendered
     if boundary in ('intent', 'bookmark'):
         assert 'No push was attempted' in rendered
         assert 'snapshot recovery information and any source bookmark are retained' in rendered
     assert 'pubanon publish' in rendered
     assert _remote_ref(host, 'refs/heads/main') is None
-    retained = _candidate.load_candidate(ctx._paths, ctx._project.name)
+    retained = _records.load_candidate(ctx._paths, ctx._project.name)
     assert retained is not None
     assert (retained.source_bookmark is None) == (boundary == 'intent')
     if boundary == 'unknown-saved':
         assert 'pubanon publish --resolve' in error.value.render()
         assert _publish.resolve(replace(ctx, _record=retained)) == 'not-sent'
-        retained = _candidate.load_candidate(ctx._paths, ctx._project.name)
+        retained = _records.load_candidate(ctx._paths, ctx._project.name)
         assert retained is not None
     _publish.publish(replace(ctx, _record=retained))
     assert _remote_ref(host, 'refs/heads/main') == ctx._record.commit
-
-
-def test_publication_finalization_checks_old_values_atomically(
-    tmp_path: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = make_repo(files={'README.md': 'original\n'})
-    ctx = _context(tmp_path, source, version='1.0.0')
-    store = _candidate.store_path(ctx._paths, ctx._project.name)
-    real_git = _publish.run_git
-
-    def _git(
-        args: list[str], *, cwd: Path, input_bytes: bytes | None = None, check: bool = True
-    ) -> GitResult:
-        if args[2] == 'update-ref':
-            _git_command(store, 'update-ref', 'refs/tags/v1.0.0', ctx._record.commit)
-        return real_git(args, cwd=cwd, input_bytes=input_bytes, check=check)
-
-    monkeypatch.setattr(_publish, 'run_git', _git)
-    with pytest.raises(PubanonError, match='cannot record published refs locally'):
-        _publish._finalize(
-            ctx, _host.RemoteRefs(ctx._record.commit, {'v1.0.0': ctx._record.commit})
-        )
-    assert _remote_ref(store, 'refs/heads/main') is None
-    assert _remote_ref(store, _candidate.CANDIDATE_REF) == ctx._record.commit
-    assert _records.load_candidate(ctx._paths, ctx._project.name) == ctx._record
-    with pytest.raises(PubanonError, match='local published refs conflict'):
-        _publish._finalize(
-            ctx, _host.RemoteRefs(ctx._record.commit, {'v1.0.0': ctx._record.commit})
-        )
 
 
 @pytest.mark.slow
@@ -1631,8 +1774,8 @@ def test_publication_interrupt_after_record_removal_reports_completed_finalizati
     assert '--resolve' not in error
     assert f'pubanon status --project={ctx._project.name} --remote' in error
     assert 'Traceback' not in error
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) is None
-    store = _candidate.store_path(ctx._paths, ctx._project.name)
+    assert _records.load_candidate(ctx._paths, ctx._project.name) is None
+    store = _store.store_path(ctx._paths, ctx._project.name)
     for ref in ('refs/heads/main', 'refs/tags/v1.0.0'):
         assert _remote_ref(store, ref) == _remote_ref(host, ref) == ctx._record.commit
     assert _cli.main(['status', '--project', ctx._project.name, '--remote']) == 0
@@ -1688,7 +1831,7 @@ def test_publication_interrupt_during_state_write_has_working_recovery(
     )
 
     def _interrupt_save(paths: Paths, project: str, record: _candidate.CandidateRecord) -> None:
-        current = _candidate.load_candidate(paths, project)
+        current = _records.load_candidate(paths, project)
         if record.state != target_state or (
             phase == 'not-pushed'
             and current is not None
@@ -1705,7 +1848,7 @@ def test_publication_interrupt_during_state_write_has_working_recovery(
 
     with monkeypatch.context() as fault:
         fault.setattr(_publish, 'save_candidate', _interrupt_save)
-        fault.setattr(_publish, 'push', _fail_push)
+        fault.setattr(_host, 'push', _fail_push)
         assert _cli.main(['publish', '--project', ctx._project.name, '--yes']) == 130
     error = capsys.readouterr().err
     assert (
@@ -1714,7 +1857,7 @@ def test_publication_interrupt_during_state_write_has_working_recovery(
         else 'still points to the previous published snapshot'
     ) in error
     assert _remote_ref(host, 'refs/heads/main') is None
-    record = _candidate.load_candidate(ctx._paths, ctx._project.name)
+    record = _records.load_candidate(ctx._paths, ctx._project.name)
     assert record is not None
     args = ['publish', '--project', ctx._project.name, '--yes']
     if record.state == _candidate.STATE_UNKNOWN_OUTCOME:
@@ -1737,8 +1880,8 @@ def test_publication_interrupt_reports_outcome_and_working_recovery(
     structured: bool,
 ) -> None:
     host, ctx = publication_cli
-    real_push = _publish.push
-    real_read = _publish.ls_remote
+    real_push = _host.push
+    real_read = _host.ls_remote
     reads = 0
 
     def _cancel() -> None:
@@ -1760,9 +1903,9 @@ def test_publication_interrupt_reports_outcome_and_working_recovery(
 
     with monkeypatch.context() as fault:
         if phase == 'readback':
-            fault.setattr(_publish, 'ls_remote', _cancel_read)
+            fault.setattr(_host, 'ls_remote', _cancel_read)
         else:
-            fault.setattr(_publish, 'push', _cancel_push)
+            fault.setattr(_host, 'push', _cancel_push)
         args = ['publish', '--project', ctx._project.name, '--yes']
         if structured:
             args.extend(['--color', 'always'])
@@ -1770,7 +1913,7 @@ def test_publication_interrupt_reports_outcome_and_working_recovery(
 
     error = capsys.readouterr().err
     assert 'Traceback' not in error
-    record = _candidate.load_candidate(ctx._paths, ctx._project.name)
+    record = _records.load_candidate(ctx._paths, ctx._project.name)
     assert record is not None
     sent = phase in {'push-sent', 'readback'}
     assert _remote_ref(host, 'refs/heads/main') == (ctx._record.commit if sent else None)
@@ -1783,19 +1926,11 @@ def test_publication_interrupt_reports_outcome_and_working_recovery(
     assert record.state == _candidate.STATE_UNKNOWN_OUTCOME
     assert _cli.main(['publish', '--project', ctx._project.name, '--resolve']) == 0
     if sent:
-        assert _candidate.load_candidate(ctx._paths, ctx._project.name) is None
+        assert _records.load_candidate(ctx._paths, ctx._project.name) is None
     else:
-        restored = _candidate.load_candidate(ctx._paths, ctx._project.name)
+        restored = _records.load_candidate(ctx._paths, ctx._project.name)
         assert restored is not None
         assert restored.state == _candidate.STATE_RETAINED
-
-
-def test_publication_next_action_watches_integrated_project(tmp_path: Path) -> None:
-    _global_config, project = _configs(tmp_path)
-    assert (
-        _publish.publication_next_action(replace(project, ci_workflow='ci.yml'))
-        == 'pubanon repo watch'
-    )
 
 
 @pytest.mark.slow
@@ -1809,13 +1944,13 @@ def test_publication_preserves_source_and_record(
 ) -> None:
     host, ctx = publication_cli
     calls: list[list[str]] = []
-    real_push = _publish.push
+    real_push = _host.push
 
     def _counted(dest: _host.Destination, store: Path, args: list[str]) -> None:
         calls.append(args)
         real_push(dest, store, args)
 
-    monkeypatch.setattr(_publish, 'push', _counted)
+    monkeypatch.setattr(_host, 'push', _counted)
     before = _git_command(ctx._project.source_path, 'show-ref', '--heads', '--tags')
     _publish.publish(ctx)
     record = _records.load_publication(ctx._paths, ctx._project.name, ctx._record.commit)
@@ -1832,18 +1967,28 @@ def test_publication_preserves_source_and_record(
     assert _git_command(ctx._project.source_path, 'show-ref', '--heads', '--tags') == before
     assert (
         _remote_ref(
-            _candidate.store_path(ctx._paths, ctx._project.name),
+            _store.store_path(ctx._paths, ctx._project.name),
             _records.publication_ref(record.commit),
         )
         == record.commit
     )
     assert len(calls) == 1
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) is None
+    assert _records.load_candidate(ctx._paths, ctx._project.name) is None
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize('boundary', ['archive', 'publication-record', 'refs', 'unlink'])
-@pytest.mark.parametrize('drift', [False, True])
+@pytest.mark.parametrize(
+    ('boundary', 'drift'),
+    [
+        ('archive', False),
+        ('publication-record', False),
+        ('publication-record', True),
+        ('refs', False),
+        ('refs', True),
+        ('unlink', False),
+        ('unlink', True),
+    ],
+)
 def test_publication_recovery_replays_recording_without_push(
     publication_cli: tuple[Path, _publish.PublishContext],
     monkeypatch: pytest.MonkeyPatch,
@@ -1854,7 +1999,7 @@ def test_publication_recovery_replays_recording_without_push(
     real_git = _history.run_git
     real_unlink = Path.unlink
     calls: list[list[str]] = []
-    real_push = _publish.push
+    real_push = _host.push
 
     def _counted(dest: _host.Destination, store: Path, args: list[str]) -> None:
         calls.append(args)
@@ -1875,7 +2020,7 @@ def test_publication_recovery_replays_recording_without_push(
             raise OSError('unlink denied')
         real_unlink(path, missing_ok=missing_ok)
 
-    monkeypatch.setattr(_publish, 'push', _counted)
+    monkeypatch.setattr(_host, 'push', _counted)
     with monkeypatch.context() as fault:
         target, name, replacement = {
             'archive': (_history, 'run_git', _fail_git),
@@ -1887,7 +2032,7 @@ def test_publication_recovery_replays_recording_without_push(
         with pytest.raises(PubanonError, match='Local finalization is incomplete'):
             _publish.publish(ctx)
     assert _remote_ref(host, 'refs/heads/main') == ctx._record.commit
-    retained = _candidate.load_candidate(ctx._paths, ctx._project.name)
+    retained = _records.load_candidate(ctx._paths, ctx._project.name)
     assert retained is not None
     assert retained.source_bookmark is not None
     assert (
@@ -1905,7 +2050,7 @@ def test_publication_recovery_replays_recording_without_push(
     assert saved is not None
     if first is not None:
         assert saved.confirmed_at == first.confirmed_at
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) is None
+    assert _records.load_candidate(ctx._paths, ctx._project.name) is None
     assert len(calls) == 1
 
 
@@ -1920,7 +2065,7 @@ def test_publication_reporting_cancellation_preserves_completed_record(
     host, ctx = publication_cli
     real_output = _publish.output
 
-    def _interrupted(text: str = '', *, kind: str = 'plain') -> None:
+    def _interrupted(text: str = '', *, kind: _terminal.StyleKind = 'plain') -> None:
         if text.startswith('Published '):
             if structured:
                 raise OperationCanceled('operation cancelled')
@@ -1941,7 +2086,7 @@ def test_publication_reporting_cancellation_preserves_completed_record(
     assert '--remote; do not publish a new snapshot' in error
     assert 'operation cancelled' not in error
     assert 'Canceled.' not in error
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) is None
+    assert _records.load_candidate(ctx._paths, ctx._project.name) is None
     assert _records.load_publication(ctx._paths, ctx._project.name, ctx._record.commit) is not None
     assert _remote_ref(host, 'refs/heads/main') == ctx._record.commit
 
@@ -1953,7 +2098,7 @@ def test_publication_source_disappears_after_push_preserves_recorded_locator(
     _host_path, ctx = publication_cli
     with _failed_readback(monkeypatch), pytest.raises(PubanonError, match='unknown'):
         _publish.publish(ctx)
-    retained = _candidate.load_candidate(ctx._paths, ctx._project.name)
+    retained = _records.load_candidate(ctx._paths, ctx._project.name)
     assert retained is not None
     assert retained.source_bookmark is not None
     remove_tree(ctx._project.source_path)
@@ -1981,10 +2126,10 @@ def test_publish_acknowledges_visible_exposure_before_confirmation(
     )
     prompts: list[str] = []
     answers = [
-        ('Continue despite this earlier exposure? [y/n] ', 'yes'),
+        ('Continue despite this earlier exposure? [y/n] ', 'y'),
         (
             ('Publish untagged snapshot to public-owner/public-repo? [y/n] '),
-            'no',
+            'n',
         ),
     ]
 
@@ -2015,7 +2160,7 @@ def test_publish_acknowledges_visible_exposure_before_confirmation(
     saved = _config.load_project(ctx._paths, ctx._project.name)
     assert saved.acknowledged_exposure
     _assert_provisional_bookmark(ctx)
-    retained = _candidate.load_candidate(ctx._paths, ctx._project.name)
+    retained = _records.load_candidate(ctx._paths, ctx._project.name)
     assert retained is not None
     _verify_for_publish(replace(ctx, _project=saved, _record=retained))
 
@@ -2057,15 +2202,13 @@ def test_publish_acknowledgment_displays_identity_and_hygiene_in_one_path(
             None,
         ),
     )
-    ctx = _publish.PublishContext(
-        paths, global_config, project, record, _yes=False, _unattended=False
-    )
+    ctx = _publish.PublishContext(paths, global_config, project, record, _yes=False)
     prompts: list[str] = []
     answers = [
-        ('Continue despite this earlier exposure? [y/n] ', 'yes'),
+        ('Continue despite this earlier exposure? [y/n] ', 'y'),
         (
             'Publish untagged snapshot to public-owner/public-repo? [y/n] ',
-            'no',
+            'n',
         ),
     ]
     before = _git_command(host, 'for-each-ref')
@@ -2123,7 +2266,7 @@ def test_publish_declined_exposure_acknowledgment_retains_candidate(
     def _decline(prompt: str) -> str:
         assert expected, f'unexpected prompt: {prompt}'
         assert expected.pop(0) == prompt
-        return 'no'
+        return 'n'
 
     monkeypatch.setattr('builtins.input', _decline)
 
@@ -2154,7 +2297,7 @@ def test_publish_first_and_second_release_enforce_parent(
 
     assert _remote_ref(host, 'refs/heads/main') == first._record.commit
     assert _remote_ref(host, 'refs/tags/v1.0.0') == first._record.commit
-    assert _candidate.load_candidate(first._paths, first._project.name) is None
+    assert _records.load_candidate(first._paths, first._project.name) is None
     output = capsys.readouterr().out
     assert 'GitHub keeps a record of this upload' in output
     assert 'pubanon stage push' not in output
@@ -2172,7 +2315,7 @@ def test_publish_first_and_second_release_enforce_parent(
     assert _remote_ref(host, 'refs/heads/main') == second._record.commit
     assert (
         _git_command(
-            _candidate.store_path(second._paths, second._project.name),
+            _store.store_path(second._paths, second._project.name),
             'rev-parse',
             f'{second._record.commit}^',
         )
@@ -2219,7 +2362,7 @@ def test_publish_hygiene_audit_result_does_not_block(
 
     def _decline_mutation(prompt: str) -> str:
         prompts.append(prompt)
-        return 'no'
+        return 'n'
 
     monkeypatch.setattr(_audit, 'audit_history', _audit_with_hygiene_finding)
     monkeypatch.setattr('builtins.input', _decline_mutation)
@@ -2241,7 +2384,7 @@ def test_publish_ignores_host_managed_pull_refs(
     host = _new_host(tmp_path)
     _configure_host(host, fake_gh, monkeypatch)
     ctx = _context(tmp_path, source)
-    store = _candidate.store_path(ctx._paths, ctx._project.name)
+    store = _store.store_path(ctx._paths, ctx._project.name)
     _git_command(host, 'fetch', str(store), f'{ctx._record.commit}:refs/pull/1/head')
 
     _publish.publish(ctx)
@@ -2274,29 +2417,8 @@ def test_publish_marks_source_only_when_enabled(
     expected = ctx._record.pinned.commit if source_tags else None
     assert _remote_ref(source, source_ref) == expected
     assert _remote_ref(host, source_ref) is None
-    assert _remote_ref(_candidate.store_path(ctx._paths, ctx._project.name), source_ref) is None
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) is None
-
-
-def test_publish_prestate_diagnostic_reports_effective_term_in_branch(
-    tmp_path: Path,
-    fake_gh: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    term = 'private-branch-name'
-    source = make_repo(files={'README.md': 'first\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    ctx = _context(tmp_path, source, extra_terms=(term,))
-    store = _candidate.store_path(ctx._paths, ctx._project.name)
-    _git_command(host, 'fetch', str(store), f'{ctx._record.commit}:refs/heads/{term}')
-
-    with pytest.raises(PubanonError, match='remote prestate') as error:
-        _publish.publish(ctx)
-
-    rendered = error.value.render()
-    assert term in rendered
+    assert _remote_ref(_store.store_path(ctx._paths, ctx._project.name), source_ref) is None
+    assert _records.load_candidate(ctx._paths, ctx._project.name) is None
 
 
 @pytest.mark.slow
@@ -2322,7 +2444,7 @@ def test_publish_proceeds_when_staging_evidence_covers_the_candidate(
     assert 'CI checks succeeded' not in output.getvalue()
     assert 'GitHub keeps a record of this upload' not in output.getvalue()
     assert _remote_ref(host, 'refs/heads/main') == ctx._record.commit
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) is None
+    assert _records.load_candidate(ctx._paths, ctx._project.name) is None
 
 
 def test_publish_rechecks_ci_after_confirmation(
@@ -2357,7 +2479,7 @@ def test_publish_rechecks_ci_after_confirmation(
                 data['total_count'] = len(data['workflow_runs'])
                 response['stdout'] = json.dumps(data)
         fake_gh.write_text(json.dumps(responses))
-        return 'yes'
+        return 'y'
 
     monkeypatch.setattr('builtins.input', _confirm)
     with pytest.raises(PubanonError, match='the latest staging CI run is not acceptable') as error:
@@ -2367,7 +2489,7 @@ def test_publish_rechecks_ci_after_confirmation(
     assert 'Nothing was published. No push was attempted' in error.value.render()
     assert error.value.recovery == 'wait for the run to complete, then pubanon stage watch'
     assert _remote_ref(host, 'refs/heads/main') is None
-    saved = _candidate.load_candidate(ctx._paths, ctx._project.name)
+    saved = _records.load_candidate(ctx._paths, ctx._project.name)
     assert saved is not None
     assert saved.commit == ctx._record.commit
     assert saved.state == _candidate.STATE_RETAINED
@@ -2383,10 +2505,42 @@ def test_publish_refuses_existing_intended_tag(
     host = _new_host(tmp_path)
     _configure_host(host, fake_gh, monkeypatch)
     ctx = _context(tmp_path, source, version='1.0.0')
-    store = _candidate.store_path(ctx._paths, ctx._project.name)
+    store = _store.store_path(ctx._paths, ctx._project.name)
     _git_command(host, 'fetch', str(store), f'{ctx._record.commit}:refs/tags/v1.0.0')
 
     with pytest.raises(PubanonError, match='intended tag already exists'):
+        _publish.publish(ctx)
+
+
+def test_publish_refuses_record_edited_before_review(
+    tmp_path: Path,
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_repo(files={'README.md': 'first\n'})
+    host = _new_host(tmp_path)
+    _configure_host(host, fake_gh, monkeypatch)
+    ctx = _context(tmp_path, source, version='1.0.0')
+    preserve_previous_tip = _history.preserve_previous_tip
+
+    def _preserve_then_edit(
+        paths: Paths, project: str, record: _candidate.CandidateRecord
+    ) -> None:
+        preserve_previous_tip(paths, project, record)
+        current = _records.load_candidate(paths, project)
+        assert current is not None
+        _records.save_candidate(
+            paths, project, replace(current, message=current.message + ' (edited)')
+        )
+
+    def _refuse_push(*_args: object) -> Never:
+        pytest.fail('edited snapshot record reached publication transport')
+
+    monkeypatch.setattr(_history, 'preserve_previous_tip', _preserve_then_edit)
+    monkeypatch.setattr(_host, 'push', _refuse_push)
+
+    with pytest.raises(PubanonError, match='snapshot record changed'):
         _publish.publish(ctx)
 
 
@@ -2400,21 +2554,18 @@ def test_publish_refuses_remote_prestate_mismatch_before_push(
     host = _new_host(tmp_path)
     _configure_host(host, fake_gh, monkeypatch)
     ctx = _context(tmp_path, source)
-    store = _candidate.store_path(ctx._paths, ctx._project.name)
+    store = _store.store_path(ctx._paths, ctx._project.name)
     _git_command(host, 'fetch', str(store), f'{ctx._record.commit}:refs/heads/main')
 
-    with pytest.raises(PubanonError, match='remote prestate') as error:
+    with pytest.raises(PubanonError, match='what this snapshot expects') as error:
         _publish.publish(ctx)
 
-    assert error.value.recovery == (
-        'pubanon status --remote, then see "Accepting an outside fix" in the operator guide'
-    )
     rendered = error.value.render()
     assert 'Expected:' in rendered
     assert 'Found:' in rendered
     assert 'merge' not in rendered
     assert 'pull request' not in rendered
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) == ctx._record
+    assert _records.load_candidate(ctx._paths, ctx._project.name) == ctx._record
 
 
 @pytest.mark.slow
@@ -2432,7 +2583,7 @@ def test_publish_refuses_repaired_structural_history_before_acknowledgment_or_pr
         make_repo,
         monkeypatch,
     )
-    store = _candidate.store_path(second._paths, second._project.name)
+    store = _store.store_path(second._paths, second._project.name)
     tree = _git_command(store, 'rev-parse', f'{second._record.commit}^{{tree}}').decode().strip()
     invalid = _literal_history_commit(
         store,
@@ -2454,7 +2605,7 @@ def test_publish_refuses_repaired_structural_history_before_acknowledgment_or_pr
         pytest.fail('structural publication failure attempted a push')
 
     monkeypatch.setattr('builtins.input', _unexpected_prompt)
-    monkeypatch.setattr(_publish, 'push', _unexpected_push)
+    monkeypatch.setattr(_host, 'push', _unexpected_push)
     capsys.readouterr()
 
     with pytest.raises(PubanonError, match='published history has identity problems'):
@@ -2476,7 +2627,7 @@ def test_publish_refuses_stale_stage_without_preview_or_push(
     _configure_host(host, fake_gh, monkeypatch)
     ctx = _context(tmp_path, source)
     candidate_a = ctx._record
-    _candidate.discard(ctx._paths, ctx._project.name, force=True)
+    _discard.discard(ctx._paths, ctx._project.name, force=True)
     (source / 'README.md').write_text('candidate B\n')
     _git_command(source, 'add', 'README.md')
     _git_command(
@@ -2507,7 +2658,7 @@ def test_publish_refuses_stale_stage_without_preview_or_push(
     assert stale_commit in rendered
     assert 'pubanon stage push' in rendered
     assert _remote_ref(host, 'refs/heads/main') is None
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) == ctx._record
+    assert _records.load_candidate(ctx._paths, ctx._project.name) == ctx._record
 
 
 def test_publish_refuses_unexpected_destination_branch_before_push(
@@ -2516,26 +2667,26 @@ def test_publish_refuses_unexpected_destination_branch_before_push(
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    term = 'private-branch-name'
     source = make_repo(files={'README.md': 'first\n'})
     host = _new_host(tmp_path)
     _configure_host(host, fake_gh, monkeypatch)
-    ctx = _context(tmp_path, source)
-    store = _candidate.store_path(ctx._paths, ctx._project.name)
+    ctx = _context(tmp_path, source, extra_terms=(term,))
+    store = _store.store_path(ctx._paths, ctx._project.name)
     _git_command(
         host,
         'fetch',
         str(store),
-        f'{ctx._record.commit}:refs/heads/private-backup',
+        f'{ctx._record.commit}:refs/heads/{term}',
     )
 
-    with pytest.raises(PubanonError, match='remote prestate') as error:
+    with pytest.raises(PubanonError, match='what this snapshot expects') as error:
         _publish.publish(ctx)
 
-    assert error.value.actual == (
-        f'main=absent; tags=none; branches=private-backup={ctx._record.commit}'
-    )
+    assert term in error.value.render()
+    assert error.value.actual == (f'main=absent; tags=none; branches={term}={ctx._record.commit}')
     assert _remote_ref(host, 'refs/heads/main') is None
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) == ctx._record
+    assert _records.load_candidate(ctx._paths, ctx._project.name) == ctx._record
 
 
 @pytest.mark.slow
@@ -2552,7 +2703,7 @@ def test_publish_reports_hygiene_only_tag_in_identity_failure(
     _configure_host(host, fake_gh, monkeypatch)
     first = _context(tmp_path, source, version='1.0.0')
     _publish.publish(first)
-    store = _candidate.store_path(first._paths, first._project.name)
+    store = _store.store_path(first._paths, first._project.name)
     blob = (
         _git_command(store, 'hash-object', '-w', '--stdin', input_bytes=b'not a commit\n')
         .decode()
@@ -2577,9 +2728,7 @@ def test_publish_reports_hygiene_only_tag_in_identity_failure(
             None,
         ),
     )
-    ctx = _publish.PublishContext(
-        paths, global_config, project, record, _yes=True, _unattended=True
-    )
+    ctx = _publish.PublishContext(paths, global_config, project, record, _yes=True)
     capsys.readouterr()
 
     with pytest.raises(PubanonError, match='published history has identity problems') as error:
@@ -2621,13 +2770,13 @@ def test_publish_requires_completed_rewrite_cleanup_before_any_external_work(
     host = tmp_path / 'host.git'
     _configure_host(host, fake_gh, monkeypatch)
     before = _git_command(host, 'show-ref')
-    ctx = _publish.PublishContext(paths, g, project, record, _yes=True, _unattended=True)
+    ctx = _publish.PublishContext(paths, g, project, record, _yes=True)
 
     def _forbidden(*_args: object, **_kwargs: object) -> None:
         pytest.fail('unfinished rewrite reached host or preservation work')
 
     with monkeypatch.context() as blocked:
-        blocked.setattr(_publish, 'verify_destination', _forbidden)
+        blocked.setattr(_host, 'verify_destination', _forbidden)
         blocked.setattr(_publish, '_preserve_source', _forbidden)
         blocked.setattr(_history, 'preserve_previous_tip', _forbidden)
         with pytest.raises(PubanonError, match='rewrite completion is pending') as error:
@@ -2655,7 +2804,7 @@ def test_publish_requires_confirmation_but_retains_declined_candidate(
 
     def _decline(prompt: str) -> str:
         assert prompt == ('Publish untagged snapshot to public-owner/public-repo? [y/n] ')
-        return 'no'
+        return 'n'
 
     monkeypatch.setattr('builtins.input', _decline)
 
@@ -2677,13 +2826,13 @@ def test_publish_verification_reads_snapshot_once(
     _configure_host(host, fake_gh, monkeypatch)
     ctx = _context(tmp_path, source)
     reads: list[int] = []
-    original = _candidate.read_snapshot
+    original = _verification.read_snapshot
 
     def _counting(root: Path, commit: str, *, git_dir: Path | None = None) -> Snapshot:
         reads.append(1)
         return original(root, commit, git_dir=git_dir)
 
-    monkeypatch.setattr(_candidate, 'read_snapshot', _counting)
+    monkeypatch.setattr(_verification, 'read_snapshot', _counting)
 
     _verify_for_publish(ctx)
 
@@ -2775,14 +2924,14 @@ def test_push_writes_unknown_outcome_before_transport_runs(
     host = _new_host(tmp_path)
     _configure_host(host, fake_gh, monkeypatch)
     ctx = _context(tmp_path, source, version='1.0.0')
-    real_push = _publish.push
+    real_push = _host.push
 
     def _inspect_then_push(
         dest: _host.Destination,
         cwd: Path,
         args: list[str],
     ) -> GitResult:
-        current = _candidate.load_candidate(ctx._paths, ctx._project.name)
+        current = _records.load_candidate(ctx._paths, ctx._project.name)
         assert current is not None
         assert current.state == _candidate.STATE_UNKNOWN_OUTCOME
         assert args == [
@@ -2795,7 +2944,7 @@ def test_push_writes_unknown_outcome_before_transport_runs(
         ]
         return real_push(dest, cwd, args)
 
-    monkeypatch.setattr(_publish, 'push', _inspect_then_push)
+    monkeypatch.setattr(_host, 'push', _inspect_then_push)
 
     _publish.publish(ctx)
 
@@ -2823,165 +2972,48 @@ def test_readback_failure_leaves_unknown_outcome_and_publish_refuses_resend(
 
     assert raised.value.fact == 'error: simulated remote read failure'
     assert raised.value.recovery == 'pubanon publish --resolve'
-    retained = _candidate.load_candidate(ctx._paths, ctx._project.name)
+    retained = _records.load_candidate(ctx._paths, ctx._project.name)
     assert retained is not None
     assert retained.state == _candidate.STATE_UNKNOWN_OUTCOME
     assert _remote_ref(host, 'refs/heads/main') == ctx._record.commit
-    assert (
-        _remote_ref(_candidate.store_path(ctx._paths, ctx._project.name), 'refs/heads/main')
-        is None
-    )
+    assert _remote_ref(_store.store_path(ctx._paths, ctx._project.name), 'refs/heads/main') is None
     retry = replace(ctx, _record=retained)
 
     def _refuse_resend(*_args: object) -> None:
         pytest.fail('unknown publication outcome attempted another push')
 
-    monkeypatch.setattr(_publish, 'push', _refuse_resend)
+    monkeypatch.setattr(_host, 'push', _refuse_resend)
     with pytest.raises(PubanonError) as error:
         _publish.publish(retry)
     assert error.value.recovery == 'pubanon publish --resolve'
 
 
 @pytest.mark.slow
-def test_rebuild_store_from_host_allows_following_release(
+def test_recreated_destination_refuses_correction_until_history_is_restored(
     tmp_path: Path,
     fake_gh: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = make_repo(files={'README.md': 'first\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    first = _context(tmp_path, source)
-    _publish.publish(first)
-    store = _candidate.store_path(first._paths, first._project.name)
-    remove_tree(store)
-    destination = _host.verify_destination(first._paths, first._global_config, first._project)
+    host, _first, ctx = _replacement_fixture(tmp_path, source, fake_gh, monkeypatch, '1.0.0')
+    remove_tree(host)
+    _new_host(tmp_path)
 
-    _publish.rebuild_store(
-        first._paths, (first._global_config, first._project), destination, yes=True
-    )
+    with pytest.raises(PubanonError, match='final repository is empty') as error:
+        _publish.publish(ctx)
 
-    assert _remote_ref(store, 'refs/heads/main') == first._record.commit
-    _second_source_commit(source)
-    second = _context(tmp_path, source)
-    _publish.publish(second)
-    assert _remote_ref(host, 'refs/heads/main') == second._record.commit
+    recovery = error.value.recovery
+    assert recovery is not None
+    assert 'pubanon repo restore --to remote' in recovery
+    assert 'Recreating the final repository' in recovery
+    assert _records.load_candidate(ctx._paths, ctx._project.name) == ctx._record
 
-
-@pytest.mark.slow
-def test_rebuild_store_preserves_existing_history_when_fetch_fails(
-    tmp_path: Path,
-    fake_gh: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    ctx = _context(tmp_path, source)
+    _publish.sync(_sync_context(ctx))
     _publish.publish(ctx)
-    store = _candidate.store_path(ctx._paths, ctx._project.name)
-    destination = _host.verify_destination(ctx._paths, ctx._global_config, ctx._project)
 
-    def _fail_fetch(
-        _destination: _host.Destination,
-        _store: Path,
-        _refspecs: list[str],
-    ) -> GitResult:
-        raise PubanonError('simulated fetch failure')
-
-    monkeypatch.setattr(_publish, 'fetch', _fail_fetch)
-
-    with pytest.raises(PubanonError, match='simulated fetch failure'):
-        _publish.rebuild_store(
-            ctx._paths, (ctx._global_config, ctx._project), destination, yes=True
-        )
-
-    assert _remote_ref(store, 'refs/heads/main') == ctx._record.commit
-    _git_command(store, 'cat-file', '-e', f'{ctx._record.commit}^{{commit}}')
-
-
-@pytest.mark.slow
-def test_rebuild_store_refreshes_stale_existing_store(
-    tmp_path: Path,
-    fake_gh: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    first = _context(tmp_path, source)
-    _publish.publish(first)
-    store = _candidate.store_path(first._paths, first._project.name)
-    _second_source_commit(source)
-    second = _context(tmp_path, source)
-    _git_command(
-        store,
-        'push',
-        str(host),
-        f'{second._record.commit}:refs/heads/main',
-        f'{second._record.commit}:refs/tags/v2.0.0',
-    )
-    _candidate.discard(first._paths, first._project.name, force=False)
-    _git_command(store, 'update-ref', 'refs/tags/local-only', first._record.commit)
-    destination = _host.verify_destination(first._paths, first._global_config, first._project)
-
-    result = _publish.rebuild_store(
-        first._paths, (first._global_config, first._project), destination, yes=True
-    )
-
-    assert _remote_ref(store, 'refs/heads/main') == second._record.commit
-    assert _remote_ref(store, 'refs/tags/v2.0.0') == second._record.commit
-    assert _remote_ref(store, 'refs/tags/local-only') is None
-
-    assert result.refs == _host.RemoteRefs(
-        second._record.commit,
-        {'v2.0.0': second._record.commit},
-    )
-    assert result.audit == _audit.HistoryAudit((), (), ())
-
-
-@pytest.mark.slow
-def test_rebuild_store_restores_current_findings_without_acknowledgment_or_ancestry(
-    tmp_path: Path,
-    fake_gh: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = make_repo(files={'README.md': 'public\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    ctx = _context(tmp_path, source)
-    _publish.publish(ctx)
-    store = _candidate.store_path(ctx._paths, ctx._project.name)
-    tree = _git_command(host, 'rev-parse', 'main^{tree}').decode().strip()
-    restored = _literal_history_commit(host, tree, message=b'Private Person\n')
-    _git_command(host, 'update-ref', 'refs/heads/main', restored)
-    _git_command(store, 'symbolic-ref', 'refs/pubanon/repair/stale', 'refs/heads/main')
-    _git_command(store, 'update-ref', 'refs/pubanon/unrelated', ctx._record.commit)
-    archive_ref = _records.publication_ref(ctx._record.commit)
-    record_path = _records.publication_path(ctx._paths, ctx._project.name, ctx._record.commit)
-    original_record = record_path.read_bytes()
-    assert _remote_ref(store, archive_ref) == ctx._record.commit
-    destination = _host.verify_destination(ctx._paths, ctx._global_config, ctx._project)
-    before = ctx._project.acknowledged_exposure
-
-    result = _publish.rebuild_store(
-        ctx._paths, (ctx._global_config, ctx._project), destination, yes=True
-    )
-
-    assert result.refs == _host.RemoteRefs(restored, {})
-    assert _remote_ref(store, 'refs/heads/main') == restored
-    assert any(finding.term == 'Private Person' for finding in result.audit.findings)
-    assert not result.audit.identity_problems
-    assert ctx._project.acknowledged_exposure == before == ''
-    assert _git_command(store, 'for-each-ref', 'refs/pubanon/repair/') == b''
-    assert _remote_ref(store, 'refs/pubanon/unrelated') == ctx._record.commit
-    assert _remote_ref(store, archive_ref) == ctx._record.commit
-    assert record_path.read_bytes() == original_record
-    assert _history.select_publication(ctx._paths, ctx._project.name, ctx._record.commit).record
+    assert _remote_ref(host, 'refs/heads/main') == ctx._record.commit
+    assert _remote_ref(host, 'refs/tags/v1.0.0') == ctx._record.commit
 
 
 def test_rejected_push_with_unrelated_tag_keeps_candidate_reusable(
@@ -3000,49 +3032,61 @@ def test_rejected_push_with_unrelated_tag_keeps_candidate_reusable(
         _cwd: Path,
         _args: list[str],
     ) -> GitResult:
-        store = _candidate.store_path(ctx._paths, ctx._project.name)
+        store = _store.store_path(ctx._paths, ctx._project.name)
         _git_command(host, 'fetch', str(store), f'{ctx._record.commit}:refs/tags/unrelated')
         raise PubanonError('credential-bearing command failed')
 
-    monkeypatch.setattr(_publish, 'push', _reject_after_drift)
+    monkeypatch.setattr(_host, 'push', _reject_after_drift)
 
     with pytest.raises(PubanonError, match='credential-bearing command failed'):
         _publish.publish(ctx)
 
-    retained = _candidate.load_candidate(ctx._paths, ctx._project.name)
+    retained = _records.load_candidate(ctx._paths, ctx._project.name)
     assert retained is not None
     assert retained.state == _candidate.STATE_RETAINED
 
 
+def test_remote_prestate_empty_host_recovery_restores_published_history(
+    tmp_path: Path,
+) -> None:
+    ctx = _literal_context(tmp_path)
+    release = replace(ctx._record, prestate_main='1' * 40, prestate_tags={'v0.1.0': '1' * 40})
+
+    with pytest.raises(PubanonError, match='final repository is empty') as excinfo:
+        _verify_remote(release, _host.RemoteRefs(None, {}))
+
+    recovery = excinfo.value.recovery
+    assert recovery is not None
+    assert 'pubanon repo restore --to remote' in recovery
+    assert 'pubanon publish' in recovery
+
+
 def test_remote_prestate_recovery_names_operator_guide(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
 ) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
-    ctx = _context(tmp_path, source)
+    ctx = _literal_context(tmp_path)
     stale = replace(ctx._record, prestate_main='1' * 40)
     remote = _host.RemoteRefs('2' * 40, {})
 
     with pytest.raises(PubanonError) as excinfo:
         _verify_remote(stale, remote)
 
-    assert excinfo.value.recovery == (
-        'pubanon status --remote, then see "Accepting an outside fix" in the operator guide'
-    )
-    assert 'outside fix' in excinfo.value.render()
+    recovery = excinfo.value.recovery
+    assert recovery is not None
+    assert 'pubanon status --remote' in recovery
+    assert 'Accepting an outside fix' in recovery
+    assert 'operator guide' in recovery
 
 
 def test_remote_prestate_renders_complete_terminal_safe_ref_fields(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
 ) -> None:
     term = 'private-canary'
-    source = make_repo(files={'README.md': 'first\n'})
-    ctx = _context(tmp_path, source, extra_terms=(term,))
+    ctx = _literal_context(tmp_path, extra_terms=(term,))
     branch = f'backup\x1b{term}'
     remote = _host.RemoteRefs(None, {}, ((branch, 'a' * 40),))
 
-    with pytest.raises(PubanonError, match='remote prestate') as exc_info:
+    with pytest.raises(PubanonError, match='what this snapshot expects') as exc_info:
         _verify_remote(ctx._record, remote)
 
     assert exc_info.value.expected == 'main=absent; tags=none; branches=none'
@@ -3051,72 +3095,6 @@ def test_remote_prestate_renders_complete_terminal_safe_ref_fields(
     assert actual == f'main=absent; tags=none; branches=backup\\x1b{term}={"a" * 40}'
     assert '\x1b' not in actual
     assert term in actual
-
-
-@pytest.mark.slow
-def test_repair_decline_preserves_newer_local_refs(
-    tmp_path: Path,
-    fake_gh: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    first = _context(tmp_path, source, version='1.0.0')
-    _publish.publish(first)
-    _second_source_commit(source)
-    second = _context(tmp_path, source, version='2.0.0')
-    _publish.publish(second)
-    store = _candidate.store_path(first._paths, first._project.name)
-    _git_command(host, 'update-ref', 'refs/heads/main', first._record.commit)
-    _git_command(host, 'update-ref', '-d', 'refs/tags/v2.0.0')
-    local_before = _git_command(store, 'for-each-ref')
-    host_before = _git_command(host, 'for-each-ref')
-    destination = _host.verify_destination(first._paths, first._global_config, first._project)
-    capsys.readouterr()
-    answers = ['n']
-
-    def _decline(prompt: str) -> str:
-        assert prompt == 'Replace local publication refs with verified GitHub refs? [y/n] '
-        output = capsys.readouterr().out
-        assert f'refs/heads/main: {second._record.commit} -> {first._record.commit}' in output
-        assert f'refs/tags/v2.0.0: {second._record.commit} -> absent' in output
-        return answers.pop(0)
-
-    monkeypatch.setattr('builtins.input', _decline)
-    with pytest.raises(OperationCanceled, match=r'Canceled\. Nothing was restored.'):
-        _publish.rebuild_store(
-            first._paths, (first._global_config, first._project), destination, yes=False
-        )
-    assert not answers
-    assert _git_command(store, 'for-each-ref') == local_before
-    assert _git_command(host, 'for-each-ref') == host_before
-
-
-@pytest.mark.slow
-def test_repair_noop_avoids_consent_and_managed_ref_writes(
-    fake_gh: Path, make_repo: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    ctx, destination, host = _published_repair_context(fake_gh, make_repo, monkeypatch)
-    store = _candidate.store_path(ctx._paths, ctx._project.name)
-    local_before, host_before = (
-        _git_command(store, 'for-each-ref'),
-        _git_command(host, 'for-each-ref'),
-    )
-
-    def _refuse_action(*_args: object) -> None:
-        pytest.fail('no-op repair requested consent or wrote managed refs')
-
-    monkeypatch.setattr('builtins.input', _refuse_action)
-    monkeypatch.setattr(_publish, '_install_repair_refs', _refuse_action)
-    result = _publish.rebuild_store(
-        ctx._paths, (ctx._global_config, ctx._project), destination, yes=False
-    )
-    assert result.refs == _host.RemoteRefs(ctx._record.commit, {})
-    assert _git_command(store, 'for-each-ref') == local_before
-    assert _git_command(host, 'for-each-ref') == host_before
 
 
 @pytest.mark.slow
@@ -3141,6 +3119,7 @@ def test_replace_all_confirmation_handles_no_removed_tags(
             _publish._Verified(
                 destination, _host.RemoteRefs(record.prestate_main, record.prestate_tags)
             ),
+            _page_plan(ctx),
         )
     assert question == 'Publish this replacement?'
 
@@ -3171,6 +3150,7 @@ def test_replace_all_preview_shows_removed_tags_and_scope(
         _publish._Verified(
             destination, _host.RemoteRefs(ctx._record.prestate_main, ctx._record.prestate_tags)
         ),
+        _page_plan(ctx),
     )
     preview = re.sub(r': +', ': ', capsys.readouterr().out)
     assert 'Scope: all published history (3 snapshots) -> one snapshot' in preview
@@ -3188,7 +3168,7 @@ def test_replace_all_publishes_updated_identity_in_exact_new_history(
 ) -> None:
     source = make_repo(files={'README.md': 'original\n'})
     host, ctx, originals = _rewrite_fixture(tmp_path, source, fake_gh, monkeypatch, selection=None)
-    _candidate.discard(ctx._paths, ctx._project.name, force=False)
+    _discard.discard(ctx._paths, ctx._project.name, force=False)
     identity = replace(ctx._global_config, anon_name='Corrected Publisher')
     pinned = pin(source, 'HEAD')
     candidate = _candidate.build_candidate(
@@ -3237,7 +3217,7 @@ def test_replaced_tag_object_reports_unchanged_selected_commit(
         captured.getvalue()
         == 'Warning: source tag has changed; it still selects the prepared source commit.\n'
     )
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) == ctx._record
+    assert _records.load_candidate(ctx._paths, ctx._project.name) == ctx._record
 
 
 @pytest.mark.slow
@@ -3260,7 +3240,8 @@ def test_replacement_completion_reports_tip_and_watches_published_main(
     assert 'Corrected snapshot: v1.0.1' in report
     assert 'Replayed snapshots: 1' in report
     assert 'Moved tags: v1.0.1, v1.0.2' in report
-    assert report.rstrip().endswith('Next: pubanon repo watch')
+    assert 'Next:' not in report
+    assert _publish.publication_next_action(project, ctx._record) == 'pubanon repo watch'
 
 
 @pytest.mark.slow
@@ -3283,8 +3264,8 @@ def test_replacement_refreshes_source_tag(
 
     assert _remote_ref(source, source_ref) == ctx._record.pinned.commit
     assert _remote_ref(host, source_ref) is None
-    assert _remote_ref(_candidate.store_path(ctx._paths, ctx._project.name), source_ref) is None
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) is None
+    assert _remote_ref(_store.store_path(ctx._paths, ctx._project.name), source_ref) is None
+    assert _records.load_candidate(ctx._paths, ctx._project.name) is None
 
 
 def test_resolution_requires_saved_source_bookmark(
@@ -3294,7 +3275,7 @@ def test_resolution_requires_saved_source_bookmark(
     _git_command(
         host,
         'fetch',
-        str(_candidate.store_path(ctx._paths, ctx._project.name)),
+        str(_store.store_path(ctx._paths, ctx._project.name)),
         f'{ctx._record.commit}:refs/heads/main',
         f'{ctx._record.commit}:refs/tags/v1.0.0',
     )
@@ -3302,7 +3283,7 @@ def test_resolution_requires_saved_source_bookmark(
     _candidate.save_candidate(ctx._paths, ctx._project.name, unknown)
     with pytest.raises(PubanonError, match='source bookmark is missing'):
         _publish.resolve(replace(ctx, _record=unknown))
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) == unknown
+    assert _records.load_candidate(ctx._paths, ctx._project.name) == unknown
     assert _records.load_publication(ctx._paths, ctx._project.name, ctx._record.commit) is None
     assert _remote_ref(host, 'refs/heads/main') == ctx._record.commit
 
@@ -3319,10 +3300,10 @@ def test_resolve_reads_remote_exactly_once(
     ctx = _publish._preserve_source(_context(tmp_path, source))
     unknown = replace(ctx._record, state=_candidate.STATE_UNKNOWN_OUTCOME)
     _candidate.save_candidate(ctx._paths, ctx._project.name, unknown)
-    store = _candidate.store_path(ctx._paths, ctx._project.name)
+    store = _store.store_path(ctx._paths, ctx._project.name)
     _git_command(host, 'fetch', str(store), f'{unknown.commit}:refs/heads/main')
     reads: list[int] = []
-    real_ls_remote = _publish.ls_remote
+    real_ls_remote = _host.ls_remote
 
     def _counting(
         dest: _host.Destination,
@@ -3332,7 +3313,7 @@ def test_resolve_reads_remote_exactly_once(
         reads.append(1)
         return real_ls_remote(dest, paths, project)
 
-    monkeypatch.setattr(_publish, 'ls_remote', _counting)
+    monkeypatch.setattr(_host, 'ls_remote', _counting)
 
     assert _publish.resolve(replace(ctx, _record=unknown)) == 'published'
     assert len(reads) == 1
@@ -3341,13 +3322,10 @@ def test_resolve_reads_remote_exactly_once(
 def test_resolve_refuses_account_mismatch_before_remote_read(
     tmp_path: Path,
     fake_gh: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    ctx = _context(tmp_path, source)
+    _configure_host(tmp_path / 'host.git', fake_gh, monkeypatch)
+    ctx = _literal_context(tmp_path)
     unknown = replace(ctx._record, state=_candidate.STATE_UNKNOWN_OUTCOME)
     _candidate.save_candidate(ctx._paths, ctx._project.name, unknown)
     fake_gh.write_text(
@@ -3366,7 +3344,7 @@ def test_resolve_refuses_account_mismatch_before_remote_read(
     def _unexpected_remote_read(*_args: object, **_kwargs: object) -> _host.RemoteRefs:
         pytest.fail('resolve read remote refs before destination verification')
 
-    monkeypatch.setattr(_publish, 'ls_remote', _unexpected_remote_read)
+    monkeypatch.setattr(_host, 'ls_remote', _unexpected_remote_read)
 
     with pytest.raises(PubanonError, match='authenticated account') as exc_info:
         _publish.resolve(replace(ctx, _record=unknown))
@@ -3374,16 +3352,14 @@ def test_resolve_refuses_account_mismatch_before_remote_read(
     rendered = exc_info.value.render()
     assert 'release-account' in rendered
     assert 'real-login-canary' in rendered
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) == unknown
+    assert _records.load_candidate(ctx._paths, ctx._project.name) == unknown
 
 
 def test_resolve_refuses_unsupported_recorded_adapter_before_host_calls(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
-    ctx = _context(tmp_path, source)
+    ctx = _literal_context(tmp_path)
     unknown = replace(
         ctx._record,
         destination=replace(
@@ -3393,7 +3369,7 @@ def test_resolve_refuses_unsupported_recorded_adapter_before_host_calls(
         state=_candidate.STATE_UNKNOWN_OUTCOME,
     )
     _candidate.save_candidate(ctx._paths, ctx._project.name, unknown)
-    loaded = _candidate.load_candidate(ctx._paths, ctx._project.name)
+    loaded = _records.load_candidate(ctx._paths, ctx._project.name)
     assert loaded is not None
 
     def _unexpected_verification(*_args: object, **_kwargs: object) -> _host.Destination:
@@ -3403,16 +3379,16 @@ def test_resolve_refuses_unsupported_recorded_adapter_before_host_calls(
         pytest.fail('resolve read remote refs for an unsupported recorded adapter')
 
     monkeypatch.setattr(_host, '_verify_destination', _unexpected_verification)
-    monkeypatch.setattr(_publish, 'ls_remote', _unexpected_remote_read)
+    monkeypatch.setattr(_host, 'ls_remote', _unexpected_remote_read)
 
     with pytest.raises(PubanonError, match='unsupported recorded destination adapter') as exc_info:
         _publish.resolve(replace(ctx, _record=loaded))
 
     assert 'unsupported-adapter-canary' not in exc_info.value.render()
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) == unknown
+    assert _records.load_candidate(ctx._paths, ctx._project.name) == unknown
 
 
-def test_resolve_reports_effective_term_in_unrelated_branch_diagnostic(
+def test_resolve_reports_unexpected_destination_branch_and_retains_candidate(
     tmp_path: Path,
     fake_gh: Path,
     make_repo: Callable[..., Path],
@@ -3426,37 +3402,15 @@ def test_resolve_reports_effective_term_in_unrelated_branch_diagnostic(
     ctx = _context(tmp_path, source, extra_terms=(term,))
     unknown = replace(ctx._record, state=_candidate.STATE_UNKNOWN_OUTCOME)
     _candidate.save_candidate(ctx._paths, ctx._project.name, unknown)
-    store = _candidate.store_path(ctx._paths, ctx._project.name)
+    store = _store.store_path(ctx._paths, ctx._project.name)
     _git_command(host, 'fetch', str(store), f'{unknown.commit}:refs/heads/{term}')
 
     assert _publish.resolve(replace(ctx, _record=unknown)) == 'not-sent'
 
-    rendered = capsys.readouterr().out
-    assert term in rendered
-
-
-def test_resolve_reports_unexpected_destination_branch_and_retains_candidate(
-    tmp_path: Path,
-    fake_gh: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    ctx = _context(tmp_path, source)
-    unknown = replace(ctx._record, state=_candidate.STATE_UNKNOWN_OUTCOME)
-    _candidate.save_candidate(ctx._paths, ctx._project.name, unknown)
-    store = _candidate.store_path(ctx._paths, ctx._project.name)
-    _git_command(host, 'fetch', str(store), f'{unknown.commit}:refs/heads/private-backup')
-
-    assert _publish.resolve(replace(ctx, _record=unknown)) == 'not-sent'
-
     assert capsys.readouterr().out == (
-        f'unrelated remote drift: branches: private-backup={unknown.commit}\n'
+        f'unrelated remote drift: branches: {term}={unknown.commit}\n'
     )
-    retained = _candidate.load_candidate(ctx._paths, ctx._project.name)
+    retained = _records.load_candidate(ctx._paths, ctx._project.name)
     assert retained is not None
     assert retained.state == _candidate.STATE_RETAINED
 
@@ -3487,7 +3441,7 @@ def test_resolve_uses_recorded_destination_when_configuration_drifted(
 
     assert _publish.resolve(drifted) == 'not-sent'
 
-    retained = _candidate.load_candidate(ctx._paths, ctx._project.name)
+    retained = _records.load_candidate(ctx._paths, ctx._project.name)
     assert retained is not None
     assert retained.state == _candidate.STATE_RETAINED
 
@@ -3541,7 +3495,7 @@ def test_source_tag_failure_warns_after_confirmed_publication(
         _publish.publish(ctx)
 
     assert _remote_ref(host, 'refs/heads/main') == ctx._record.commit
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) is None
+    assert _records.load_candidate(ctx._paths, ctx._project.name) is None
     assert _records.load_publication(ctx._paths, ctx._project.name, ctx._record.commit) is not None
     assert _remote_ref(source, 'refs/tags/pubanon/v1.0.0') is None
     warning = captured.getvalue()
@@ -3565,13 +3519,13 @@ def test_source_tag_waits_for_confirmed_publication(
     def _reject_push(*_args: object) -> Never:
         raise PubanonError('transport rejected')
 
-    monkeypatch.setattr(_publish, 'push', _reject_push)
+    monkeypatch.setattr(_host, 'push', _reject_push)
     with pytest.raises(PubanonError, match='transport rejected'):
         _publish.publish(ctx)
 
     assert _remote_ref(host, 'refs/heads/main') is None
     assert _remote_ref(source, 'refs/tags/pubanon/v1.0.0') is None
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) is not None
+    assert _records.load_candidate(ctx._paths, ctx._project.name) is not None
 
 
 @pytest.mark.parametrize(
@@ -3608,7 +3562,7 @@ def test_staged_publication_failure_preserves_candidate_before_preview_or_transp
             ctx._project, publication_route='staged', required_checks=('build', 'test')
         ),
     )
-    _candidate.discard(ctx._paths, ctx._project.name, force=True)
+    _discard.discard(ctx._paths, ctx._project.name, force=True)
     record = _candidate.build_candidate(
         ctx._paths,
         ctx._global_config,
@@ -3649,15 +3603,16 @@ def test_staged_publication_failure_preserves_candidate_before_preview_or_transp
         reads.append(name)
         if failure == 'unreadable':
             raise PubanonError('cannot read required check')
+        assert failure in ('missing', 'pending', 'unacceptable', 'ambiguous')
         return _host.CheckVerdict(name, 'success' if name == 'build' else failure, 'check detail')
 
     def _forbidden(*_args: object, **_kwargs: object) -> None:
         pytest.fail('staging prerequisite failure reached preservation, preview, or transport')
 
-    monkeypatch.setattr(_watch, 'check_result', _check)
+    monkeypatch.setattr(_host, 'check_result', _check)
     monkeypatch.setattr(_publish, '_preserve_source', _forbidden)
     monkeypatch.setattr(_publish, '_review_publication', _forbidden)
-    monkeypatch.setattr(_publish, 'push', _forbidden)
+    monkeypatch.setattr(_host, 'push', _forbidden)
     capsys.readouterr()
     with pytest.raises(PubanonError) as error:
         _publish.publish(ctx)
@@ -3682,7 +3637,7 @@ def test_staged_publication_failure_preserves_candidate_before_preview_or_transp
         }[failure]
         assert expected in error.value.render()
         assert reads == []
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) == ctx._record
+    assert _records.load_candidate(ctx._paths, ctx._project.name) == ctx._record
     assert _remote_ref(host, 'refs/heads/main') is None
     assert 'Publish prepared snapshot' not in capsys.readouterr().out
 
@@ -3703,7 +3658,11 @@ def test_publish_reuses_raw_symlink_inspection_and_refuses_actual_edit(
     host = _new_host(tmp_path)
     _configure_host(host, fake_gh, monkeypatch)
     ctx = _context(tmp_path, source)
-    inspection = _candidate.materialize_inspect(ctx._paths, ctx._project.name, ctx._record)
+    inspection = _verification.materialize_inspect(
+        ctx._paths,
+        ctx._project.name,
+        _verification.prove_objects(ctx._paths, ctx._project.name, ctx._record),
+    )
     assert os.fsencode(os.readlink(inspection / 'dot-link', dir_fd=None)) == b'./file'
     assert os.fsencode(os.readlink(inspection / 'double-link', dir_fd=None)) == b'relative//file'
     if edit_target:
@@ -3733,8 +3692,12 @@ def test_readonly_inspection_survives_publish(
     host = _new_host(tmp_path)
     _configure_host(host, fake_gh, monkeypatch)
     ctx = _context(tmp_path, source)
-    inspection = _candidate.materialize_inspect(ctx._paths, ctx._project.name, ctx._record)
-    store = _candidate.store_path(ctx._paths, ctx._project.name)
+    inspection = _verification.materialize_inspect(
+        ctx._paths,
+        ctx._project.name,
+        _verification.prove_objects(ctx._paths, ctx._project.name, ctx._record),
+    )
+    store = _store.store_path(ctx._paths, ctx._project.name)
     original_commit = _git_command(store, 'cat-file', 'commit', ctx._record.commit)
     _publish.publish(ctx)
     assert _git_command(host, 'show', 'main:README.md') == b'public\n'
@@ -3743,320 +3706,6 @@ def test_readonly_inspection_survives_publish(
     assert (inspection / 'README.md').read_text() == 'public\n'
     assert_private_mode(inspection, 0o500)
     assert_private_mode(inspection / 'README.md', 0o400)
-
-
-@pytest.mark.slow
-@pytest.mark.parametrize('failure', ['locked-tag', 'changed-main'])
-def test_rebuild_store_atomic_failure_preserves_managed_refs(
-    failure: str,
-    tmp_path: Path,
-    fake_gh: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = make_repo(files={'README.md': 'public\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    ctx = _context(tmp_path, source, version='1.0.0')
-    _publish.publish(ctx)
-    store = _candidate.store_path(ctx._paths, ctx._project.name)
-    tree = _git_command(host, 'rev-parse', 'main^{tree}').decode().strip()
-    advanced = _literal_history_commit(host, tree, message=b'advance\n', parent=ctx._record.commit)
-    _git_command(host, 'update-ref', 'refs/heads/main', advanced)
-    _git_command(host, 'update-ref', 'refs/tags/v2.0.0', advanced)
-    _git_command(store, 'update-ref', 'refs/tags/obsolete', ctx._record.commit)
-    destination = _host.verify_destination(ctx._paths, ctx._global_config, ctx._project)
-    real_install = _publish._install_repair_refs
-    expected = b''
-
-    def _install(repo: Path, before: _host.RemoteRefs, fetched: _host.RemoteRefs) -> None:
-        nonlocal expected
-        if failure == 'locked-tag':
-            (store / 'refs/tags/v2.0.0.lock').write_text('locked')
-        else:
-            _git_command(store, 'update-ref', 'refs/heads/main', advanced)
-        expected = _git_command(store, 'for-each-ref', 'refs/heads/', 'refs/tags/')
-        real_install(repo, before, fetched)
-
-    monkeypatch.setattr(_publish, '_install_repair_refs', _install)
-    with pytest.raises(PubanonError):
-        _publish.rebuild_store(
-            ctx._paths, (ctx._global_config, ctx._project), destination, yes=True
-        )
-
-    assert _git_command(store, 'for-each-ref', 'refs/heads/', 'refs/tags/') == expected
-    assert _remote_ref(store, 'refs/tags/obsolete') == ctx._record.commit
-    assert _remote_ref(store, 'refs/tags/v2.0.0') is None
-    assert _git_command(store, 'for-each-ref', 'refs/pubanon/repair/') == b''
-
-
-@pytest.mark.parametrize('state', [_candidate.STATE_RETAINED, _candidate.STATE_UNKNOWN_OUTCOME])
-def test_rebuild_store_candidate_guard_precedes_missing_store_creation(
-    state: str,
-    tmp_path: Path,
-    fake_gh: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = make_repo(files={'README.md': 'public\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    ctx = _context(tmp_path, source)
-    record = replace(ctx._record, state=state)
-    _candidate.save_candidate(ctx._paths, ctx._project.name, record)
-    store = _candidate.store_path(ctx._paths, ctx._project.name)
-    destination = _host.verify_destination(ctx._paths, ctx._global_config, ctx._project)
-    remove_tree(store)
-
-    with pytest.raises(PubanonError, match='snapshot'):
-        _publish.rebuild_store(
-            ctx._paths, (ctx._global_config, ctx._project), destination, yes=True
-        )
-
-    assert not store.exists()
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) == record
-
-
-@pytest.mark.slow
-@pytest.mark.parametrize(
-    'boundary', ['pre-main', 'pre-branch', 'post-main', 'post-branch', 'post-read']
-)
-def test_rebuild_store_host_races_report_actual_local_state(
-    boundary: str,
-    tmp_path: Path,
-    fake_gh: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = make_repo(files={'README.md': 'public\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    ctx = _context(tmp_path, source, version='1.0.0')
-    _publish.publish(ctx)
-    store = _candidate.store_path(ctx._paths, ctx._project.name)
-    before = _git_command(store, 'for-each-ref', 'refs/heads/', 'refs/tags/')
-    tree = _git_command(host, 'rev-parse', 'main^{tree}').decode().strip()
-    advanced = _literal_history_commit(host, tree, message=b'advance\n', parent=ctx._record.commit)
-    _git_command(host, 'update-ref', 'refs/heads/main', advanced)
-    _git_command(host, 'update-ref', 'refs/tags/v2.0.0', advanced)
-    destination = _host.verify_destination(ctx._paths, ctx._global_config, ctx._project)
-    real_ls_remote = _publish.ls_remote
-    calls = 0
-
-    def _observe(dest: _host.Destination, paths: Paths, project: str) -> _host.RemoteRefs:
-        nonlocal calls
-        calls += 1
-        if calls == (1 if boundary.startswith('pre') else 3):
-            if boundary == 'post-read':
-                raise PubanonError('simulated read failure')
-            ref = 'refs/heads/extra' if boundary.endswith('branch') else 'refs/heads/main'
-            _git_command(host, 'update-ref', ref, ctx._record.commit)
-        return real_ls_remote(dest, paths, project)
-
-    monkeypatch.setattr(_publish, 'ls_remote', _observe)
-    with pytest.raises(PubanonError) as error:
-        _publish.rebuild_store(
-            ctx._paths, (ctx._global_config, ctx._project), destination, yes=True
-        )
-
-    if boundary.startswith('pre'):
-        assert 'managed refs were not replaced' in error.value.render()
-        assert _git_command(store, 'for-each-ref', 'refs/heads/', 'refs/tags/') == before
-    else:
-        assert 'local refs may have changed' in error.value.render()
-        assert 'pubanon repo restore --to local' in error.value.render()
-        assert _remote_ref(store, 'refs/heads/main') == advanced
-        assert _remote_ref(store, 'refs/tags/v2.0.0') == advanced
-    assert _git_command(store, 'for-each-ref', 'refs/pubanon/repair/') == b''
-
-
-@pytest.mark.parametrize(
-    'case',
-    [
-        (
-            _candidate.STATE_RETAINED,
-            'pubanon discard, then pubanon repo restore --to local',
-        ),
-        (_candidate.STATE_UNKNOWN_OUTCOME, 'pubanon publish --resolve'),
-    ],
-)
-def test_rebuild_store_refuses_retained_candidate_without_losing_objects(
-    case: tuple[str, str],
-    tmp_path: Path,
-    fake_gh: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    state, recovery = case
-    source = make_repo(files={'README.md': 'first\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    ctx = _context(tmp_path, source)
-    record = replace(ctx._record, state=state)
-    _candidate.save_candidate(ctx._paths, ctx._project.name, record)
-    destination = _host.verify_destination(ctx._paths, ctx._global_config, ctx._project)
-    store = _candidate.store_path(ctx._paths, ctx._project.name)
-    inspection = _candidate.materialize_inspect(ctx._paths, ctx._project.name, record)
-    inspected = (inspection / 'README.md').read_bytes()
-
-    with pytest.raises(PubanonError, match='snapshot') as error:
-        _publish.rebuild_store(
-            ctx._paths, (ctx._global_config, ctx._project), destination, yes=True
-        )
-
-    assert error.value.recovery == recovery
-    if state == _candidate.STATE_RETAINED:
-        assert 'a later pubanon prepare rebuilds the discarded snapshot' in error.value.render()
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) == record
-    assert _remote_ref(store, _candidate.CANDIDATE_REF) == record.commit
-    _git_command(store, 'cat-file', '-e', f'{record.commit}^{{commit}}')
-    assert (inspection / 'README.md').read_bytes() == inspected
-
-
-@pytest.mark.slow
-@pytest.mark.parametrize('invalid', ['identity', 'merge', 'outside-tag', 'signed'])
-def test_rebuild_store_rejects_structural_import_preserving_managed_refs(
-    invalid: str,
-    tmp_path: Path,
-    fake_gh: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = make_repo(files={'README.md': 'public\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    ctx = _context(tmp_path, source, version='1.0.0')
-    _publish.publish(ctx)
-    store = _candidate.store_path(ctx._paths, ctx._project.name)
-    before = _git_command(store, 'for-each-ref', 'refs/heads/', 'refs/tags/')
-    tree = _git_command(host, 'rev-parse', 'main^{tree}').decode().strip()
-    foreign = _literal_history_commit(
-        host,
-        tree,
-        author_name='Private Person' if invalid == 'identity' else 'Anonymous Publisher',
-        message=b'public import\n',
-    )
-    if invalid in {'merge', 'signed'}:
-        raw = _git_command(host, 'cat-file', 'commit', foreign)
-        extra = (
-            f'parent {ctx._record.commit}\nparent {foreign}\n'.encode()
-            if invalid == 'merge'
-            else b'gpgsig signature\n'
-        )
-        header, rest = raw.split(b'\n', 1)
-        foreign = (
-            _git_command(
-                host,
-                'hash-object',
-                '-t',
-                'commit',
-                '-w',
-                '--stdin',
-                input_bytes=(
-                    header + b'\n' + extra + rest
-                    if invalid == 'merge'
-                    else raw.replace(b'\n\n', b'\n' + extra + b'\n', 1)
-                ),
-            )
-            .decode()
-            .strip()
-        )
-    _git_command(
-        host,
-        'update-ref',
-        'refs/heads/main',
-        ctx._record.commit if invalid == 'outside-tag' else foreign,
-    )
-    _git_command(host, 'update-ref', 'refs/tags/new-tag', foreign)
-    destination = _host.verify_destination(ctx._paths, ctx._global_config, ctx._project)
-
-    with pytest.raises(PubanonError, match='structur'):
-        _publish.rebuild_store(
-            ctx._paths, (ctx._global_config, ctx._project), destination, yes=True
-        )
-
-    assert _git_command(store, 'for-each-ref', 'refs/heads/', 'refs/tags/') == before
-    assert _git_command(store, 'for-each-ref', 'refs/pubanon/repair/') == b''
-
-
-@pytest.mark.slow
-@pytest.mark.parametrize('decision', ['host-moved', 'local-moved', 'cancel'])
-def test_repair_consent_preserves_ref_leases_and_cancellation(
-    fake_gh: Path, make_repo: Callable[..., Path], monkeypatch: pytest.MonkeyPatch, decision: str
-) -> None:
-    ctx, destination, host = _published_repair_context(fake_gh, make_repo, monkeypatch)
-    store = _candidate.store_path(ctx._paths, ctx._project.name)
-    _git_command(store, 'update-ref', 'refs/tags/local-only', ctx._record.commit)
-    local_before, host_before = (
-        _git_command(store, 'for-each-ref'),
-        _git_command(host, 'for-each-ref'),
-    )
-    answers = ['y']
-    changed_oid = ''
-
-    def _answer(prompt: str) -> str:
-        nonlocal changed_oid
-        assert prompt == 'Replace local publication refs with verified GitHub refs? [y/n] '
-        response = answers.pop(0)
-        if decision == 'cancel':
-            raise KeyboardInterrupt
-        target = host if decision == 'host-moved' else store
-        tree = _git_command(target, 'rev-parse', 'main^{tree}').decode().strip()
-        changed_oid = _literal_history_commit(
-            target, tree, message=b'moved\n', parent=ctx._record.commit
-        )
-        ref = 'refs/heads/main' if decision == 'host-moved' else 'refs/tags/local-only'
-        _git_command(target, 'update-ref', ref, changed_oid)
-        return response
-
-    monkeypatch.setattr('builtins.input', _answer)
-    with pytest.raises(PubanonError) as error:
-        _publish.rebuild_store(
-            ctx._paths, (ctx._global_config, ctx._project), destination, yes=False
-        )
-    assert not answers
-    if decision == 'host-moved':
-        assert 'host refs changed during consent' in error.value.render()
-    elif decision == 'cancel':
-        assert isinstance(error.value, OperationCanceled)
-    if decision != 'local-moved':
-        assert _git_command(store, 'for-each-ref') == local_before
-    else:
-        assert _remote_ref(store, 'refs/tags/local-only') == changed_oid
-        assert _remote_ref(store, 'refs/heads/main') == ctx._record.commit
-    if decision != 'host-moved':
-        assert _git_command(host, 'for-each-ref') == host_before
-    assert _git_command(store, 'for-each-ref', 'refs/pubanon/repair/') == b''
-
-
-@pytest.mark.parametrize(
-    'output',
-    [
-        b'',
-        b'invalid refs/pubanon/repair/main\n',
-        b'a' * 40 + b' refs/pubanon/repair/other\n',
-        (b'a' * 40 + b' refs/pubanon/repair/main\n') * 2,
-        b'a' * 40
-        + b' refs/pubanon/repair/main\n'
-        + (b'b' * 40 + b' refs/pubanon/repair/tags/v1\n') * 2,
-        b'a' * 40
-        + b' refs/pubanon/repair/main\n'
-        + b'b' * 40
-        + b' refs/pubanon/repair/tags/\xff\n',
-    ],
-)
-def test_repair_refs_refuses_missing_or_malformed_result(
-    output: bytes,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def _read(_args: list[str], *, cwd: Path) -> GitResult:
-        del cwd
-        return GitResult(0, output, b'')
-
-    monkeypatch.setattr(_publish, 'run_git', _read)
-    with pytest.raises(PubanonError):
-        _publish._repair_refs(tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -4070,11 +3719,11 @@ def test_repair_refs_refuses_missing_or_malformed_result(
     ],
 )
 def test_replacement_completion_selects_latest_strict_release_version(
-    publication_cli: tuple[Path, _publish.PublishContext],
+    tmp_path: Path,
     tags: tuple[str, ...],
     expected: str,
 ) -> None:
-    _host_path, ctx = publication_cli
+    ctx = _literal_context(tmp_path)
     tip = ctx._record.commit
     record = replace(
         ctx._record,
@@ -4123,6 +3772,7 @@ def test_replacement_preview_names_ref_changes_warning_and_single_confirmation(
             _publish._Verified(
                 destination, _host.RemoteRefs(ctx._record.prestate_main, ctx._record.prestate_tags)
             ),
+            _page_plan(ctx),
         )
     preview = re.sub(r': +', ': ', rendered.getvalue())
     assert preview.startswith('Replace published snapshot\n')
@@ -4140,12 +3790,13 @@ def test_replacement_preview_names_ref_changes_warning_and_single_confirmation(
     assert questions == ['Publish this replacement?']
 
     detailed = StringIO()
-    with redirect_stdout(detailed):
+    with redirect_stdout(detailed), verbose_context(enabled=True):
         _publish._review_publication(
-            replace(ctx, _verbose=True),
+            ctx,
             _publish._Verified(
                 destination, _host.RemoteRefs(ctx._record.prestate_main, ctx._record.prestate_tags)
             ),
+            _page_plan(ctx),
         )
     assert f'Commit: {originals[1].commit} -> {ctx._record.commit}' in re.sub(
         r': +', ': ', detailed.getvalue()
@@ -4169,6 +3820,7 @@ def test_replacement_preview_names_ref_changes_warning_and_single_confirmation(
             _publish._Verified(
                 destination, _host.RemoteRefs(latest.prestate_main, latest.prestate_tags)
             ),
+            _page_plan(ctx),
         )
     compact_output = re.sub(r': +', ': ', compact.getvalue())
     assert 'Replace published snapshot' in compact_output
@@ -4214,14 +3866,14 @@ def test_replacement_push_moves_existing_tag_and_preserves_history(
     if version:
         assert _remote_ref(host, 'refs/tags/v1.0.0') == ctx._record.commit
     assert _git_command(host, 'show', 'main:README.md') == b'corrected publication\n'
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) is None
+    assert _records.load_candidate(ctx._paths, ctx._project.name) is None
     saved = _records.load_publication(ctx._paths, ctx._project.name, ctx._record.commit)
     assert saved is not None
     assert saved.replaces == first.commit
     assert _records.load_publication(ctx._paths, ctx._project.name, first.commit) == old_record
     assert (
         _remote_ref(
-            _candidate.store_path(ctx._paths, ctx._project.name),
+            _store.store_path(ctx._paths, ctx._project.name),
             _records.publication_ref(first.commit),
         )
         == first.commit
@@ -4248,7 +3900,7 @@ def test_replacement_resolves_lost_readback_without_repeating_push(
 ) -> None:
     source = make_repo(files={'README.md': 'original\n'})
     host, first, ctx = _replacement_fixture(tmp_path, source, fake_gh, monkeypatch, '1.0.0')
-    real_push = _publish.push
+    real_push = _host.push
     calls: list[list[str]] = []
 
     def _push(dest: _host.Destination, store: Path, args: list[str]) -> None:
@@ -4258,13 +3910,13 @@ def test_replacement_resolves_lost_readback_without_repeating_push(
         else:
             raise PubanonError('simulated transport failure')
 
-    monkeypatch.setattr(_publish, 'push', _push)
+    monkeypatch.setattr(_host, 'push', _push)
     with (
         _failed_readback(monkeypatch),
         pytest.raises(PubanonError, match='the outcome of the last publication is unknown'),
     ):
         _publish.publish(ctx)
-    retained = _candidate.load_candidate(ctx._paths, ctx._project.name)
+    retained = _records.load_candidate(ctx._paths, ctx._project.name)
     assert retained is not None
     assert retained.state == _candidate.STATE_UNKNOWN_OUTCOME
     outcome = _publish.resolve(replace(ctx, _record=retained))
@@ -4282,11 +3934,9 @@ def test_replacement_resolves_lost_readback_without_repeating_push(
 def test_replacement_staging_evidence_must_cover_resulting_tip(
     matches_tip: bool,
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
-    ctx = _context(tmp_path, source)
+    ctx = _literal_context(tmp_path)
     correction = ctx._record.commit
     tip = 'b' * 40 if correction != 'b' * 40 else 'c' * 40
     replacement = replace(ctx._record, replaces='a' * 40, tip=tip, poststate_tags={})
@@ -4333,7 +3983,7 @@ def test_replay_nonrelease_tags_recover_finalization_without_another_push(
 ) -> None:
     source = make_repo(files={'README.md': 'original\n'})
     host, ctx, originals = _rewrite_fixture(tmp_path, source, fake_gh, monkeypatch)
-    store = _candidate.candidate_store_path(ctx._paths, ctx._project.name)
+    store = _store.candidate_store_path(ctx._paths, ctx._project.name)
     before = dict(ctx._record.prestate_tags)
     after = dict(_records.candidate_poststate(ctx._record)[1])
     del before['v1.0.2']
@@ -4347,7 +3997,7 @@ def test_replay_nonrelease_tags_recover_finalization_without_another_push(
         after[tag] = _records.candidate_tip(ctx._record)
     ctx = replace(ctx, _record=replace(ctx._record, prestate_tags=before, poststate_tags=after))
     _records.save_candidate(ctx._paths, ctx._project.name, ctx._record)
-    real_push = _publish.push
+    real_push = _host.push
     real_save = _records.save_publication
     pushes: list[list[str]] = []
     failed = False
@@ -4363,7 +4013,7 @@ def test_replay_nonrelease_tags_recover_finalization_without_another_push(
             raise OSError('record write interrupted')
         real_save(paths, project, record)
 
-    monkeypatch.setattr(_publish, 'push', _push)
+    monkeypatch.setattr(_host, 'push', _push)
     monkeypatch.setattr(_records, 'save_publication', _save)
     with pytest.raises(PubanonError, match='Local finalization is incomplete'):
         _publish.publish(ctx)
@@ -4371,11 +4021,11 @@ def test_replay_nonrelease_tags_recover_finalization_without_another_push(
     retained = _records.load_candidate(ctx._paths, ctx._project.name)
     assert retained is not None
     tip = _records.candidate_tip(retained)
-    assert _candidate.confirmed_publication(ctx._paths, ctx._project.name, retained)
+    assert _verification.confirmed_publication(ctx._paths, ctx._project.name, retained)
     assert _candidate.publication_archive(ctx._paths, ctx._project.name, tip)
     assert _records.load_publication(ctx._paths, ctx._project.name, tip) is None
     with pytest.raises(PubanonError, match='confirmed publication cannot be discarded'):
-        _candidate.discard(ctx._paths, ctx._project.name, force=True)
+        _discard.discard(ctx._paths, ctx._project.name, force=True)
 
     assert _publish.resolve(replace(ctx, _record=retained)) == 'published'
 
@@ -4407,17 +4057,17 @@ def test_resolve_classifies_prestate_and_pushed_state(
     unknown = replace(ctx._record, state=_candidate.STATE_UNKNOWN_OUTCOME)
     _candidate.save_candidate(ctx._paths, ctx._project.name, unknown)
     if sent:
-        store = _candidate.store_path(ctx._paths, ctx._project.name)
+        store = _store.store_path(ctx._paths, ctx._project.name)
         _git_command(host, 'fetch', str(store), f'{unknown.commit}:refs/heads/main')
 
     outcome = _publish.resolve(replace(ctx, _record=unknown))
 
     assert outcome == ('published' if sent else 'not-sent')
-    current = _candidate.load_candidate(ctx._paths, ctx._project.name)
+    current = _records.load_candidate(ctx._paths, ctx._project.name)
     if sent:
         assert current is None
         assert (
-            _remote_ref(_candidate.store_path(ctx._paths, ctx._project.name), 'refs/heads/main')
+            _remote_ref(_store.store_path(ctx._paths, ctx._project.name), 'refs/heads/main')
             == unknown.commit
         )
     else:
@@ -4443,7 +4093,7 @@ def test_resolve_interrupt_before_readback_retains_unknown_outcome(
         raise KeyboardInterrupt
 
     with monkeypatch.context() as fault:
-        fault.setattr(_publish, 'ls_remote', _interrupt_read)
+        fault.setattr(_host, 'ls_remote', _interrupt_read)
         assert _cli.main(['publish', '--project', ctx._project.name, '--resolve']) == 130
     error = capsys.readouterr().err
     assert error.startswith('error: the outcome of the last publication is unknown')
@@ -4451,7 +4101,7 @@ def test_resolve_interrupt_before_readback_retains_unknown_outcome(
     assert f'pubanon publish --project={ctx._project.name} --resolve' in error
     assert 'Traceback' not in error
     assert _cli.main(['publish', '--project', ctx._project.name, '--resolve']) == 0
-    record = _candidate.load_candidate(ctx._paths, ctx._project.name)
+    record = _records.load_candidate(ctx._paths, ctx._project.name)
     assert record is not None
     assert record.state == _candidate.STATE_RETAINED
 
@@ -4482,7 +4132,7 @@ def test_rewrite_atomic_transport_refuses_races_and_mixed_readback(
             newline='\n',
         )
         hook.chmod(0o755)
-    real_push = _publish.push
+    real_push = _host.push
     calls: list[list[str]] = []
 
     def _push(dest: _host.Destination, store: Path, args: list[str]) -> None:
@@ -4499,7 +4149,7 @@ def test_rewrite_atomic_transport_refuses_races_and_mixed_readback(
             return
         real_push(dest, store, args)
 
-    monkeypatch.setattr(_publish, 'push', _push)
+    monkeypatch.setattr(_host, 'push', _push)
     with pytest.raises(PubanonError):
         _publish.publish(ctx)
     retained = _records.load_candidate(ctx._paths, ctx._project.name)
@@ -4515,7 +4165,7 @@ def test_rewrite_atomic_transport_refuses_races_and_mixed_readback(
         assert _remote_ref(host, 'refs/heads/main') == originals[-1].commit
     assert _remote_ref(host, 'refs/tags/v1.0.2') == originals[-1].commit
     assert len(calls) == 1
-    assert not _candidate.confirmed_publication(ctx._paths, ctx._project.name, retained)
+    assert not _verification.confirmed_publication(ctx._paths, ctx._project.name, retained)
 
 
 @pytest.mark.slow
@@ -4550,7 +4200,7 @@ def test_rewrite_preservation_failure_never_pushes_and_retains_locators(
     def _archive(*_args: object) -> None:
         raise PubanonError('archive creation refused')
 
-    monkeypatch.setattr(_publish, 'push', _forbidden)
+    monkeypatch.setattr(_host, 'push', _forbidden)
     if boundary == 'locator':
         monkeypatch.setattr(_publish, 'save_candidate', _save)
     elif boundary == 'bookmark':
@@ -4588,7 +4238,7 @@ def test_rewrite_resolve_retains_tip_proof_after_interruption_and_remote_drift(
     )
     real_save, real_git, real_unlink = _records.save_publication, _publish.run_git, Path.unlink
     pushes: list[list[str]] = []
-    real_push = _publish.push
+    real_push = _host.push
 
     def _push(dest: _host.Destination, store: Path, args: list[str]) -> None:
         pushes.append(args)
@@ -4616,7 +4266,7 @@ def test_rewrite_resolve_retains_tip_proof_after_interruption_and_remote_drift(
             raise OSError('candidate removal interrupted')
         real_unlink(path, missing_ok=missing_ok)
 
-    monkeypatch.setattr(_publish, 'push', _push)
+    monkeypatch.setattr(_host, 'push', _push)
     with monkeypatch.context() as fault:
         if boundary.endswith('record'):
             fault.setattr(_records, 'save_publication', _save)
@@ -4628,7 +4278,7 @@ def test_rewrite_resolve_retains_tip_proof_after_interruption_and_remote_drift(
             _publish.publish(ctx)
     retained = _records.load_candidate(ctx._paths, ctx._project.name)
     assert retained is not None
-    assert _candidate.confirmed_publication(ctx._paths, ctx._project.name, retained)
+    assert _verification.confirmed_publication(ctx._paths, ctx._project.name, retained)
     assert _candidate.publication_archive(
         ctx._paths, ctx._project.name, _records.candidate_tip(retained)
     )
@@ -4665,21 +4315,21 @@ def test_rewrite_transaction_preserves_old_chain_and_moves_only_changed_tags(
             (path.name, path.read_bytes()) for path in sorted(source.iterdir()) if path.is_file()
         ),
     )
-    store = _candidate.store_path(ctx._paths, ctx._project.name)
+    store = _store.store_path(ctx._paths, ctx._project.name)
     old_bytes = _git_command(store, 'cat-file', 'commit', originals[0].commit)
     if all_history:
         # A recovered tip has no record or archive; pretransport preservation must retain it.
         _records.publication_path(ctx._paths, ctx._project.name, originals[-1].commit).unlink()
         _git_command(store, 'update-ref', '-d', _records.publication_ref(originals[-1].commit))
     calls: list[list[str]] = []
-    real_push = _publish.push
+    real_push = _host.push
 
     def _push(dest: _host.Destination, path: Path, args: list[str]) -> None:
         assert _candidate.publication_archive(ctx._paths, ctx._project.name, originals[-1].commit)
         calls.append(args)
         real_push(dest, path, args)
 
-    monkeypatch.setattr(_publish, 'push', _push)
+    monkeypatch.setattr(_host, 'push', _push)
     _publish.publish(ctx)
     tip, tags = _records.candidate_poststate(ctx._record)
     assert _remote_ref(host, 'refs/heads/main') == tip
@@ -4736,7 +4386,7 @@ def test_source_drift_warns_without_changing_snapshot(
     with redirect_stdout(captured):
         _verify_for_publish(ctx)
     assert captured.getvalue() == 'Warning: source has changed since snapshot was prepared.\n'
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) == ctx._record
+    assert _records.load_candidate(ctx._paths, ctx._project.name) == ctx._record
 
 
 @pytest.mark.slow
@@ -4770,8 +4420,8 @@ def test_sync_acknowledgment_displays_identity_and_hygiene_in_one_path(
     ctx = replace(second, _project=project)
     prompts: list[str] = []
     answers = [
-        ('Continue despite this earlier exposure? [y/n] ', 'yes'),
-        ('Restore these branches and tags to public-owner/public-repo? [y/n] ', 'no'),
+        ('Continue despite this earlier exposure? [y/n] ', 'y'),
+        ('Restore these branches and tags to public-owner/public-repo? [y/n] ', 'n'),
     ]
 
     def _answer(prompt: str) -> str:
@@ -4827,7 +4477,7 @@ def test_sync_ancestry_failure_retains_classification_and_diagnostics(
     assert error.value.expected == ctx._record.commit
     assert error.value.actual == remote_commit
     assert error.value.recovery == 'pubanon repo verify'
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) == ctx._record
+    assert _records.load_candidate(ctx._paths, ctx._project.name) == ctx._record
 
 
 @pytest.mark.slow
@@ -4857,7 +4507,7 @@ def test_sync_declined_confirmation_leaves_remote_unchanged(
         assert second._record.message not in preview
         assert f'{second._project.owner}/{second._project.repo}' in preview
         assert _remote_ref(host, 'refs/heads/main') == first._record.commit
-        return 'no'
+        return 'n'
 
     monkeypatch.setattr('builtins.input', _decline)
 
@@ -4891,7 +4541,7 @@ def test_sync_empty_host_restores_full_history_and_tags(
     assert _remote_ref(host, 'refs/heads/main') == second._record.commit
     assert _remote_ref(host, 'refs/tags/v1.0.0') == first._record.commit
     assert _remote_ref(host, 'refs/tags/v2.0.0') == second._record.commit
-    assert _candidate.load_candidate(second._paths, second._project.name) is None
+    assert _records.load_candidate(second._paths, second._project.name) is None
     output = capsys.readouterr().out
     assert f'empty -> {second._record.commit[:12]}' in output
     assert 'v1.0.0, v2.0.0' in output
@@ -4916,7 +4566,7 @@ def test_sync_equal_host_is_noop(
     def _unexpected_push(*_args: object, **_kwargs: object) -> GitResult:
         pytest.fail('equal sync attempted a push')
 
-    monkeypatch.setattr(_publish, 'push', _unexpected_push)
+    monkeypatch.setattr(_host, 'push', _unexpected_push)
     capsys.readouterr()
 
     _publish.sync(_sync_context(second))
@@ -4969,8 +4619,8 @@ def test_sync_newly_sensitive_anonymous_identity_requires_explicit_acknowledgmen
     assert _config.load_project(ctx._paths, project.name).acknowledged_exposure == ''
     prompts: list[str] = []
     expected = [
-        ('Continue despite this earlier exposure? [y/n] ', 'yes'),
-        ('Restore these branches and tags to public-owner/public-repo? [y/n] ', 'yes'),
+        ('Continue despite this earlier exposure? [y/n] ', 'y'),
+        ('Restore these branches and tags to public-owner/public-repo? [y/n] ', 'y'),
     ]
     output_buffer = StringIO()
 
@@ -5026,7 +4676,7 @@ def test_sync_preserves_retained_candidate_byte_for_byte_then_publishes_it(
     _publish.sync(_sync_context(retained))
 
     assert record_path.read_bytes() == before
-    assert _candidate.load_candidate(retained._paths, retained._project.name) == retained._record
+    assert _records.load_candidate(retained._paths, retained._project.name) == retained._record
     assert _remote_ref(host, 'refs/heads/main') == second._record.commit
 
     _publish.publish(retained)
@@ -5073,7 +4723,7 @@ def test_sync_refuses_diverged_host_showing_both_tips_before_push(
     def _unexpected_push(*_args: object, **_kwargs: object) -> GitResult:
         pytest.fail('diverged sync attempted a push')
 
-    monkeypatch.setattr(_publish, 'push', _unexpected_push)
+    monkeypatch.setattr(_host, 'push', _unexpected_push)
 
     with pytest.raises(PubanonError, match='diverg') as error:
         _publish.sync(_sync_context(second))
@@ -5126,7 +4776,7 @@ def test_sync_refuses_mismatched_readback_with_complete_refs(
         reads.append(None)
         return response
 
-    monkeypatch.setattr(_publish, 'ls_remote', _remote_refs)
+    monkeypatch.setattr(_host, 'ls_remote', _remote_refs)
     sensitive_term_ctx = replace(
         second, _project=replace(second._project, extra_terms=(first._record.commit, branch))
     )
@@ -5153,7 +4803,7 @@ def test_sync_refuses_missing_local_published_main(
     host = _new_host(tmp_path)
     _configure_host(host, fake_gh, monkeypatch)
     ctx = _context(tmp_path, source)
-    _candidate.discard(ctx._paths, ctx._project.name, force=False)
+    _discard.discard(ctx._paths, ctx._project.name, force=False)
 
     with pytest.raises(PubanonError, match='local published history') as error:
         _publish.sync(_sync_context(ctx))
@@ -5175,7 +4825,7 @@ def test_sync_refuses_structural_problem_outside_exact_range_before_preview(
         make_repo,
         monkeypatch,
     )
-    store = _candidate.store_path(second._paths, second._project.name)
+    store = _store.store_path(second._paths, second._project.name)
     tree = _git_command(store, 'rev-parse', f'{second._record.commit}^{{tree}}').decode().strip()
     invalid_root = _literal_history_commit(
         store,
@@ -5200,7 +4850,7 @@ def test_sync_refuses_structural_problem_outside_exact_range_before_preview(
     def _unexpected_push(*_args: object, **_kwargs: object) -> GitResult:
         pytest.fail('structural sync failure attempted a push')
 
-    monkeypatch.setattr(_publish, 'push', _unexpected_push)
+    monkeypatch.setattr(_host, 'push', _unexpected_push)
     capsys.readouterr()
 
     with pytest.raises(PubanonError, match='published history has identity problems'):
@@ -5236,12 +4886,12 @@ def test_sync_refuses_unknown_outcome_candidate_naming_resolve(
     def _refuse_push(*_args: object) -> None:
         pytest.fail('unknown publication outcome attempted a sync push')
 
-    monkeypatch.setattr(_publish, 'push', _refuse_push)
+    monkeypatch.setattr(_host, 'push', _refuse_push)
     with pytest.raises(PubanonError) as error:
         _publish.sync(_sync_context(second))
 
     assert error.value.recovery == 'pubanon publish --resolve'
-    saved = _candidate.load_candidate(retained._paths, retained._project.name)
+    saved = _records.load_candidate(retained._paths, retained._project.name)
     assert saved is not None
     assert saved.state == _candidate.STATE_UNKNOWN_OUTCOME
 
@@ -5332,7 +4982,7 @@ def test_sync_reports_unexpected_branch_before_noop_or_push(
     def _unexpected_push(*_args: object, **_kwargs: object) -> GitResult:
         pytest.fail('branch-bearing sync attempted a push')
 
-    monkeypatch.setattr(_publish, 'push', _unexpected_push)
+    monkeypatch.setattr(_host, 'push', _unexpected_push)
 
     with pytest.raises(PubanonError, match='unexpected branch') as error:
         _publish.sync(_sync_context(ctx))
@@ -5374,7 +5024,7 @@ def test_sync_sent_exposure_requires_interactive_acknowledgment(
         assert expected, f'unexpected prompt: {prompt}'
         assert expected.pop(0) == prompt
         prompts.append(prompt)
-        return 'yes' if approve else 'no'
+        return 'y' if approve else 'n'
 
     monkeypatch.setattr('builtins.input', _accept)
 
@@ -5426,7 +5076,7 @@ def test_sync_strict_prefix_audits_and_pushes_exact_missing_range(
         'Callable[..., tuple[_audit.HistoryAudit, _audit.HistoryAudit]]',
         _audit.audit_history_pair,
     )
-    real_push = _publish.push
+    real_push = _host.push
     pushed_args: list[str] = []
 
     def _audit_range(
@@ -5451,7 +5101,7 @@ def test_sync_strict_prefix_audits_and_pushes_exact_missing_range(
         return real_push(destination, cwd, args)
 
     monkeypatch.setattr(_audit, 'audit_history_pair', _audit_range)
-    monkeypatch.setattr(_publish, 'push', _record_push)
+    monkeypatch.setattr(_host, 'push', _record_push)
     capsys.readouterr()
 
     _publish.sync(_sync_context(second))
@@ -5509,7 +5159,7 @@ def test_sync_suffix_preserves_full_history_acknowledgment_bytes(
     def _accept_publication(prompt: str) -> str:
         assert expected_publication_prompts
         assert expected_publication_prompts.pop(0) == prompt
-        return 'yes'
+        return 'y'
 
     monkeypatch.setattr('builtins.input', _accept_publication)
     _publish.publish(second)
@@ -5523,7 +5173,7 @@ def test_sync_suffix_preserves_full_history_acknowledgment_bytes(
     def _accept_push(prompt: str) -> str:
         assert prompt == 'Restore these branches and tags to public-owner/public-repo? [y/n] '
         prompts.append(prompt)
-        return 'yes'
+        return 'y'
 
     monkeypatch.setattr('builtins.input', _accept_push)
     saved = _config.load_project(second._paths, second._project.name)
@@ -5676,7 +5326,7 @@ def test_publish_accepts_latest_hosted_pass(
     assert r'CI / hosted\x1b[31m' in rendered.getvalue()
     assert r'https://example.invalid/runs/9\x0aend' in rendered.getvalue()
     assert _remote_ref(host, 'refs/heads/main') == ctx._record.commit
-    assert _candidate.load_candidate(ctx._paths, ctx._project.name) is None
+    assert _records.load_candidate(ctx._paths, ctx._project.name) is None
     calls = gh_calls(fake_gh.parent)
     assert sum('/actions/workflows/ci.yml/runs?' in ' '.join(call) for call in calls) == 4
     assert not any('/check-runs?' in ' '.join(call) for call in calls)
@@ -5710,6 +5360,158 @@ def test_publish_refuses_final_repository_with_push_ci_turned_off(
     assert not any('/actions/workflows/' in ' '.join(call) for call in gh_calls(fake_gh.parent))
 
 
+@pytest.mark.parametrize('failure', [False, True])
+def test_page_planning_precedes_push_and_decline_has_no_later_lookup(
+    page_context: tuple[_publish.PublishContext, _ReleaseHost],
+    fake_gh: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: bool,
+) -> None:
+    ctx, host = page_context
+    _configure_host(_new_host(ctx._paths.data_dir.parent), fake_gh, monkeypatch)
+    host.destination = _publish._destination_from_record(ctx._record)
+    notes = b'Private Person' if failure else b'Full\x1b[31m notes\nlast line\n'
+    ctx = replace(ctx, _yes=False, _release_page=_releases.PageRequest(notes=notes))
+
+    def _decline(question: str) -> bool:
+        assert (
+            question == 'Publish v1.2.3 to public-owner/public-repo and create its release page?'
+        )
+        assert host.scans == 1
+        return False
+
+    def _push(*_args: object) -> None:
+        pytest.fail('push must not happen')
+
+    monkeypatch.setattr(_publish, 'confirm', _decline)
+    monkeypatch.setattr(_publish, '_push_candidate', _push)
+    with pytest.raises(PubanonError) as caught:
+        _publish.publish(ctx)
+    assert 'Nothing was published' in caught.value.render()
+    assert host.scans == 1
+    assert host.writes == []
+    if not failure:
+        out = capsys.readouterr().out
+        assert 'Release page' in out
+        assert 'create "v1.2.3"' in out
+        for line in notes.decode().split('\n'):
+            assert escape(line) in out
+
+
+@pytest.mark.parametrize(
+    'case',
+    [
+        ('created', 0),
+        ('existing', 0),
+        ('different', 1),
+        ('missing', 1),
+        ('unknown', 1),
+        ('interrupt', 130),
+    ],
+)
+def test_page_completion_follows_finalized_publication(
+    page_context: tuple[_publish.PublishContext, _ReleaseHost],
+    fake_gh: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    case: tuple[str, int],
+) -> None:
+    outcome, status = case
+    ctx, host = page_context
+    ctx = replace(
+        ctx,
+        _project=replace(
+            ctx._project, package=_config.PackageObservation('pypi', 'example', ('Release',))
+        ),
+    )
+    git_host = _new_host(ctx._paths.data_dir.parent)
+    _configure_host(git_host, fake_gh, monkeypatch)
+    host.destination = _publish._destination_from_record(ctx._record)
+    notes_file = ctx._paths.data_dir.parent / 'notes.md'
+    notes_file.write_bytes(b'Exact\r\nnotes\n')
+    page = _host.GitHubRelease(
+        'v1.2.3',
+        'v1.2.3',
+        'Exact\r\nnotes\n',
+        'https://example.invalid/page',
+        draft=False,
+        prerelease=False,
+    )
+    if outcome == 'missing':
+        host.page = page
+    _config.save_global(ctx._paths, ctx._global_config, None)
+    _config.save_project(ctx._paths, ctx._project)
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(ctx._paths.config_dir.parent))
+    monkeypatch.setenv('XDG_DATA_HOME', str(ctx._paths.data_dir.parent))
+    monkeypatch.setattr(_host, 'read_release', host._read)
+    push_candidate = _publish._push_candidate
+    pushed = False
+
+    def _push(context: _publish.PublishContext, verified: _publish._Verified) -> None:
+        nonlocal pushed
+        assert host.writes == []
+        push_candidate(context, verified)
+        assert _records.load_candidate(ctx._paths, ctx._project.name) is None
+        assert _candidate.published_refs(ctx._paths, ctx._project.name) == (
+            ctx._record.commit,
+            {'v1.2.3': ctx._record.commit},
+        )
+        pushed = True
+        if outcome in {'existing', 'different'}:
+            host.page = replace(page, notes='Different') if outcome == 'different' else page
+        elif outcome == 'missing':
+            host.page = None
+        elif outcome == 'unknown':
+            host.write_error = PubanonError('connection lost')
+        elif outcome == 'interrupt':
+            host.write_error = KeyboardInterrupt()
+        notes_file.write_bytes(b'changed after confirmation')
+
+    def _create(
+        destination: _host.Destination,
+        tag: str,
+        *,
+        title: str,
+        notes: bytes,
+        mark_latest: bool = True,
+    ) -> None:
+        assert pushed
+        host._create(destination, tag, title=title, notes=notes, mark_latest=mark_latest)
+
+    monkeypatch.setattr(_publish, '_push_candidate', _push)
+    monkeypatch.setattr(_host, 'create_release', _create)
+    capsys.readouterr()
+    assert (
+        _cli.main(
+            [
+                'publish',
+                '--project',
+                ctx._project.name,
+                '--yes',
+                '--release-notes-file',
+                str(notes_file),
+            ]
+        )
+        == status
+    )
+    captured = capsys.readouterr()
+    assert 'Published v1.2.3 to public-owner/public-repo (public).' in captured.out
+    assert _records.load_candidate(ctx._paths, ctx._project.name) is None
+    assert _candidate.published_refs(ctx._paths, ctx._project.name) == (
+        ctx._record.commit,
+        {'v1.2.3': ctx._record.commit},
+    )
+    assert (
+        _git_command(git_host, 'rev-parse', 'refs/tags/v1.2.3').decode().strip()
+        == ctx._record.commit
+    )
+    _assert_page_completion_report(captured, outcome, host, notes_file)
+    assert len(host.writes) == (1 if outcome in {'created', 'unknown', 'interrupt'} else 0)
+    if host.writes:
+        assert host.writes[0][2] == b'Exact\r\nnotes\n'
+
+
 def test_verify_refuses_tampered_candidate_commit_author(
     tmp_path: Path,
     fake_gh: Path,
@@ -5720,7 +5522,7 @@ def test_verify_refuses_tampered_candidate_commit_author(
     host = _new_host(tmp_path)
     _configure_host(host, fake_gh, monkeypatch)
     ctx = _context(tmp_path, source)
-    store = _candidate.store_path(ctx._paths, ctx._project.name)
+    store = _store.store_path(ctx._paths, ctx._project.name)
     timestamp = (
         _git_command(store, 'show', '-s', '--format=%at', ctx._record.commit).decode().strip()
     )

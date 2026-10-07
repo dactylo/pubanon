@@ -10,32 +10,24 @@ class ObservationTimeoutError(Exception):
 
     Attributes:
         stage: Optional observation stage that exceeded its time budget.
-        stdout: Raw standard output retained from the timed-out child.
-        stderr: Raw standard error retained from the timed-out child.
     """
 
     def __init__(
         self,
         *,
         stage: str | None = None,
-        stdout: bytes = b'',
-        stderr: bytes = b'',
     ) -> None:
-        """Create an observation timeout with retained raw context.
+        """Create an observation timeout with optional stage context.
 
         Args:
             stage: Optional observation stage that exceeded its time budget.
-            stdout: Raw standard output retained from the timed-out child.
-            stderr: Raw standard error retained from the timed-out child.
         """
         super().__init__()
         self.stage = stage
-        self.stderr = stderr
-        self.stdout = stdout
 
 
 class PubanonError(Exception):
-    """Describe a fail-closed Pubanon error.
+    """Describe a fail-closed pubanon error.
 
     Attributes:
         actual: Optional observed state that caused the refusal.

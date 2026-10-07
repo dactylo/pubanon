@@ -18,9 +18,9 @@ from pubanon import (
 )
 from pubanon._cli import _prepare, _workflow
 from pubanon._config import PackageObservation, Settings
-from pubanon._remote import _host, _package, _publish, _stage, _watch
+from pubanon._remote import _host, _package, _stage, _watch
 from pubanon._run import GitResult
-from pubanon._snapshots import _candidate, _records, _source
+from pubanon._snapshots import _candidate, _records, _source, _store
 from pubanon._terminal import display_path
 from tests._git import git_env
 
@@ -227,6 +227,15 @@ def _disclosure_responses(
         {
             'args': [
                 'api',
+                '--method',
+                'GET',
+                f'repos/{owner}/{repo}/releases?per_page=100&page=1',
+            ],
+            'stdout': '[]',
+        },
+        {
+            'args': [
+                'api',
                 f'repos/{owner}/{repo}/actions/runs?per_page=100&page=1',
             ],
             'stdout': '{"total_count": 0, "workflow_runs": []}',
@@ -315,13 +324,14 @@ def _init_answers(
         ('Publication route (staged/direct) [direct]: ', ''),
         ('Create local tags marking the source of each publication? [y/N] ', ''),
         ('Required CI checks (comma separated, blank for none): ', checks),
+        ('Create a release page for each published version? [y/N] ', ''),
         ('Repository description (blank for none): ', description),
-        ('Enable issues? [Y/n] ', 'yes'),
-        ('Enable wiki? [y/N] ', 'no'),
-        ('Enable projects? [y/N] ', 'no'),
-        ('Enable pull requests? [y/N] ', 'no'),
-        ('Enable discussions? [y/N] ', 'no'),
-        ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 'save'),
+        ('Enable issues? [Y/n] ', 'y'),
+        ('Enable wiki? [y/N] ', 'n'),
+        ('Enable projects? [y/N] ', 'n'),
+        ('Enable pull requests? [y/N] ', 'n'),
+        ('Enable discussions? [y/N] ', 'n'),
+        ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
     ]
 
 
@@ -366,7 +376,7 @@ def _prepare_guided_review(
     prepared = capsys.readouterr()
     cli_output.extend((prepared.out, prepared.err))
     assert 'left out: 1 staged change, 1 unstaged change, 1 untracked change' in prepared.out
-    candidate = _candidate.load_candidate(fixture._paths, 'demo')
+    candidate = _records.load_candidate(fixture._paths, 'demo')
     assert candidate is not None
 
     assert _cli.main(['inspect']) == 0
@@ -450,10 +460,10 @@ def _reveal_after_disclosure_review(
         if reveal_prompts:
             before_disclosure, _ = capture_output()
             assert 'matches GitHub; no sensitive terms or identity problems' in before_disclosure
-            assert 'Pubanon has not scanned Actions logs, artifact contents' in before_disclosure
+            assert 'pubanon has not scanned Actions logs, artifact contents' in before_disclosure
             assert 'Saved inventory:' not in before_disclosure
             assert f'https://github.com/{owner}/{repo}/actions' in before_disclosure
-        return 'yes'
+        return 'y'
 
     monkeypatch.setattr('builtins.input', _reveal_answer)
     assert _cli.main(['repo', 'reveal']) == 0
@@ -552,7 +562,7 @@ def _assert_negative_gates(
     gate_error = capsys.readouterr().err
     assert 'cannot prepare: blocked text in included files' in gate_error
     assert 'private-canary' in gate_error
-    assert _candidate.load_candidate(paths, 'demo') is None
+    assert _records.load_candidate(paths, 'demo') is None
 
     _commit(source, 'third release\n', add_env=True)
     assert_answers = _script_answers(
@@ -563,7 +573,7 @@ def _assert_negative_gates(
     credential_walk = capsys.readouterr()
     assert 'Credential-like file: .env' in credential_walk.out
     assert 'Canceled. Nothing was saved.' in credential_walk.err
-    assert _candidate.load_candidate(paths, 'demo') is None
+    assert _records.load_candidate(paths, 'demo') is None
 
 
 def _initialize_lifecycle(
@@ -614,6 +624,7 @@ def _initialize_lifecycle(
         _config.load_project(paths, 'demo'),
         settings=settings,
         _stage_repo='staging-repo',
+        release_page=_config.ReleasePageSettings(enabled=False),
     )
     _config.save_project(paths, project)
     assert project.required_checks == ('Acceptance',)
@@ -841,6 +852,13 @@ def _initialize(
     assert _cli.main(['init', '--project', 'demo']) == 0
     assert_answers()
     assert _config.load_project(paths, 'demo').allow == ('**',)
+    _config.save_project(
+        paths,
+        replace(
+            _config.load_project(paths, 'demo'),
+            release_page=_config.ReleasePageSettings(enabled=False),
+        ),
+    )
     assert _host_calls() == []
     return paths, source, host
 
@@ -894,11 +912,11 @@ def _assert_policy_growth_acknowledgment(
         displayed = re.sub(r': +', ': ', capsys.readouterr().out)
         assert f'  {new_path}\n' in displayed
         assert 'Saved list:' not in displayed
-        return 'yes'
+        return 'y'
 
     monkeypatch.setattr('builtins.input', _include_new_path)
     assert _cli.main(['prepare', '--version', '1.1.0']) == 0
-    fresh = _candidate.load_candidate(fixture._paths, 'demo')
+    fresh = _records.load_candidate(fixture._paths, 'demo')
     assert fresh is not None
     _write_responses(
         fixture._fake_gh,
@@ -918,7 +936,7 @@ def _assert_policy_growth_acknowledgment(
     refusal = capsys.readouterr().err
     assert '--yes cannot acknowledge historical exposure' in refusal
     assert _git_refs(fixture._publication_host) == published_refs
-    retained = _candidate.load_candidate(fixture._paths, 'demo')
+    retained = _records.load_candidate(fixture._paths, 'demo')
     assert retained is not None
     assert replace(retained, source_bookmark=None) == fresh
     bookmark = _source.describe_bookmark(fixture._source, 'demo', fresh.commit)
@@ -928,17 +946,17 @@ def _assert_policy_growth_acknowledgment(
     assert_answers = _script_answers(
         monkeypatch,
         [
-            ('Continue despite this earlier exposure? [y/n] ', 'yes'),
+            ('Continue despite this earlier exposure? [y/n] ', 'y'),
             (
                 (f'Publish v1.1.0 to {fixture._owner}/{fixture._publication_repo}? [y/n] '),
-                'yes',
+                'y',
             ),
         ],
     )
     assert _cli.main(['publish']) == 0
     assert_answers()
     assert _config.load_project(fixture._paths, 'demo').acknowledged_exposure
-    assert _candidate.load_candidate(fixture._paths, 'demo') is None
+    assert _records.load_candidate(fixture._paths, 'demo') is None
 
 
 def _complete_guided_publication(
@@ -955,7 +973,7 @@ def _complete_guided_publication(
             _repository_response(fixture._owner, fixture._publication_repo, 'private'),
         ],
     )
-    answers = ['no', 'yes']
+    answers = ['n', 'y']
 
     def _publication_answer(prompt: str) -> str:
         assert prompt == (
@@ -979,7 +997,7 @@ def _complete_guided_publication(
     assert 'Canceled. Nothing was published.' in declined.err
     cli_output.extend((declined.out, declined.err))
     assert _git_refs(fixture._publication_host) == {}
-    retained = _candidate.load_candidate(fixture._paths, 'demo')
+    retained = _records.load_candidate(fixture._paths, 'demo')
     assert retained is not None
     assert replace(retained, source_bookmark=None) == candidate
     bookmark = _source.describe_bookmark(fixture._source, 'demo', candidate.commit)
@@ -1221,6 +1239,9 @@ def _initialize_guided_first_run(
     output.extend((init_output.out, init_output.err))
     project = _config.load_project(paths, 'demo')
     assert (project.allow, project.deny) == (('README.md', 'docs/guide.md'), ('docs/private/**',))
+    _config.save_project(
+        paths, replace(project, release_page=_config.ReleasePageSettings(enabled=False))
+    )
     assert project.settings is not None
     assert _git_source_state(source) == (source_refs, source_remotes)
     fixture = _LifecycleFixture(
@@ -1282,6 +1303,9 @@ def _initialize_real_name(
     capture_output()
     project = _config.load_project(paths, 'demo')
     assert project.settings == _REAL_SETTINGS
+    _config.save_project(
+        paths, replace(project, release_page=_config.ReleasePageSettings(enabled=False))
+    )
     return paths, source, host
 
 
@@ -1321,13 +1345,12 @@ def _initialize_release_walk(
     assert 'Created private repository release-account/public-repo.' in created
 
     walk = _ReleaseWalk(fixture, [], [], [], [], 0, 0)
-    real_build_candidate = _prepare.build_candidate
+    real_build_candidate = _prepare._build_candidate
     real_execute_run_stage = _workflow._execute_run_stage
-    real_publication_push = _publish.push
-    real_stage_push = _stage.push
+    real_push = _host.push
 
     def _build_candidate(
-        plan: _prepare.PreparePlan,
+        plan: _prepare._PreparePlan,
         options: _prepare.PrepareOptions,
     ) -> _candidate.CandidateRecord:
         walk._candidate_builds += 1
@@ -1361,7 +1384,7 @@ def _initialize_release_walk(
                         conclusion='failure',
                     ),
                 )
-        return real_publication_push(destination, cwd, args)
+        return real_push(destination, cwd, args)
 
     def _stage_push(
         destination: _host.Destination,
@@ -1381,12 +1404,21 @@ def _initialize_release_walk(
                 fixture._check,
             ),
         )
-        return real_stage_push(destination, cwd, args)
+        return real_push(destination, cwd, args)
 
-    monkeypatch.setattr(_prepare, 'build_candidate', _build_candidate)
+    def _record_push(
+        destination: _host.Destination,
+        cwd: Path,
+        args: Sequence[str],
+    ) -> GitResult:
+        if destination.repo == fixture._staging_repo:
+            return _stage_push(destination, cwd, args)
+        assert destination.repo == fixture._publication_repo
+        return _publication_push(destination, cwd, args)
+
+    monkeypatch.setattr(_prepare, '_build_candidate', _build_candidate)
     monkeypatch.setattr(_workflow, '_execute_run_stage', _execute_run_stage)
-    monkeypatch.setattr(_publish, 'push', _publication_push)
-    monkeypatch.setattr(_stage, 'push', _stage_push)
+    monkeypatch.setattr(_host, 'push', _record_push)
     return walk
 
 
@@ -1451,11 +1483,11 @@ def _reveal_clean_and_restore(
                     'These runs, logs, and artifacts become public with the repository. '
                     'Continue? [y/n] '
                 ),
-                'yes',
+                'y',
             ),
             (
                 'Make it public? [y/n] ',
-                'yes',
+                'y',
             ),
         ],
     )
@@ -1519,7 +1551,7 @@ def _reveal_clean_and_restore(
     )
     assert _cli.main(['repo', 'restore', '--to', 'remote', '--yes']) == 0
     assert _git_refs(fixture._publication_host) == _git_refs(
-        _candidate.store_path(fixture._paths, 'demo')
+        _store.store_path(fixture._paths, 'demo')
     )
 
 
@@ -1557,7 +1589,7 @@ def _run_release_failed_ship(
     assert 'pubanon repo watch' in first_run.err
     assert '--version 0.1.0' in first_run.err
     assert len(walk._publication_pushes) == 1
-    assert _candidate.load_candidate(fixture._paths, 'demo') is None
+    assert _records.load_candidate(fixture._paths, 'demo') is None
     assert f'/commits/{walk._first_oid}/check-runs?' in json.dumps(_host_calls())
 
 
@@ -1593,7 +1625,7 @@ def _run_release_old_version_resume(
     fixture = walk._fixture
     before = _release_published_snapshot(walk)
     _assert_release_published_snapshot(walk, before)
-    assert _candidate.load_candidate(fixture._paths, 'demo') is None
+    assert _records.load_candidate(fixture._paths, 'demo') is None
     first_stage = len(walk._executed_stages)
     builds_before = walk._candidate_builds
 
@@ -1619,7 +1651,7 @@ def _run_release_old_version_resume(
     assert 'Repo watch' in resumed
     assert 'Required checks passed.' in resumed
     assert len(walk._publication_pushes) == 2
-    assert _candidate.load_candidate(fixture._paths, 'demo') is None
+    assert _records.load_candidate(fixture._paths, 'demo') is None
     assert walk._executed_stages[first_stage:] == ['repo watch']
     assert walk._candidate_builds == builds_before
     assert f'/commits/{walk._first_oid}/check-runs?' in resume_log
@@ -1717,7 +1749,7 @@ def _run_release_published_noop(
     fixture = walk._fixture
     before = _release_published_snapshot(walk)
     _assert_release_published_snapshot(walk, before)
-    assert _candidate.load_candidate(fixture._paths, 'demo') is None
+    assert _records.load_candidate(fixture._paths, 'demo') is None
     first_stage = len(walk._executed_stages)
     builds_before = walk._candidate_builds
 
@@ -1734,7 +1766,7 @@ def _run_release_published_noop(
     assert 'Nothing to do: v0.1.0 is already published.' in noop
     assert len(walk._publication_pushes) == 2
     assert _stage.load_stage(fixture._paths, 'demo') == stage_before_noop
-    assert _candidate.load_candidate(fixture._paths, 'demo') is None
+    assert _records.load_candidate(fixture._paths, 'demo') is None
     assert walk._executed_stages[first_stage:] == []
     assert walk._candidate_builds == builds_before
     after = _release_published_snapshot(walk)
@@ -1818,7 +1850,7 @@ def _run_release_reveal_with_package_gate(
             assert '  release-package (id 201)\n  checks-report (id 202)' in visible
         else:
             assert 'Make it public?' in prompt
-        return 'yes'
+        return 'y'
 
     monkeypatch.setattr('builtins.input', _reveal_answer)
     assert _cli.main(['repo', 'reveal']) == 0
@@ -1910,9 +1942,9 @@ def _run_release_staged_release(
 
     def _staged_answer(prompt: str) -> str:
         if prompt.startswith('Use this selection?'):
-            assert _candidate.load_candidate(fixture._paths, 'demo') is None
-            return 'continue'
-        record = _candidate.load_candidate(fixture._paths, 'demo')
+            assert _records.load_candidate(fixture._paths, 'demo') is None
+            return 'c'
+        record = _records.load_candidate(fixture._paths, 'demo')
         assert record is not None
         expected = [
             (
@@ -1927,7 +1959,7 @@ def _run_release_staged_release(
         staged_output.append(visible)
         assert record.commit[:12] in visible if len(prompts_seen) < 2 else 'v0.3.0' in visible
         prompts_seen.append(prompt)
-        return 'yes'
+        return 'y'
 
     monkeypatch.setattr('builtins.input', _staged_answer)
     assert _cli.main(['run', 'staged', '--version', '0.3.0']) == 0
@@ -1961,7 +1993,7 @@ def _stage_and_publish_lifecycle_candidate(
     project = _config.load_project(fixture._paths, 'demo')
     _config.save_project(fixture._paths, replace(project, publication_route='staged'))
     assert _cli.main(['prepare', '--version', '1.0.0', '--yes']) == 0
-    candidate = _candidate.load_candidate(fixture._paths, 'demo')
+    candidate = _records.load_candidate(fixture._paths, 'demo')
     assert candidate is not None
 
     # This is the same fake-create seam for the disposable staging transport.
@@ -2018,7 +2050,7 @@ def _stage_and_publish_lifecycle_candidate(
                     f'{fixture._owner}/{fixture._staging_repo}?'
                     ' [y/n] '
                 ),
-                'yes',
+                'y',
             )
         ],
     )
@@ -2236,25 +2268,25 @@ def test_publication_history_survives_rebase_and_cleanup(
     )
     assert _cli.main(['prepare', '--version', '1.0.0']) == 0
     assert_answers()
-    candidate = _candidate.load_candidate(paths, 'demo')
+    candidate = _records.load_candidate(paths, 'demo')
     assert candidate is not None
     assert candidate.pinned.commit == original
     push_calls: list[tuple[str, ...]] = []
-    real_push = _publish.push
+    real_push = _host.push
 
     def _record_push(destination: _host.Destination, cwd: Path, args: Iterable[str]) -> GitResult:
         refspecs = tuple(args)
         push_calls.append(refspecs)
         return real_push(destination, cwd, refspecs)
 
-    monkeypatch.setattr(_publish, 'push', _record_push)
+    monkeypatch.setattr(_host, 'push', _record_push)
     assert _cli.main(['publish', '--yes']) == 0
     published = candidate.commit
     record = _records.load_publication(paths, 'demo', published)
     assert record is not None
     assert record.source_bookmark is not None
     private_record = _records.publication_path(paths, 'demo', published).read_bytes()
-    assert _candidate.load_candidate(paths, 'demo') is None
+    assert _records.load_candidate(paths, 'demo') is None
     assert len(push_calls) == 1
     host_calls = _host_calls()
     host_refs = _git_refs(host)
@@ -2361,10 +2393,10 @@ def test_real_name_identity_two_releases_audit_and_reveal_work_offline(
     )
 
     def _publish_first(prompt: str) -> str:
-        record = _candidate.load_candidate(paths, 'demo')
+        record = _records.load_candidate(paths, 'demo')
         assert record is not None
         assert prompt == (f'Publish v0.1.0 to {owner}/{repo}? [y/n] ')
-        return 'yes'
+        return 'y'
 
     assert _cli.main(['prepare', '--version', '0.1.0', '--yes']) == 0
     assert _cli.main(['inspect']) == 0
@@ -2441,7 +2473,7 @@ def test_stepwise_publish_path_and_gates_work_offline(
     paths, source, host = _initialize(tmp_path, fake_gh, make_repo, monkeypatch)
 
     assert _cli.main(['prepare', '--version', '1.0.0', '--yes']) == 0
-    first = _candidate.load_candidate(paths, 'demo')
+    first = _records.load_candidate(paths, 'demo')
     assert first is not None
     assert _cli.main(['inspect']) == 0
     inspection = paths.data_dir / 'projects' / 'demo' / 'inspections' / first.commit
@@ -2459,7 +2491,7 @@ def test_stepwise_publish_path_and_gates_work_offline(
 
     _commit(source, 'second release\n')
     assert _cli.main(['prepare', '--version', '1.1.0', '--yes']) == 0
-    second = _candidate.load_candidate(paths, 'demo')
+    second = _records.load_candidate(paths, 'demo')
     assert second is not None
     assert second.prestate_main == first.commit
     assert _cli.main(['inspect']) == 0
