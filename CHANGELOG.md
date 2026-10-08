@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.4.0 (2026-10-07)
+
+### Added
+
+- On the staged route, `init` connects a CI workflow as `ci_workflow` when exactly one selected
+  workflow qualifies, and lists only that workflow's jobs as checks. A workflow qualifies when it
+  declares boolean `workflow_dispatch` inputs named `hosted` and `full_tests` and runs on every
+  branch push.
+- `init --edit` can connect, change, or disconnect the CI workflow in its **checks** section.
+- A starter CI workflow, linked from the guide, that `init` can connect. It can run requested quick
+  and full-test runs on your own runners.
+
+### Changed
+
+- `init` always offers **all listed** for required checks. It is the default when no check is
+  unresolved and either a workflow is connected or no check is flagged.
+- `init` turns on local source tags by default for new projects. Existing projects keep their
+  setting.
+- `repo create` verifies a matching empty repository that you created beforehand, without changing
+  it, instead of refusing it.
+- `stage push` refuses required checks that cannot pass: names that are not jobs in the connected
+  workflow, or checks that no push can start because `CI_RUN_ON_PUSH` is `false` in the staging
+  repository.
+
 ## 0.3.0 (2026-10-06)
 
 ### Added

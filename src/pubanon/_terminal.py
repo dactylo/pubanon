@@ -490,16 +490,26 @@ def next_step(text: str) -> None:
     print(f'{style("Next:")} {style(guidance(text), "choice")}')
 
 
-def render_fields(rows: Sequence[tuple[str, str]], *, indent: int = 0) -> str:
+def render_fields(
+    rows: Sequence[tuple[str, str]], *, indent: int = 0, align_continuations: bool = True
+) -> str:
     """Render already escaped field rows with bold labels and aligned values.
 
     Args:
-        rows: Pairs of field labels without colons and field values.
+        rows: Pairs of field labels without colons and field values. Later
+            lines of a multi-line value align under its first line unless
+            `align_continuations` is false.
         indent: Number of spaces before each label.
+        align_continuations: Add value-column indentation to continuation
+            lines; disable for blocks whose layout is already formatted.
     """
     width = max((len(label) for label, _value in rows), default=0)
+    continuation = '\n' + ' ' * (indent + width + 2) if align_continuations else '\n'
     return '\n'.join(
-        ' ' * indent + style(label + ':') + ' ' * (width - len(label) + 1) + value
+        ' ' * indent
+        + style(label + ':')
+        + ' ' * (width - len(label) + 1)
+        + value.replace('\n', continuation)
         for label, value in rows
     )
 
@@ -508,7 +518,8 @@ def fields(rows: Sequence[tuple[str, str]], *, indent: int = 0) -> None:
     """Print already escaped field rows with bold labels and aligned values.
 
     Args:
-        rows: Pairs of field labels without colons and field values.
+        rows: Pairs of field labels without colons and field values. Later
+            lines of a multi-line value align under its first line.
         indent: Number of spaces before each label.
     """
     if rows:

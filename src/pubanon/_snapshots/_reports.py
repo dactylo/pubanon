@@ -277,7 +277,7 @@ def _candidate_report_details(
                 ('Snapshot tree', record.tree),
             ]
         )
-    lines = [style(title, 'heading'), render_fields(rows)]
+    lines = [style(title, 'heading'), render_fields(rows, align_continuations=False)]
     warning = credential_warning(paths, p.name, record)
     if warning:
         lines.append(warning)

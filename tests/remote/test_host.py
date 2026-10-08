@@ -2491,6 +2491,32 @@ def test_repository_settings_refuses_missing_or_wrongly_typed_facts(
         _host.repository_settings('publication-owner', 'public-repo')
 
 
+def test_repository_variable_passes_its_timeout_to_gh(
+    fake_gh: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_responses(
+        fake_gh,
+        [
+            {
+                'args': ['api', 'repos/owner/repo/actions/variables/CI_RUN_ON_PUSH'],
+                'stdout': json.dumps({'name': 'CI_RUN_ON_PUSH', 'value': 'false'}),
+            }
+        ],
+    )
+    original_run = cast('Callable[..., subprocess.CompletedProcess[bytes]]', subprocess.run)
+    timeouts: list[object] = []
+
+    def _capture(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        timeouts.append(kwargs.get('timeout'))
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(_host.subprocess, 'run', _capture)
+
+    assert _host.repository_variable(('owner', 'repo'), 'CI_RUN_ON_PUSH', timeout=30.0) == 'false'
+    assert timeouts == [30.0]
+
+
 @pytest.mark.parametrize(
     'stdout',
     [

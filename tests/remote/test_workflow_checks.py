@@ -1,13 +1,122 @@
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
 from pubanon._remote import _workflow_checks
 from pubanon._snapshots._source import Entry
 
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+_DISPATCH_INPUTS = """\
+  workflow_dispatch:
+    inputs:
+      hosted:
+        type: boolean
+      full_tests:
+        type: boolean
+"""
+_DYNAMIC_PUSH = """\
+on: push
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: ${{ fromJSON(vars.OSES) }}
+    runs-on: linux
+"""
+_JOB = 'jobs:\n  test:\n    runs-on: linux\n'
+_PLAIN_LINT = 'on: push\njobs:\n  lint:\n    runs-on: linux\n'
+_PLAIN_TEST = 'on: push\njobs:\n  test:\n    runs-on: linux\n'
+_STARTER = Path(__file__).parents[2] / 'docs/examples/ci.yml'
+
+
+def _requestable(push: str = '  push:\n', jobs: str = _JOB) -> str:
+    return f'on:\n{push}{_DISPATCH_INPUTS}{jobs}'
+
 
 def _workflow(data: str, path: str = '.github/workflows/checks.yml') -> Entry:
     return Entry(path, 0o100644, 'blob', data.encode())
+
+
+def test_detect_checks_the_trigger_even_when_no_job_resolves() -> None:
+    jobs = (
+        'jobs:\n  test:\n    strategy:\n      matrix:\n'
+        '        os: ${{ fromJSON(vars.OSES) }}\n    runs-on: linux\n'
+    )
+    snapshot = (
+        _workflow(
+            _requestable(push='  push:\n    paths: ["src/**"]\n', jobs=jobs),
+            '.github/workflows/ci.yml',
+        ),
+    )
+
+    assert _workflow_checks.discover(snapshot).cautions == ()
+    detection = _workflow_checks.detect(snapshot)
+    assert detection.requestable == ('ci.yml',)
+    assert detection.connectable == ()
+
+
+def test_detect_classifies_requestable_and_connectable_workflows() -> None:
+    manual = (
+        'does not start on every branch push (workflow starts manually; a push does not start it)'
+    )
+    paths = (
+        'does not start on every branch push '
+        '(workflow filters changed paths and may not run for every push)'
+    )
+    missing = 'does not declare workflow_dispatch inputs'
+    detection = _workflow_checks.detect(
+        (
+            _workflow(_requestable(), '.github/workflows/ci.yml'),
+            _workflow(_requestable(push=''), '.github/workflows/manual.yml'),
+            _workflow('on:\n  workflow_dispatch:\njobs: {}\n', '.github/workflows/partial.yml'),
+            _workflow(
+                _requestable(push='  push:\n    paths: ["src/**"]\n'),
+                '.github/workflows/paths.yml',
+            ),
+            _workflow(_PLAIN_LINT, '.github/workflows/plain.yml'),
+        )
+    )
+
+    assert detection.requestable == ('ci.yml', 'manual.yml', 'paths.yml')
+    assert detection.connectable == ('ci.yml',)
+    assert detection.problems == {
+        'manual.yml': manual,
+        'partial.yml': missing,
+        'paths.yml': paths,
+        'plain.yml': missing,
+    }
+    assert detection.notes == (
+        f'.github/workflows/manual.yml: {manual}',
+        f'.github/workflows/partial.yml: {missing}',
+        f'.github/workflows/paths.yml: {paths}',
+    )
+
+
+def test_detect_reads_only_direct_workflow_blobs() -> None:
+    data = _requestable().encode()
+    detection = _workflow_checks.detect(
+        (
+            Entry('workflow.yml', 0o100644, 'blob', data),
+            Entry('.github/workflows/nested/ci.yml', 0o100644, 'blob', data),
+            Entry('.github/workflows/ci.txt', 0o100644, 'blob', data),
+            Entry('.github/workflows/link.yml', 0o120000, 'symlink', data),
+        )
+    )
+
+    assert detection == _workflow_checks.WorkflowDetection((), (), {}, ())
+
+
+def test_detect_refuses_a_file_name_ci_workflow_cannot_use() -> None:
+    detection = _workflow_checks.detect(
+        (_workflow(_requestable(), '.github/workflows/.hidden.yml'),)
+    )
+
+    assert detection.requestable == ('.hidden.yml',)
+    assert detection.connectable == ()
+    assert detection.problems == {'.hidden.yml': 'has a file name that ci_workflow cannot use'}
 
 
 def test_discover_applies_simple_exclude_and_include_entries() -> None:
@@ -109,6 +218,10 @@ jobs:
     assert tuple(caution.name for caution in result.cautions) == result.names
     assert all(
         any('condition' in message for message in caution.reasons) for caution in result.cautions
+    )
+    assert all(
+        caution.reasons == ('job runs only when its if: condition holds',)
+        for caution in result.cautions
     )
 
 
@@ -248,6 +361,18 @@ jobs:
     assert result.notes == ()
 
 
+def test_discover_workflow_reads_only_the_named_workflow() -> None:
+    snapshot = (
+        _workflow('jobs:\n  quality:\n    runs-on: linux\n', '.github/workflows/ci.yml'),
+        _workflow('jobs:\n  publish:\n    runs-on: linux\n', '.github/workflows/release.yml'),
+    )
+
+    assert _workflow_checks.discover_workflow(snapshot, 'ci.yml').names == ('quality',)
+    assert _workflow_checks.discover_workflow(
+        snapshot, 'absent.yml'
+    ) == _workflow_checks.Discovery((), ())
+
+
 def test_dispatch_contract_accepts_pubanon_workflow() -> None:
     workflow = Path(__file__).parents[2] / '.github/workflows/ci.yml'
 
@@ -321,3 +446,95 @@ def test_discover_recognizes_unfiltered_branch_pushes(trigger: str) -> None:
 
     assert result.names == ('quality',)
     assert result.cautions == ()
+
+
+@pytest.mark.parametrize(
+    ('push', 'connectable'),
+    [
+        ('  push:\n', True),
+        ('  push:\n    branches: ["**"]\n', True),
+        ('  push:\n    branches: [main]\n', False),
+        ('  push:\n    tags: ["v*"]\n', False),
+        ('  push:\n    paths-ignore: ["docs/**"]\n', False),
+        ('', False),
+    ],
+)
+def test_detect_connects_only_workflows_that_start_on_every_branch_push(
+    push: str,
+    connectable: bool,
+) -> None:
+    detection = _workflow_checks.detect(
+        (_workflow(_requestable(push=push), '.github/workflows/ci.yml'),)
+    )
+
+    assert detection.requestable == ('ci.yml',)
+    assert (detection.connectable == ('ci.yml',)) is connectable
+
+
+@pytest.mark.parametrize(
+    ('trigger', 'noted'),
+    [
+        ('on: workflow_dispatch', True),
+        ('on: [push, workflow_dispatch]', True),
+        ('on:\n  workflow_dispatch:', True),
+        ('on: push', False),
+    ],
+)
+def test_detect_notes_dispatch_triggers_without_inputs(trigger: str, noted: bool) -> None:
+    detection = _workflow_checks.detect((_workflow(f'{trigger}\njobs: {{}}\n'),))
+
+    assert detection.requestable == ()
+    assert detection.problems == {'checks.yml': 'does not declare workflow_dispatch inputs'}
+    expected = ('.github/workflows/checks.yml: does not declare workflow_dispatch inputs',)
+    assert detection.notes == (expected if noted else ())
+
+
+@pytest.mark.parametrize(
+    ('files', 'checks', 'expected'),
+    [
+        ({'ci.yml': _requestable()}, ('test',), True),
+        ({'ci.yml': _requestable(push='')}, ('test',), True),
+        ({'ci.yml': _requestable()}, (), False),
+        ({'ci.yml': _requestable(), 'plain.yml': _PLAIN_LINT}, ('lint',), False),
+        ({'ci.yml': _requestable(), 'plain.yml': _PLAIN_TEST}, ('test',), False),
+        ({'ci.yml': _requestable(), 'plain.yml': _DYNAMIC_PUSH}, ('test',), False),
+        ({'ci.yml': _requestable()}, ('missing',), False),
+        ({'plain.yml': _PLAIN_TEST}, ('test',), False),
+    ],
+)
+def test_only_requestable_checks_requires_evidence(
+    files: dict[str, str],
+    checks: tuple[str, ...],
+    expected: bool,
+) -> None:
+    snapshot = tuple(_workflow(data, f'.github/workflows/{name}') for name, data in files.items())
+
+    assert _workflow_checks.only_requestable_checks(snapshot, checks) is expected
+
+
+def test_starter_workflow_is_connectable_and_lists_every_job() -> None:
+    data = _STARTER.read_bytes()
+    snapshot = (Entry('.github/workflows/ci.yml', 0o100644, 'blob', data),)
+    discovered = _workflow_checks.discover(snapshot)
+
+    assert _workflow_checks.dispatch_contract_problem(data) is None
+    assert _workflow_checks.detect(snapshot).connectable == ('ci.yml',)
+    assert discovered.names == (
+        'test (ubuntu-24.04)',
+        'test (macos-15)',
+        'test (windows-2022)',
+        'hosted-validation',
+    )
+    assert discovered.notes == ()
+
+
+def test_starter_workflow_skips_push_runs_and_fails_until_customized() -> None:
+    root, problem = _workflow_checks._load_workflow(_STARTER.read_bytes())
+    assert problem is None
+    assert root is not None
+    jobs = cast('Mapping[str, Mapping[str, object]]', root['jobs'])
+
+    assert set(jobs) == {'test', 'hosted-validation'}
+    assert all("vars.CI_RUN_ON_PUSH != 'false'" in str(job['if']) for job in jobs.values())
+    steps = cast('list[Mapping[str, object]]', jobs['test']['steps'])
+    assert str(steps[-1]['run']).rstrip().endswith('exit 1')

@@ -37,7 +37,7 @@ and change before it runs.
 | Command                                | External change                                                                                                                                                                                                        | What stays unchanged                                                     |
 | -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
 | `pubanon setup` (selected login only)  | Starts the GitHub CLI browser login you select; `gh` may store credentials and select HTTPS.                                                                                                                           | No repository creation, push, visibility change, or `gh auth setup-git`. |
-| `pubanon repo create`                  | Creates the configured empty repository with its saved visibility.                                                                                                                                                     | No push or visibility change.                                            |
+| `pubanon repo create`                  | Creates the configured empty repository with its saved visibility, or checks an existing empty repository without changing it.                                                                                         | No push or visibility change.                                            |
 | `pubanon publish`                      | Atomically publishes the snapshot; an explicit replacement rewrites `main` and its planned tags. Creates a release page for a tagged version after publication when release pages are on or `--release-page` is given. | No repository creation, visibility change, staging, or package upload.   |
 | `pubanon release create TAG`           | Creates a GitHub release page for a verified published tag after confirmation.                                                                                                                                         | No snapshot push, tag creation, or package upload.                       |
 | `pubanon release edit TAG`             | Changes the selected page's title or notes after confirmation.                                                                                                                                                         | Keeps the tag, status, assets, and other page settings.                  |
@@ -247,11 +247,11 @@ A replacement publication updates the version's tag to its replacement source. F
 release, the tag identifies its original source input; use `inspect --published` to see the
 complete derived result.
 
-The option defaults to off. `pubanon init --no-source-tags` stops tag updates without deleting
-existing tags. Snapshot cleanup also preserves these visible tags; remove unwanted ones with
-`git tag -d pubanon/v0.1.0`. A conflicting tag is left unchanged with a warning, and a tag update
-failure does not undo a completed publication. Correct the local problem and run `pubanon list` to
-retry.
+New project initialization defaults to on. `pubanon init --no-source-tags` stops tag updates
+without deleting existing tags. Snapshot cleanup also preserves these visible tags; remove unwanted
+ones with `git tag -d pubanon/v0.1.0`. A conflicting tag is left unchanged with a warning, and a
+tag update failure does not undo a completed publication. Correct the local problem and run
+`pubanon list` to retry.
 
 ## Retrying an interrupted command
 
@@ -283,7 +283,8 @@ replacement may move or remove tags only as already reviewed in that snapshot.
 - If `run NAME` stops, rerun the same invocation. Completed publication is recognized by its exact
   version, and only the declared later stages run. If you edit the workflow declaration, the next
   invocation uses the new sequence. Review its printed stages before proceeding.
-- If repository creation may be partial, run `pubanon repo verify`.
+- If repository creation may be partial, rerun `pubanon repo create`. It checks an existing empty
+  repository without changing it and reports any configuration mismatch.
 - If the host is an empty or exact-prefix restoration, run `pubanon repo restore --to remote`.
 - If staging fails, check `pubanon stage status`, then use `stage repair` to reconnect tracking or
   `stage push` to send a new reviewed snapshot. `stage forget` only disconnects tracking; to
@@ -298,6 +299,11 @@ replacement may move or remove tags only as already reviewed in that snapshot.
   rerunning requests another run and makes it the latest evidence. A failed or cancelled latest run
   blocks publication. Inspect its jobs, then request a new run; use `--hosted` when a required
   `hosted-validation` job was skipped by a local run.
+- If `stage push` reports that required checks are not jobs in the connected workflow, correct them
+  with `pubanon init --edit`, then run `pubanon discard` and `pubanon prepare`. If it reports that
+  push CI is off in the staging repository and no CI workflow is connected, connect the workflow it
+  names with `pubanon init --edit`, then run `pubanon discard` and `pubanon prepare`.
+  Alternatively, delete `CI_RUN_ON_PUSH` from the staging repository on GitHub.
 - If a watch reaches its time limit, follow its observed-state recovery and rerun the same watch.
   Pending checks need more time; missing checks need their configured name and workflow trigger
   checked; ambiguous checks need the multiple matches resolved; failed checks need inspection and a

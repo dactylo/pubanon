@@ -20,6 +20,28 @@ from tests._setup import configure
 
 _Script = Callable[[Sequence[str | tuple[str, str]]], None]
 
+_CONNECTABLE = """\
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      hosted:
+        type: boolean
+      full_tests:
+        type: boolean
+jobs:
+  quality:
+    if: github.event_name != 'push'
+    runs-on: linux
+  hosted-validation:
+    runs-on: linux
+"""
+_EDIT = (
+    'Edit: [v]isibility / [s]ettings / [r]oute / [c]hecks / re[l]ease pages / [t]ags / [b]ack: '
+)
+_KEEP_CHECKS = (
+    'Require checks: [a]ll listed / [s]elect / [n]one / [m]anual / [k]eep current [keep current]: '
+)
 _PAGES = 'Create a release page for each published version? [y/N] '
 _SAVE = 'Save this configuration? [s]ave / [e]dit / [c]ancel: '
 
@@ -77,7 +99,7 @@ def _default_route(answer: Callable[[str], str]) -> Callable[[str], str]:
     def _reply(prompt: str) -> str:
         if prompt.startswith('Publication route (staged/direct) ['):
             return ''
-        if prompt == 'Create local tags marking the source of each publication? [y/N] ':
+        if prompt.startswith('Create local tags marking the source of each publication? '):
             return ''
         if prompt in {'Enable pull requests? [y/N] ', 'Enable discussions? [y/N] '}:
             return ''
@@ -86,6 +108,36 @@ def _default_route(answer: Callable[[str], str]) -> Callable[[str], str]:
         return answer(prompt)
 
     return _reply
+
+
+def _edit_checks(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    workflows: dict[str, str],
+    **changes: object,
+) -> tuple[_context.ProjectContext, _source.Snapshot, _config.ProjectConfig]:
+    files = {f'.github/workflows/{name}': data for name, data in workflows.items()}
+    source = make_repo(files={**files, 'README.md': 'public\n'})
+    paths, global_config, project = configure(tmp_path, monkeypatch, source)
+    assert project is not None
+    project = replace(project, **changes)
+    snapshot = _source.read_snapshot(source, _source.pin(source, 'HEAD').commit)
+    return _context.ProjectContext(paths, global_config, project), snapshot, project
+
+
+def _unselected_project(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[_config.Paths, Path]:
+    source = make_repo(files={'README.md': 'public\n', 'extra.txt': 'new\n'})
+    paths, _global_config, project = configure(tmp_path, monkeypatch, source)
+    assert project is not None
+    _config.save_project(paths, replace(project, allow=('README.md',)))
+    monkeypatch.chdir(source)
+    monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+    return paths, paths.config_dir / 'projects' / 'demo.toml'
 
 
 def test_init_back_corrects_flagged_and_group_choices(
@@ -113,12 +165,23 @@ def test_init_back_corrects_flagged_and_group_choices(
     assert project.secret_exceptions == ('.env',)
 
 
+@pytest.mark.parametrize(
+    'tag_case',
+    [
+        ('', None, True),
+        ('n', None, False),
+        (None, '--no-source-tags', False),
+        (None, '--source-tags', True),
+    ],
+)
 def test_init_collects_complete_repository_settings_for_new_project(
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    tag_case: tuple[str | None, str | None, bool],
 ) -> None:
+    tag_answer, flag, source_tags = tag_case
     source = make_repo(files={'README.md': 'public\n'})
     paths, _global_config, _project = configure(tmp_path, monkeypatch)
     monkeypatch.chdir(source)
@@ -137,9 +200,11 @@ def test_init_collects_complete_repository_settings_for_new_project(
         'Enable projects? [y/N] ': 'y',
         'Enable pull requests? [y/N] ': '',
         'Enable discussions? [y/N] ': 'y',
-        'Create local tags marking the source of each publication? [y/N] ': 'y',
         'Save this configuration? [s]ave / [e]dit / [c]ancel: ': 's',
     }
+
+    if tag_answer is not None:
+        answers['Create local tags marking the source of each publication? [Y/n] '] = tag_answer
 
     def _answer(prompt: str) -> str:
         prompts.append(prompt)
@@ -149,7 +214,7 @@ def test_init_collects_complete_repository_settings_for_new_project(
 
     monkeypatch.setattr('builtins.input', _answer)
 
-    assert _cli.main(['init', '--project', 'demo']) == 0
+    assert _cli.main(['init', '--project', 'demo', *([flag] if flag else [])]) == 0
 
     project = _config.load_project(paths, 'demo')
     assert project.settings == _config.Settings(
@@ -161,36 +226,127 @@ def test_init_collects_complete_repository_settings_for_new_project(
         pull_requests=False,
         discussions=True,
     )
-    assert project.source_tags is True
+    assert project.source_tags is source_tags
     assert project.release_page == _config.ReleasePageSettings(enabled=True)
-    assert prompts.count('Create local tags marking the source of each publication? [y/N] ') == 1
+    assert prompts.count('Create local tags marking the source of each publication? [Y/n] ') == (
+        tag_answer is not None
+    )
     text = (paths.config_dir / 'projects' / 'demo.toml').read_text()
     assert '[settings]\ndescription = "Example project"\n' in text
     assert '[release_page]\nenabled = true\n' in text
     assert 'projects = true\npull_requests = false\ndiscussions = true\n' in text
-    assert prompts.index('Enable projects? [y/N] ') < prompts.index('Enable pull requests? [y/N] ')
-    assert prompts.index('Enable pull requests? [y/N] ') < prompts.index(
-        'Enable discussions? [y/N] '
-    )
-    assert prompts.index('Required CI checks (comma separated, blank for none): ') < prompts.index(
-        'Repository description (blank for none): '
-    )
-    page_prompt = 'Create a release page for each published version? [y/N] '
-    assert prompts.index('Required CI checks (comma separated, blank for none): ') < (
-        prompts.index(page_prompt)
-    )
-    assert prompts.index(page_prompt) < prompts.index('Repository description (blank for none): ')
+    ordered = [
+        'Repository visibility (private/public) [private]: ',
+        'Repository description (blank for none): ',
+        'Enable issues? [Y/n] ',
+        'Enable pull requests? [y/N] ',
+        'Enable discussions? [y/N] ',
+        'Enable projects? [y/N] ',
+        'Enable wiki? [y/N] ',
+        'Publication route (staged/direct) [staged]: ',
+        'Required CI checks (comma separated, blank for none): ',
+        'Create a release page for each published version? [y/N] ',
+        *(
+            ['Create local tags marking the source of each publication? [Y/n] ']
+            if tag_answer is not None
+            else []
+        ),
+    ]
+    positions = [prompts.index(prompt) for prompt in ordered]
+    assert positions == sorted(positions)
     review = capsys.readouterr().out
     assert 'Each page is created right after publishing, before CI runs.' in review
     assert 'Release pages:' in review
     assert 'pubanon publishes from the private source and does not merge on GitHub.' in review
     assert 'Features:' in review
-    assert 'issues, projects, and discussions on' in review
-    assert 'wiki and pull requests off' in review
+    assert 'issues, discussions, and projects on' in review
+    assert 'pull requests and wiki off' in review
     assert 'Staging repository:' in review
     assert 'Publication uses the main branch.' not in review
     assert 'Setup progress saved.' not in review
     assert 'Next: pubanon repo create' in review
+
+
+def test_init_connects_none_of_several_connectable_workflows(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = make_repo(
+        files={
+            '.github/workflows/ci.yml': _CONNECTABLE,
+            '.github/workflows/other.yml': _CONNECTABLE,
+            'README.md': 'public\n',
+        }
+    )
+    paths, _global, _project = configure(tmp_path, monkeypatch)
+    monkeypatch.chdir(source)
+    replies = iter(['c', '', '', '', '', '', '', '', 'n', 's'])
+
+    def _reply(_prompt: str) -> str:
+        return next(replies)
+
+    monkeypatch.setattr('builtins.input', _default_route(_reply))
+    assert _cli.main(['init', '--project', 'demo']) == 0
+
+    assert _config.load_project(paths, 'demo').ci_workflow is None
+    assert (
+        'Several workflows can be connected: ci.yml, other.yml. '
+        'Choose one with pubanon init --edit.'
+    ) in capsys.readouterr().out
+
+
+def test_init_connects_nothing_on_the_direct_route(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_repo(files={'.github/workflows/ci.yml': _CONNECTABLE, 'README.md': 'public\n'})
+    paths, _global, _project = configure(tmp_path, monkeypatch)
+    monkeypatch.chdir(source)
+    replies = iter(['c', '', '', '', '', '', '', '', 'a', 's'])
+    prompts: list[str] = []
+
+    def _reply(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(replies)
+
+    monkeypatch.setattr('builtins.input', _default_route(_reply))
+    assert _cli.main(['init', '--project', 'demo', '--publication-route', 'direct']) == 0
+
+    project = _config.load_project(paths, 'demo')
+    assert project.ci_workflow is None
+    assert project.required_checks == ('quality', 'hosted-validation')
+    assert 'Require checks: [a]ll listed / [s]elect / [n]one / [m]anual: ' in prompts
+
+
+def test_init_connects_the_single_connectable_workflow_on_the_staged_route(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = make_repo(files={'.github/workflows/ci.yml': _CONNECTABLE, 'README.md': 'public\n'})
+    paths, _global, _project = configure(tmp_path, monkeypatch)
+    monkeypatch.chdir(source)
+    replies = iter(['c', '', '', '', '', '', '', '', '', 's'])
+    prompts: list[str] = []
+
+    def _reply(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(replies)
+
+    monkeypatch.setattr('builtins.input', _default_route(_reply))
+    assert _cli.main(['init', '--project', 'demo']) == 0
+
+    project = _config.load_project(paths, 'demo')
+    assert project.ci_workflow == 'ci.yml'
+    assert project.required_checks == ('quality', 'hosted-validation')
+    assert 'Require checks: [a]ll listed / [s]elect / [n]one / [m]anual [all listed]: ' in prompts
+    output = capsys.readouterr().out
+    assert 'pubanon will request runs of ci.yml' in output
+    assert re.search(r'CI workflow:\s+ci\.yml', output)
 
 
 def test_init_displays_policy_offer_paths(
@@ -275,6 +431,30 @@ def test_init_edit_accepting_off_release_pages_keeps_unset_configuration(
     assert _config.load_project(paths, 'demo').release_page == page
 
 
+@pytest.mark.parametrize(
+    'case',
+    [('staged', (), 'ci.yml'), ('direct', (), None), ('staged', ('.github/**',), None)],
+)
+def test_connect_workflow_follows_the_current_route_and_selection(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    case: tuple[str, tuple[str, ...], str | None],
+) -> None:
+    route, deny, expected = case
+    source = make_repo(files={'.github/workflows/ci.yml': _CONNECTABLE, 'README.md': 'public\n'})
+    paths, global_config, project = configure(tmp_path, monkeypatch, source)
+    assert project is not None
+    project = replace(project, publication_route=route, deny=deny)
+    snapshot = _source.read_snapshot(source, _source.pin(source, 'HEAD').commit)
+
+    connected = _init._connect_workflow(
+        _context.ProjectContext(paths, global_config, project), snapshot
+    )
+
+    assert connected.project.ci_workflow == expected
+
+
 def test_init_edit_can_correct_description_after_failed_save(
     tmp_path: Path,
     make_repo: Callable[..., Path],
@@ -290,10 +470,10 @@ def test_init_edit_can_correct_description_after_failed_save(
     monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
     feature_answers = [
         ('Enable issues? [Y/n] ', ''),
-        ('Enable wiki? [y/N] ', ''),
-        ('Enable projects? [y/N] ', ''),
         ('Enable pull requests? [y/N] ', ''),
         ('Enable discussions? [y/N] ', ''),
+        ('Enable projects? [y/N] ', ''),
+        ('Enable wiki? [y/N] ', ''),
     ]
     answers(
         [
@@ -319,6 +499,30 @@ def test_init_edit_can_correct_description_after_failed_save(
     out = capsys.readouterr().out
     assert 'repository description did not pass content checks' in out
     assert 'Saved project demo.' in out
+
+
+def test_init_edit_cancel_after_blocked_checks_saves_nothing(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    answers: _Script,
+) -> None:
+    _paths, project_file = _unselected_project(tmp_path, make_repo, monkeypatch)
+    before = project_file.read_bytes()
+    answers(
+        [
+            (_SAVE, 'e'),
+            (_EDIT, 'v'),
+            ('Repository visibility (private/public) [private]: ', 'public'),
+            (_SAVE, 'e'),
+            (_EDIT, 'c'),
+            (_SAVE, 'c'),
+        ]
+    )
+
+    assert _cli.main(['init', '--edit']) == 130
+
+    assert project_file.read_bytes() == before
 
 
 def test_init_edit_cancel_or_unchanged_save_writes_nothing(
@@ -366,10 +570,10 @@ def test_init_edit_changes_checks_and_repository_settings(
             's',
             ('Repository description (blank for none): ', 'Public tool'),
             ('Enable issues? [Y/n] ', 'n'),
-            ('Enable wiki? [y/N] ', ''),
-            ('Enable projects? [y/N] ', ''),
             ('Enable pull requests? [y/N] ', ''),
             ('Enable discussions? [y/N] ', 'y'),
+            ('Enable projects? [y/N] ', ''),
+            ('Enable wiki? [y/N] ', ''),
             (_SAVE, 's'),
         ]
     )
@@ -384,6 +588,90 @@ def test_init_edit_changes_checks_and_repository_settings(
     assert saved.allow == project.allow
     assert (saved.owner, saved.repo) == (project.owner, project.repo)
     assert 'Changing required checks invalidates a prepared snapshot.' in capsys.readouterr().out
+
+
+def test_init_edit_changes_the_workflow_by_number(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    answers: _Script,
+) -> None:
+    ctx, snapshot, project = _edit_checks(
+        tmp_path,
+        make_repo,
+        monkeypatch,
+        {'ci.yml': _CONNECTABLE, 'other.yml': _CONNECTABLE},
+        publication_route='staged',
+        ci_workflow='ci.yml',
+        required_checks=('quality',),
+    )
+    answers(
+        [
+            (_EDIT, 'c'),
+            ('CI workflow: [k]eep / [c]onnect / [n]one [keep]: ', 'c'),
+            ('Workflow number: ', '3'),
+            ('Workflow number: ', '2'),
+            (_KEEP_CHECKS, ''),
+        ]
+    )
+
+    edited = _init._edit_project_section(ctx, snapshot, project)
+
+    assert edited.ci_workflow == 'other.yml'
+    assert edited.required_checks == ('quality',)
+
+
+def test_init_edit_connects_the_offered_workflow(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    answers: _Script,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ctx, snapshot, project = _edit_checks(
+        tmp_path, make_repo, monkeypatch, {'ci.yml': _CONNECTABLE}, publication_route='staged'
+    )
+    answers(
+        [
+            (_EDIT, 'c'),
+            ('CI workflow: [c]onnect / [n]one [connect]: ', ''),
+            ('Require checks: [a]ll listed / [s]elect / [n]one / [m]anual [all listed]: ', ''),
+        ]
+    )
+
+    edited = _init._edit_project_section(ctx, snapshot, project)
+
+    assert edited.ci_workflow == 'ci.yml'
+    assert edited.required_checks == ('quality', 'hosted-validation')
+    assert 'Changing the CI workflow invalidates a prepared snapshot.' in capsys.readouterr().out
+
+
+def test_init_edit_disconnects_the_workflow(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    answers: _Script,
+) -> None:
+    ctx, snapshot, project = _edit_checks(
+        tmp_path,
+        make_repo,
+        monkeypatch,
+        {'ci.yml': _CONNECTABLE},
+        publication_route='staged',
+        ci_workflow='ci.yml',
+    )
+    answers(
+        [
+            (_EDIT, 'c'),
+            ('CI workflow: [k]eep / [c]onnect / [n]one [keep]: ', 'n'),
+            ('Require checks: [a]ll listed / [s]elect / [n]one / [m]anual: ', 'n'),
+        ]
+    )
+
+    edited = _init._edit_project_section(ctx, snapshot, project)
+
+    assert edited.ci_workflow is None
+    assert edited.required_checks == ()
 
 
 def test_init_edit_invalid_saved_default_branch_can_cancel_after_failed_save(
@@ -424,6 +712,36 @@ def test_init_edit_invalid_saved_default_branch_can_cancel_after_failed_save(
     assert escape(project_file.as_posix()) in out
 
 
+def test_init_edit_keeps_unsaved_edits_when_new_files_block_checks(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    answers: _Script,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paths, _project_file = _unselected_project(tmp_path, make_repo, monkeypatch)
+    answers(
+        [
+            (_SAVE, 'e'),
+            (_EDIT, 'v'),
+            ('Repository visibility (private/public) [private]: ', 'public'),
+            (_SAVE, 'e'),
+            (_EDIT, 'c'),
+            (_SAVE, 's'),
+        ]
+    )
+
+    assert _cli.main(['init', '--edit']) == 0
+
+    project = _config.load_project(paths, 'demo')
+    assert project.visibility == 'public'
+    assert project.allow == ('README.md',)
+    output = capsys.readouterr().out
+    assert 'Checks cannot be edited yet' in output
+    assert '  extra.txt\n' in output
+    assert 'Save or cancel this session first.' in output
+
+
 def test_init_edit_refuses_without_project_or_terminal(
     tmp_path: Path,
     make_repo: Callable[..., Path],
@@ -444,6 +762,40 @@ def test_init_edit_refuses_without_project_or_terminal(
     monkeypatch.setattr(sys.stdin, 'isatty', lambda: False)
     assert _cli.main(['init', '--edit']) == 1
     assert 'init --edit requires an interactive terminal' in capsys.readouterr().err
+
+
+def test_init_edit_skips_the_workflow_prompt_without_candidates(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    answers: _Script,
+) -> None:
+    ctx, snapshot, project = _edit_checks(
+        tmp_path, make_repo, monkeypatch, {}, publication_route='staged'
+    )
+    answers([(_EDIT, 'c'), ('Required CI checks (comma separated, blank for none): ', '')])
+
+    assert _init._edit_project_section(ctx, snapshot, project).ci_workflow is None
+
+
+def test_init_edit_suggests_no_workflow_on_the_direct_route(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    answers: _Script,
+) -> None:
+    ctx, snapshot, project = _edit_checks(
+        tmp_path, make_repo, monkeypatch, {'ci.yml': _CONNECTABLE}, publication_route='direct'
+    )
+    answers(
+        [
+            (_EDIT, 'c'),
+            ('CI workflow: [c]onnect / [n]one [none]: ', ''),
+            ('Require checks: [a]ll listed / [s]elect / [n]one / [m]anual: ', 'n'),
+        ]
+    )
+
+    assert _init._edit_project_section(ctx, snapshot, project).ci_workflow is None
 
 
 def test_init_edit_turns_on_release_pages_and_keeps_other_settings(
@@ -488,6 +840,37 @@ def test_init_edit_turns_on_release_pages_and_keeps_other_settings(
     out = capsys.readouterr().out
     assert 'To change the selected files, run pubanon prepare and choose review.' in out
     assert 'Saved project demo.' in out
+
+
+def test_init_edit_warns_about_a_workflow_that_cannot_be_connected(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    answers: _Script,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ctx, snapshot, project = _edit_checks(
+        tmp_path,
+        make_repo,
+        monkeypatch,
+        {'ci.yml': _CONNECTABLE},
+        publication_route='staged',
+        ci_workflow='gone.yml',
+    )
+    answers(
+        [
+            (_EDIT, 'c'),
+            ('CI workflow: [k]eep / [c]onnect / [n]one [keep]: ', 'k'),
+            ('Required CI checks (comma separated, blank for none): ', ''),
+        ]
+    )
+
+    edited = _init._edit_project_section(ctx, snapshot, project)
+
+    assert edited.ci_workflow == 'gone.yml'
+    output = capsys.readouterr().out
+    assert 'gone.yml is not in the selected files.' in output
+    assert 'Changing the CI workflow' not in output
 
 
 def test_init_existing_project_with_local_publication_offers_prepare(
@@ -706,7 +1089,7 @@ def test_init_offers_committed_workflow_checks_without_typing_names(
         'tests (ubuntu-24.04, 3.13)',
         'tests (macos-15, 3.13)',
     )
-    assert 'Require checks: [a]ll listed / [s]elect / [n]one / [m]anual: ' in prompts
+    assert 'Require checks: [a]ll listed / [s]elect / [n]one / [m]anual [all listed]: ' in prompts
     output = capsys.readouterr().out
     assert '1. quality' in output
     assert '2. tests (ubuntu-24.04, 3.13)' in output
@@ -1151,7 +1534,7 @@ def test_init_resumes_each_repository_setting_answer(
     source = make_repo(files={'README.md': 'public\n'})
     paths, _global, _project = configure(tmp_path, monkeypatch)
     monkeypatch.chdir(source)
-    first = iter(['c', '', '', '', 'Lint', 'Description', 'n'])
+    first = iter(['c', '', '', '', 'Description', 'n', 'n'])
 
     def _interrupt(prompt: str) -> str:
         if prompt == 'Enable wiki? [y/N] ':
@@ -1160,7 +1543,7 @@ def test_init_resumes_each_repository_setting_answer(
 
     monkeypatch.setattr('builtins.input', _default_route(_interrupt))
     assert _cli.main(['init', '--project', 'demo']) == 130
-    replies = iter(['r', 'y', 'n', 's'])
+    replies = iter(['r', 'y', 'Lint', 's'])
     prompts: list[str] = []
 
     def _resume(prompt: str) -> str:
@@ -1197,23 +1580,23 @@ def test_init_retries_description_matching_sensitive_term(
         ('GitHub owner [anonymous-account]: ', ''),
         ('GitHub repository [demo]: ', ''),
         ('Repository visibility (private/public) [private]: ', ''),
-        ('Required CI checks (comma separated, blank for none): ', ''),
         ('Repository description (blank for none): ', 'Work by Private Person'),
         ('Enable issues? [Y/n] ', 'n'),
-        ('Enable wiki? [y/N] ', 'y'),
         ('Enable projects? [y/N] ', 'y'),
+        ('Enable wiki? [y/N] ', 'y'),
+        ('Required CI checks (comma separated, blank for none): ', ''),
         (
             (
-                'Edit: [d]estination / [v]isibility / [r]oute / [t]ags / '
-                're[l]ease pages / [p]olicy / [c]hecks / [s]ettings / [b]ack: '
+                'Edit: [p]olicy / [d]estination / [v]isibility / [s]ettings / '
+                '[r]oute / [c]hecks / re[l]ease pages / [t]ags / [b]ack: '
             ),
             's',
         ),
         ('Description: [k]eep / [r]eplace / [c]lear [keep]: ', 'r'),
         ('Repository description (blank for none): ', 'Published demo'),
         ('Enable issues? [y/N] ', ''),
-        ('Enable wiki? [Y/n] ', ''),
         ('Enable projects? [Y/n] ', ''),
+        ('Enable wiki? [Y/n] ', ''),
         ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
     ]
 
@@ -1260,11 +1643,11 @@ def test_init_retries_late_answer_without_losing_policy(
             'published-demo',
             'unlisted',
             'public',
-            'Test, Lint',
             'Published demo',
             'y',
             'n',
             'n',
+            'Test, Lint',
             's',
         ]
     )
@@ -1296,6 +1679,42 @@ def test_init_retries_late_answer_without_losing_policy(
     assert 'Publication uses the main branch.' not in output
     assert 'Setup progress saved.' not in output
     assert 'Next: pubanon repo create' in output
+
+
+def test_init_review_follows_question_order_and_lists_each_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / 'source'
+    source.mkdir()
+    _paths, global_config, project = configure(tmp_path, monkeypatch, source)
+    assert project is not None
+    reviewed = replace(
+        project,
+        publication_route='staged',
+        ci_workflow='ci.yml',
+        required_checks=('quality', 'test (linux, 3.13)'),
+    )
+    snapshot = (_source.Entry('README.md', 0o100644, 'blob', b'public\n'),)
+
+    _init._project_review(reviewed, snapshot, global_config)
+
+    output = capsys.readouterr().out
+    assert re.findall(r'^([A-Z][A-Za-z ]+):', output, flags=re.MULTILINE) == [
+        'Source',
+        'Files',
+        'Final repository',
+        'Description',
+        'Features',
+        'Route',
+        'Staging repository',
+        'CI workflow',
+        'Required checks',
+        'Release pages',
+        'Source tags',
+    ]
+    assert 'Required checks:    quality\n' + ' ' * 20 + 'test (linux, 3.13)\n' in output
 
 
 def test_init_review_shows_overridden_private_staging_destination(
@@ -1405,8 +1824,8 @@ def test_init_reviews_complete_configuration_before_save(
             '',
             '',
             '',
-            '',
             'Published demo',
+            '',
             '',
             '',
             '',
@@ -1439,10 +1858,11 @@ def test_init_reviews_complete_configuration_before_save(
         'Source tags:',
         'Files:',
         '1 included, 0 excluded',
+        'CI workflow:',
         'Required checks:',
         'Description:',
         'Published demo',
-        'issues on; wiki, projects, pull requests, and discussions off',
+        'issues on; pull requests, discussions, projects, and wiki off',
     ):
         assert expected in review
     assert re.search(
@@ -1595,16 +2015,16 @@ def test_init_self_publication_flag_enables_existing_project(
             ('GitHub owner [anonymous-account]: ', ''),
             ('GitHub repository [demo]: ', ''),
             ('Repository visibility (private/public) [private]: ', ''),
-            ('Publication route (staged/direct) [staged]: ', ''),
-            ('Create local tags marking the source of each publication? [y/N] ', ''),
-            ('Required CI checks (comma separated, blank for none): ', ''),
-            ('Create a release page for each published version? [y/N] ', ''),
             ('Repository description (blank for none): ', ''),
             ('Enable issues? [Y/n] ', ''),
-            ('Enable wiki? [y/N] ', ''),
-            ('Enable projects? [y/N] ', ''),
             ('Enable pull requests? [y/N] ', ''),
             ('Enable discussions? [y/N] ', ''),
+            ('Enable projects? [y/N] ', ''),
+            ('Enable wiki? [y/N] ', ''),
+            ('Publication route (staged/direct) [staged]: ', ''),
+            ('Required CI checks (comma separated, blank for none): ', ''),
+            ('Create a release page for each published version? [y/N] ', ''),
+            ('Create local tags marking the source of each publication? [Y/n] ', ''),
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
         ]
     )
@@ -1637,16 +2057,16 @@ def test_init_self_publication_flag_sets_project_field(
             ('GitHub owner [anonymous-account]: ', ''),
             ('GitHub repository [pubanon]: ', ''),
             ('Repository visibility (private/public) [private]: ', ''),
-            ('Publication route (staged/direct) [staged]: ', ''),
-            ('Create local tags marking the source of each publication? [y/N] ', ''),
-            ('Required CI checks (comma separated, blank for none): ', ''),
-            ('Create a release page for each published version? [y/N] ', ''),
             ('Repository description (blank for none): ', ''),
             ('Enable issues? [Y/n] ', ''),
-            ('Enable wiki? [y/N] ', ''),
-            ('Enable projects? [y/N] ', ''),
             ('Enable pull requests? [y/N] ', ''),
             ('Enable discussions? [y/N] ', ''),
+            ('Enable projects? [y/N] ', ''),
+            ('Enable wiki? [y/N] ', ''),
+            ('Publication route (staged/direct) [staged]: ', ''),
+            ('Required CI checks (comma separated, blank for none): ', ''),
+            ('Create a release page for each published version? [y/N] ', ''),
+            ('Create local tags marking the source of each publication? [Y/n] ', ''),
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
         ]
     )
@@ -1913,22 +2333,52 @@ def test_project_from_draft_omits_reserved_case_variants_from_proposed_groups(
 
 
 @pytest.mark.parametrize(
-    ('route', 'checks', 'timing'),
+    'case',
+    [((), None, True), ((), 'ci.yml', False), (('test',), None, False)],
+)
+def test_project_review_counts_a_connected_workflow_as_configured_ci(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    case: tuple[tuple[str, ...], str | None, bool],
+) -> None:
+    checks, workflow, warned = case
+    source = make_repo(files={'README.md': 'public\n'})
+    _paths, global_config, project = configure(tmp_path, monkeypatch, source)
+    assert project is not None
+    project = replace(
+        project, publication_route='staged', required_checks=checks, ci_workflow=workflow
+    )
+    snapshot = _source.read_snapshot(source, _source.pin(source, 'HEAD').commit)
+
+    _init._project_review(project, snapshot, global_config)
+
+    output = capsys.readouterr().out
+    assert re.search(rf'CI workflow:\s+{re.escape(workflow or "none")}', output)
+    assert ('No CI checks configured; CI waiting is optional.' in output) is warned
+
+
+@pytest.mark.parametrize(
+    ('route', 'ci_configured', 'timing'),
     [
-        ('staged', ('test',), 'Each page is created when you publish, after staging checks pass.'),
-        ('staged', (), 'Each page is created right after publishing, before CI runs.'),
-        ('direct', ('test',), 'Each page is created right after publishing, before CI runs.'),
+        ('staged', True, 'Each page is created when you publish, after staging checks pass.'),
+        ('staged', False, 'Each page is created right after publishing, before CI runs.'),
+        ('direct', True, 'Each page is created right after publishing, before CI runs.'),
     ],
 )
 def test_release_pages_prompt_explains_when_pages_are_created(
     route: str,
-    checks: tuple[str, ...],
+    ci_configured: bool,
     timing: str,
     answers: _Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     answers([('Create a release page for each published version? [y/N] ', 'y')])
-    assert _init._release_pages_prompt(route=route, checks=checks, default=False) is True
+    assert (
+        _init._release_pages_prompt(route=route, ci_configured=ci_configured, default=False)
+        is True
+    )
     out = capsys.readouterr().out
     assert 'Release pages announce published versions.' in out
     assert 'Creating one can start release workflows, such as package uploads.' in out
@@ -2031,7 +2481,7 @@ def test_init_unusable_draft_offers_start_over_or_quit(
         assert new_draft is not None
         assert new_draft.source == source
         assert new_draft.pending[0] == 'selection'
-        assert new_draft.source_tags is False
+        assert new_draft.source_tags is True
         assert draft_path.read_bytes() != old_bytes
 
 
@@ -2096,7 +2546,7 @@ def test_new_project_uses_global_route_or_explicit_override(
         'Repository visibility (private/public) [private]: ': '',
         'Required CI checks (comma separated, blank for none): ': '',
         'Create a release page for each published version? [y/N] ': '',
-        'Create local tags marking the source of each publication? [y/N] ': '',
+        'Create local tags marking the source of each publication? [Y/n] ': '',
         'Repository description (blank for none): ': '',
         'Enable issues? [Y/n] ': '',
         'Enable wiki? [y/N] ': '',
@@ -2331,16 +2781,16 @@ def test_init_review_can_clear_keep_or_replace_description(
         ('GitHub owner [anonymous-account]: ', ''),
         ('GitHub repository [demo]: ', ''),
         ('Repository visibility (private/public) [private]: ', ''),
-        ('Required CI checks (comma separated, blank for none): ', ''),
         ('Repository description (blank for none): ', 'Published demo'),
         ('Enable issues? [Y/n] ', ''),
-        ('Enable wiki? [y/N] ', ''),
         ('Enable projects? [y/N] ', ''),
+        ('Enable wiki? [y/N] ', ''),
+        ('Required CI checks (comma separated, blank for none): ', ''),
         ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 'e'),
         (
             (
-                'Edit: [d]estination / [v]isibility / [r]oute / [t]ags / '
-                're[l]ease pages / [p]olicy / [c]hecks / [s]ettings / [b]ack: '
+                'Edit: [p]olicy / [d]estination / [v]isibility / [s]ettings / '
+                '[r]oute / [c]hecks / re[l]ease pages / [t]ags / [b]ack: '
             ),
             's',
         ),
@@ -2351,8 +2801,8 @@ def test_init_review_can_clear_keep_or_replace_description(
             else [('Repository description (blank for none): ', replacement)]
         ),
         ('Enable issues? [Y/n] ', ''),
-        ('Enable wiki? [y/N] ', ''),
         ('Enable projects? [y/N] ', ''),
+        ('Enable wiki? [y/N] ', ''),
         ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
     ]
 
@@ -2426,10 +2876,12 @@ def test_relocation_invalidates_candidate_and_discard_prepare_recovers(
     )
 
 
+@pytest.mark.parametrize('source_tags', [False, True])
 def test_resumed_route_and_source_tags_choices_survive_global_default_change(
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
+    source_tags: bool,
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, global_config, _ = configure(tmp_path, monkeypatch)
@@ -2439,12 +2891,22 @@ def test_resumed_route_and_source_tags_choices_survive_global_default_change(
         'GitHub owner [anonymous-account]: ': '',
         'GitHub repository [demo]: ': '',
         'Repository visibility (private/public) [private]: ': '',
+        'Repository description (blank for none): ': '',
+        'Enable issues? [Y/n] ': '',
+        'Enable pull requests? [y/N] ': '',
+        'Enable discussions? [y/N] ': '',
+        'Enable projects? [y/N] ': '',
+        'Enable wiki? [y/N] ': '',
         'Publication route (staged/direct) [staged]: ': '',
-        'Create local tags marking the source of each publication? [y/N] ': 'y',
+        'Required CI checks (comma separated, blank for none): ': '',
+        'Create a release page for each published version? [y/N] ': '',
+        'Create local tags marking the source of each publication? [Y/n] ': 'y'
+        if source_tags
+        else 'n',
     }
 
     def _interrupt(prompt: str) -> str:
-        if prompt == 'Required CI checks (comma separated, blank for none): ':
+        if prompt == 'Save this configuration? [s]ave / [e]dit / [c]ancel: ':
             raise EOFError
         return first[prompt]
 
@@ -2453,7 +2915,7 @@ def test_resumed_route_and_source_tags_choices_survive_global_default_change(
     draft = _init_draft.load(paths, 'demo')
     assert draft is not None
     assert draft.publication_route == 'staged'
-    assert draft.source_tags is True
+    assert draft.source_tags is source_tags
     _config.save_global(
         paths,
         replace(global_config, default_publication_route='direct'),
@@ -2461,14 +2923,6 @@ def test_resumed_route_and_source_tags_choices_survive_global_default_change(
     )
     remaining = {
         'Saved setup: [r]esume / [s]tart over / [q]uit: ': 'r',
-        'Required CI checks (comma separated, blank for none): ': '',
-        'Create a release page for each published version? [y/N] ': '',
-        'Repository description (blank for none): ': '',
-        'Enable issues? [Y/n] ': '',
-        'Enable wiki? [y/N] ': '',
-        'Enable projects? [y/N] ': '',
-        'Enable pull requests? [y/N] ': '',
-        'Enable discussions? [y/N] ': '',
         'Save this configuration? [s]ave / [e]dit / [c]ancel: ': 's',
     }
 
@@ -2480,4 +2934,4 @@ def test_resumed_route_and_source_tags_choices_survive_global_default_change(
     monkeypatch.setattr('builtins.input', _resume)
     assert _cli.main(['init', '--project', 'demo']) == 0
     assert _config.load_project(paths, 'demo').publication_route == 'staged'
-    assert _config.load_project(paths, 'demo').source_tags is True
+    assert _config.load_project(paths, 'demo').source_tags is source_tags

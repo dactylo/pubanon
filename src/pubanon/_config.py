@@ -630,15 +630,6 @@ def _validate_acknowledged_exposure(value: object) -> str:
     return value
 
 
-def _validate_ci_workflow(value: object) -> str | None:
-    """Validate one optional workflow filename."""
-    if value is None:
-        return None
-    if not isinstance(value, str) or _CI_WORKFLOW_PATTERN.fullmatch(value) is None:
-        raise PubanonError('ci_workflow must be a workflow file name such as ci.yml')
-    return value
-
-
 def _validate_package(value: object) -> PackageObservation | None:
     """Validate and return an optional in-memory package observation target."""
     if value is None:
@@ -1131,6 +1122,20 @@ def identity_rule_sources(
         if hit.term in derived:
             found.add('private path')
     return tuple(source for source in _IDENTITY_SOURCE_RECOVERY if source in found)
+
+
+def is_ci_workflow_name(value: str) -> bool:
+    """Return whether `value` is a workflow filename that `ci_workflow` accepts."""
+    return _CI_WORKFLOW_PATTERN.fullmatch(value) is not None
+
+
+def _validate_ci_workflow(value: object) -> str | None:
+    """Validate one optional workflow filename."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not is_ci_workflow_name(value):
+        raise PubanonError('ci_workflow must be a workflow file name such as ci.yml')
+    return value
 
 
 def machine_private_terms(paths: Paths, env: Mapping[str, str]) -> tuple[str, ...]:

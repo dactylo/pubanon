@@ -113,7 +113,7 @@ def test_guided_policy_exposes_nested_internal_groups(
             'GitHub repository [demo]: ',
             'Repository visibility (private/public) [private]: ',
             'Publication route (staged/direct) [staged]: ',
-            'Create local tags marking the source of each publication? [y/N] ',
+            'Create local tags marking the source of each publication? [Y/n] ',
             'Required CI checks (comma separated, blank for none): ',
             'Create a release page for each published version? [y/N] ',
             'Repository description (blank for none): ',

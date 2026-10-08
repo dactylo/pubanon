@@ -186,6 +186,39 @@ def _verify_disclosure(
         raise OperationCanceled('Canceled. Nothing was changed.')
 
 
+def _verify_existing_empty_repository(paths: Paths, g: GlobalConfig, p: ProjectConfig) -> None:
+    """Verify a pre-created destination without changing it or recording history."""
+    dest = _host.verify_destination(paths, g, p)
+    if _host.read_remote_refs(dest) != RemoteRefs(None, {}, ()):
+        commit, tags = published_refs(paths, p.name)
+        raise PubanonError(
+            'configured repository already contains branches or tags',
+            recovery=(
+                'pubanon repo verify'
+                if commit is not None or tags
+                else 'use an empty repository for first publication; '
+                'if recovering published history from this repository, '
+                'run pubanon repo restore --to local'
+            ),
+        )
+    if p.settings is None:
+        raise PubanonError('repository settings are missing')
+    mismatches = _host.settings_differences(
+        p.settings,
+        _host.repository_settings(p.owner, p.repo),
+        skip_default_branch=True,
+    )
+    if mismatches:
+        raise PubanonError(
+            'repository settings do not match configuration',
+            fact='; '.join(escape(item) for item in mismatches),
+            recovery=(
+                "correct the repository's GitHub settings or saved configuration, "
+                'then rerun pubanon repo create'
+            ),
+        )
+
+
 def _verify_history(
     paths: Paths,
     g: GlobalConfig,
@@ -328,10 +361,10 @@ def feature_summary(settings: Settings) -> str:
     """Summarize enabled features before disabled features for display."""
     features = (
         ('issues', settings.issues),
-        ('wiki', settings.wiki),
-        ('projects', settings.projects),
         ('pull requests', settings.pull_requests),
         ('discussions', settings.discussions),
+        ('projects', settings.projects),
+        ('wiki', settings.wiki),
     )
     enabled = [name for name, value in features if value]
     disabled = [name for name, value in features if not value]
@@ -405,9 +438,10 @@ def repo_create(
     *,
     yes: bool,
 ) -> None:
-    """Create and independently verify the configured empty repository.
+    """Create or independently verify the configured empty repository.
 
     The caller must hold the project lock for the complete operation.
+    An existing empty repository is checked without host mutations.
 
     Args:
         paths: Derived pubanon configuration and data paths.
@@ -428,10 +462,15 @@ def repo_create(
 
     account = _host.require_authenticated_account(g.accounts[p.host], authority='configuration')
     if _host.repository_visible(p.owner, p.repo):
-        raise PubanonError(
-            'configured repository already exists',
-            recovery='pubanon repo verify',
+        _verify_existing_empty_repository(paths, g, p)
+        output(
+            'Repository already exists and is empty; configuration matches.',
+            kind='success',
         )
+        if candidate is not None and candidate.state == STATE_UNKNOWN_OUTCOME:
+            output('The pending publication outcome needs resolution.')
+        next_step(_stage.candidate_next_action(paths, g, p, candidate))
+        return
 
     dest = Destination(
         adapter=p.host,
@@ -452,14 +491,14 @@ def repo_create(
             p.settings,
             settings_recovery=(
                 "check the settings in the repository's GitHub settings, "
-                'then run pubanon repo verify'
+                'then run pubanon repo create'
             ),
         )
     except RepositoryCreationUncertainError as exc:
         raise PubanonError(
             'repository creation outcome is unknown; the repository may already exist',
             fact=exc.render(),
-            recovery='pubanon repo verify',
+            recovery='pubanon repo create',
         ) from exc
 
     try:
@@ -469,12 +508,12 @@ def repo_create(
         raise PubanonError(
             'repository creation is partial; post-create verification failed',
             fact=exc.render(),
-            recovery='pubanon repo verify',
+            recovery='pubanon repo create',
         ) from exc
     if remote != RemoteRefs(None, {}, ()):
         raise PubanonError(
             'repository creation is partial; created repository is not empty',
-            recovery='pubanon repo verify',
+            recovery='pubanon repo create',
         )
     output(
         f'Created {escape(p.visibility)} repository {escape(p.owner)}/{escape(p.repo)}.',

@@ -10,7 +10,7 @@ requires = [ "editables>=0.3", "hatch-fancy-pypi-readme>=25.1", "hatchling>=1.27
 # ==========================================================
 [project]
 name = "pubanon"
-version = "0.3.0"
+version = "0.4.0"
 description = "Publish selected files to GitHub under a separate identity"
 keywords = [ "anonymization", "git", "privacy", "publishing", "security" ]
 license = "MIT"

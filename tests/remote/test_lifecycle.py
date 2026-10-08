@@ -357,6 +357,49 @@ def test_disclosure_local_inventory_path_remains_usable_without_display_prompt(
     assert f'Saved inventory: {escape((disclosure_path).as_posix())}' in capsys.readouterr().out
 
 
+@pytest.mark.parametrize('yes', [False, True])
+def test_repo_create_accepts_matching_empty_repository_without_mutation(
+    fake_gh: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    yes: bool,
+) -> None:
+    paths, global_config, project = _configs(tmp_path)
+    assert project.settings is not None
+    remote = tmp_path / 'host.git'
+    subprocess.run(['git', 'init', '--bare', '-q', remote], check=True, env=git_env())
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', remote.as_uri())
+    _responses(
+        fake_gh,
+        [
+            {'args': _ACCOUNT_ARGS, 'stdout': 'anonymous-account\n'},
+            _repository_response('private'),
+            _settings_response(replace(project.settings, default_branch='master')),
+        ],
+    )
+
+    def _unexpected_prompt(_prompt: str) -> str:
+        pytest.fail('checking an existing repository requested confirmation')
+
+    monkeypatch.setattr('builtins.input', _unexpected_prompt)
+    _lifecycle.repo_create(paths, global_config, project, yes=yes)
+
+    output = capsys.readouterr().out
+    assert 'Repository already exists and is empty; configuration matches.' in output
+    assert output.rstrip().endswith('Next: pubanon prepare')
+    assert gh_calls(tmp_path) == [
+        _ACCOUNT_ARGS,
+        _ABSENCE_ARGS,
+        _ACCOUNT_ARGS,
+        _REPOSITORY_ARGS,
+        _SETTINGS_ARGS,
+    ]
+    assert _git(remote, 'for-each-ref') == b''
+    assert not _store.candidate_store_path(paths, project.name).exists()
+    assert _records.load_candidate(paths, project.name) is None
+
+
 def test_repo_create_declined_confirmation_creates_nothing(
     fake_gh: Path,
     tmp_path: Path,
@@ -423,9 +466,15 @@ def test_repo_create_failed_owner_lookup_is_safe_preflight_failure(
 def test_repo_create_failed_post_reports_unknown_outcome_and_present_retry(
     fake_gh: Path,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     term = 'private-canary'
     paths, global_config, project = _configs(tmp_path)
+    assert project.settings is not None
+    remote = tmp_path / 'host.git'
+    subprocess.run(['git', 'init', '--bare', '-q', remote], check=True, env=git_env())
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', remote.as_uri())
     absence: dict[str, object] = {
         'args': _ABSENCE_ARGS,
         'returncode': 1,
@@ -438,6 +487,7 @@ def test_repo_create_failed_post_reports_unknown_outcome_and_present_retry(
             {'args': _ACCOUNT_ARGS, 'stdout': 'anonymous-account\n'},
             absence,
             _repository_response('private'),
+            _settings_response(project.settings),
             {
                 'args': _CREATE_ARGS,
                 'returncode': 1,
@@ -454,16 +504,15 @@ def test_repo_create_failed_post_reports_unknown_outcome_and_present_retry(
     assert str(error) == (
         'repository creation outcome is unknown; the repository may already exist'
     )
-    assert error.recovery == 'pubanon repo verify'
+    assert error.recovery == 'pubanon repo create'
     rendered = error.render()
     assert term in rendered
     assert gh_calls(tmp_path).count(_CREATE_ARGS) == 1
     assert not (paths.config_dir / 'projects' / f'{project.name}.toml').exists()
 
-    with pytest.raises(PubanonError, match='already exists') as retry_info:
-        _lifecycle.repo_create(paths, global_config, project, yes=True)
+    _lifecycle.repo_create(paths, global_config, project, yes=True)
 
-    assert retry_info.value.recovery == 'pubanon repo verify'
+    assert capsys.readouterr().out.rstrip().endswith('Next: pubanon prepare')
     assert gh_calls(tmp_path).count(_CREATE_ARGS) == 1
     assert not (paths.config_dir / 'projects' / f'{project.name}.toml').exists()
 
@@ -527,8 +576,108 @@ def test_repo_create_preserves_post_create_diagnostic(
         _lifecycle.repo_create(paths, global_config, project, yes=True)
     assert str(error.value) == 'repository creation is partial; post-create verification failed'
     assert error.value.fact == original.render()
-    assert error.value.recovery == 'pubanon repo verify'
+    assert error.value.recovery == 'pubanon repo create'
     assert _CREATE_ARGS in gh_calls(tmp_path)
+
+
+@pytest.mark.parametrize(
+    'case',
+    [
+        (ref, known)
+        for ref in ('refs/heads/main', 'refs/heads/other', 'refs/tags/v1.0.0')
+        for known in (False, True)
+    ],
+)
+def test_repo_create_refuses_nonempty_existing_repository_with_relevant_recovery(
+    fake_gh: Path,
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    case: tuple[str, bool],
+) -> None:
+    ref, known = case
+    paths, global_config, project = _configs(tmp_path)
+    source = make_repo(files={'README.md': 'existing\n'})
+    tip = _git(source, 'rev-parse', 'HEAD').decode().strip()
+    remote = tmp_path / 'host.git'
+    subprocess.run(['git', 'init', '--bare', '-q', remote], check=True, env=git_env())
+    _git(remote, 'fetch', '-q', source.as_uri(), f'{tip}:{ref}')
+    before = _git(remote, 'for-each-ref')
+    if known:
+        store = _store.store_path(paths, project.name)
+        _git(store, 'fetch', '-q', source.as_uri(), f'{tip}:refs/heads/main')
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', remote.as_uri())
+    _responses(
+        fake_gh,
+        [
+            {'args': _ACCOUNT_ARGS, 'stdout': 'anonymous-account\n'},
+            _repository_response('private'),
+        ],
+    )
+
+    with pytest.raises(PubanonError, match='already contains branches or tags') as exc_info:
+        _lifecycle.repo_create(paths, global_config, project, yes=True)
+
+    recovery = exc_info.value.recovery or ''
+    if known:
+        assert recovery == 'pubanon repo verify'
+    else:
+        assert 'empty repository for first publication' in recovery
+        assert 'recovering published history' in recovery
+        assert 'pubanon repo restore --to local' in recovery
+        assert 'pubanon repo verify' not in recovery
+        assert not _store.candidate_store_path(paths, project.name).exists()
+    assert gh_calls(tmp_path) == [_ACCOUNT_ARGS, _ABSENCE_ARGS, _ACCOUNT_ARGS, _REPOSITORY_ARGS]
+    assert _git(remote, 'for-each-ref') == before
+
+
+@pytest.mark.parametrize('failure', ['visibility', 'description', 'issues', 'settings-read'])
+def test_repo_create_refuses_unverified_existing_repository_without_mutation(
+    fake_gh: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    paths, global_config, project = _configs(tmp_path)
+    assert project.settings is not None
+    remote = tmp_path / 'host.git'
+    subprocess.run(['git', 'init', '--bare', '-q', remote], check=True, env=git_env())
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', remote.as_uri())
+    settings = project.settings
+    if failure == 'description':
+        settings = replace(settings, description='Other description')
+    elif failure == 'issues':
+        settings = replace(settings, issues=False)
+    response = _settings_response(settings)
+    if failure == 'settings-read':
+        response.update(returncode=1, stderr='cannot read settings\n')
+    _responses(
+        fake_gh,
+        [
+            {'args': _ACCOUNT_ARGS, 'stdout': 'anonymous-account\n'},
+            _repository_response('public' if failure == 'visibility' else 'private'),
+            response,
+        ],
+    )
+
+    with pytest.raises(PubanonError) as exc_info:
+        _lifecycle.repo_create(paths, global_config, project, yes=True)
+
+    error = exc_info.value
+    if failure in {'description', 'issues'}:
+        assert str(error) == 'repository settings do not match configuration'
+        assert failure in (error.fact or '')
+        assert 'GitHub settings or saved configuration' in (error.recovery or '')
+        assert 'pubanon repo create' in (error.recovery or '')
+    elif failure == 'visibility':
+        assert 'visibility' in error.render()
+    else:
+        assert 'cannot read settings' in error.render()
+    calls = gh_calls(tmp_path)
+    assert all(method not in call for call in calls for method in ('POST', 'PATCH', 'DELETE'))
+    assert calls.count(_SETTINGS_ARGS) == (failure != 'visibility')
+    assert _git(remote, 'for-each-ref') == b''
+    assert not _store.candidate_store_path(paths, project.name).exists()
 
 
 def test_repo_create_refuses_user_type_for_organization_owner_before_post(
@@ -561,27 +710,6 @@ def test_repo_create_refuses_user_type_for_organization_owner_before_post(
         _lifecycle.repo_create(paths, global_config, project, yes=True)
 
     assert gh_calls(tmp_path) == [_ACCOUNT_ARGS, absence_args, owner_args]
-    assert all('POST' not in call for call in gh_calls(tmp_path))
-
-
-def test_repo_create_refuses_visible_repository_before_creation(
-    fake_gh: Path,
-    tmp_path: Path,
-) -> None:
-    paths, global_config, project = _configs(tmp_path)
-    _responses(
-        fake_gh,
-        [
-            {'args': _ACCOUNT_ARGS, 'stdout': 'anonymous-account\n'},
-            _repository_response('private'),
-        ],
-    )
-
-    with pytest.raises(PubanonError) as exc_info:
-        _lifecycle.repo_create(paths, global_config, project, yes=True)
-
-    assert exc_info.value.recovery == 'pubanon repo verify'
-    assert gh_calls(tmp_path) == [_ACCOUNT_ARGS, _ABSENCE_ARGS]
     assert all('POST' not in call for call in gh_calls(tmp_path))
 
 
@@ -618,12 +746,12 @@ def test_repo_create_routes_account_requirement_with_configuration_authority(
         return expected
 
     def _repository_visible(_owner: str, _repo: str) -> bool:
-        return True
+        raise PubanonError('visibility checked')
 
     monkeypatch.setattr(_host, 'require_authenticated_account', _require_account)
     monkeypatch.setattr(_host, 'repository_visible', _repository_visible)
 
-    with pytest.raises(PubanonError, match='configured repository already exists'):
+    with pytest.raises(PubanonError, match='visibility checked'):
         _lifecycle.repo_create(paths, global_config, project, yes=True)
 
     assert requirements == [('anonymous-account', 'configuration')]
@@ -660,7 +788,7 @@ def test_repo_create_settings_failure_reports_created_repository(
 
     assert 'repository was created' in str(error.value)
     assert 'GitHub settings' in (error.value.recovery or '')
-    assert 'pubanon repo verify' in (error.value.recovery or '')
+    assert 'pubanon repo create' in (error.value.recovery or '')
     assert error.value.actual is None
     if failure == 'mismatch':
         assert 'settings do not match' in str(error.value)
@@ -718,26 +846,30 @@ def test_repo_create_reports_partial_creation_when_remote_is_not_empty(
         _lifecycle.repo_create(paths, global_config, project, yes=True)
 
     assert 'partial' in str(exc_info.value)
-    assert exc_info.value.recovery == 'pubanon repo verify'
+    assert exc_info.value.recovery == 'pubanon repo create'
     assert _CREATE_ARGS in gh_calls(tmp_path)
 
 
 @pytest.mark.parametrize(
     'case',
     [
-        (None, 'pubanon prepare'),
-        ('retained', 'pubanon publish'),
-        ('unknown-outcome', 'pubanon publish --resolve'),
+        (state, action, existing)
+        for state, action in (
+            (None, 'pubanon prepare'),
+            ('retained', 'pubanon publish'),
+            ('unknown-outcome', 'pubanon publish --resolve'),
+        )
+        for existing in (False, True)
     ],
 )
-def test_repo_create_user_owner_posts_settings_then_verifies_empty_repository(
+def test_repo_create_routes_after_verifying_new_or_existing_empty_repository(
     fake_gh: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     make_repo: Callable[..., Path],
-    case: tuple[str | None, str],
+    case: tuple[str | None, str, bool],
 ) -> None:
-    candidate_state, next_action = case
+    candidate_state, next_action, existing = case
     paths, global_config, project = _configs(tmp_path)
     settings = Settings(
         description='Public repository',
@@ -778,31 +910,51 @@ def test_repo_create_user_owner_posts_settings_then_verifies_empty_repository(
     subprocess.run(['git', 'init', '--bare', '-q', remote], check=True, env=git_env())
     monkeypatch.setattr(_host, '_URL_TEMPLATE', remote.as_uri())
     create_args = _CREATE_ARGS
-    _responses(fake_gh, _success_responses(create_args=create_args))
+    responses: list[dict[str, object]] = _success_responses(create_args=create_args)
+    if existing:
+        responses = [
+            {'args': _ACCOUNT_ARGS, 'stdout': 'anonymous-account\n'},
+            _repository_response('private'),
+            _settings_response(settings),
+        ]
+    _responses(fake_gh, responses)
 
     captured = StringIO()
     with redirect_stdout(captured):
         _lifecycle.repo_create(paths, global_config, project, yes=True)
 
-    assert gh_calls(tmp_path) == [
-        _ACCOUNT_ARGS,
-        _ABSENCE_ARGS,
-        create_args,
-        _PATCH_SETTINGS_ARGS,
-        _SETTINGS_ARGS,
-        _ACCOUNT_ARGS,
-        _REPOSITORY_ARGS,
-    ]
+    assert gh_calls(tmp_path) == (
+        [
+            _ACCOUNT_ARGS,
+            _ABSENCE_ARGS,
+            _ACCOUNT_ARGS,
+            _REPOSITORY_ARGS,
+            _SETTINGS_ARGS,
+        ]
+        if existing
+        else [
+            _ACCOUNT_ARGS,
+            _ABSENCE_ARGS,
+            create_args,
+            _PATCH_SETTINGS_ARGS,
+            _SETTINGS_ARGS,
+            _ACCOUNT_ARGS,
+            _REPOSITORY_ARGS,
+        ]
+    )
     output = captured.getvalue()
-    assert 'Create repository anonymous-account/public-repo' in output
-    assert 'Visibility:' in output
-    assert 'private' in output
-    assert 'Description:' in output
-    assert 'Public repository' in output
-    assert 'Default branch:' in output
-    assert 'Features:' in output
-    assert 'pull requests, and discussions off' in output
-    assert 'Created private repository anonymous-account/public-repo.' in output
+    if existing:
+        assert 'Repository already exists and is empty; configuration matches.' in output
+    else:
+        assert 'Create repository anonymous-account/public-repo' in output
+        assert 'Visibility:' in output
+        assert 'private' in output
+        assert 'Description:' in output
+        assert 'Public repository' in output
+        assert 'Default branch:' in output
+        assert 'Features:' in output
+        assert 'pull requests, discussions, and wiki off' in output
+        assert 'Created private repository anonymous-account/public-repo.' in output
     assert output.rstrip().endswith(f'Next: {next_action}')
     if candidate_before is not None:
         assert _records.candidate_path(paths, project.name).read_bytes() == candidate_before

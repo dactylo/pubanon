@@ -41,6 +41,8 @@ if TYPE_CHECKING:
 
 from pubanon._cli import _context, _init_draft, _selection
 
+_UNSELECTED_SHOWN = 5
+
 
 def _back_init_selection(draft: _init_draft.Draft) -> _init_draft.Draft:
     """Undo the previous selection decision without discarding other setup fields."""
@@ -130,26 +132,26 @@ def _draft_edit(draft: _init_draft.Draft) -> _init_draft.Draft:
     action = ask(
         'Edit:',
         choices=[
+            'policy',
             'destination',
             'visibility',
-            'route',
-            'tags',
-            're[l]ease pages',
-            'policy',
-            'checks',
             'settings',
+            'route',
+            'checks',
+            're[l]ease pages',
+            'tags',
             'back',
         ],
     )
     steps = {
+        'policy': ('selection',),
         'destination': ('owner', 'repo'),
         'visibility': ('visibility',),
+        'settings': ('description', 'issues', 'pull_requests', 'discussions', 'projects', 'wiki'),
         'route': ('publication_route',),
-        'tags': ('source_tags',),
-        'release pages': ('release_pages',),
-        'policy': ('selection',),
         'checks': ('checks',),
-        'settings': ('description', 'issues', 'wiki', 'projects', 'pull_requests', 'discussions'),
+        'release pages': ('release_pages',),
+        'tags': ('source_tags',),
         'back': (),
     }[action]
     return replace(draft, pending=(*steps, 'review'), phase='preview')
@@ -257,15 +259,19 @@ def _project_review(
     settings = project.settings
     if settings is None:
         raise PubanonError('repository settings are missing')
-    checks = _check_names_csv(project.required_checks) if project.required_checks else 'none'
+    checks = '\n'.join(escape(name) for name in project.required_checks) or 'none'
     included_count = len(membership.allowed)
     excluded_count = len(membership.denied) + len(membership.reserved)
     values = [
         ('Source', display_path(project.source_path)),
+        ('Files', f'{included_count} included, {excluded_count} excluded'),
         (
             'Final repository',
             f'{escape(project.owner)}/{escape(project.repo)} ({escape(project.visibility)})',
         ),
+        ('Description', escape(settings.description or '(empty)')),
+        ('Features', _lifecycle.feature_summary(settings)),
+        ('Route', escape(project.publication_route)),
     ]
     if project.publication_route == 'staged':
         values.append(
@@ -276,18 +282,19 @@ def _project_review(
         )
     values.extend(
         [
-            ('Route', escape(project.publication_route)),
-            ('Files', f'{included_count} included, {excluded_count} excluded'),
-            ('Required checks', escape(checks)),
-            ('Source tags', 'yes' if project.source_tags else 'no'),
+            ('CI workflow', escape(project.ci_workflow or 'none')),
+            ('Required checks', checks),
             ('Release pages', 'yes' if _config.release_pages_enabled(project) else 'no'),
-            ('Description', escape(settings.description or '(empty)')),
-            ('Features', _lifecycle.feature_summary(settings)),
+            ('Source tags', 'yes' if project.source_tags else 'no'),
         ]
     )
     heading('Project configuration to save', separate=True)
     fields(values)
-    if project.publication_route == 'staged' and not project.required_checks:
+    if (
+        project.publication_route == 'staged'
+        and not project.required_checks
+        and project.ci_workflow is None
+    ):
         output('No CI checks configured; CI waiting is optional.', kind='warning')
 
 
@@ -340,7 +347,9 @@ def _load_init_draft(
     if draft is not None and _choose_saved_draft(ctx, draft, resume) == 'start over':
         draft = None
     if draft is None:
-        draft = _init_draft.Draft(ctx.project.source_path, commit, ctx.project.self_publication)
+        draft = _init_draft.Draft(
+            ctx.project.source_path, commit, ctx.project.self_publication, source_tags=True
+        )
     elif draft.commit != commit:
         print(
             'The source changed. Review the updated selection; your earlier choices are retained.'
@@ -364,11 +373,11 @@ def _load_init_draft(
     return _checkpoint_init(ctx, draft)
 
 
-def _release_pages_prompt(*, route: str, checks: tuple[str, ...], default: bool) -> bool:
+def _release_pages_prompt(*, route: str, ci_configured: bool, default: bool) -> bool:
     """Explain when release pages are created, then ask whether to create them."""
-    print('Release pages announce published versions.')
+    print('\nRelease pages announce published versions.')
     print('Creating one can start release workflows, such as package uploads.')
-    if route == 'staged' and checks:
+    if route == 'staged' and ci_configured:
         print('Each page is created when you publish, after staging checks pass.')
     else:
         print('Each page is created right after publishing, before CI runs.')
@@ -382,6 +391,21 @@ def _replace_project_context(
 ) -> _context.ProjectContext:
     """Return one project context for the replacement values."""
     return _context.ProjectContext(ctx.paths, ctx.global_config, project)
+
+
+def _connect_workflow(
+    proposed: _context.ProjectContext, snapshot: _source.Snapshot
+) -> _context.ProjectContext:
+    """Connect the single connectable workflow of a staged guided-init project."""
+    project = proposed.project
+    workflow = None
+    if project.publication_route == 'staged':
+        connectable = _workflow_checks.detect(
+            _selection.sanitized_snapshot(proposed, snapshot)
+        ).connectable
+        if len(connectable) == 1:
+            workflow = connectable[0]
+    return _replace_project_context(proposed, replace(project, ci_workflow=workflow))
 
 
 def _project_from_draft(
@@ -486,7 +510,7 @@ def _draft_review(
     """Require an explicit final save even after resuming a complete draft."""
     if draft.publication_route is None:
         raise PubanonError('choose a publication route before saving')
-    proposed = _project_from_draft(ctx, snapshot, draft)
+    proposed = _connect_workflow(_project_from_draft(ctx, snapshot, draft), snapshot)
     try:
         _config.gate_host_coordinates(
             ctx.paths,
@@ -556,8 +580,8 @@ def _report_existing_project_init(
     fields(
         [
             ('Route', escape(project.publication_route)),
-            ('Source tags', 'yes' if project.source_tags else 'no'),
             ('Release pages', 'yes' if _config.release_pages_enabled(project) else 'no'),
+            ('Source tags', 'yes' if project.source_tags else 'no'),
         ]
     )
     project_file = paths.config_dir / 'projects' / f'{project.name}.toml'
@@ -582,6 +606,24 @@ def _report_existing_project_init(
     except PubanonError:
         known_existing = False
     next_step('pubanon prepare' if known_existing else 'pubanon repo create')
+
+
+def _report_unselected_paths(paths: list[str]) -> None:
+    """Explain how to select new files before editing the CI workflow and checks."""
+    output(
+        'Checks cannot be edited yet: these committed files are not in the saved selection.',
+        kind='warning',
+    )
+    for path in paths[:_UNSELECTED_SHOWN]:
+        print(f'  {escape(path)}')
+    if len(paths) > _UNSELECTED_SHOWN:
+        print(f'  and {len(paths) - _UNSELECTED_SHOWN} more')
+    output(
+        'Save or cancel this session first. Then run pubanon prepare, after pubanon discard '
+        'if a snapshot is prepared, choose which new files to publish, and rerun '
+        'pubanon init --edit.',
+        kind='note',
+    )
 
 
 def _review_relocation(project: _config.ProjectConfig, source: Path, *, yes: bool) -> None:
@@ -617,40 +659,103 @@ def _select_check_numbers(names: tuple[str, ...]) -> tuple[str, ...] | None:
         output(f'Choose numbers from 1 to {len(names)}.', kind='warning')
 
 
+def _select_workflow_number(names: tuple[str, ...]) -> str:
+    """Read the number of one listed workflow."""
+    while True:
+        answer = ask('Workflow number')
+        try:
+            index = int(answer)
+        except ValueError:
+            index = 0
+        if 1 <= index <= len(names):
+            return names[index - 1]
+        output(f'Choose a number from 1 to {len(names)}.', kind='warning')
+
+
+def _ci_workflow_prompt(
+    project: _config.ProjectConfig, detection: _workflow_checks.WorkflowDetection
+) -> str | None:
+    """Choose the connected CI workflow, starting from the saved value."""
+    current = project.ci_workflow
+    connectable = detection.connectable
+    if current is None and not connectable:
+        return None
+    heading('CI workflow', separate=True)
+    print(
+        'pubanon requests runs of the connected workflow from stage push '
+        'and judges its push runs after publishing.'
+    )
+    print(f'{style("Current:")} {escape(current or "none")}')
+    if current is not None and current not in connectable:
+        reason = detection.problems.get(current, 'is not in the selected files')
+        output(f'{escape(current)} {escape(reason)}.', kind='warning')
+    for number, name in enumerate(connectable, start=1):
+        print(f'  {number}. {escape(name)}')
+    choices = ['keep'] if current is not None else []
+    if connectable:
+        choices.append('connect')
+    choices.append('none')
+    if current is not None:
+        suggested = 'keep'
+    elif project.publication_route == 'staged' and len(connectable) == 1:
+        suggested = 'connect'
+    else:
+        suggested = 'none'
+    action = ask('CI workflow:', choices=choices, default=suggested)
+    if action == 'keep':
+        return current
+    if action == 'none':
+        return None
+    return connectable[0] if len(connectable) == 1 else _select_workflow_number(connectable)
+
+
 def _settings_prompt(current: _config.Settings) -> _config.Settings:
     """Edit the repository description and features, starting from saved values."""
     return replace(
         current,
         description=_description_prompt(current.description),
         issues=_feature_prompt('issues', current.issues),
-        wiki=_feature_prompt('wiki', current.wiki),
-        projects=_feature_prompt('projects', current.projects),
         pull_requests=_feature_prompt('pull_requests', current.pull_requests),
         discussions=_feature_prompt('discussions', current.discussions),
+        projects=_feature_prompt('projects', current.projects),
+        wiki=_feature_prompt('wiki', current.wiki),
     )
 
 
-def _show_discovered_checks(discovered: _workflow_checks.Discovery) -> None:
-    """List check names and the execution limitations needing review."""
-    heading('GitHub checks found in selected workflow files', separate=True)
+def _show_discovered_checks(
+    discovered: _workflow_checks.Discovery, *, connected: str | None
+) -> None:
+    """List check names and explain what requiring a flagged check means."""
+    source = escape(connected) if connected is not None else 'selected workflow files'
+    heading(f'GitHub checks found in {source}', separate=True)
     print('Choose which results pubanon waits for. This does not change which jobs GitHub runs.')
     for number, name in enumerate(discovered.names, start=1):
         print(f'  {number}. {escape(name)}')
         for caution in discovered.cautions:
             if caution.name == name:
                 print(f'     {escape(caution.path)}: {escape("; ".join(caution.reasons))}')
-    if discovered.cautions or discovered.notes:
-        print('\nSelect checks individually after reviewing when they run.')
-        print('A required check that never runs cannot pass; a skipped check is rejected.')
+    if not discovered.cautions:
+        return
+    if connected is not None:
+        print('\npubanon accepts a run only if it executed every required job.')
+        print('A quick run that skips a hosted-only job cannot satisfy it; a hosted run can.')
+    else:
+        print('\nA required check that never runs for a push cannot pass.')
+        print('Leave out jobs that run only for tags, releases, or schedules.')
 
 
 def _required_checks_prompt(
     *,
     default: tuple[str, ...] = (),
     snapshot: _source.Snapshot = (),
+    connected: str | None = None,
 ) -> tuple[str, ...]:
-    """Offer workflow check names, preserving a manual CSV entry option."""
-    discovered = _workflow_checks.discover(snapshot)
+    """Offer workflow check names, limited to a connected workflow's jobs."""
+    discovered = (
+        _workflow_checks.discover(snapshot)
+        if connected is None
+        else _workflow_checks.discover_workflow(snapshot, connected)
+    )
     if discovered.notes:
         heading('Checks pubanon could not list automatically', separate=True)
         for note in discovered.notes:
@@ -662,15 +767,17 @@ def _required_checks_prompt(
         )
     if not discovered.names:
         return _manual_required_checks(default)
-    _show_discovered_checks(discovered)
-    choices = ['select', 'none', 'manual']
-    if not discovered.cautions and not discovered.notes:
-        choices.insert(0, 'all listed')
+    _show_discovered_checks(discovered, connected=connected)
+    choices = ['all listed', 'select', 'none', 'manual']
+    suggested = None
     if default:
         print(f'\n{style("Current requirements:")} {escape(_check_names_csv(default))}')
         choices.append('keep current')
+        suggested = 'keep current'
+    elif not discovered.notes and (connected is not None or not discovered.cautions):
+        suggested = 'all listed'
     while True:
-        action = ask('Require checks:', choices=choices)
+        action = ask('Require checks:', choices=choices, default=suggested)
         if action == 'select':
             selected = _select_check_numbers(discovered.names)
             if selected is None:
@@ -681,9 +788,70 @@ def _required_checks_prompt(
         return {'all listed': discovered.names, 'none': (), 'keep current': default}[action]
 
 
+def _show_workflow_connection(project: _config.ProjectConfig, snapshot: _source.Snapshot) -> None:
+    """Explain the connected CI workflow, or why guided init connected none."""
+    if project.ci_workflow is not None:
+        heading('CI workflow', separate=True)
+        print(
+            f'pubanon will request runs of {escape(project.ci_workflow)}: it declares the '
+            'hosted and full_tests inputs and runs on every branch push.'
+        )
+        return
+    if project.publication_route != 'staged':
+        return
+    detection = _workflow_checks.detect(snapshot)
+    if len(detection.connectable) > 1:
+        names = ', '.join(escape(name) for name in detection.connectable)
+        output(
+            f'Several workflows can be connected: {names}. Choose one with pubanon init --edit.',
+            kind='note',
+        )
+        return
+    for note in detection.notes:
+        output(escape(note), kind='note')
+    if detection.notes:
+        output(
+            'To let pubanon request CI runs, start from the starter workflow described '
+            'under "Request CI from stage push" in the pubanon guide.',
+            kind='note',
+        )
+
+
 def _source_tags_prompt(*, default: bool) -> bool:
     """Ask whether to mark the source commit of each publication with a local tag."""
     return confirm('Create local tags marking the source of each publication?', default=default)
+
+
+def _unselected_paths(ctx: _context.ProjectContext, snapshot: _source.Snapshot) -> list[str]:
+    """Return committed paths that the saved selection neither includes nor excludes."""
+    return _policy.evaluate_membership(
+        [entry.path for entry in snapshot],
+        ctx.project.allow,
+        ctx.project.deny,
+        global_deny=_config.global_deny(ctx.global_config),
+    ).unmatched
+
+
+def _edit_checks_section(
+    ctx: _context.ProjectContext,
+    snapshot: _source.Snapshot,
+    project: _config.ProjectConfig,
+) -> _config.ProjectConfig:
+    """Edit a connected workflow and its required checks when selection is complete."""
+    current = _replace_project_context(ctx, project)
+    if unselected := _unselected_paths(current, snapshot):
+        _report_unselected_paths(unselected)
+        return project
+    selected = _selection.sanitized_snapshot(current, snapshot)
+    workflow = _ci_workflow_prompt(project, _workflow_checks.detect(selected))
+    if workflow != project.ci_workflow:
+        output('Changing the CI workflow invalidates a prepared snapshot.', kind='warning')
+    checks = _required_checks_prompt(
+        default=project.required_checks, snapshot=selected, connected=workflow
+    )
+    if checks != project.required_checks:
+        output('Changing required checks invalidates a prepared snapshot.', kind='warning')
+    return replace(project, ci_workflow=workflow, required_checks=checks)
 
 
 def _visibility_prompt(*, default: str) -> str:
@@ -721,13 +889,15 @@ def _draft_field(
             ),
         )
     elif step == 'checks':
+        proposed = _connect_workflow(_project_from_draft(ctx, snapshot, draft), snapshot)
+        selected = _selection.sanitized_snapshot(proposed, snapshot)
+        _show_workflow_connection(proposed.project, selected)
         draft = replace(
             draft,
             required_checks=_required_checks_prompt(
                 default=draft.required_checks or (),
-                snapshot=_selection.sanitized_snapshot(
-                    _project_from_draft(ctx, snapshot, draft), snapshot
-                ),
+                snapshot=selected,
+                connected=proposed.project.ci_workflow,
             ),
         )
     elif step == 'description':
@@ -738,11 +908,14 @@ def _draft_field(
             source_tags=_source_tags_prompt(default=draft.source_tags),
         )
     elif step == 'release_pages':
+        proposed = _connect_workflow(_project_from_draft(ctx, snapshot, draft), snapshot)
         draft = replace(
             draft,
             release_pages=_release_pages_prompt(
-                route=draft.publication_route or ctx.project.publication_route,
-                checks=draft.required_checks or (),
+                route=proposed.project.publication_route,
+                ci_configured=bool(
+                    proposed.project.required_checks or proposed.project.ci_workflow
+                ),
                 default=draft.release_pages,
             ),
         )
@@ -759,7 +932,7 @@ def _edit_project_section(
     """Change one selected settings section while keeping every other saved value."""
     action = ask(
         'Edit:',
-        choices=['visibility', 'route', 'tags', 're[l]ease pages', 'checks', 'settings', 'back'],
+        choices=['visibility', 'settings', 'route', 'checks', 're[l]ease pages', 'tags', 'back'],
     )
     if action == 'visibility':
         visibility = _visibility_prompt(default=project.visibility)
@@ -779,20 +952,12 @@ def _edit_project_section(
     elif action == 'release pages':
         enabled = _release_pages_prompt(
             route=project.publication_route,
-            checks=project.required_checks,
+            ci_configured=bool(project.required_checks or project.ci_workflow),
             default=_config.release_pages_enabled(project),
         )
         project = _edited_release_pages(project, enabled=enabled)
     elif action == 'checks':
-        checks = _required_checks_prompt(
-            default=project.required_checks,
-            snapshot=_selection.sanitized_snapshot(
-                _replace_project_context(ctx, project), snapshot
-            ),
-        )
-        if checks != project.required_checks:
-            output('Changing required checks invalidates a prepared snapshot.', kind='warning')
-        project = replace(project, required_checks=checks)
+        project = _edit_checks_section(ctx, snapshot, project)
     elif action == 'settings':
         if project.settings is None:
             raise PubanonError('repository settings are missing')
@@ -875,7 +1040,7 @@ def _initial_project(
         error.fact = 'project configuration was not saved; setup draft was saved'
         error.recovery = f'rerun {escape(resume)} to resume'
         raise
-    return _project_from_draft(ctx, snapshot, draft).project
+    return _connect_workflow(_project_from_draft(ctx, snapshot, draft), snapshot).project
 
 
 def command_init(args: argparse.Namespace) -> None:

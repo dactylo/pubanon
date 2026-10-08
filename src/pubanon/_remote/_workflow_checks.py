@@ -2,13 +2,14 @@
 
 import itertools
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol, TypeGuard, cast
 
 from ruamel.yaml import YAML
 from ruamel.yaml.error import YAMLError
 
+from pubanon._config import is_ci_workflow_name
 from pubanon._snapshots import _source
 
 type _Combination = dict[str, _Scalar]
@@ -16,6 +17,7 @@ type _Scalar = str | int | float | bool | None
 
 _EXPRESSION = re.compile(r'\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}')
 _REGULAR_MODES = frozenset({0o100644, 0o100755})
+_WORKFLOW_DIRECTORY = '.github/workflows/'
 _WORKFLOW_PATH = re.compile(r'\.github/workflows/[^/]+\.ya?ml')
 
 
@@ -50,6 +52,30 @@ class Discovery:
     cautions: tuple[CheckCaution, ...] = ()
 
 
+@dataclass(frozen=True)
+class WorkflowDetection:
+    """Classify selected workflows by whether pubanon can request or connect them.
+
+    Attributes:
+        requestable: Filenames of workflows declaring the boolean
+            `workflow_dispatch` inputs `hosted` and `full_tests`, in path
+            order.
+        connectable: Requestable filenames that `ci_workflow` accepts and that
+            start on every branch push, in path order.
+        problems: Why each other selected workflow is not connectable, keyed by
+            filename. Each reason completes a sentence that starts with the
+            filename.
+        notes: Path-qualified problems for workflows that declare
+            `workflow_dispatch` without both inputs and for requestable
+            workflows that are not connectable.
+    """
+
+    requestable: tuple[str, ...]
+    connectable: tuple[str, ...]
+    problems: Mapping[str, str]
+    notes: tuple[str, ...]
+
+
 class _YamlLoader(Protocol):
     """Describe the typed part of the ruamel safe-loader boundary."""
 
@@ -69,6 +95,32 @@ def _as_sequence(value: object) -> Sequence[object] | None:
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
         return None
     return cast('Sequence[object]', value)
+
+
+def _declares_dispatch(root: Mapping[object, object]) -> bool:
+    """Return whether a workflow lists `workflow_dispatch` among its triggers."""
+    events = root.get('on')
+    if (mapping := _as_mapping(events)) is not None:
+        return 'workflow_dispatch' in mapping
+    if isinstance(events, str):
+        return events == 'workflow_dispatch'
+    sequence = _as_sequence(events)
+    return sequence is not None and 'workflow_dispatch' in sequence
+
+
+def _dispatch_problem(root: Mapping[object, object]) -> str | None:
+    """Describe a missing boolean input in one parsed dispatch declaration."""
+    triggers = _as_mapping(root.get('on'))
+    dispatch = _as_mapping(triggers.get('workflow_dispatch')) if triggers is not None else None
+    inputs = _as_mapping(dispatch.get('inputs')) if dispatch is not None else None
+    if inputs is None:
+        return 'does not declare workflow_dispatch inputs'
+
+    for name in ('hosted', 'full_tests'):
+        input_definition = _as_mapping(inputs.get(name))
+        if input_definition is None or input_definition.get('type') != 'boolean':
+            return f'does not declare the boolean input {name}'
+    return None
 
 
 def _format_scalar(value: _Scalar) -> str:
@@ -343,7 +395,7 @@ def _discover_workflow(
             continue
         reasons = workflow_cautions
         if 'if' in job:
-            reasons += ('job has a condition and may be skipped',)
+            reasons += ('job runs only when its if: condition holds',)
         for name in discovered:
             caution = CheckCaution(name, entry.path, reasons)
             if reasons and caution not in cautions:
@@ -353,6 +405,62 @@ def _discover_workflow(
                 continue
             seen.add(name)
             names.append(name)
+
+
+def _workflow_entries(snapshot: _source.Snapshot) -> tuple[_source.Entry, ...]:
+    """Return the regular workflow blobs directly under `.github/workflows`."""
+    return tuple(
+        entry
+        for entry in snapshot
+        if entry.kind == 'blob'
+        and entry.mode in _REGULAR_MODES
+        and _WORKFLOW_PATH.fullmatch(entry.path) is not None
+    )
+
+
+def detect(snapshot: _source.Snapshot) -> WorkflowDetection:
+    """Classify selected workflows as requestable, connectable, or neither.
+
+    A requestable workflow declares pubanon's boolean dispatch inputs. A
+    connectable one also has a valid `ci_workflow` name and starts on every
+    branch push, which the final repository's CI evidence needs. The trigger is
+    inspected directly, so unresolved jobs cannot hide a filtered push.
+
+    Args:
+        snapshot: Selected committed source entries to inspect.
+
+    Returns:
+        Workflow filenames by class, why every other workflow is not
+        connectable, and the notes worth showing the user.
+    """
+    requestable: list[str] = []
+    connectable: list[str] = []
+    problems: dict[str, str] = {}
+    notes: list[str] = []
+    for entry in _workflow_entries(snapshot):
+        name = entry.path.removeprefix(_WORKFLOW_DIRECTORY)
+        root, problem = _load_workflow(entry.data)
+        if root is None:
+            problems[name] = str(problem)
+            continue
+        problem = _dispatch_problem(root)
+        if problem is not None:
+            problems[name] = problem
+            if _declares_dispatch(root):
+                notes.append(f'{entry.path}: {problem}')
+            continue
+        requestable.append(name)
+        trigger = _workflow_cautions(root.get('on'))
+        if trigger:
+            problem = f'does not start on every branch push ({"; ".join(trigger)})'
+        elif not is_ci_workflow_name(name):
+            problem = 'has a file name that ci_workflow cannot use'
+        else:
+            connectable.append(name)
+            continue
+        problems[name] = problem
+        notes.append(f'{entry.path}: {problem}')
+    return WorkflowDetection(tuple(requestable), tuple(connectable), problems, tuple(notes))
 
 
 def discover(snapshot: _source.Snapshot) -> Discovery:
@@ -374,16 +482,24 @@ def discover(snapshot: _source.Snapshot) -> Discovery:
     seen: set[str] = set()
     cautions: list[CheckCaution] = []
 
-    for entry in snapshot:
-        if (
-            entry.kind != 'blob'
-            or entry.mode not in _REGULAR_MODES
-            or _WORKFLOW_PATH.fullmatch(entry.path) is None
-        ):
-            continue
+    for entry in _workflow_entries(snapshot):
         _discover_workflow(entry, names, notes, seen, cautions)
 
     return Discovery(tuple(names), tuple(notes), tuple(cautions))
+
+
+def discover_workflow(snapshot: _source.Snapshot, name: str) -> Discovery:
+    """Discover check names from one selected workflow file.
+
+    Args:
+        snapshot: Selected committed source entries to inspect.
+        name: Workflow filename under `.github/workflows/`, such as `ci.yml`.
+
+    Returns:
+        The discovery result for that workflow alone; empty when it is absent.
+    """
+    path = f'{_WORKFLOW_DIRECTORY}{name}'
+    return discover(tuple(entry for entry in snapshot if entry.path == path))
 
 
 def dispatch_contract_problem(data: bytes) -> str | None:
@@ -391,15 +507,33 @@ def dispatch_contract_problem(data: bytes) -> str | None:
     workflow, problem = _load_workflow(data)
     if workflow is None:
         return problem
+    return _dispatch_problem(workflow)
 
-    triggers = _as_mapping(workflow.get('on'))
-    dispatch = _as_mapping(triggers.get('workflow_dispatch')) if triggers is not None else None
-    inputs = _as_mapping(dispatch.get('inputs')) if dispatch is not None else None
-    if inputs is None:
-        return 'does not declare workflow_dispatch inputs'
 
-    for name in ('hosted', 'full_tests'):
-        input_definition = _as_mapping(inputs.get(name))
-        if input_definition is None or input_definition.get('type') != 'boolean':
-            return f'does not declare the boolean input {name}'
-    return None
+def only_requestable_checks(snapshot: _source.Snapshot, checks: Collection[str]) -> bool:
+    """Return whether only requestable workflows define every named check.
+
+    Under pubanon's workflow contract, a requestable workflow runs no jobs for
+    a push when `CI_RUN_ON_PUSH` is `false`. pubanon relies on that promise
+    without verifying the workflow's conditions.
+
+    Args:
+        snapshot: Selected committed source entries to inspect.
+        checks: Required check names.
+
+    Returns:
+        `True` when `checks` is non-empty, discovery is complete for every
+        workflow that is not requestable, and each check is a job of a
+        requestable workflow and of no other workflow.
+    """
+    requestable = detect(snapshot).requestable
+    if not checks or not requestable:
+        return False
+    names: set[str] = set()
+    for workflow in requestable:
+        names.update(discover_workflow(snapshot, workflow).names)
+    request_paths = {f'{_WORKFLOW_DIRECTORY}{workflow}' for workflow in requestable}
+    others = discover(tuple(entry for entry in snapshot if entry.path not in request_paths))
+    if others.notes:
+        return False
+    return all(check in names and check not in others.names for check in checks)

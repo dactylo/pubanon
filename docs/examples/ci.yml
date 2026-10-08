@@ -1,0 +1,99 @@
+# Starter CI workflow for pubanon's staged route.
+#
+# Copy this file to .github/workflows/ci.yml, replace the marked test step with
+# your project's test commands, and commit it. `pubanon init` then connects it,
+# and `pubanon stage push` requests its runs. See "Request CI from stage push"
+# in pubanon's guide.
+#
+# Lines marked "pubanon:" are part of the contract pubanon relies on.
+name: CI
+run-name: >-
+  ${{ github.event_name == 'push' && vars.CI_RUN_ON_PUSH == 'false' && 'CI / push skipped' ||
+      (!github.event.repository.private || github.event_name != 'workflow_dispatch' ||
+       inputs.hosted || !(vars.CI_LINUX_RUNNER || vars.CI_MACOS_RUNNER || vars.CI_WINDOWS_RUNNER)) &&
+      'CI / hosted' || inputs.full_tests && 'CI / local (full)' || 'CI / local' }}
+
+on:
+  pull_request:
+  # pubanon: run on every branch push; the final repository's CI uses it.
+  # Publications push a branch and tags together, so test the branch once.
+  push:
+    branches:
+      - "**"
+  # pubanon: stage push requests runs through these two boolean inputs.
+  workflow_dispatch:
+    inputs:
+      hosted:
+        description: Run every check on GitHub-hosted runners
+        type: boolean
+        default: true
+      full_tests:
+        description: Include slow tests on self-hosted runners
+        type: boolean
+        default: false
+
+# pubanon: a newer requested run on a branch replaces the older one. Each push
+# run keeps its own group.
+concurrency:
+  group: >-
+    ${{ github.event_name == 'workflow_dispatch'
+        && format('ci-dispatch-{0}', github.ref)
+        || format('ci-run-{0}', github.run_id) }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    # pubanon: stage push turns push runs off in the staging repository.
+    if: github.event_name != 'push' || vars.CI_RUN_ON_PUSH != 'false'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2022]
+    # Requested runs in a private repository use a self-hosted runner when
+    # CI_LINUX_RUNNER, CI_MACOS_RUNNER, or CI_WINDOWS_RUNNER names one, unless
+    # hosted is true. Every other run uses GitHub-hosted runners.
+    runs-on: >-
+      ${{ github.event.repository.private && github.event_name == 'workflow_dispatch' &&
+          !inputs.hosted &&
+          (matrix.os == 'ubuntu-24.04' && vars.CI_LINUX_RUNNER ||
+           matrix.os == 'macos-15' && vars.CI_MACOS_RUNNER ||
+           matrix.os == 'windows-2022' && vars.CI_WINDOWS_RUNNER) || matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Run tests (replace this step)
+        env:
+          # True on a self-hosted runner unless full_tests was requested; your
+          # test command may skip slow tests then.
+          CI_QUICK_TESTS: ${{ runner.environment == 'self-hosted' && !inputs.full_tests }}
+        run: |
+          echo "::error::Replace this step with your project's test commands."
+          exit 1
+
+  # Require this job in pubanon to make publication wait for a passing hosted
+  # run. It runs only for hosted runs and fails unless every test job passed.
+  hosted-validation:
+    if: >-
+      ${{ always() &&
+          (github.event_name != 'push' || vars.CI_RUN_ON_PUSH != 'false') &&
+          (!github.event.repository.private || github.event_name != 'workflow_dispatch' ||
+           inputs.hosted || !(vars.CI_LINUX_RUNNER || vars.CI_MACOS_RUNNER || vars.CI_WINDOWS_RUNNER)) }}
+    needs: [test]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require complete hosted CI
+        env:
+          CI_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          test "$CI_RUNNER_ENVIRONMENT" = github-hosted
+          test "$TEST_RESULT" = success

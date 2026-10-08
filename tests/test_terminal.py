@@ -856,6 +856,13 @@ def test_redirected_output_has_no_ansi(capsys: pytest.CaptureFixture[str]) -> No
     assert capsys.readouterr().out == 'Saved.\n'
 
 
+def test_render_fields_aligns_continuation_lines_under_the_value() -> None:
+    with _terminal.color_context('never'):
+        assert _terminal.render_fields([('A', 'one\ntwo'), ('Long', 'three')], indent=2) == (
+            '  A:    one\n        two\n  Long: three'
+        )
+
+
 def test_render_fields_returns_text_without_printing(capsys: pytest.CaptureFixture[str]) -> None:
     with _terminal.color_context('never'):
         assert _terminal.render_fields([('A', 'one'), ('Long', 'two')], indent=2) == (

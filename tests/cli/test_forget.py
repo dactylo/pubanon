@@ -237,7 +237,7 @@ def test_forget_removes_local_state_keeps_source_and_lock(
 
     def _answer(prompt: str) -> str:
         if prompt.startswith('Publication route (staged/direct) [') or prompt in {
-            'Create local tags marking the source of each publication? [y/N] ',
+            'Create local tags marking the source of each publication? [Y/n] ',
             'Create a release page for each published version? [y/N] ',
             'Enable pull requests? [y/N] ',
             'Enable discussions? [y/N] ',

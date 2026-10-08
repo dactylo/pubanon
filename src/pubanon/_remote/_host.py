@@ -1022,17 +1022,21 @@ def repository_url(owner: str, repo: str) -> str:
     return _URL_TEMPLATE.format(owner=owner, repo=repo)
 
 
-def repository_variable(coordinates: tuple[str, str], name: str) -> str | None:
+def repository_variable(
+    coordinates: tuple[str, str], name: str, *, timeout: float | None = None
+) -> str | None:
     """Read an Actions variable, distinguishing absence from denied access.
 
     Args:
         coordinates: Verified repository owner and name.
         name: Actions variable name to read.
+        timeout: Optional maximum read duration in seconds.
 
     Returns:
         The literal value, or `None` when GitHub returns HTTP 404.
 
     Raises:
+        ObservationTimeoutError: `timeout` expires before GitHub answers.
         PubanonError: Access is denied, the read fails, or the response is
             malformed.
     """
@@ -1040,6 +1044,7 @@ def repository_variable(coordinates: tuple[str, str], name: str) -> str | None:
     returncode, stdout, stderr = _gh(
         ['api', f'repos/{owner}/{repo}/actions/variables/{name}'],
         check=False,
+        timeout=timeout,
     )
     if returncode:
         status = _http_status(stdout, stderr)

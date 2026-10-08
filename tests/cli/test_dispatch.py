@@ -947,7 +947,11 @@ def test_configuration_readers_refuse_while_initialization_holds_project_lock(
         (['run'], ('name', '--version', '--acknowledge-new-paths', '--yes', 'cannot')),
         (
             ['repo', 'create'],
-            ('create the final repository using the saved visibility', '--yes', 'without asking'),
+            (
+                'create or check an empty final repository using saved settings',
+                '--yes',
+                'without asking',
+            ),
         ),
         (['repo'], ('create, reveal, verify, or restore',)),
         (['repo', 'reveal'], ('make the final repository public',)),

@@ -79,8 +79,9 @@ source, then run `pubanon discard` and `pubanon prepare` again.
 
 `stage push` sends that exact snapshot to a separate private GitHub repository, asking before it
 creates the repository the first time. Staging never changes your source branches, and the same
-staging repository is reused for later releases. For projects with `ci_workflow`, use
-`stage push --full-tests` for a full test run or `stage push --hosted` for a hosted run.
+staging repository is reused for later releases. When `init` connects a CI workflow
+(`ci_workflow`), use `stage push --full-tests` for a full test run or `stage push --hosted` for a
+hosted run; see [Request CI from stage push](docs/guide.md#request-ci-from-stage-push).
 `stage watch` waits for its configured checks; if you have neither `ci_workflow` nor configured
 checks, skip it and review the staging repository yourself.
 
@@ -95,10 +96,10 @@ pubanon repo watch
 pubanon repo reveal
 ```
 
-`repo create` creates the final repository, still private; skip it if the repository already
-exists. Before the first upload, keep in mind that GitHub can retain old commits, activity, Actions
-logs, and artifacts even after history is replaced. Staging lets you test before anything reaches
-the final repository.
+`repo create` creates the final repository, still private, or verifies a matching empty repository
+you created beforehand. Before the first upload, keep in mind that GitHub can retain old commits,
+activity, Actions logs, and artifacts even after history is replaced. Staging lets you test before
+anything reaches the final repository.
 
 `publish` asks for confirmation, then sends the snapshot to the final repository. If you turned on
 release pages, a tagged publication also gets a release page, shown in the preview first. A new

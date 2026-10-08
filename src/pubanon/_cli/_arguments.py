@@ -253,8 +253,8 @@ def _add_init_parser(commands: _Commands) -> None:
         '--edit',
         action='store_true',
         help=(
-            'review and change saved visibility, route, source tags, release pages, '
-            'required checks, and repository settings'
+            'review and change saved visibility, repository settings, route, '
+            'CI workflow and required checks, release pages, and source tags'
         ),
     )
     init.add_argument(
@@ -631,7 +631,7 @@ def build_parser() -> _RootParser:
     )
     repo_commands = repo.add_subparsers(dest='repo_command', required=True)
     create = _add_command_parser(
-        repo_commands, 'create', 'create the final repository using the saved visibility'
+        repo_commands, 'create', 'create or check an empty final repository using saved settings'
     )
     create.add_argument(
         '--yes',
