@@ -68,6 +68,25 @@ def staged_publication_cli(
                         'api',
                         f'repos/{project.owner}/{project.repo}',
                         '--jq',
+                        _host._REPOSITORY_SETTINGS_QUERY,
+                    ],
+                    'stdout': json.dumps(
+                        {
+                            'description': '',
+                            'default_branch': 'main',
+                            'issues': True,
+                            'wiki': False,
+                            'projects': False,
+                            'pull_requests': False,
+                            'discussions': False,
+                        }
+                    ),
+                },
+                {
+                    'args': [
+                        'api',
+                        f'repos/{project.owner}/{project.repo}',
+                        '--jq',
                         _host._REPOSITORY_QUERY,
                     ],
                     'stdout': json.dumps(

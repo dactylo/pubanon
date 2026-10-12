@@ -14,6 +14,7 @@ from pubanon import (
 from pubanon._errors import OperationCanceled, PubanonError
 from pubanon._terminal import (
     ask,
+    confirm,
     detail,
     display_path,
     escape,
@@ -30,6 +31,30 @@ if TYPE_CHECKING:
 
 
 from pubanon._cli import _context
+
+
+def _confirm_effect(pattern: str, action: str, membership: _policy.Membership) -> bool:
+    """Report what a group choice changes, refusing no-ops and unconfirmed exclusions."""
+    decided = _policy.evaluate_membership(membership.unmatched, (pattern,), ()).allowed
+    removed = (
+        _policy.evaluate_membership(membership.allowed, (), (pattern,)).denied
+        if action == 'deny'
+        else []
+    )
+    if not decided and not removed:
+        output(f'No undecided files match {escape(pattern)}. Nothing changed.', kind='warning')
+        return False
+    if removed:
+        output('This pattern also matches files that are already included:', kind='warning')
+        for path in removed:
+            print(f'  {escape(path)}')
+        if not confirm('Exclude them too?', default=False):
+            output('Nothing changed.', kind='note')
+            return False
+    count = len(decided) + len(removed)
+    verb = 'Included' if action == 'publish' else 'Excluded'
+    output(f'{verb} {count} {"file" if count == 1 else "files"}.')
+    return True
 
 
 def _policy_review_notice(membership: _policy.Membership, exceptions: tuple[str, ...]) -> None:
@@ -91,23 +116,44 @@ def _save_new_path_list(
     return path
 
 
-def policy_decision(pattern: str, admitted: list[str], *, back: bool = False) -> tuple[str, str]:
-    """Read a group choice, optionally allowing the previous choice to be undone."""
-    print(style('Files to include or exclude:'))
-    for path in admitted:
-        print(f'  {escape(path)}')
-    print(f'Selection pattern: {escape(pattern)} (also applies to future matching files).')
-    choices = ['include', 'exclude', 'customize', *(['back'] if back else []), 'quit']
-    decision = ask('Include these files?', choices=choices)
-    if decision == 'back':
-        return 'back', pattern
-    if decision == 'customize':
-        return 'publish', ask('Replacement pattern')
-    if decision == 'include':
-        return 'publish', pattern
-    if decision == 'exclude':
-        return 'deny', pattern
-    raise OperationCanceled('Canceled. Nothing was saved.')
+def policy_decision(
+    pattern: str, admitted: list[str], membership: _policy.Membership, *, back: bool = False
+) -> tuple[str, str]:
+    """Read a group choice that changes the selection, optionally undoing the previous one.
+
+    Args:
+        pattern: Offered pattern for the group.
+        admitted: Undecided paths in the group, shown before the choice.
+        membership: Current selection. Its unmatched paths are undecided and
+            its allowed paths are already included; a choice that changes
+            neither, or an unconfirmed exclusion of included paths, asks again.
+        back: Whether to offer undoing the previous choice.
+
+    Returns:
+        `('publish', pattern)` or `('deny', pattern)` with the offered or
+        custom pattern, or `('back', pattern)` to undo the previous choice.
+
+    Raises:
+        OperationCanceled: The operator chose quit.
+    """
+    while True:
+        print(style('Undecided files:'))
+        for path in admitted:
+            print(f'  {escape(path)}')
+        print(f'Selection pattern: {escape(pattern)} (also applies to future matching files).')
+        choices = ['include', 'exclude', 'customize', *(['back'] if back else []), 'quit']
+        decision = ask('Include these files?', choices=choices)
+        if decision == 'back':
+            return 'back', pattern
+        if decision == 'quit':
+            raise OperationCanceled('Canceled. Nothing was saved.')
+        selected = pattern
+        if decision == 'customize':
+            selected = ask('Custom pattern')
+            decision = ask('Include or exclude matching files?', choices=['include', 'exclude'])
+        action = 'publish' if decision == 'include' else 'deny'
+        if _confirm_effect(selected, action, membership):
+            return action, selected
 
 
 def _apply_policy_offers(
@@ -132,12 +178,9 @@ def _apply_policy_offers(
     exceptions = list(project.secret_exceptions)
     membership = _policy.evaluate_membership(paths, tuple(allow), deny, global_deny=global_deny)
     while membership.unmatched:
-        for pattern, admitted in _policy.narrowest_offer(
-            membership.unmatched,
-            guided=False,
-        ):
-            action, selected = policy_decision(pattern, admitted)
-            (allow if action == 'publish' else deny).append(selected)
+        pattern, admitted = _policy.narrowest_offer(membership.unmatched, guided=False)[0]
+        action, selected = policy_decision(pattern, admitted, membership)
+        (allow if action == 'publish' else deny).append(selected)
         membership = _policy.evaluate_membership(
             paths, tuple(allow), deny, global_deny=global_deny
         )
@@ -171,11 +214,13 @@ def _review_groups(ctx: _context.ProjectContext, paths: list[str]) -> _context.P
     eligible = _policy.evaluate_membership(paths, ('**',), (), global_deny=global_deny).allowed
     project = replace(ctx.project, allow=(), deny=())
     previous: list[_config.ProjectConfig] = []
-    while unmatched := _policy.evaluate_membership(
-        eligible, project.allow, project.deny, global_deny=global_deny
+    while (
+        membership := _policy.evaluate_membership(
+            eligible, project.allow, project.deny, global_deny=global_deny
+        )
     ).unmatched:
-        pattern, admitted = _policy.narrowest_offer(unmatched, guided=True)[0]
-        action, selected = policy_decision(pattern, admitted, back=True)
+        pattern, admitted = _policy.narrowest_offer(membership.unmatched, guided=True)[0]
+        action, selected = policy_decision(pattern, admitted, membership, back=True)
         if action == 'back':
             if previous:
                 project = previous.pop()
@@ -295,7 +340,7 @@ def review_selection(
                 raise OperationCanceled('Canceled. Nothing was saved.')
             if choice == 'continue':
                 break
-            print('Review each group below. Customize lets you edit its filename pattern.')
+            print('Review each group below. Customize takes a pattern to include or exclude.')
             ctx = _apply_policy_offers(
                 _review_groups(ctx, paths), snapshot, persist=False, yes=False
             )

@@ -50,6 +50,10 @@ _REAL_SETTINGS = Settings(
     discussions=False,
 )
 _REAL_TERM = 'internal-host.example'
+_SETTINGS_CALL: dict[str, object] = {
+    'args': ['api', 'repos/release-owner/public-repo', '--jq', _host._REPOSITORY_SETTINGS_QUERY],
+    'stdin': '',
+}
 
 
 @dataclass(frozen=True)
@@ -314,7 +318,8 @@ def _init_answers(
                     ),
                     'c',
                 ),
-                ('Replacement pattern: ', '**'),
+                ('Custom pattern: ', '**'),
+                ('Include or exclude matching files? [i]nclude / [e]xclude: ', 'i'),
                 ('Use this selection? [c]ontinue / [r]eview / [b]ack / [q]uit: ', 'c'),
             ]
         ),
@@ -813,6 +818,19 @@ def _write_host_responses(path: Path) -> None:
                         }
                     ),
                 },
+                _settings_response(
+                    'release-owner',
+                    'public-repo',
+                    Settings(
+                        description='',
+                        default_branch='main',
+                        issues=True,
+                        wiki=False,
+                        projects=False,
+                        pull_requests=False,
+                        discussions=False,
+                    ),
+                ),
             ]
         )
         + '\n'
@@ -923,6 +941,7 @@ def _assert_policy_growth_acknowledgment(
         [
             _account_response(fixture._account),
             _repository_response(fixture._owner, fixture._publication_repo, 'public'),
+            _settings_response(fixture._owner, fixture._publication_repo, fixture._settings),
         ],
     )
 
@@ -971,6 +990,7 @@ def _complete_guided_publication(
         [
             _account_response(fixture._account),
             _repository_response(fixture._owner, fixture._publication_repo, 'private'),
+            _settings_response(fixture._owner, fixture._publication_repo, fixture._settings),
         ],
     )
     answers = ['n', 'y']
@@ -1566,6 +1586,7 @@ def _run_release_failed_ship(
         [
             _account_response(fixture._account),
             _repository_response(fixture._owner, fixture._publication_repo, 'private'),
+            _settings_response(fixture._owner, fixture._publication_repo, fixture._settings),
         ],
     )
     assert (
@@ -1605,6 +1626,7 @@ def _run_release_green_release(
         [
             _account_response(fixture._account),
             _repository_response(fixture._owner, fixture._publication_repo, 'private'),
+            _settings_response(fixture._owner, fixture._publication_repo, fixture._settings),
         ],
     )
     assert _cli.main(['prepare', '--version', '0.2.0', '--yes']) == 0
@@ -1929,6 +1951,7 @@ def _run_release_staged_release(
         [
             _account_response(fixture._account),
             _repository_response(fixture._owner, fixture._publication_repo, 'private'),
+            _settings_response(fixture._owner, fixture._publication_repo, fixture._settings),
             stage_missing,
             stage_missing,
             stage_missing,
@@ -2084,6 +2107,7 @@ def _stage_and_publish_lifecycle_candidate(
         [
             _account_response(fixture._account),
             _repository_response(fixture._owner, fixture._publication_repo, 'private'),
+            _settings_response(fixture._owner, fixture._publication_repo, fixture._settings),
             _repository_response(fixture._owner, fixture._staging_repo, 'private'),
             _settings_response(fixture._owner, fixture._staging_repo, fixture._settings),
             _check_response(fixture._owner, fixture._staging_repo, staged_oid, fixture._check),
@@ -2389,6 +2413,7 @@ def test_real_name_identity_two_releases_audit_and_reveal_work_offline(
         [
             _account_response(_REAL_ACCOUNT),
             _repository_response(owner, repo, 'private'),
+            _settings_response(owner, repo, _REAL_SETTINGS),
         ],
     )
 
@@ -2411,6 +2436,7 @@ def test_real_name_identity_two_releases_audit_and_reveal_work_offline(
         [
             _account_response(_REAL_ACCOUNT),
             _repository_response(owner, repo, 'private'),
+            _settings_response(owner, repo, _REAL_SETTINGS),
         ],
     )
     assert _cli.main(['prepare', '--version', '0.2.0', '--yes']) == 0
@@ -2483,7 +2509,7 @@ def test_stepwise_publish_path_and_gates_work_offline(
     assert (inspection / 'README.md').read_text() == 'first release\n'
     assert _host_calls() == []
     assert _cli.main(['publish', '--yes']) == 0
-    assert _host_calls() == [_ACCOUNT_CALL, _REPOSITORY_CALL]
+    assert _host_calls() == [_ACCOUNT_CALL, _REPOSITORY_CALL, _SETTINGS_CALL]
     assert _git_refs(host) == {
         'refs/heads/main': first.commit,
         'refs/tags/v1.0.0': first.commit,
@@ -2498,9 +2524,9 @@ def test_stepwise_publish_path_and_gates_work_offline(
     assert (inspection / 'README.md').read_text() == 'first release\n'
     second_inspection = paths.data_dir / 'projects' / 'demo' / 'inspections' / second.commit
     assert (second_inspection / 'README.md').read_text() == 'second release\n'
-    assert _host_calls() == [_ACCOUNT_CALL, _REPOSITORY_CALL]
+    assert _host_calls() == [_ACCOUNT_CALL, _REPOSITORY_CALL, _SETTINGS_CALL]
     assert _cli.main(['publish', '--yes']) == 0
-    assert _host_calls() == [_ACCOUNT_CALL, _REPOSITORY_CALL, _ACCOUNT_CALL, _REPOSITORY_CALL]
+    assert _host_calls() == [_ACCOUNT_CALL, _REPOSITORY_CALL, _SETTINGS_CALL] * 2
     assert _git_refs(host) == {
         'refs/heads/main': second.commit,
         'refs/tags/v1.0.0': first.commit,

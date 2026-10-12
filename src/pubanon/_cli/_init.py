@@ -488,16 +488,16 @@ def _draft_group_choice(
     ).allowed
     flagged = set(_policy.secret_like(paths, ()))
     ordinary = [path for path in paths if path not in flagged]
-    unmatched = _policy.evaluate_membership(
+    membership = _policy.evaluate_membership(
         ordinary,
         proposed.project.allow,
         proposed.project.deny,
         global_deny=_config.global_deny(ctx.global_config),
-    ).unmatched
-    if not unmatched:
+    )
+    if not membership.unmatched:
         return replace(draft, phase='preview')
-    pattern, admitted = _policy.narrowest_offer(unmatched, guided=True)[0]
-    action, pattern = _selection.policy_decision(pattern, admitted, back=True)
+    pattern, admitted = _policy.narrowest_offer(membership.unmatched, guided=True)[0]
+    action, pattern = _selection.policy_decision(pattern, admitted, membership, back=True)
     if action == 'back':
         return _back_init_selection(draft)
     choice = 'include' if action == 'publish' else 'exclude'
@@ -562,7 +562,7 @@ def _draft_selection(
             if choice == 'back':
                 draft = _back_init_selection(draft)
             else:
-                print('Review each group below. Customize lets you edit its filename pattern.')
+                print('Review each group below. Customize takes a pattern to include or exclude.')
                 draft = replace(draft, reviewing=True, groups=(), phase='groups')
             draft = _checkpoint_init(ctx, draft)
 

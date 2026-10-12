@@ -329,6 +329,15 @@ def _context(
     )
 
 
+def _description_context(
+    tmp_path: Path, source: Path, description: str
+) -> _publish.PublishContext:
+    ctx = _context(tmp_path, source)
+    assert ctx._project.settings is not None
+    settings = replace(ctx._project.settings, description=description)
+    return replace(ctx, _project=replace(ctx._project, settings=settings))
+
+
 def _literal_context(
     tmp_path: Path, *, extra_terms: tuple[str, ...] = (), version: str | None = None
 ) -> _publish.PublishContext:
@@ -535,6 +544,25 @@ def _write_host_responses(path: Path, visibility: str = 'public') -> None:
                 {
                     'args': ['api', 'user', '--jq', '.login'],
                     'stdout': 'release-account\n',
+                },
+                {
+                    'args': [
+                        'api',
+                        'repos/public-owner/public-repo',
+                        '--jq',
+                        _host._REPOSITORY_SETTINGS_QUERY,
+                    ],
+                    'stdout': json.dumps(
+                        {
+                            'description': '',
+                            'default_branch': 'main',
+                            'issues': True,
+                            'wiki': False,
+                            'projects': False,
+                            'pull_requests': False,
+                            'discussions': False,
+                        }
+                    ),
                 },
                 {
                     'args': [
@@ -2325,6 +2353,129 @@ def test_publish_first_and_second_release_enforce_parent(
     )
 
 
+@pytest.mark.parametrize('unattended', [False, True])
+def test_publish_fills_existing_repository_description_before_push(
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    unattended: bool,
+) -> None:
+    tmp_path = fake_gh.parent
+    source = make_repo(files={'README.md': 'public\n'})
+    host = _new_host(tmp_path)
+    _configure_host(host, fake_gh, monkeypatch)
+    description = 'Public project'
+    ctx = replace(_description_context(tmp_path, source, description), _yes=unattended)
+    actual = _host.SettingsFacts(
+        '', 'main', issues=True, wiki=False, projects=False, pull_requests=False, discussions=False
+    )
+    real_gh = _host._gh
+    events: list[str] = []
+
+    def _settings(_owner: str, _repo: str) -> _host.SettingsFacts:
+        return actual
+
+    def _gh(
+        args: list[str], *, check: bool = True, timeout: float | None = None
+    ) -> bytes | tuple[int, bytes, bytes]:
+        nonlocal actual
+        if args[:3] == ['api', '-X', 'PATCH']:
+            assert args == [
+                'api',
+                '-X',
+                'PATCH',
+                'repos/public-owner/public-repo',
+                '-f',
+                f'description={description}',
+            ]
+            assert unattended or events == ['confirmed']
+            assert _remote_ref(host, 'refs/heads/main') is None
+            actual = actual._replace(description=description)
+            events.append('description updated')
+            return b''
+        return real_gh(args, check=check, timeout=timeout)
+
+    def _confirm(_prompt: str) -> str:
+        assert actual.description == ''
+        assert f'Description: {description}' in capsys.readouterr().out
+        events.append('confirmed')
+        return 'y'
+
+    monkeypatch.setattr(_host, 'repository_settings', _settings)
+    monkeypatch.setattr(_host, '_gh', _gh)
+    monkeypatch.setattr('builtins.input', _confirm)
+
+    _publish.publish(ctx)
+
+    assert actual.description == description
+    assert events == ([] if unattended else ['confirmed']) + ['description updated']
+    assert _remote_ref(host, 'refs/heads/main') == ctx._record.commit
+    assert _records.load_candidate(ctx._paths, ctx._project.name) is None
+
+
+@pytest.mark.parametrize('failure', ['read', 'write', 'verify', 'interrupt'])
+def test_publish_description_failure_keeps_snapshot_for_retry(
+    tmp_path: Path,
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    source = make_repo(files={'README.md': 'public\n'})
+    host = _new_host(tmp_path)
+    _configure_host(host, fake_gh, monkeypatch)
+    ctx = _description_context(tmp_path, source, 'Public project')
+    actual = _host.SettingsFacts(
+        '', 'main', issues=True, wiki=False, projects=False, pull_requests=False, discussions=False
+    )
+    attempted: list[str] = []
+    real_gh = _host._gh
+
+    def _settings(_owner: str, _repo: str) -> _host.SettingsFacts:
+        if failure == 'read':
+            raise PubanonError('read failed')
+        return actual
+
+    def _gh(
+        args: list[str], *, check: bool = True, timeout: float | None = None
+    ) -> bytes | tuple[int, bytes, bytes]:
+        nonlocal actual
+        if args[:3] == ['api', '-X', 'PATCH']:
+            attempted.append('patch')
+            if failure == 'write':
+                raise PubanonError('write failed')
+            if failure == 'interrupt':
+                actual = actual._replace(description='Public project')
+                raise KeyboardInterrupt
+            return b''
+        return real_gh(args, check=check, timeout=timeout)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(_host, 'repository_settings', _settings)
+        fault.setattr(_host, '_gh', _gh)
+        with pytest.raises(PubanonError) as error:
+            _publish.publish(ctx)
+
+    assert attempted == ([] if failure == 'read' else ['patch'])
+    assert isinstance(error.value, OperationCanceled) is (failure == 'interrupt')
+    assert 'No code was pushed' in error.value.render()
+    assert 'description may have changed' in error.value.render()
+    assert 'pubanon publish' in (error.value.recovery or '')
+    assert _remote_ref(host, 'refs/heads/main') is None
+    retained = _records.load_candidate(ctx._paths, ctx._project.name)
+    assert retained is not None
+    assert retained.state == _candidate.STATE_RETAINED
+    assert retained.commit == ctx._record.commit
+
+    def _updated_settings(_owner: str, _repo: str) -> _host.SettingsFacts:
+        return actual._replace(description='Public project')
+
+    monkeypatch.setattr(_host, 'repository_settings', _updated_settings)
+    _publish.publish(replace(ctx, _record=retained))
+    assert _remote_ref(host, 'refs/heads/main') == ctx._record.commit
+
+
 @pytest.mark.slow
 def test_publish_hygiene_audit_result_does_not_block(
     tmp_path: Path,
@@ -2456,6 +2607,13 @@ def test_publish_rechecks_ci_after_confirmation(
     host = _new_host(fake_gh.parent)
     _configure_host(host, fake_gh, monkeypatch)
     ctx = _publish_mode(_ci_context(fake_gh.parent, source), 'interactive')
+    assert ctx._project.settings is not None
+    ctx = replace(
+        ctx,
+        _project=replace(
+            ctx._project, settings=replace(ctx._project.settings, description='Public project')
+        ),
+    )
     _configure_staged_candidate(ctx, fake_gh, monkeypatch)
     _configure_ci_evidence(ctx, fake_gh)
     prompts: list[str] = []
@@ -2493,6 +2651,7 @@ def test_publish_rechecks_ci_after_confirmation(
     assert saved is not None
     assert saved.commit == ctx._record.commit
     assert saved.state == _candidate.STATE_RETAINED
+    assert not any('PATCH' in call for call in gh_calls(fake_gh.parent))
 
 
 def test_publish_refuses_existing_intended_tag(
@@ -2614,6 +2773,19 @@ def test_publish_refuses_repaired_structural_history_before_acknowledgment_or_pr
     assert 'Publish prepared snapshot' not in capsys.readouterr().out
     assert _remote_ref(host, 'refs/heads/main') == remote_before
     _assert_provisional_bookmark(ctx)
+
+
+def test_publish_refuses_sensitive_description_before_host_access(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+) -> None:
+    ctx = _description_context(tmp_path, make_repo(), 'By Private Person')
+
+    with pytest.raises(PubanonError, match='repository description did not pass content checks'):
+        _publish.publish(ctx)
+
+    assert gh_calls(tmp_path) == []
+    assert _records.load_candidate(ctx._paths, ctx._project.name) == ctx._record
 
 
 def test_publish_refuses_stale_stage_without_preview_or_push(
@@ -2800,7 +2972,7 @@ def test_publish_requires_confirmation_but_retains_declined_candidate(
     source = make_repo(files={'README.md': 'first\n'})
     host = _new_host(tmp_path)
     _configure_host(host, fake_gh, monkeypatch)
-    ctx = _publish_mode(_context(tmp_path, source), 'interactive')
+    ctx = _publish_mode(_description_context(tmp_path, source, 'Public project'), 'interactive')
 
     def _decline(prompt: str) -> str:
         assert prompt == ('Publish untagged snapshot to public-owner/public-repo? [y/n] ')
@@ -2813,6 +2985,7 @@ def test_publish_requires_confirmation_but_retains_declined_candidate(
 
     _assert_provisional_bookmark(ctx)
     assert _remote_ref(host, 'refs/heads/main') is None
+    assert not any('PATCH' in call for call in gh_calls(tmp_path))
 
 
 def test_publish_verification_reads_snapshot_once(

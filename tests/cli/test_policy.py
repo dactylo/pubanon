@@ -40,7 +40,7 @@ def test_adjust_reoffers_unmatched_remainder(
         _source.Entry('pkg/a.py', 0o100644, 'blob', b'a'),
         _source.Entry('pkg/b.py', 0o100644, 'blob', b'b'),
     )
-    answers = iter(['c', 'pkg/a.py', 'i'])  # narrow to one file, then accept rest
+    answers = iter(['c', 'pkg/a.py', 'i', 'i'])  # narrow to one file, then accept rest
 
     def _answer(_prompt: str) -> str:
         return next(answers)
@@ -195,16 +195,75 @@ def test_policy_decision_accepts_single_key_and_renders_matches(
         return 'i'
 
     monkeypatch.setattr('builtins.input', _answer)
+    membership = _policy.evaluate_membership(['src/a.py', 'src/b.py'], (), ())
 
-    assert policy_decision('src/**', ['src/a.py', 'src/b.py']) == (
+    assert policy_decision('src/**', ['src/a.py', 'src/b.py'], membership) == (
         'publish',
         'src/**',
     )
     assert capsys.readouterr().out == (
-        'Files to include or exclude:\n  src/a.py\n  src/b.py\n'
+        'Undecided files:\n  src/a.py\n  src/b.py\n'
         'Selection pattern: src/** (also applies to future matching files).\n'
+        'Included 2 files.\n'
     )
     assert prompts == ['Include these files? [i]nclude / [e]xclude / [c]ustomize / [q]uit: ']
+
+
+def test_policy_decision_confirms_exclusion_of_included_files(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    answers = iter(['e', 'n', 'e', 'y'])
+    prompts: list[str] = []
+
+    def _answer(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(answers)
+
+    monkeypatch.setattr('builtins.input', _answer)
+    membership = _policy.evaluate_membership(
+        ['tests/test_public.py', 'tests/human/a.py', 'tests/human/b.py'],
+        ('tests/test_public.py',),
+        (),
+    )
+
+    assert policy_decision('tests/**', membership.unmatched, membership) == (
+        'deny',
+        'tests/**',
+    )
+    assert prompts.count('Exclude them too? [y/N] ') == 2
+    output = capsys.readouterr().out
+    assert (
+        output.count(
+            'This pattern also matches files that are already included:\n  tests/test_public.py\n'
+        )
+        == 2
+    )
+    assert 'Nothing changed.\n' in output
+    assert output.endswith('Excluded 3 files.\n')
+
+
+def test_policy_decision_customize_excludes_typed_pattern(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    answers = iter(['c', 'tests/human/**', 'e'])
+    prompts: list[str] = []
+
+    def _answer(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(answers)
+
+    monkeypatch.setattr('builtins.input', _answer)
+    paths = ['tests/test_a.py', 'tests/human/a.py', 'tests/human/b.py']
+    membership = _policy.evaluate_membership(paths, (), ())
+
+    assert policy_decision('tests/**', paths, membership) == ('deny', 'tests/human/**')
+    assert prompts[1:] == [
+        'Custom pattern: ',
+        'Include or exclude matching files? [i]nclude / [e]xclude: ',
+    ]
+    assert capsys.readouterr().out.endswith('Excluded 2 files.\n')
 
 
 def test_policy_decision_quit_refuses_run(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -212,10 +271,35 @@ def test_policy_decision_quit_refuses_run(monkeypatch: pytest.MonkeyPatch) -> No
         return 'q'
 
     monkeypatch.setattr('builtins.input', _quit_decision)
+    membership = _policy.evaluate_membership(['README.md'], (), ())
 
     with pytest.raises(OperationCanceled, match=r'Canceled\.') as error:
-        policy_decision('**', ['README.md'])
+        policy_decision('**', ['README.md'], membership)
     assert 'Nothing was saved.' in str(error.value)
+
+
+def test_policy_decision_reasks_when_pattern_changes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    answers = iter(['c', 'scripts/a.py', 'i', 'i'])
+
+    def _answer(_prompt: str) -> str:
+        return next(answers)
+
+    monkeypatch.setattr('builtins.input', _answer)
+    membership = _policy.evaluate_membership(
+        ['scripts/a.py', 'scripts/b.py'], ('scripts/a.py',), ()
+    )
+
+    assert policy_decision('scripts/b.py', ['scripts/b.py'], membership) == (
+        'publish',
+        'scripts/b.py',
+    )
+    output = capsys.readouterr().out
+    assert 'No undecided files match scripts/a.py. Nothing changed.\n' in output
+    assert output.count('Undecided files:\n') == 2
+    assert output.endswith('Included 1 file.\n')
 
 
 def test_policy_offers_explain_selection_rules_once_by_default(
@@ -249,6 +333,31 @@ def test_policy_offers_explain_selection_rules_once_by_default(
         )
         == 1
     )
+
+
+def test_policy_offers_skip_groups_decided_by_custom_pattern(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / 'source'
+    source.mkdir()
+    paths, global_config, project = configure(tmp_path, monkeypatch, source)
+    assert project is not None
+    ctx = ProjectContext(paths, global_config, replace(project, allow=()))
+    snapshot = (
+        _source.Entry('docs/guide.md', 0o100644, 'blob', b'guide'),
+        _source.Entry('src/a.py', 0o100644, 'blob', b'a'),
+    )
+    answers = iter(['c', '**', 'i'])
+
+    def _answer(_prompt: str) -> str:
+        return next(answers)
+
+    monkeypatch.setattr('builtins.input', _answer)
+    updated = _apply_policy_offers(ctx, snapshot, persist=False, yes=False)
+
+    assert updated.project.allow == ('**',)
+    assert next(answers, None) is None
 
 
 def test_policy_offers_yes_still_refuses_credential_warning_without_input(
@@ -319,7 +428,7 @@ def test_selection_review_applies_edited_groups_only_on_acceptance(
         _source.Entry(path, 0o100644, 'blob', b'content')
         for path in ('README.md', 'notes/draft.md', 'private/key.pem')
     )
-    replies = iter(['r', 'e', 'b', 'c', 'README.md', 'e', decision[0]])
+    replies = iter(['r', 'e', 'b', 'c', 'README.md', 'i', 'e', decision[0]])
 
     def _answer(_prompt: str) -> str:
         return next(replies)

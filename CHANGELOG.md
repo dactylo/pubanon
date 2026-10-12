@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.1 (2026-10-11)
+
+### Changed
+
+- In file selection for `init` and `prepare`, customize asks whether to include or exclude your
+  pattern, and each choice reports how many files it decided.
+
+### Fixed
+
+- `publish` updates the final repository's description to match `[settings]`, including in
+  repositories created outside pubanon, and shows the description in its preview. If you edited the
+  description on GitHub, copy it into `[settings]` before publishing, or `publish` replaces it.
+- File selection lists the already included files that an exclusion would also remove, and asks
+  before excluding them.
+
 ## 0.4.0 (2026-10-07)
 
 ### Added

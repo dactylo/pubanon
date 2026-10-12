@@ -1681,6 +1681,64 @@ def test_init_retries_late_answer_without_losing_policy(
     assert 'Next: pubanon repo create' in output
 
 
+def test_init_review_excludes_subdirectory_without_losing_included_files(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = make_repo(
+        files={
+            'README.md': 'public\n',
+            'tests/human/a.py': 'private\n',
+            'tests/human/b.py': 'private\n',
+            'tests/test_public.py': 'public\n',
+        }
+    )
+    paths, _global_config, _project = configure(tmp_path, monkeypatch)
+    monkeypatch.chdir(source)
+    scripted = {
+        'Use this selection? [c]ontinue / [r]eview / [b]ack / [q]uit: ': iter(['r', 'c']),
+        'Include these files? [i]nclude / [e]xclude / [c]ustomize / [b]ack / [q]uit: ': iter(
+            ['i', 'c', 'e', 'c']
+        ),
+        'Custom pattern: ': iter(['tests/test_public.py', 'tests/human/**']),
+        'Include or exclude matching files? [i]nclude / [e]xclude: ': iter(['i', 'e']),
+        'Exclude them too? [y/N] ': iter(['n']),
+        'Save this configuration? [s]ave / [e]dit / [c]ancel: ': iter(['s']),
+    }
+
+    def _answer(prompt: str) -> str:
+        if prompt in scripted:
+            return next(scripted[prompt])
+        if prompt in {
+            'GitHub owner [anonymous-account]: ',
+            'GitHub repository [demo]: ',
+            'Repository visibility (private/public) [private]: ',
+            'Required CI checks (comma separated, blank for none): ',
+            'Repository description (blank for none): ',
+            'Enable issues? [Y/n] ',
+            'Enable wiki? [y/N] ',
+            'Enable projects? [y/N] ',
+        }:
+            return ''
+        pytest.fail(f'unexpected init prompt: {prompt}')
+
+    monkeypatch.setattr('builtins.input', _default_route(_answer))
+
+    assert _cli.main(['init', '--project', 'demo']) == 0
+
+    output = capsys.readouterr().out
+    assert (
+        'This pattern also matches files that are already included:\n  tests/test_public.py\n'
+    ) in output
+    assert 'Excluded 2 files.\n' in output
+    assert all(next(answers, None) is None for answers in scripted.values())
+    project = _config.load_project(paths, 'demo')
+    assert project.allow == ('README.md', 'tests/test_public.py')
+    assert project.deny == ('tests/human/**',)
+
+
 def test_init_review_follows_question_order_and_lists_each_check(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2106,7 +2164,7 @@ def test_init_skips_globally_ignored_directories(
             return 'c'
         if prompt.startswith('Save this configuration?'):
             return 's'
-        if prompt.startswith(('Include', 'Selection pattern', 'Replacement pattern')):
+        if prompt.startswith(('Include', 'Selection pattern', 'Custom pattern')):
             pytest.fail(f'Unexpected selection question: {prompt}')
         if prompt.startswith(
             (
@@ -2167,7 +2225,7 @@ def test_init_skips_globally_ignored_files(
             return 'c'
         if prompt.startswith('Save this configuration?'):
             return 's'
-        if prompt.startswith(('Include', 'Selection pattern', 'Replacement pattern')):
+        if prompt.startswith(('Include', 'Selection pattern', 'Custom pattern')):
             pytest.fail(f'Unexpected selection question: {prompt}')
         if prompt.startswith(
             (

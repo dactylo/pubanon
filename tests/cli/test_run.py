@@ -1637,17 +1637,17 @@ def test_run_staging_watch_and_publish_share_the_exact_candidate_commit(
         }
         for repo in (stage_repo, project.repo)
     )
-    responses.append(
+    responses.extend(
         {
             'args': [
                 'api',
-                f'repos/{project.owner}/{stage_repo}',
+                f'repos/{project.owner}/{repo}',
                 '--jq',
                 _host._REPOSITORY_SETTINGS_QUERY,
             ],
             'stdout': json.dumps(
                 {
-                    'description': 'retained settings',
+                    'description': 'retained settings' if repo == stage_repo else '',
                     'default_branch': 'main',
                     'issues': False,
                     'wiki': True,
@@ -1657,6 +1657,7 @@ def test_run_staging_watch_and_publish_share_the_exact_candidate_commit(
                 }
             ),
         }
+        for repo in (stage_repo, project.repo)
     )
     fake_gh.write_text(json.dumps(responses))
     assert (

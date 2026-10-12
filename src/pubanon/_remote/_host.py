@@ -1624,6 +1624,42 @@ def recent_workflow_runs(
     return runs
 
 
+def sync_repository_description(dest: Destination, description: str) -> bool:
+    """Apply a configured description to an existing repository and verify it.
+
+    Args:
+        dest: Verified destination whose description may be changed.
+        description: Content-checked description; an empty string clears it.
+
+    Returns:
+        Whether the description needed an update.
+
+    Raises:
+        PubanonError: The description could not be read, updated, or verified.
+            A failed update or verification may leave the description changed.
+    """
+    if repository_settings(dest.owner, dest.repo).description == description:
+        return False
+    _gh(
+        [
+            'api',
+            '-X',
+            'PATCH',
+            f'repos/{dest.owner}/{dest.repo}',
+            '-f',
+            f'description={description}',
+        ]
+    )
+    actual = repository_settings(dest.owner, dest.repo).description
+    if actual != description:
+        raise PubanonError(
+            'repository description did not match after update',
+            expected=escape(description),
+            actual=escape(actual),
+        )
+    return True
+
+
 def workflow_registered(
     coordinates: tuple[str, str],
     workflow: str,

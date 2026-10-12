@@ -19,7 +19,7 @@ from pubanon._config import (
 )
 from pubanon._errors import OperationCanceled, PubanonError, PublicationCanceled
 from pubanon._gate import RuleClass
-from pubanon._remote import _host, _releases, _stage, _watch
+from pubanon._remote import _host, _lifecycle, _releases, _stage, _watch
 from pubanon._remote._ci import (
     RUN_ON_PUSH_VARIABLE,
     RunQuery,
@@ -589,6 +589,8 @@ def _publication_review_question(
         _releases.show_page_plan(page)
         suffix = ' and create its release page' if page.action == 'create' else ''
         question = f'Publish {what} to {target}{suffix}?'
+    if ctx._project.settings is not None:
+        output(field('Description', escape(ctx._project.settings.description) or '(empty)'))
     if verbose_enabled():
         output(report)
     else:
@@ -729,6 +731,36 @@ def _sync_args(
     args.append(f'{local_main}:refs/heads/main')
     args.extend(f'{missing_tags[tag]}:refs/tags/{tag}' for tag in sorted(missing_tags))
     return args
+
+
+def _sync_description(ctx: PublishContext, destination: Destination) -> None:
+    """Apply the reviewed description while retaining retryable snapshot state."""
+    settings = ctx._project.settings
+    if settings is None:
+        raise PubanonError('repository settings are missing')
+    fact = (
+        'No code was pushed. The repository description may have changed. '
+        'The prepared snapshot is kept.'
+    )
+    try:
+        changed = _host.sync_repository_description(destination, settings.description)
+    except (OperationCanceled, KeyboardInterrupt) as error:
+        raise _publication_cancelled(
+            error,
+            headline='Canceled while updating the repository description.',
+            diagnostic_kind='warning',
+            fact=fact,
+            recovery='pubanon publish',
+        ) from None
+    except (OSError, PubanonError) as error:
+        reason = error.render() if isinstance(error, PubanonError) else str(error)
+        raise PubanonError(
+            'repository description could not be synchronized',
+            fact=f'{fact}\n{reason}',
+            recovery='Correct the reported problem, then rerun pubanon publish.',
+        ) from error
+    if changed:
+        output('Updated repository description.')
 
 
 def _unrelated_drift(record: CandidateRecord, remote: RemoteRefs) -> str | None:
@@ -1120,6 +1152,7 @@ def _verify_for_publish(ctx: PublishContext) -> _Verified:
     verify_retained_candidate(
         ctx._paths, ctx._global_config, ctx._project, ctx._record, env=os.environ
     )
+    _lifecycle.gate_host_fields(ctx._paths, ctx._global_config, ctx._project)
     _verify_source(ctx)
     destination = _host.verify_destination(ctx._paths, ctx._global_config, ctx._project)
     if ctx._project.ci_workflow:
@@ -1287,6 +1320,7 @@ def publish(ctx: PublishContext) -> None:
         if failure.recovery is None:
             failure.recovery = 'Correct the reported problem, then retry pubanon publish.'
         raise failure from None
+    _sync_description(ctx, verified._destination)
     _push_candidate(ctx, verified)
     try:
         _report_publication(ctx)

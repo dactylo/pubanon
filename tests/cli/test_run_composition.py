@@ -80,6 +80,17 @@ def _prepare_stale_stage(
     return source, paths, project, candidate_b, stage_host, final_host
 
 
+def _stub_repository_settings(
+    monkeypatch: pytest.MonkeyPatch, project: _config.ProjectConfig
+) -> None:
+    def _settings(owner: str, repo: str) -> _config.Settings:
+        assert (owner, repo) == (project.owner, project.repo)
+        assert project.settings is not None
+        return project.settings
+
+    monkeypatch.setattr(_host, 'repository_settings', _settings)
+
+
 @pytest.mark.slow
 def test_automatic_publication_summary_explains_hands_on_review_stopping_point(
     tmp_path: Path,
@@ -90,6 +101,7 @@ def test_automatic_publication_summary_explains_hands_on_review_stopping_point(
     historic_path = 'historical-hygiene-segment-pubanon.txt'
     source = make_repo(files={'README.md': 'public\n', historic_path: 'old\n'})
     paths, project, first = prepare(tmp_path, source, monkeypatch)
+    _stub_repository_settings(monkeypatch, project)
     store = _store.store_path(paths, project.name)
     subprocess.run(
         ['git', '-C', store, 'update-ref', 'refs/heads/main', first.commit],
@@ -181,6 +193,7 @@ def test_verbose_publication_preview_in_direct_and_composed_workflows(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, project, record = prepare(tmp_path, source, monkeypatch, version='1.0.0')
+    _stub_repository_settings(monkeypatch, project)
     if command == 'run':
         project = save_workflows(paths, project, ship=('inspect', 'publish'))
     monkeypatch.chdir(source)
@@ -233,6 +246,7 @@ def test_run_suggests_repo_watch_when_ci_workflow_is_the_only_ci_requirement(
 ) -> None:
     source = make_repo(files={'README.md': 'original\n'})
     paths, project, first = prepare(tmp_path, source, monkeypatch)
+    _stub_repository_settings(monkeypatch, project)
     store = _store.store_path(paths, project.name)
     subprocess.run(
         ['git', '-C', store, 'update-ref', 'refs/heads/main', first.commit],
@@ -303,6 +317,7 @@ def test_composed_publication_requires_explicit_route_change_after_forgetting_st
     _source, paths, project, candidate_b, stage_host, final_host = _prepare_stale_stage(
         tmp_path, make_repo, monkeypatch
     )
+    _stub_repository_settings(monkeypatch, project)
     project = replace(project, publication_route='staged')
     _config.save_project(paths, project)
     stage_refs = _git(stage_host, 'show-ref')

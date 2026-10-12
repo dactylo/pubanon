@@ -61,9 +61,10 @@ Publication leaves your source branches, checkout, and files unchanged. Optional
 
 Interactive `prepare` shows the included and excluded files and asks whether to continue, review,
 or quit. Review walks through the file groups again with include, exclude, customize, and back
-choices. A revised selection is saved to the project configuration only when you continue; quit
-leaves it unchanged. Global exclusions always apply. `--yes` skips this review but cannot answer
-unresolved file choices or approve files that are new since the last release.
+choices, as in [`init`](#initialize-a-project). A revised selection is saved to the project
+configuration only when you continue; quit leaves it unchanged. Global exclusions always apply.
+`--yes` skips this review but cannot answer unresolved file choices or approve files that are new
+since the last release.
 
 If your project has a committed package version, update and commit it before preparing; pubanon
 reads it automatically. Otherwise, choose a version tag with `pubanon prepare --version 0.2.0`. See
@@ -474,10 +475,14 @@ reasons; exclusions take precedence over includes. Subdirectories of `docs/` and
 directory appear as separate groups. Files named `.pubanon.toml` are always excluded because that
 name is reserved for pubanon configuration.
 
-Choose continue to accept the selection or review to adjust it. Back undoes the preceding choice,
-including a credential-like filename decision. The complete list of filenames, without their
-contents, is saved locally. `--verbose` adds the include and exclude patterns, the first two
-matches for each include pattern, and the path where the list was saved.
+Choose continue to accept the selection or review to adjust it. Review walks through the undecided
+files one group at a time. Include or exclude a group as offered, or choose customize to type your
+own pattern, such as `tests/fixtures/**`, and include or exclude the files it matches. Each choice
+reports how many files it decided. Because exclusions take precedence, pubanon lists any already
+included files that an exclusion would also remove and asks before excluding them. Back undoes the
+preceding choice, including a credential-like filename decision. The complete list of filenames,
+without their contents, is saved locally. `--verbose` adds the include and exclude patterns, the
+first two matches for each include pattern, and the path where the list was saved.
 
 Set the repository description and whether issues, pull requests, discussions, projects, and the
 wiki are enabled. Pull requests and discussions default to off. pubanon publishes from the private
@@ -597,8 +602,15 @@ discussions = false
 Both `pull_requests` and `discussions` are required in existing project configurations. Set each to
 `true` or `false` when updating a configuration that does not yet have them.
 
-pubanon checks these settings against the final repository before reveal. A new staging repository
-starts with the same settings, but later edits are not copied to it.
+`publish` shows the configured description in its preview. After the publication checks and your
+confirmation, it updates the final repository's description if needed and verifies the result
+before uploading code. This also applies to repositories created outside pubanon. An empty
+description clears the existing description. If the update fails or is interrupted, no code is
+uploaded and the prepared snapshot is kept for retry with `pubanon publish`. The description may
+already have changed; it also remains changed if the later code upload fails.
+
+The other repository settings are checked against the final repository before reveal. A new staging
+repository starts with the configured settings, but later edits are not copied to it.
 
 CI runs separately in the staging and final repositories. Staging receives `main` without tags, so
 tag-only workflows don't run there. Keep deployment and package-upload triggers limited to the

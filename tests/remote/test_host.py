@@ -606,38 +606,6 @@ def test_delete_repository_accepts_success(fake_gh: Path, tmp_path: Path) -> Non
     assert _gh_calls(tmp_path) == [{'args': args, 'stdin': ''}]
 
 
-@pytest.mark.parametrize(
-    ('stdout', 'stderr'),
-    [
-        ('{"message":"Not Found","status":"404"}\n', ''),
-        ('{"status":404}\n', ''),
-        ('', 'gh: Not Found (HTTP 404)\n'),
-    ],
-)
-def test_delete_repository_refuses_absent_repository(
-    fake_gh: Path, stdout: str, stderr: str
-) -> None:
-    args = ['api', '-X', 'DELETE', 'repos/publication-owner/public-repo']
-    _write_responses(
-        fake_gh,
-        [
-            {
-                'args': args,
-                'returncode': 1,
-                'stdout': stdout,
-                'stderr': stderr,
-            }
-        ],
-    )
-
-    with pytest.raises(PubanonError, match='repository is absent or inaccessible') as exc_info:
-        _host.delete_repository('publication-owner', 'public-repo')
-
-    assert exc_info.value.recovery == (
-        'verify repository access and state, then retry `pubanon stage delete`'
-    )
-
-
 def test_delete_repository_reports_scope_as_possible_cause(fake_gh: Path) -> None:
     args = ['api', '-X', 'DELETE', 'repos/publication-owner/public-repo']
     _write_responses(
@@ -1015,99 +983,6 @@ def test_gh_timeout_discards_child_streams(monkeypatch: pytest.MonkeyPatch) -> N
     assert graph == (exc_info.value,)
     assert 'private-canary' not in repr([vars(error) for error in graph])
     assert calls == [2.5]
-
-
-@pytest.mark.parametrize(
-    'response',
-    [
-        _release('v1.0.0') | {'name': None, 'body': None},
-        {key: value for key, value in _release('v1.0.0').items() if key != 'body'},
-    ],
-)
-def test_list_releases_normalizes_nullable_content(
-    fake_gh: Path,
-    response: dict[str, object],
-) -> None:
-    _write_responses(
-        fake_gh,
-        [
-            {
-                'args': [
-                    'api',
-                    '--method',
-                    'GET',
-                    'repos/publication-owner/public-repo/releases?per_page=30&page=1',
-                ],
-                'stdout': json.dumps([response]),
-            }
-        ],
-    )
-
-    (release,) = _host.list_releases(_destination(), limit=30)
-
-    assert release.title == (response.get('name') or '')
-    assert release.notes == ''
-
-
-@pytest.mark.parametrize(
-    'response',
-    [
-        {'tag_name': 'v1.0.0', 'name': 'Page', 'body': 'Notes'},
-        _release('v1.0.0') | {'draft': 'false'},
-        _release('v1.0.0') | {'body': 42},
-        {key: value for key, value in _release('v1.0.0').items() if key != 'name'},
-    ],
-)
-def test_list_releases_rejects_malformed_page(fake_gh: Path, response: dict[str, object]) -> None:
-    _write_responses(
-        fake_gh,
-        [
-            {
-                'args': [
-                    'api',
-                    '--method',
-                    'GET',
-                    'repos/publication-owner/public-repo/releases?per_page=30&page=1',
-                ],
-                'stdout': json.dumps([response]),
-            }
-        ],
-    )
-
-    with pytest.raises(PubanonError, match='invalid release response'):
-        _host.list_releases(_destination(), limit=30)
-
-
-@pytest.mark.parametrize(
-    ('response', 'error'),
-    [
-        (
-            {'stdout': json.dumps([_release('v1.0.0') | {'draft': 'false'}])},
-            'invalid release response',
-        ),
-        ({'returncode': 1, 'stderr': 'authentication failed'}, 'authentication failed'),
-    ],
-)
-def test_all_releases_propagates_invalid_or_failed_page(
-    fake_gh: Path, response: dict[str, object], error: str
-) -> None:
-    _write_responses(
-        fake_gh,
-        [
-            {
-                'args': [
-                    'api',
-                    '--method',
-                    'GET',
-                    'repos/publication-owner/public-repo/releases?per_page=100&page=1',
-                ],
-                **response,
-            }
-        ],
-    )
-
-    with pytest.raises(PubanonError, match=error):
-        _host.all_releases(_destination())
 
 
 def test_list_releases_respects_limit_across_pages(fake_gh: Path, tmp_path: Path) -> None:
@@ -1697,6 +1572,349 @@ def test_release_read_passes_remaining_deadline_to_each_page(
 
     assert _host.all_releases(_destination(), deadline=10.0)
     assert timeouts == [5.0, 4.0]
+
+
+def test_remote_refs_accepts_peeled_annotated_tag() -> None:
+    oid_a, oid_b = 'a' * 40, 'b' * 40
+    output = (
+        f'{oid_a}\trefs/heads/main\n{oid_b}\trefs/tags/v1.0.0\n{oid_a}\trefs/tags/v1.0.0^{{}}\n'
+    ).encode()
+
+    refs = _remote_refs(output)
+
+    assert refs == _host.RemoteRefs(oid_a, {'v1.0.0': oid_b})
+
+
+def test_remote_refs_records_unexpected_branch_as_fact() -> None:
+    oid_a, oid_b = 'a' * 40, 'b' * 40
+    output = (f'{oid_a}\trefs/heads/main\n{oid_b}\trefs/heads/feature\n').encode()
+
+    refs = _remote_refs(output)
+
+    assert refs.branches == (('feature', oid_b),)
+
+
+def test_repository_settings_forwards_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _timed_gh(args: list[str], *, timeout: float | None = None) -> bytes:
+        assert args == _SETTINGS_ARGS
+        assert timeout == 2.5
+        raise ObservationTimeoutError
+
+    monkeypatch.setattr(_host, '_gh', _timed_gh)
+
+    with pytest.raises(ObservationTimeoutError):
+        _host.repository_settings('publication-owner', 'public-repo', timeout=2.5)
+
+
+def test_repository_variable_passes_its_timeout_to_gh(
+    fake_gh: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_responses(
+        fake_gh,
+        [
+            {
+                'args': ['api', 'repos/owner/repo/actions/variables/CI_RUN_ON_PUSH'],
+                'stdout': json.dumps({'name': 'CI_RUN_ON_PUSH', 'value': 'false'}),
+            }
+        ],
+    )
+    original_run = cast('Callable[..., subprocess.CompletedProcess[bytes]]', subprocess.run)
+    timeouts: list[object] = []
+
+    def _capture(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        timeouts.append(kwargs.get('timeout'))
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(_host.subprocess, 'run', _capture)
+
+    assert _host.repository_variable(('owner', 'repo'), 'CI_RUN_ON_PUSH', timeout=30.0) == 'false'
+    assert timeouts == [30.0]
+
+
+def test_repository_visible_returns_false_for_http_404_fallback(fake_gh: Path) -> None:
+    _write_responses(
+        fake_gh,
+        [
+            {
+                'args': _REPOSITORY_ARGS,
+                'returncode': 1,
+                'stderr': 'gh: Not Found (HTTP 404)\n',
+            }
+        ],
+    )
+
+    assert not _host.repository_visible('publication-owner', 'public-repo')
+
+
+def test_repository_visible_returns_true_on_success(fake_gh: Path) -> None:
+    _write_responses(
+        fake_gh,
+        [
+            {
+                'args': _REPOSITORY_ARGS,
+                'stdout': (
+                    '{"owner":"publication-owner","repo":"public-repo","visibility":"private"}\n'
+                ),
+            }
+        ],
+    )
+
+    assert _host.repository_visible('publication-owner', 'public-repo')
+
+
+def test_require_authenticated_account_reports_mismatch_and_names_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = 'configured-account-canary'
+    actual = 'observed-account-canary'
+
+    def _account(*, timeout: float | None = None) -> str:
+        assert timeout is None
+        return actual
+
+    monkeypatch.setattr(_host, '_authenticated_account', _account)
+
+    with pytest.raises(PubanonError) as exc_info:
+        _host.require_authenticated_account(expected, authority='snapshot record')
+
+    error = exc_info.value
+    assert str(error) == 'authenticated account does not match snapshot record'
+    assert error.fact == 'authenticated account'
+    assert error.expected == expected
+    assert error.actual == actual
+    assert expected in error.render()
+    assert actual in error.render()
+
+
+def test_require_authenticated_account_returns_exact_host_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = 'matched-account'
+    actual = b'matched-account'.decode()
+    assert actual is not expected
+
+    def _account(*, timeout: float | None = None) -> str:
+        assert timeout is None
+        return actual
+
+    monkeypatch.setattr(_host, '_authenticated_account', _account)
+
+    returned = _host.require_authenticated_account(expected, authority='configuration')
+
+    assert returned == actual
+
+
+def test_set_default_branch_forwards_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _timed_gh(args: list[str], *, timeout: float | None = None) -> bytes:
+        assert args[0] == 'api'
+        assert timeout == 2.5
+        raise ObservationTimeoutError
+
+    monkeypatch.setattr(_host, '_gh', _timed_gh)
+
+    with pytest.raises(ObservationTimeoutError):
+        _host.set_default_branch('publication-owner', 'public-repo', 'main', timeout=2.5)
+
+
+def test_set_default_branch_sends_single_request(fake_gh: Path, tmp_path: Path) -> None:
+    args = [
+        'api',
+        '-X',
+        'PATCH',
+        'repos/publication-owner/public-repo',
+        '-f',
+        'default_branch=main',
+    ]
+    _write_responses(fake_gh, [{'args': args}])
+
+    _host.set_default_branch('publication-owner', 'public-repo', 'main')
+
+    assert _gh_calls(tmp_path) == [{'args': args, 'stdin': ''}]
+
+
+def test_set_visibility_patches_public(fake_gh: Path, tmp_path: Path) -> None:
+    args = [
+        'api',
+        '-X',
+        'PATCH',
+        'repos/publication-owner/public-repo',
+        '-f',
+        'visibility=public',
+    ]
+    _write_responses(fake_gh, [{'args': args}])
+
+    _host.set_visibility('publication-owner', 'public-repo', 'public')
+
+    assert _gh_calls(tmp_path) == [{'args': args, 'stdin': ''}]
+
+
+@pytest.mark.parametrize(
+    ('current', 'wanted'),
+    [(None, 'Public project'), ('Old', 'Updated'), ('Old', ''), ('Current', 'Current')],
+)
+def test_sync_repository_description_changes_only_description(
+    fake_gh: Path,
+    tmp_path: Path,
+    current: str | None,
+    wanted: str,
+) -> None:
+    settings = {
+        'description': current,
+        'default_branch': 'main',
+        'issues': True,
+        'wiki': False,
+        'projects': False,
+        'pull_requests': False,
+        'discussions': False,
+    }
+    patch = [
+        'api',
+        '-X',
+        'PATCH',
+        'repos/publication-owner/public-repo',
+        '-f',
+        f'description={wanted}',
+    ]
+    _write_responses(
+        fake_gh,
+        [
+            {'args': _SETTINGS_ARGS, 'stdout': json.dumps(settings), 'once': True},
+            {'args': patch},
+            {'args': _SETTINGS_ARGS, 'stdout': json.dumps(settings | {'description': wanted})},
+        ],
+    )
+
+    changed = _host.sync_repository_description(_destination(), wanted)
+
+    assert changed is (current != wanted)
+    expected = [_SETTINGS_ARGS] if current == wanted else [_SETTINGS_ARGS, patch, _SETTINGS_ARGS]
+    assert [call['args'] for call in _gh_calls(tmp_path)] == expected
+
+
+@pytest.mark.parametrize(
+    ('stdout', 'stderr'),
+    [
+        ('{"message":"Not Found","status":"404"}\n', ''),
+        ('{"status":404}\n', ''),
+        ('', 'gh: Not Found (HTTP 404)\n'),
+    ],
+)
+def test_delete_repository_refuses_absent_repository(
+    fake_gh: Path, stdout: str, stderr: str
+) -> None:
+    args = ['api', '-X', 'DELETE', 'repos/publication-owner/public-repo']
+    _write_responses(
+        fake_gh,
+        [
+            {
+                'args': args,
+                'returncode': 1,
+                'stdout': stdout,
+                'stderr': stderr,
+            }
+        ],
+    )
+
+    with pytest.raises(PubanonError, match='repository is absent or inaccessible') as exc_info:
+        _host.delete_repository('publication-owner', 'public-repo')
+
+    assert exc_info.value.recovery == (
+        'verify repository access and state, then retry `pubanon stage delete`'
+    )
+
+
+@pytest.mark.parametrize(
+    'response',
+    [
+        _release('v1.0.0') | {'name': None, 'body': None},
+        {key: value for key, value in _release('v1.0.0').items() if key != 'body'},
+    ],
+)
+def test_list_releases_normalizes_nullable_content(
+    fake_gh: Path,
+    response: dict[str, object],
+) -> None:
+    _write_responses(
+        fake_gh,
+        [
+            {
+                'args': [
+                    'api',
+                    '--method',
+                    'GET',
+                    'repos/publication-owner/public-repo/releases?per_page=30&page=1',
+                ],
+                'stdout': json.dumps([response]),
+            }
+        ],
+    )
+
+    (release,) = _host.list_releases(_destination(), limit=30)
+
+    assert release.title == (response.get('name') or '')
+    assert release.notes == ''
+
+
+@pytest.mark.parametrize(
+    'response',
+    [
+        {'tag_name': 'v1.0.0', 'name': 'Page', 'body': 'Notes'},
+        _release('v1.0.0') | {'draft': 'false'},
+        _release('v1.0.0') | {'body': 42},
+        {key: value for key, value in _release('v1.0.0').items() if key != 'name'},
+    ],
+)
+def test_list_releases_rejects_malformed_page(fake_gh: Path, response: dict[str, object]) -> None:
+    _write_responses(
+        fake_gh,
+        [
+            {
+                'args': [
+                    'api',
+                    '--method',
+                    'GET',
+                    'repos/publication-owner/public-repo/releases?per_page=30&page=1',
+                ],
+                'stdout': json.dumps([response]),
+            }
+        ],
+    )
+
+    with pytest.raises(PubanonError, match='invalid release response'):
+        _host.list_releases(_destination(), limit=30)
+
+
+@pytest.mark.parametrize(
+    ('response', 'error'),
+    [
+        (
+            {'stdout': json.dumps([_release('v1.0.0') | {'draft': 'false'}])},
+            'invalid release response',
+        ),
+        ({'returncode': 1, 'stderr': 'authentication failed'}, 'authentication failed'),
+    ],
+)
+def test_all_releases_propagates_invalid_or_failed_page(
+    fake_gh: Path, response: dict[str, object], error: str
+) -> None:
+    _write_responses(
+        fake_gh,
+        [
+            {
+                'args': [
+                    'api',
+                    '--method',
+                    'GET',
+                    'repos/publication-owner/public-repo/releases?per_page=100&page=1',
+                ],
+                **response,
+            }
+        ],
+    )
+
+    with pytest.raises(PubanonError, match=error):
+        _host.all_releases(_destination())
 
 
 @pytest.mark.parametrize('operation', ['all', 'read'])
@@ -2351,26 +2569,6 @@ def test_ls_remote_refuses_malformed_or_duplicate_direct_output(
         _host.ls_remote(destination, _paths(tmp_path), 'demo')
 
 
-def test_remote_refs_accepts_peeled_annotated_tag() -> None:
-    oid_a, oid_b = 'a' * 40, 'b' * 40
-    output = (
-        f'{oid_a}\trefs/heads/main\n{oid_b}\trefs/tags/v1.0.0\n{oid_a}\trefs/tags/v1.0.0^{{}}\n'
-    ).encode()
-
-    refs = _remote_refs(output)
-
-    assert refs == _host.RemoteRefs(oid_a, {'v1.0.0': oid_b})
-
-
-def test_remote_refs_records_unexpected_branch_as_fact() -> None:
-    oid_a, oid_b = 'a' * 40, 'b' * 40
-    output = (f'{oid_a}\trefs/heads/main\n{oid_b}\trefs/heads/feature\n').encode()
-
-    refs = _remote_refs(output)
-
-    assert refs.branches == (('feature', oid_b),)
-
-
 @pytest.mark.parametrize(
     ('refs', 'expected'),
     [
@@ -2390,18 +2588,6 @@ def test_remote_refs_text_renders_complete_deterministic_projection(
     expected: str,
 ) -> None:
     assert _host.remote_refs_text(refs) == expected
-
-
-def test_repository_settings_forwards_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _timed_gh(args: list[str], *, timeout: float | None = None) -> bytes:
-        assert args == _SETTINGS_ARGS
-        assert timeout == 2.5
-        raise ObservationTimeoutError
-
-    monkeypatch.setattr(_host, '_gh', _timed_gh)
-
-    with pytest.raises(ObservationTimeoutError):
-        _host.repository_settings('publication-owner', 'public-repo', timeout=2.5)
 
 
 @pytest.mark.parametrize(('description', 'expected'), [(None, ''), ('Public repo', 'Public repo')])
@@ -2491,32 +2677,6 @@ def test_repository_settings_refuses_missing_or_wrongly_typed_facts(
         _host.repository_settings('publication-owner', 'public-repo')
 
 
-def test_repository_variable_passes_its_timeout_to_gh(
-    fake_gh: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_responses(
-        fake_gh,
-        [
-            {
-                'args': ['api', 'repos/owner/repo/actions/variables/CI_RUN_ON_PUSH'],
-                'stdout': json.dumps({'name': 'CI_RUN_ON_PUSH', 'value': 'false'}),
-            }
-        ],
-    )
-    original_run = cast('Callable[..., subprocess.CompletedProcess[bytes]]', subprocess.run)
-    timeouts: list[object] = []
-
-    def _capture(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
-        timeouts.append(kwargs.get('timeout'))
-        return original_run(*args, **kwargs)
-
-    monkeypatch.setattr(_host.subprocess, 'run', _capture)
-
-    assert _host.repository_variable(('owner', 'repo'), 'CI_RUN_ON_PUSH', timeout=30.0) == 'false'
-    assert timeouts == [30.0]
-
-
 @pytest.mark.parametrize(
     'stdout',
     [
@@ -2575,21 +2735,6 @@ def test_repository_visible_reports_and_raises_non_404_failure(
     assert 'private-canary' in exc_info.value.render()
 
 
-def test_repository_visible_returns_false_for_http_404_fallback(fake_gh: Path) -> None:
-    _write_responses(
-        fake_gh,
-        [
-            {
-                'args': _REPOSITORY_ARGS,
-                'returncode': 1,
-                'stderr': 'gh: Not Found (HTTP 404)\n',
-            }
-        ],
-    )
-
-    assert not _host.repository_visible('publication-owner', 'public-repo')
-
-
 @pytest.mark.parametrize('status', ['"404"', '404'])
 def test_repository_visible_returns_false_for_json_404(fake_gh: Path, status: str) -> None:
     _write_responses(
@@ -2604,76 +2749,6 @@ def test_repository_visible_returns_false_for_json_404(fake_gh: Path, status: st
     )
 
     assert not _host.repository_visible('publication-owner', 'public-repo')
-
-
-def test_repository_visible_returns_true_on_success(fake_gh: Path) -> None:
-    _write_responses(
-        fake_gh,
-        [
-            {
-                'args': _REPOSITORY_ARGS,
-                'stdout': (
-                    '{"owner":"publication-owner","repo":"public-repo","visibility":"private"}\n'
-                ),
-            }
-        ],
-    )
-
-    assert _host.repository_visible('publication-owner', 'public-repo')
-
-
-def test_require_authenticated_account_reports_mismatch_and_names_authority(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    expected = 'configured-account-canary'
-    actual = 'observed-account-canary'
-
-    def _account(*, timeout: float | None = None) -> str:
-        assert timeout is None
-        return actual
-
-    monkeypatch.setattr(_host, '_authenticated_account', _account)
-
-    with pytest.raises(PubanonError) as exc_info:
-        _host.require_authenticated_account(expected, authority='snapshot record')
-
-    error = exc_info.value
-    assert str(error) == 'authenticated account does not match snapshot record'
-    assert error.fact == 'authenticated account'
-    assert error.expected == expected
-    assert error.actual == actual
-    assert expected in error.render()
-    assert actual in error.render()
-
-
-def test_require_authenticated_account_returns_exact_host_account(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    expected = 'matched-account'
-    actual = b'matched-account'.decode()
-    assert actual is not expected
-
-    def _account(*, timeout: float | None = None) -> str:
-        assert timeout is None
-        return actual
-
-    monkeypatch.setattr(_host, '_authenticated_account', _account)
-
-    returned = _host.require_authenticated_account(expected, authority='configuration')
-
-    assert returned == actual
-
-
-def test_set_default_branch_forwards_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _timed_gh(args: list[str], *, timeout: float | None = None) -> bytes:
-        assert args[0] == 'api'
-        assert timeout == 2.5
-        raise ObservationTimeoutError
-
-    monkeypatch.setattr(_host, '_gh', _timed_gh)
-
-    with pytest.raises(ObservationTimeoutError):
-        _host.set_default_branch('publication-owner', 'public-repo', 'main', timeout=2.5)
 
 
 @pytest.mark.parametrize(
@@ -2702,36 +2777,37 @@ def test_set_default_branch_propagates_host_failure(
     assert _gh_calls(tmp_path) == [{'args': args, 'stdin': ''}]
 
 
-def test_set_default_branch_sends_single_request(fake_gh: Path, tmp_path: Path) -> None:
-    args = [
-        'api',
-        '-X',
-        'PATCH',
-        'repos/publication-owner/public-repo',
-        '-f',
-        'default_branch=main',
-    ]
-    _write_responses(fake_gh, [{'args': args}])
+def test_sync_repository_description_refuses_unverified_update(
+    fake_gh: Path,
+) -> None:
+    settings = {
+        'description': 'Unchanged',
+        'default_branch': 'main',
+        'issues': True,
+        'wiki': False,
+        'projects': False,
+        'pull_requests': False,
+        'discussions': False,
+    }
+    _write_responses(
+        fake_gh,
+        [
+            {'args': _SETTINGS_ARGS, 'stdout': json.dumps(settings)},
+            {
+                'args': [
+                    'api',
+                    '-X',
+                    'PATCH',
+                    'repos/publication-owner/public-repo',
+                    '-f',
+                    'description=Expected',
+                ]
+            },
+        ],
+    )
 
-    _host.set_default_branch('publication-owner', 'public-repo', 'main')
-
-    assert _gh_calls(tmp_path) == [{'args': args, 'stdin': ''}]
-
-
-def test_set_visibility_patches_public(fake_gh: Path, tmp_path: Path) -> None:
-    args = [
-        'api',
-        '-X',
-        'PATCH',
-        'repos/publication-owner/public-repo',
-        '-f',
-        'visibility=public',
-    ]
-    _write_responses(fake_gh, [{'args': args}])
-
-    _host.set_visibility('publication-owner', 'public-repo', 'public')
-
-    assert _gh_calls(tmp_path) == [{'args': args, 'stdin': ''}]
+    with pytest.raises(PubanonError, match='description did not match'):
+        _host.sync_repository_description(_destination(), 'Expected')
 
 
 @pytest.mark.parametrize('operation', ['fetch', 'push', 'ls-remote'])
