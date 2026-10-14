@@ -258,6 +258,14 @@ def _disclosure_responses(
                 }
             ),
         },
+        {
+            'args': ['api', f'repos/{owner}/{repo}/actions/caches?per_page=1'],
+            'stdout': '{"total_count": 0, "actions_caches": []}',
+        },
+        {
+            'args': ['api', f'repos/{owner}/{repo}/immutable-releases'],
+            'stdout': '{"enabled": true, "enforced_by_owner": false}',
+        },
     ]
 
 
@@ -453,21 +461,17 @@ def _reveal_after_disclosure_review(
     repo: str,
 ) -> None:
     prior_calls = len(_host_call_args())
-    reveal_prompts = [
-        'These runs, logs, and artifacts become public with the repository. Continue? [y/n] ',
-        'Make it public? [y/n] ',
-    ]
+    reveal_prompts = ['Make it public? [y/n] ']
 
     def _reveal_answer(prompt: str) -> str:
         assert reveal_prompts, f'unexpected prompt: {prompt}'
         assert prompt == reveal_prompts.pop(0)
         assert not any('PATCH' in call for call in _host_call_args()[prior_calls:])
-        if reveal_prompts:
-            before_disclosure, _ = capture_output()
-            assert 'matches GitHub; no sensitive terms or identity problems' in before_disclosure
-            assert 'pubanon has not scanned Actions logs, artifact contents' in before_disclosure
-            assert 'Saved inventory:' not in before_disclosure
-            assert f'https://github.com/{owner}/{repo}/actions' in before_disclosure
+        before_question, _ = capture_output()
+        assert 'matches GitHub; no sensitive terms or identity problems' in before_question
+        assert 'Not checked: earlier pushes on the Activity page.' in before_question
+        assert 'Saved inventory:' not in before_question
+        assert f'https://github.com/{owner}/{repo}/actions' in before_question
         return 'y'
 
     monkeypatch.setattr('builtins.input', _reveal_answer)
@@ -527,7 +531,7 @@ def _run_release_unattended_reveal_refusal(
     calls_before_refusal = _host_calls()
     assert _cli.main(['run', 'reveal-declared', '--yes']) == 1
     refused = capsys.readouterr()
-    assert '--yes cannot answer the repository disclosure acknowledgment' in refused.err
+    assert '--yes cannot make the repository public' in refused.err
     assert 'run pubanon repo reveal interactively' in refused.err
     assert _host_calls() == calls_before_refusal
 
@@ -908,10 +912,8 @@ def _assert_policy_growth_acknowledgment(
     assert 'Warning: historical exposure' in exposure_audit
     assert f'Published snapshot: v1.0.0 ({published_commit[:12]})' in exposure_audit
     assert '  README.md:1\n' in exposure_audit
-    assert (
-        'Historical exposure unacknowledged; publish requires interactive acknowledgment.'
-        in exposure_audit
-    )
+    assert 'Historical exposure unacknowledged' in exposure_audit
+    assert 'interactive acknowledgment' in exposure_audit
     assert 'Text: historical-canary' in exposure_audit
 
     new_path = 'release-notes.txt'
@@ -965,7 +967,7 @@ def _assert_policy_growth_acknowledgment(
     assert_answers = _script_answers(
         monkeypatch,
         [
-            ('Continue despite this earlier exposure? [y/n] ', 'y'),
+            ('Continue with this history? [y/n] ', 'y'),
             (
                 (f'Publish v1.1.0 to {fixture._owner}/{fixture._publication_repo}? [y/n] '),
                 'y',
@@ -1232,7 +1234,7 @@ def _initialize_guided_first_run(
     assert _cli.main(['doctor']) == 0
     doctor_output = capsys.readouterr()
     output.extend((doctor_output.out, doctor_output.err))
-    assert 'Your configuration and GitHub login are ready.' in doctor_output.out
+    assert 'configuration and GitHub login are ready' in doctor_output.out
 
     assert_answers = _script_answers(
         monkeypatch,
@@ -1497,19 +1499,7 @@ def _reveal_clean_and_restore(
     )
     assert_answers = _script_answers(
         monkeypatch,
-        [
-            (
-                (
-                    'These runs, logs, and artifacts become public with the repository. '
-                    'Continue? [y/n] '
-                ),
-                'y',
-            ),
-            (
-                'Make it public? [y/n] ',
-                'y',
-            ),
-        ],
+        [('Make it public? [y/n] ', 'y')],
     )
     assert _cli.main(['repo', 'reveal']) == 0
     assert_answers()
@@ -1858,20 +1848,16 @@ def _run_release_reveal_with_package_gate(
             },
         ],
     )
-    expected_prompts = [
-        'These runs, logs, and artifacts become public with the repository. Continue? [y/n] ',
-        'Make it public? [y/n] ',
-    ]
+    expected_prompts = ['Make it public? [y/n] ']
     reveal_output: list[str] = []
 
     def _reveal_answer(prompt: str) -> str:
         assert prompt == expected_prompts.pop(0)
         visible = re.sub(r': +', ': ', capsys.readouterr().out)
         reveal_output.append(visible)
-        if expected_prompts:
-            assert '  release-package (id 201)\n  checks-report (id 202)' in visible
-        else:
-            assert 'Make it public?' in prompt
+        unchecked = next(line for line in visible.splitlines() if line.startswith('Not checked:'))
+        assert re.search(r'\b2 artifacts\b', unchecked)
+        assert 'earlier pushes on the Activity page' in unchecked
         return 'y'
 
     monkeypatch.setattr('builtins.input', _reveal_answer)
@@ -2194,12 +2180,14 @@ def test_guided_first_publication_works_from_empty_roots(
         [
             _account_response(fixture._account),
             _repository_response(fixture._owner, fixture._publication_repo, 'private'),
+            *_disclosure_responses(fixture._owner, fixture._publication_repo),
         ],
     )
     assert _cli.main(['audit', '--remote']) == 0
     audited = capsys.readouterr()
     cli_output.extend((audited.out, audited.err))
-    assert 'audit: local copy of published history; verified against GitHub' in audited.out
+    assert 'local copy of published history' in audited.out
+    assert 'verified against GitHub' in audited.out
     assert 'Warning: historical exposure' not in audited.out
     assert 'Warning: policy mismatch' not in audited.out
     assert 'identity problem:' not in audited.out
@@ -2457,12 +2445,23 @@ def test_real_name_identity_two_releases_audit_and_reveal_work_offline(
         assert author.endswith(' +0000')
         assert committer.startswith(f'committer {expected_identity} ')
         assert committer.endswith(' +0000')
-        assert parents == expected_parents
-        assert signed is False
+        assert (parents, signed) == (expected_parents, False)
 
+    _write_responses(
+        fake_gh,
+        [
+            _account_response(_REAL_ACCOUNT),
+            _repository_response(owner, repo, 'private'),
+            _settings_response(owner, repo, _REAL_SETTINGS),
+            *_disclosure_responses(owner, repo),
+        ],
+    )
     assert _cli.main(['audit', '--remote']) == 0
     audit, _ = _capture_output()
-    assert 'audit: local copy of published history; verified against GitHub' in audit
+    assert all(
+        fragment in audit
+        for fragment in ('local copy of published history', 'verified against GitHub')
+    )
     assert 'historical exposure' not in audit
     assert 'identity problem' not in audit
 

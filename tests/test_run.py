@@ -228,6 +228,20 @@ def test_credential_child_timeout_discards_both_streams(
     assert calls == [3.25]
 
 
+def test_git_failure_fact_shows_each_stderr_line_escaped() -> None:
+    result = _run_module.GitResult(
+        128,
+        b'',
+        b'remote: Your repository is disabled.\r\nremote: See \x1b[31mhere\x0bthere\nfatal: 403\n',
+    )
+
+    assert _run_module.git_failure_fact(result) == (
+        'exit status 128: remote: Your repository is disabled.\n'
+        'remote: See \\x1b[31mhere\\x0bthere\n'
+        'fatal: 403'
+    )
+
+
 def test_git_spawn_failure_is_a_domain_error(monkeypatch: pytest.MonkeyPatch) -> None:
     def _fail_spawn(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
         raise FileNotFoundError('git')

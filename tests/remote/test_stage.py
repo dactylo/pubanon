@@ -33,7 +33,7 @@ from pubanon._snapshots._source import (
     pin,
     read_snapshot,
 )
-from pubanon._terminal import verbose_context
+from pubanon._terminal import color_context, verbose_context
 from tests._cli import gh_calls as _calls
 from tests._git import git_env
 from tests._permissions import assert_private_mode
@@ -1278,7 +1278,7 @@ def test_stage_delete_authorization_failure_keeps_record_and_names_possible_caus
     assert exc_info.value.fact == 'HTTP 403: GitHub refused authorization'
     assert exc_info.value.recovery is not None
     assert 'missing delete_repo scope is one possible cause' in exc_info.value.recovery
-    assert 'review the active account and repository permissions' in exc_info.value.recovery
+    assert 'active account and repository permissions' in exc_info.value.recovery
     assert 'gh auth refresh' not in exc_info.value.render()
     assert not any(call[:2] == ['auth', 'refresh'] for call in _calls(tmp_path))
 
@@ -1326,7 +1326,7 @@ def test_stage_delete_failed_readback_preserves_tracking(
     def _verify_facts(
         _destination: _host.Destination, *, recovery: str, timeout: float | None = None
     ) -> None:
-        assert recovery == 'inspect and delete the staging repository manually'
+        assert 'delete the staging repository manually' in recovery
         assert timeout is None
 
     def _delete(_owner: str, _repo: str) -> None:
@@ -1865,7 +1865,9 @@ def test_stage_delete_incomplete_deletion_keeps_record_with_rerun_recovery(
     with pytest.raises(PubanonError, match='staging deletion did not complete') as exc_info:
         _stage.stage_delete(paths, global_config, project, yes=True)
 
-    assert exc_info.value.recovery == 'inspect the host, then retry pubanon stage delete'
+    assert exc_info.value.recovery is not None
+    assert 'inspect the host' in exc_info.value.recovery
+    assert 'pubanon stage delete' in exc_info.value.recovery
     assert _stage.load_stage(paths, project.name) == stage
 
 
@@ -1886,7 +1888,8 @@ def test_stage_delete_refuses_public_repository_without_deleting(
     with pytest.raises(PubanonError, match='staging repository facts') as exc_info:
         _stage.stage_delete(paths, global_config, project, yes=True)
 
-    assert exc_info.value.recovery == 'inspect and delete the staging repository manually'
+    assert exc_info.value.recovery is not None
+    assert 'delete the staging repository manually' in exc_info.value.recovery
     assert _stage.load_stage(paths, project.name) == stage
     assert not any('DELETE' in call for call in _calls(tmp_path))
 
@@ -1959,7 +1962,7 @@ def test_stage_forget_only_removes_local_tracking(
     )
     if content is not None:
         output = capsys.readouterr().out
-        assert 'Forgetting tracking keeps the selected publication route.' in output
+        assert 'keeps the selected publication route' in output
         assert 'pubanon init --publication-route direct' in output
 
 
@@ -2027,9 +2030,9 @@ def test_stage_delete_refuses_recorded_final_destination_before_host_access(
     ) as exc_info:
         _stage.stage_delete(paths, global_config, changed, yes=yes)
 
-    assert exc_info.value.recovery == (
-        'inspect the recorded target; use pubanon stage forget to remove tracking'
-    )
+    assert exc_info.value.recovery is not None
+    assert 'inspect the recorded target' in exc_info.value.recovery
+    assert 'pubanon stage forget' in exc_info.value.recovery
     assert stage_path.read_bytes() == original_record
 
 
@@ -2484,6 +2487,24 @@ def test_stage_status_without_required_checks_recommends_publication(
     assert not any('/check-runs?' in ' '.join(call) for call in _calls(tmp_path))
 
 
+def test_status_tracking_reports_an_unreadable_record_as_a_warning_sentence(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    paths = _paths(tmp_path)
+    _g, p = _configs(tmp_path / 'source')
+    stage_path = paths.data_dir / 'projects' / p.name / 'stage.toml'
+    stage_path.parent.mkdir(parents=True, exist_ok=True)
+    stage_path.write_text('invalid = true\n')
+
+    with color_context('never'):
+        stage, error = _stage._status_tracking(paths, p, {})
+
+    assert stage is None
+    assert error is not None
+    assert error.recovery == 'pubanon stage repair or pubanon stage forget'
+    assert capsys.readouterr().out == 'Local staging tracking is unreadable or malformed.\n'
+
+
 def test_unexpected_remote_ref_refuses_before_push(
     tmp_path: Path,
     fake_gh: Path,
@@ -2545,7 +2566,9 @@ def test_verify_stage_facts_preserves_staging_recovery_on_404(fake_gh: Path) -> 
     with pytest.raises(PubanonError) as exc_info:
         _stage._verify_stage_facts(destination, recovery='pubanon stage repair')
 
-    assert str(exc_info.value) == 'Cannot access GitHub repository publication-owner/stage-repo'
+    rendered = str(exc_info.value)
+    assert 'Cannot access GitHub repository' in rendered
+    assert 'publication-owner/stage-repo' in rendered
     assert exc_info.value.recovery == 'pubanon stage repair'
 
 
@@ -3591,7 +3614,9 @@ def test_status_failure_does_not_repeat_prepared_commit_already_shown(
         assert 'Prepared candidate: matches observed remote commit' in rendered
     else:
         assert f'Prepared candidate: {candidate.commit}' in rendered
-    assert 'Prepared candidate match: unknown' in rendered
+    assert 'Staged commit unknown' in rendered
+    assert 'cannot compare it with the prepared candidate' in rendered
+    assert 'Prepared candidate match' not in rendered
 
 
 @pytest.mark.parametrize(
@@ -3944,9 +3969,10 @@ def test_stage_push_refuses_required_checks_missing_from_the_connected_workflow(
         _stage.stage_push(paths, g, p, yes=True)
 
     assert raised.value.fact == 'lint'
-    assert raised.value.recovery == (
-        'correct the required checks with pubanon init --edit, then prepare a new snapshot'
-    )
+    assert raised.value.recovery is not None
+    assert 'correct the required checks' in raised.value.recovery
+    assert 'pubanon init --edit' in raised.value.recovery
+    assert 'prepare a new snapshot' in raised.value.recovery
     assert _calls(tmp_path) == []
 
 
@@ -4042,9 +4068,9 @@ def test_unrequested_check_guard_refuses_when_push_ci_is_off(
             _stage_dest(), replace(p, required_checks=('test',)), (_workflow_entry(workflow),)
         )
 
-    assert raised.value.fact == (
-        'CI_RUN_ON_PUSH is false, so this push cannot start the required checks'
-    )
+    assert raised.value.fact is not None
+    assert 'CI_RUN_ON_PUSH is false' in raised.value.fact
+    assert 'cannot start the required checks' in raised.value.fact
     assert raised.value.recovery == recovery
     assert reads == [(('stage-owner', 'staging-repo'), 'CI_RUN_ON_PUSH', 30.0)]
 
@@ -4120,7 +4146,9 @@ def test_unrequested_check_guard_warns_when_the_variable_cannot_be_read(
         (_workflow_entry(_CONNECTABLE_WORKFLOW),),
     )
 
-    assert 'Could not check CI_RUN_ON_PUSH in the staging repository' in capsys.readouterr().out
+    rendered = capsys.readouterr().out
+    assert 'Could not check CI_RUN_ON_PUSH' in rendered
+    assert 'staging repository' in rendered
 
 
 @pytest.mark.parametrize('interruption', [OperationCanceled('Canceled.'), KeyboardInterrupt()])

@@ -512,7 +512,7 @@ def _status_candidate(
     )
     detail(field('Prepared candidate', rendered))
     if commit is None:
-        detail(field('Prepared candidate match', 'unknown'))
+        detail('Staged commit unknown; cannot compare it with the prepared candidate.')
         return
     matches = tip == commit
     if not matches:
@@ -874,7 +874,7 @@ def _status_tracking(
     except OperationCanceled:
         raise
     except PubanonError as exc:
-        output(field('Local tracking', 'unreadable or malformed'))
+        output('Local staging tracking is unreadable or malformed.', kind='warning')
         exc.recovery = 'pubanon stage repair or pubanon stage forget'
         return None, exc
     if stage is not None:

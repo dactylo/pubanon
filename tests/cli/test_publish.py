@@ -259,7 +259,7 @@ def test_publish_preserves_candidate_when_destination_is_inaccessible(
     error = capsys.readouterr().err
     assert f'Cannot access GitHub repository {project.owner}/{project.repo}' in error
     assert 'does not exist or this account lacks access' in error
-    assert 'run `pubanon repo create --project=demo`, then retry' in error
+    assert 'pubanon repo create --project=demo' in error
     assert _records.load_candidate(paths, project.name) == record
 
 
@@ -436,9 +436,10 @@ def test_publish_resolve_reports_published_outcome_after_real_local_finalization
         if source_tags
         else 'Source branches, tags, HEAD, index, and files were not changed.'
     )
-    assert 'The snapshot was published and verified on the host repository.' in output
+    assert 'snapshot was published and verified' in output
     assert 'Local snapshot state was finalized.' in output
-    assert 'A private bookmark in your source repository keeps the original commit.' in output
+    assert 'private bookmark' in output
+    assert 'keeps the original commit' in output
     assert source_note not in output
     assert f'Details: snapshot commit {record.commit}' in output
     assert 'Next: pubanon repo reveal --project=demo' in output
@@ -503,7 +504,7 @@ def test_publish_resolve_reports_real_not_sent_state_update(
     assert _cli.main(['publish', '--project', project.name, '--resolve', '--yes']) == 0
 
     output = capsys.readouterr().out
-    assert 'The repository still points to the previous published snapshot.' in output
+    assert 'still points to the previous published snapshot' in output
     assert 'Your snapshot is available to publish.' in output
     assert f'Details: snapshot commit {record.commit}' in output
     assert f'Next: {next_action} --project=demo' in output

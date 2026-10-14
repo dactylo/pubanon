@@ -271,6 +271,28 @@ def display_check_result(verdict: CheckVerdict) -> str:
     return 'failed' + (f' ({escape(", ".join(details))})' if details else '')
 
 
+def escape_lines(text: str) -> list[str]:
+    """Split command output at line feeds and escape each line visibly.
+
+    A carriage return just before a line feed ends the line with it. Every
+    other control character, including vertical tabs, lone carriage returns,
+    and Unicode line separators, stays in its line and is escaped. Lines that
+    are empty or hold only spaces and tabs are dropped at the start and end.
+
+    Args:
+        text: Decoded command output.
+
+    Returns:
+        The escaped lines; empty when no line has other content.
+    """
+    lines = text.replace('\r\n', '\n').split('\n')
+    while lines and not lines[0].strip(' \t'):
+        del lines[0]
+    while lines and not lines[-1].strip(' \t'):
+        del lines[-1]
+    return [escape(line) for line in lines]
+
+
 @contextmanager
 def guidance_context(
     *, project: str | None = None, implicit_project: str | None = None, workflow: bool = False

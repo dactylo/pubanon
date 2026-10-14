@@ -37,7 +37,7 @@ def test_doctor_checks_floors_schema_and_expected_account(
     assert _cli.main(['doctor']) == 0
     assert floors == [None]
     assert requirements == [('anonymous-account', 'configuration')]
-    assert 'Your configuration and GitHub login are ready.' in capsys.readouterr().out
+    assert 'configuration and GitHub login are ready' in capsys.readouterr().out
 
 
 def test_doctor_missing_configuration_reports_setup_recovery(

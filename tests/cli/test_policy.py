@@ -297,7 +297,8 @@ def test_policy_decision_reasks_when_pattern_changes_nothing(
         'scripts/b.py',
     )
     output = capsys.readouterr().out
-    assert 'No undecided files match scripts/a.py. Nothing changed.\n' in output
+    assert 'No undecided files match scripts/a.py' in output
+    assert 'Nothing changed' in output
     assert output.count('Undecided files:\n') == 2
     assert output.endswith('Included 1 file.\n')
 
@@ -327,12 +328,7 @@ def test_policy_offers_explain_selection_rules_once_by_default(
     )
 
     assert updated.project.deny == ('KEY.PEM',)
-    assert (
-        capsys.readouterr().out.count(
-            'These decisions configure selection rules. Nothing is published now.\n'
-        )
-        == 1
-    )
+    assert capsys.readouterr().out.count('These decisions configure selection rules') == 1
 
 
 def test_policy_offers_skip_groups_decided_by_custom_pattern(

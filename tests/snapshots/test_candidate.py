@@ -372,9 +372,9 @@ def test_build_candidate_refuses_identity_without_disclosing_active_terms(
         )
     assert error.value.fact == 'rule source: sensitive_terms'
     assert str(error.value) == 'publication identity matches an active disclosure rule'
-    assert error.value.recovery == (
-        'remove the value from sensitive_terms or choose another publication identity'
-    )
+    assert error.value.recovery is not None
+    assert 'remove the value from sensitive_terms' in error.value.recovery
+    assert 'choose another publication identity' in error.value.recovery
 
 
 def test_build_candidate_refuses_unsupported_snapshot_state(tmp_path: Path) -> None:

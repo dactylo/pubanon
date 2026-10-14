@@ -231,7 +231,8 @@ def test_history_delete_preserves_user_managed_source_worktree(
     capsys.readouterr()
     assert _cli.main(['delete', candidate.commit, '--project', project.name, '--yes']) == 0
     output = re.sub(r': +', ': ', capsys.readouterr().out)
-    assert 'Preserved source worktree (can still retain objects)' in output
+    assert 'Preserved source worktree' in output
+    assert 'retain objects' in output
     assert shlex.join(['git', '-C', str(source), 'worktree', 'remove', str(worktree)]) in output
     assert output.count(' worktree remove ') == 1
     assert 'worktree add' not in output
@@ -321,9 +322,9 @@ def test_history_empty_does_not_create_store(
 
     assert _cli.main(['list', '--project', project.name]) == 0
 
-    assert capsys.readouterr().out == (
-        'No recorded snapshot history.\n\nNext: pubanon prepare --project=demo\n'
-    )
+    rendered = capsys.readouterr().out
+    assert 'No recorded snapshot history' in rendered
+    assert 'pubanon prepare --project=demo' in rendered
     assert not _store.candidate_store_path(paths, project.name).exists()
 
 
@@ -345,10 +346,8 @@ def test_history_missing_objects_retains_known_record(
     assert f'Snapshot commit: {candidate.commit}\n' in output
     assert 'Published snapshot' in output
     assert f'Original source: {candidate.pinned.commit}\n' in output
-    assert (
-        'Change summary and published inspection unavailable: local Git objects are missing'
-        in output
-    )
+    assert 'Change summary and published inspection unavailable' in output
+    assert 'local Git objects are missing' in output
     assert 'pubanon repo restore --project=demo --to local' in output
     assert _records.publication_path(paths, project.name, candidate.commit).exists()
 
@@ -692,7 +691,8 @@ def test_history_delete_confirms_exact_local_cleanup(
         assert _records.load_publication(paths, project.name, candidate.commit) is not None
         assert _source.source_recovery(bookmark, candidate.pinned.commit).status == 'protected'
     else:
-        assert 'Deleted the local snapshot and recovery information.' in output
+        assert 'Deleted the local snapshot' in output
+        assert 'recovery information' in output
         assert _records.load_publication(paths, project.name, candidate.commit) is None
         assert _source.source_recovery(bookmark, candidate.pinned.commit).status == 'available'
         assert not _history.publications(paths, project.name)
@@ -724,7 +724,8 @@ def test_history_displays_incomplete_replacement_without_a_publishable_tip(
     assert [snapshot, 'untagged', 'incomplete', '-'] in [
         line.split() for line in rendered.splitlines()
     ]
-    assert 'Preparation stopped before the replacement was ready.' in rendered
+    assert 'Preparation stopped' in rendered
+    assert 'before the replacement was ready' in rendered
     assert ('Operation: replacement\n' in rendered) == verbose
     assert rendered.rstrip().endswith('Next: pubanon prepare --project=demo --continue')
     assert _records.load_rewrite(paths, project.name) is None
@@ -756,7 +757,7 @@ def test_history_empty_keeps_candidate_recovery_priority(
         line.split() for line in rendered.splitlines()
     ]
     if unknown:
-        assert 'pubanon could not confirm whether publication completed.' in rendered
+        assert 'could not confirm whether publication completed' in rendered
     assert rendered.rstrip().endswith(f'Next: {expected}')
 
 

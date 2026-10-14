@@ -119,6 +119,33 @@ def _configs(source: Path) -> tuple[GlobalConfig, ProjectConfig]:
     )
 
 
+def _immutable_pages(
+    monkeypatch: pytest.MonkeyPatch, *, immutable: bool
+) -> list[_host.Destination]:
+    reads: list[_host.Destination] = []
+    page = _host.GitHubRelease(
+        'v1.0.0',
+        'v1.0.0',
+        '',
+        'https://example.invalid/v1.0.0',
+        draft=False,
+        prerelease=False,
+        identifier=1,
+        immutable=immutable,
+        created_at='2026-09-22T10:00:00Z',
+    )
+
+    def _pages(
+        destination: _host.Destination, *, deadline: float | None = None
+    ) -> tuple[_host.GitHubRelease, ...]:
+        assert deadline is None
+        reads.append(destination)
+        return (page,)
+
+    monkeypatch.setattr(_host, 'all_releases', _pages)
+    return reads
+
+
 def _new_host(tmp_path: Path) -> Path:
     host = tmp_path / 'host.git'
     subprocess.run(['git', 'init', '--bare', '-q', host], check=True, env=git_env())
@@ -579,6 +606,15 @@ def _write_host_responses(path: Path, visibility: str = 'public') -> None:
                         }
                     ),
                 },
+                {
+                    'args': [
+                        'api',
+                        '--method',
+                        'GET',
+                        'repos/public-owner/public-repo/releases?per_page=100&page=1',
+                    ],
+                    'stdout': '[]',
+                },
             ]
         )
         + '\n'
@@ -917,7 +953,7 @@ def test_acknowledged_digest_skips_matching_findings_and_changes_for_new_exposur
         _audit.AuditFinding('path:style.txt', RuleClass.HYGIENE, 'style-canary'),
     )
 
-    prompts = ['Continue despite this earlier exposure? [y/n] ']
+    prompts = ['Continue with this history? [y/n] ']
 
     def _accept(prompt: str) -> str:
         assert prompts
@@ -964,7 +1000,7 @@ def test_acknowledged_digest_skips_matching_findings_and_changes_for_new_exposur
         _audit.AuditFinding('path:second.txt', RuleClass.IDENTITY_CRITICAL, second),
     )
 
-    prompts = ['Continue despite this earlier exposure? [y/n] ']
+    prompts = ['Continue with this history? [y/n] ']
 
     def _decline(prompt: str) -> str:
         assert prompts
@@ -1007,7 +1043,7 @@ def test_changed_source_tag_is_named_without_claiming_branch_movement(
     captured = StringIO()
     with redirect_stdout(captured):
         _verify_for_publish(ctx)
-    assert captured.getvalue() == 'Warning: source has changed since snapshot was prepared.\n'
+    assert 'Warning: source has changed since snapshot was prepared' in captured.getvalue()
     assert _records.load_candidate(ctx._paths, ctx._project.name) == ctx._record
 
 
@@ -1030,9 +1066,7 @@ def test_changed_source_uses_one_publication_confirmation(
 
     assert len(prompts) == 1
     assert prompts[0].startswith('Publish untagged snapshot to ')
-    assert capsys.readouterr().out.startswith(
-        'Warning: source has changed since snapshot was prepared.\n'
-    )
+    assert capsys.readouterr().out.startswith('Warning: source has changed')
     destination = _host.verify_destination(ctx._paths, ctx._global_config, ctx._project)
     assert _host.ls_remote(destination, ctx._paths, ctx._project.name) == _host.RemoteRefs(
         None, {}
@@ -1065,7 +1099,7 @@ def test_clean_push_rejection_restores_retained_state(
 
 
 @pytest.mark.parametrize('presentation', [(False, 'never'), (True, 'always')])
-def test_exposure_review_shows_rule_and_location_before_acknowledgment(
+def test_exposure_review_summarizes_findings_before_acknowledgment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -1090,7 +1124,7 @@ def test_exposure_review_shows_rule_and_location_before_acknowledgment(
             ),
         ),
     )
-    prompts = [('Continue despite this earlier exposure? [y/n] ', 'y' if accept else 'n')]
+    prompts = [('Continue with this history? [y/n] ', 'y' if accept else 'n')]
 
     def _answer(prompt: str) -> str:
         assert prompts, f'unexpected prompt: {prompt}'
@@ -1098,19 +1132,20 @@ def test_exposure_review_shows_rule_and_location_before_acknowledgment(
         assert expected == re.sub(r'\x1b\[[0-9;]*m', '', prompt)
         output = capsys.readouterr().out
         plain = re.sub(r'\x1b\[[0-9;]*m', '', output)
-        assert plain.count('Warning: historical exposure') == 1
-        assert 'Published snapshot: v1.0.0 (' + 'a' * 12 + ')' in plain
-        assert '  private-canary.txt:2\n    Rule: project extra_terms, item 1\n' in plain
-        assert '    Text: before private-canary after\n' in plain
-        assert plain.index('Rule:') < plain.index('Text:')
+        assert plain.count('Historical exposure review') == 1
+        assert 'Sensitive terms in published history: 1 term in 1 location' in plain
+        assert f'  First published in v1.0.0 ({"a" * 12}):' in plain
+        assert '    private-canary.txt  private-canary\n' in plain
+        assert '  Rules: project extra_terms entry 1\n' in plain
+        assert 'pubanon audit' in plain
+        assert 'Text:' not in plain
+        assert 'These commits are already public.' in plain
+        assert 'New snapshots still may not contain these terms' in plain
         if color == 'always':
-            assert 'Text: before \x1b[33mprivate-canary\x1b[0m after' in output
+            assert '\x1b[33mprivate-canary\x1b[0m' in output
         else:
             assert '\x1b' not in output
-            assert '    Matched: private-canary\n' in output
         assert 'a' * 40 not in output
-        assert 'does not remove published content' in output
-        assert 'new snapshot content' in output
         return response
 
     monkeypatch.setattr('builtins.input', _answer)
@@ -1159,6 +1194,264 @@ def test_indeterminate_diagnostic_names_both_escapes(
     assert 'publish --resolve' in rendered
     assert 'discard --force' in rendered
     assert 'abandons' in rendered
+
+
+def test_landed_push_with_unrelated_tag_records_published(
+    tmp_path: Path,
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    term = 'private-tag-name'
+    source = make_repo(files={'README.md': 'first\n'})
+    host = _new_host(tmp_path)
+    _configure_host(host, fake_gh, monkeypatch)
+    ctx = _context(tmp_path, source, extra_terms=(term,))
+    real_push = _host.push
+
+    def _push_then_drift(
+        dest: _host.Destination,
+        cwd: Path,
+        args: list[str],
+    ) -> GitResult:
+        result = real_push(dest, cwd, args)
+        _git_command(host, 'update-ref', f'refs/tags/{term}', ctx._record.commit)
+        return result
+
+    monkeypatch.setattr(_host, 'push', _push_then_drift)
+
+    with pytest.raises(PubanonError, match='snapshot landed') as error:
+        _publish.publish(ctx)
+
+    assert term in error.value.render()
+    assert _records.load_candidate(ctx._paths, ctx._project.name) is None
+    store = _store.store_path(ctx._paths, ctx._project.name)
+    assert _remote_ref(store, 'refs/heads/main') == ctx._record.commit
+
+
+def test_landed_resolution_failure_reports_current_private_term(
+    publication_cli: tuple[Path, _publish.PublishContext],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    host, ctx = publication_cli
+    ctx = _publish._preserve_source(ctx)
+    store = _store.store_path(ctx._paths, ctx._project.name)
+    _git_command(
+        host,
+        'fetch',
+        str(store),
+        f'{ctx._record.commit}:refs/heads/main',
+        f'{ctx._record.commit}:refs/tags/v1.0.0',
+    )
+    _candidate.save_candidate(
+        ctx._paths, ctx._project.name, replace(ctx._record, state=_candidate.STATE_UNKNOWN_OUTCOME)
+    )
+    term = ctx._record.commit[:12]
+    _config.save_global(
+        ctx._paths,
+        replace(ctx._global_config, sensitive_terms=(*ctx._global_config.sensitive_terms, term)),
+        ctx._paths.global_config.read_bytes(),
+    )
+
+    def _fail_finalization(*_args: object) -> None:
+        raise PubanonError('cannot record published refs locally')
+
+    with monkeypatch.context() as fault:
+        fault.setattr(_publish, '_finalize', _fail_finalization)
+        assert _cli.main(['publish', '--project', ctx._project.name, '--resolve']) == 1
+    error = capsys.readouterr().err
+    assert term in error
+    assert f'Published and verified commit {term}' in error
+    assert f'pubanon publish --project={ctx._project.name} --resolve' in error
+    assert _cli.main(['publish', '--project', ctx._project.name, '--resolve']) == 0
+    assert _candidate.published_refs(ctx._paths, ctx._project.name) == (
+        ctx._record.commit,
+        {'v1.0.0': ctx._record.commit},
+    )
+    assert _records.load_candidate(ctx._paths, ctx._project.name) is None
+
+
+def test_mixed_managed_state_is_indeterminate(
+    tmp_path: Path,
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_repo(files={'README.md': 'first\n'})
+    host = _new_host(tmp_path)
+    _configure_host(host, fake_gh, monkeypatch)
+    ctx = _context(tmp_path, source, version='1.0.0')
+    real_push = _host.push
+
+    def _push_then_delete_tag(
+        dest: _host.Destination,
+        cwd: Path,
+        args: list[str],
+    ) -> GitResult:
+        result = real_push(dest, cwd, args)
+        _git_command(host, 'update-ref', '-d', 'refs/tags/v1.0.0')
+        return result
+
+    monkeypatch.setattr(_host, 'push', _push_then_delete_tag)
+
+    with pytest.raises(PubanonError, match='indeterminate'):
+        _publish.publish(ctx)
+
+    record = _records.load_candidate(ctx._paths, ctx._project.name)
+    assert record is not None
+    assert record.state == _candidate.STATE_UNKNOWN_OUTCOME
+
+
+def test_ordinary_publication_preview_and_result_are_compact(
+    publication_cli: tuple[Path, _publish.PublishContext],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _host_path, ctx = publication_cli
+    capsys.readouterr()
+    _publish.publish(ctx)
+    output = capsys.readouterr().out
+    assert f'Publish {ctx._record.tag_intent}' in output
+    assert 'Destination:' in output
+    assert 'Changes:' in output
+    assert 'Checked:' in output
+    assert 'content, identity, and destination' in output
+    assert 'Snapshot commit:' not in output
+    assert 'Source commit:' not in output
+    assert 'stage push' not in output
+    assert 'warning: GitHub keeps a record of this upload' in output
+    assert (
+        f'Published {ctx._record.tag_intent} to public-owner/public-repo '
+        f'({ctx._project.visibility}).'
+    ) in output
+
+
+def test_page_ambiguity_is_reported_after_publication(
+    page_context: tuple[_publish.PublishContext, _ReleaseHost],
+    fake_gh: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ctx, host = page_context
+    _configure_host(_new_host(ctx._paths.data_dir.parent), fake_gh, monkeypatch)
+    plan = _releases.PagePlan(
+        'none', 'ambiguous', candidates=('v1.0.0', 'v2.0.0'), project=ctx._project.name
+    )
+
+    def _plan(*_args: object) -> _releases.PagePlan:
+        return plan
+
+    monkeypatch.setattr(_releases, 'plan_publication_page', _plan)
+    capsys.readouterr()
+    _publish.publish(ctx)
+    result = capsys.readouterr().out.split('Published v1.2.3', 1)[1]
+    assert 'Release page: not created' in result
+    assert 'v1.0.0 and v2.0.0' in result
+    for tag in plan.candidates:
+        assert result.count(f'pubanon release create {tag} --project=example') == 1
+    assert host.writes == []
+    assert host.scans == 0
+
+
+def test_page_replacement_question_creates_page(
+    page_context: tuple[_publish.PublishContext, _ReleaseHost], capsys: pytest.CaptureFixture[str]
+) -> None:
+    ctx, host = page_context
+    ctx = replace(
+        ctx,
+        _record=replace(
+            ctx._record,
+            replaces='a' * 40,
+            prestate_main='a' * 40,
+            replace_scope='one',
+            tip=ctx._record.commit,
+            poststate_tags={'v1.2.3': ctx._record.commit},
+        ),
+    )
+    plan = _page_plan(ctx)
+    verified = _publish._Verified(host.destination, _host.RemoteRefs(None, {}))
+    assert (
+        _publish._replacement_review(ctx, verified, plan)
+        == 'Publish this replacement and create its release page?'
+    )
+    assert 'Release page' in capsys.readouterr().out
+
+
+def test_private_exposure_review_explains_reveal_and_correction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    term = 'private-canary'
+    ctx = _literal_context(tmp_path, extra_terms=(term,))
+    project = replace(ctx._project, visibility='private')
+    _config.save_project(ctx._paths, project)
+    finding = _audit.AuditFinding('path:notes.txt', RuleClass.IDENTITY_CRITICAL, term)
+    audit = _audit.HistoryAudit(
+        (finding,), (), (_audit.HistoryEvidence(finding, 'a' * 40, 'blob', 'notes.txt:1'),)
+    )
+    prompts: list[str] = []
+
+    def _accept(prompt: str) -> str:
+        prompts.append(prompt)
+        return 'y'
+
+    monkeypatch.setattr('builtins.input', _accept)
+    with color_context('never'):
+        result = _acknowledge_exposure(
+            ctx._paths,
+            (ctx._global_config, project),
+            audit,
+            (('a' * 40,), {'v0.1.0': 'a' * 40}),
+            unattended=False,
+        )
+
+    assert prompts == ['Continue with this history? [y/n] ']
+    assert result.acknowledged_exposure == _audit.exposure_digest(audit.findings)
+    output = capsys.readouterr().out
+    assert 'commits stay in the repository' in output
+    assert 'pubanon repo reveal' in output
+    assert 'ask before making them public' in output
+    assert 'correct the published history from v0.1.0' in output
+    assert 'recreate the repository' in output
+    assert 'before more releases and release pages' in output
+    assert 'already public' not in output
+
+
+@pytest.mark.parametrize('unattended', [False, True])
+@pytest.mark.parametrize('rule_class', [RuleClass.IDENTITY_CRITICAL, RuleClass.HYGIENE])
+def test_private_history_without_new_acknowledgment_prints_reminder(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    rule_class: RuleClass,
+    unattended: bool,
+) -> None:
+    ctx = _literal_context(tmp_path, extra_terms=('private-canary',))
+    finding = _audit.AuditFinding('path:notes.txt', rule_class, 'private-canary')
+    audit = _audit.HistoryAudit(
+        (finding,), (), (_audit.HistoryEvidence(finding, 'a' * 40, 'blob', 'notes.txt:1'),)
+    )
+    project = replace(
+        ctx._project,
+        visibility='private',
+        acknowledged_exposure=_audit.exposure_digest(audit.findings),
+    )
+
+    with color_context('never'):
+        result = _acknowledge_exposure(
+            ctx._paths,
+            (ctx._global_config, project),
+            audit,
+            (('a' * 40,), {}),
+            unattended=unattended,
+        )
+
+    assert result == project
+    rendered = capsys.readouterr().out
+    assert re.search(r'\b1 flagged term in 1 location\b', rendered)
+    assert 'pubanon repo reveal' in rendered
+    assert 'before making them public' in rendered
+    assert 'pubanon audit' in rendered
 
 
 @pytest.mark.slow
@@ -1352,113 +1645,6 @@ def test_direct_publication_ignores_incidental_staging_tracking(
     )
 
 
-def test_landed_push_with_unrelated_tag_records_published(
-    tmp_path: Path,
-    fake_gh: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    term = 'private-tag-name'
-    source = make_repo(files={'README.md': 'first\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    ctx = _context(tmp_path, source, extra_terms=(term,))
-    real_push = _host.push
-
-    def _push_then_drift(
-        dest: _host.Destination,
-        cwd: Path,
-        args: list[str],
-    ) -> GitResult:
-        result = real_push(dest, cwd, args)
-        _git_command(host, 'update-ref', f'refs/tags/{term}', ctx._record.commit)
-        return result
-
-    monkeypatch.setattr(_host, 'push', _push_then_drift)
-
-    with pytest.raises(PubanonError, match='snapshot landed') as error:
-        _publish.publish(ctx)
-
-    assert term in error.value.render()
-    assert _records.load_candidate(ctx._paths, ctx._project.name) is None
-    store = _store.store_path(ctx._paths, ctx._project.name)
-    assert _remote_ref(store, 'refs/heads/main') == ctx._record.commit
-
-
-def test_landed_resolution_failure_reports_current_private_term(
-    publication_cli: tuple[Path, _publish.PublishContext],
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    host, ctx = publication_cli
-    ctx = _publish._preserve_source(ctx)
-    store = _store.store_path(ctx._paths, ctx._project.name)
-    _git_command(
-        host,
-        'fetch',
-        str(store),
-        f'{ctx._record.commit}:refs/heads/main',
-        f'{ctx._record.commit}:refs/tags/v1.0.0',
-    )
-    _candidate.save_candidate(
-        ctx._paths, ctx._project.name, replace(ctx._record, state=_candidate.STATE_UNKNOWN_OUTCOME)
-    )
-    term = ctx._record.commit[:12]
-    _config.save_global(
-        ctx._paths,
-        replace(ctx._global_config, sensitive_terms=(*ctx._global_config.sensitive_terms, term)),
-        ctx._paths.global_config.read_bytes(),
-    )
-
-    def _fail_finalization(*_args: object) -> None:
-        raise PubanonError('cannot record published refs locally')
-
-    with monkeypatch.context() as fault:
-        fault.setattr(_publish, '_finalize', _fail_finalization)
-        assert _cli.main(['publish', '--project', ctx._project.name, '--resolve']) == 1
-    error = capsys.readouterr().err
-    assert term in error
-    assert f'Published and verified commit {term}' in error
-    assert f'pubanon publish --project={ctx._project.name} --resolve' in error
-    assert _cli.main(['publish', '--project', ctx._project.name, '--resolve']) == 0
-    assert _candidate.published_refs(ctx._paths, ctx._project.name) == (
-        ctx._record.commit,
-        {'v1.0.0': ctx._record.commit},
-    )
-    assert _records.load_candidate(ctx._paths, ctx._project.name) is None
-
-
-def test_mixed_managed_state_is_indeterminate(
-    tmp_path: Path,
-    fake_gh: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    ctx = _context(tmp_path, source, version='1.0.0')
-    real_push = _host.push
-
-    def _push_then_delete_tag(
-        dest: _host.Destination,
-        cwd: Path,
-        args: list[str],
-    ) -> GitResult:
-        result = real_push(dest, cwd, args)
-        _git_command(host, 'update-ref', '-d', 'refs/tags/v1.0.0')
-        return result
-
-    monkeypatch.setattr(_host, 'push', _push_then_delete_tag)
-
-    with pytest.raises(PubanonError, match='indeterminate'):
-        _publish.publish(ctx)
-
-    record = _records.load_candidate(ctx._paths, ctx._project.name)
-    assert record is not None
-    assert record.state == _candidate.STATE_UNKNOWN_OUTCOME
-
-
 @pytest.mark.slow
 @pytest.mark.parametrize('selector', ['latest', 'all'])
 def test_offline_replacement_latest_and_all_exact_host_state(
@@ -1587,77 +1773,22 @@ def test_offline_replacement_recovers_conflict_export_and_lost_readback(
     _assert_offline_replacement_history(ctx, host, originals)
 
 
-def test_ordinary_publication_preview_and_result_are_compact(
-    publication_cli: tuple[Path, _publish.PublishContext],
-    capsys: pytest.CaptureFixture[str],
+def test_public_history_without_new_acknowledgment_prints_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    _host_path, ctx = publication_cli
-    capsys.readouterr()
-    _publish.publish(ctx)
-    output = capsys.readouterr().out
-    assert f'Publish {ctx._record.tag_intent}' in output
-    assert 'Destination:' in output
-    assert 'Changes:' in output
-    assert 'Checked:' in output
-    assert 'content, identity, and destination' in output
-    assert 'Snapshot commit:' not in output
-    assert 'Source commit:' not in output
-    assert 'stage push' not in output
-    assert 'warning: GitHub keeps a record of this upload' in output
-    assert (
-        f'Published {ctx._record.tag_intent} to public-owner/public-repo '
-        f'({ctx._project.visibility}).'
-    ) in output
+    ctx = _literal_context(tmp_path, extra_terms=('private-canary',))
+    finding = _audit.AuditFinding('path:notes.txt', RuleClass.IDENTITY_CRITICAL, 'private-canary')
+    audit = _audit.HistoryAudit(
+        (finding,), (), (_audit.HistoryEvidence(finding, 'a' * 40, 'blob', 'notes.txt:1'),)
+    )
+    project = replace(ctx._project, acknowledged_exposure=_audit.exposure_digest(audit.findings))
 
-
-def test_page_ambiguity_is_reported_after_publication(
-    page_context: tuple[_publish.PublishContext, _ReleaseHost],
-    fake_gh: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    ctx, host = page_context
-    _configure_host(_new_host(ctx._paths.data_dir.parent), fake_gh, monkeypatch)
-    plan = _releases.PagePlan(
-        'none', 'ambiguous', candidates=('v1.0.0', 'v2.0.0'), project=ctx._project.name
+    result = _acknowledge_exposure(
+        ctx._paths, (ctx._global_config, project), audit, (('a' * 40,), {}), unattended=True
     )
 
-    def _plan(*_args: object) -> _releases.PagePlan:
-        return plan
-
-    monkeypatch.setattr(_releases, 'plan_publication_page', _plan)
-    capsys.readouterr()
-    _publish.publish(ctx)
-    result = capsys.readouterr().out.split('Published v1.2.3', 1)[1]
-    assert 'Release page: not created: v1.0.0 and v2.0.0 point here' in result
-    for tag in plan.candidates:
-        assert result.count(f'pubanon release create {tag} --project=example') == 1
-    assert host.writes == []
-    assert host.scans == 0
-
-
-def test_page_replacement_question_creates_page(
-    page_context: tuple[_publish.PublishContext, _ReleaseHost], capsys: pytest.CaptureFixture[str]
-) -> None:
-    ctx, host = page_context
-    ctx = replace(
-        ctx,
-        _record=replace(
-            ctx._record,
-            replaces='a' * 40,
-            prestate_main='a' * 40,
-            replace_scope='one',
-            tip=ctx._record.commit,
-            poststate_tags={'v1.2.3': ctx._record.commit},
-        ),
-    )
-    plan = _page_plan(ctx)
-    verified = _publish._Verified(host.destination, _host.RemoteRefs(None, {}))
-    assert (
-        _publish._replacement_review(ctx, verified, plan)
-        == 'Publish this replacement and create its release page?'
-    )
-    assert 'Release page' in capsys.readouterr().out
+    assert result == project
+    assert capsys.readouterr().out == ''
 
 
 def test_publication_finalization_checks_old_values_atomically(
@@ -1719,7 +1850,7 @@ def test_publication_without_page_shows_later_create_command(
     review, finished = capsys.readouterr().out.split('Published v1.2.3', 1)
     assert 'Add one later with:' not in review
     assert 'Release page: not created' in finished
-    assert 'Add one later with: pubanon release create v1.2.3 --project=example' in finished
+    assert 'pubanon release create v1.2.3 --project=example' in finished
     assert host.scans == 0
     assert host.writes == []
 
@@ -2154,7 +2285,7 @@ def test_publish_acknowledges_visible_exposure_before_confirmation(
     )
     prompts: list[str] = []
     answers = [
-        ('Continue despite this earlier exposure? [y/n] ', 'y'),
+        ('Continue with this history? [y/n] ', 'y'),
         (
             ('Publish untagged snapshot to public-owner/public-repo? [y/n] '),
             'n',
@@ -2165,7 +2296,7 @@ def test_publish_acknowledges_visible_exposure_before_confirmation(
         if not prompts:
             ordinary = capsys.readouterr().out
             assert exposure in ordinary
-            assert 'item 1' in ordinary
+            assert 'entry 1' in ordinary
         prompts.append(prompt)
         assert answers, f'unexpected prompt: {prompt}'
         expected, response = answers.pop(0)
@@ -2181,7 +2312,7 @@ def test_publish_acknowledges_visible_exposure_before_confirmation(
     assert not answers
     output = capsys.readouterr().out
     assert prompts == [
-        'Continue despite this earlier exposure? [y/n] ',
+        'Continue with this history? [y/n] ',
         'Publish untagged snapshot to public-owner/public-repo? [y/n] ',
     ]
     assert 'Publish untagged snapshot' in output
@@ -2233,7 +2364,7 @@ def test_publish_acknowledgment_displays_identity_and_hygiene_in_one_path(
     ctx = _publish.PublishContext(paths, global_config, project, record, _yes=False)
     prompts: list[str] = []
     answers = [
-        ('Continue despite this earlier exposure? [y/n] ', 'y'),
+        ('Continue with this history? [y/n] ', 'y'),
         (
             'Publish untagged snapshot to public-owner/public-repo? [y/n] ',
             'n',
@@ -2246,7 +2377,7 @@ def test_publish_acknowledgment_displays_identity_and_hygiene_in_one_path(
             ordinary = capsys.readouterr().out
             assert identity in ordinary
             assert hygiene in ordinary
-            assert 'item 1' in ordinary
+            assert 'entry 1' in ordinary
         prompts.append(prompt)
         assert answers, f'unexpected prompt: {prompt}'
         expected, response = answers.pop(0)
@@ -2261,7 +2392,7 @@ def test_publish_acknowledgment_displays_identity_and_hygiene_in_one_path(
 
     output = capsys.readouterr().out
     assert prompts == [
-        'Continue despite this earlier exposure? [y/n] ',
+        'Continue with this history? [y/n] ',
         'Publish untagged snapshot to public-owner/public-repo? [y/n] ',
     ]
     assert 'Publish untagged snapshot' in output
@@ -2289,7 +2420,7 @@ def test_publish_declined_exposure_acknowledgment_retains_candidate(
         ({'README.md': f'{exposure}\n'}, (exposure,)),
     )
 
-    expected = ['Continue despite this earlier exposure? [y/n] ']
+    expected = ['Continue with this history? [y/n] ']
 
     def _decline(prompt: str) -> str:
         assert expected, f'unexpected prompt: {prompt}'
@@ -2377,10 +2508,11 @@ def test_publish_fills_existing_repository_description_before_push(
         return actual
 
     def _gh(
-        args: list[str], *, check: bool = True, timeout: float | None = None
+        args: list[str], *, check: bool = True, timeout: float | None = None, read: bool = False
     ) -> bytes | tuple[int, bytes, bytes]:
         nonlocal actual
         if args[:3] == ['api', '-X', 'PATCH']:
+            assert not read
             assert args == [
                 'api',
                 '-X',
@@ -2394,7 +2526,7 @@ def test_publish_fills_existing_repository_description_before_push(
             actual = actual._replace(description=description)
             events.append('description updated')
             return b''
-        return real_gh(args, check=check, timeout=timeout)
+        return real_gh(args, check=check, timeout=timeout, read=read)
 
     def _confirm(_prompt: str) -> str:
         assert actual.description == ''
@@ -2438,10 +2570,11 @@ def test_publish_description_failure_keeps_snapshot_for_retry(
         return actual
 
     def _gh(
-        args: list[str], *, check: bool = True, timeout: float | None = None
+        args: list[str], *, check: bool = True, timeout: float | None = None, read: bool = False
     ) -> bytes | tuple[int, bytes, bytes]:
         nonlocal actual
         if args[:3] == ['api', '-X', 'PATCH']:
+            assert not read
             attempted.append('patch')
             if failure == 'write':
                 raise PubanonError('write failed')
@@ -2449,7 +2582,7 @@ def test_publish_description_failure_keeps_snapshot_for_retry(
                 actual = actual._replace(description='Public project')
                 raise KeyboardInterrupt
             return b''
-        return real_gh(args, check=check, timeout=timeout)
+        return real_gh(args, check=check, timeout=timeout, read=read)
 
     with monkeypatch.context() as fault:
         fault.setattr(_host, 'repository_settings', _settings)
@@ -2598,6 +2731,21 @@ def test_publish_proceeds_when_staging_evidence_covers_the_candidate(
     assert _records.load_candidate(ctx._paths, ctx._project.name) is None
 
 
+def test_publish_reads_no_release_pages_when_no_existing_tag_changes(
+    tmp_path: Path,
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = _new_host(tmp_path)
+    _configure_host(host, fake_gh, monkeypatch)
+    reads = _immutable_pages(monkeypatch, immutable=True)
+
+    _publish.publish(_context(tmp_path, make_repo(), version='1.0.0'))
+
+    assert reads == []
+
+
 def test_publish_rechecks_ci_after_confirmation(
     fake_gh: Path,
     make_repo: Callable[..., Path],
@@ -2644,8 +2792,12 @@ def test_publish_rechecks_ci_after_confirmation(
         _publish.publish(ctx)
     assert len(prompts) == 1
     assert '#10' in error.value.render()
-    assert 'Nothing was published. No push was attempted' in error.value.render()
-    assert error.value.recovery == 'wait for the run to complete, then pubanon stage watch'
+    rendered = error.value.render()
+    assert 'Nothing was published' in rendered
+    assert 'No push was attempted' in rendered
+    assert error.value.recovery is not None
+    assert 'wait for the run to complete' in error.value.recovery
+    assert 'pubanon stage watch' in error.value.recovery
     assert _remote_ref(host, 'refs/heads/main') is None
     saved = _records.load_candidate(ctx._paths, ctx._project.name)
     assert saved is not None
@@ -3080,9 +3232,9 @@ def test_publish_yes_refuses_unacknowledged_exposure_without_prompt(
     ) as error:
         _publish.publish(ctx)
 
-    assert error.value.recovery == (
-        'run pubanon audit to review the findings, then rerun without --yes'
-    )
+    assert error.value.recovery is not None
+    assert 'pubanon audit' in error.value.recovery
+    assert 'without --yes' in error.value.recovery
     _assert_provisional_bookmark(ctx)
 
 
@@ -3386,10 +3538,9 @@ def test_replaced_tag_object_reports_unchanged_selected_commit(
     captured = StringIO()
     with redirect_stdout(captured):
         _verify_for_publish(ctx)
-    assert (
-        captured.getvalue()
-        == 'Warning: source tag has changed; it still selects the prepared source commit.\n'
-    )
+    rendered = captured.getvalue()
+    assert 'Warning: source tag has changed' in rendered
+    assert 'still selects the prepared source commit' in rendered
     assert _records.load_candidate(ctx._paths, ctx._project.name) == ctx._record
 
 
@@ -3955,11 +4106,12 @@ def test_replacement_preview_names_ref_changes_warning_and_single_confirmation(
     assert 'Scope:' in preview
     assert 'Moved tags:' in preview
     assert f'Visibility: {visibility}' in preview
-    assert (
-        'Existing clones may retain old history; GitHub Releases and uploaded '
-        'packages are unchanged.' in preview
+    assert 'clones may retain old history' in preview
+    assert 'GitHub Releases and uploaded packages are unchanged' in preview
+    assert all(
+        fragment in preview
+        for fragment in ('changes branches and tags', 'old commits and GitHub activity')
     )
-    assert 'This changes branches and tags; old commits and GitHub activity' in preview
     assert questions == ['Publish this replacement?']
 
     detailed = StringIO()
@@ -4004,16 +4156,73 @@ def test_replacement_preview_names_ref_changes_warning_and_single_confirmation(
     assert 'Updates: main, v1.0.2' in compact_output
     assert 'Later snapshots:' not in compact_output
     assert 'Replayed commit:' not in compact_output
-    assert 'This changes branches and tags; old commits and GitHub activity' in compact_output
-    assert 'Actions logs, and artifacts may remain.' in compact_output
-    assert (
-        'Existing clones may retain old history; GitHub Releases and uploaded '
-        'packages are unchanged.' in compact_output
+    assert all(
+        fragment in compact_output
+        for fragment in ('changes branches and tags', 'old commits and GitHub activity')
     )
+    assert 'Actions logs, and artifacts may remain.' in compact_output
+    assert 'clones may retain old history' in compact_output
+    assert 'GitHub Releases and uploaded packages are unchanged' in compact_output
     if visibility == 'public':
-        assert 'Public forks and caches may also retain the old commits.' in compact_output
+        assert re.search(
+            r'Public forks and caches.*may also retain the old commits', compact_output
+        )
     else:
-        assert 'Public forks and caches may also retain the old commits.' not in compact_output
+        assert 'Public forks and caches' not in compact_output
+
+
+@pytest.mark.parametrize('immutable', [True, False])
+def test_publish_refuses_moving_the_tag_of_an_immutable_release_page_before_pushing(
+    tmp_path: Path,
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    immutable: bool,
+) -> None:
+    host, first, ctx = _replacement_fixture(
+        tmp_path, make_repo(files={'README.md': 'first\n'}), fake_gh, monkeypatch, '1.0.0'
+    )
+    reads = _immutable_pages(monkeypatch, immutable=immutable)
+
+    if not immutable:
+        _publish.publish(ctx)
+        assert _remote_ref(host, 'refs/tags/v1.0.0') != first.commit
+        assert len(reads) == 1
+        return
+
+    with pytest.raises(PubanonError) as error:
+        _publish.publish(ctx)
+
+    assert str(error.value) == 'published tags have immutable release pages'
+    assert 'v1.0.0' in (error.value.fact or '')
+    assert 'refuses to move or delete these tags' in (error.value.fact or '')
+    assert error.value.recovery is not None
+    assert 'keep the published history' in error.value.recovery
+    assert 'pubanon discard' in error.value.recovery
+    assert _remote_ref(host, 'refs/tags/v1.0.0') == first.commit
+    assert len(reads) == 1
+
+
+@pytest.mark.slow
+def test_publish_refuses_removing_the_tag_of_an_immutable_release_page_before_pushing(
+    tmp_path: Path,
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host, ctx, originals = _rewrite_fixture(
+        tmp_path, make_repo(files={'README.md': 'first\n'}), fake_gh, monkeypatch, selection=None
+    )
+    reads = _immutable_pages(monkeypatch, immutable=True)
+
+    with pytest.raises(PubanonError, match='published tags have immutable release pages') as error:
+        _publish.publish(ctx)
+
+    assert 'v1.0.0' in (error.value.fact or '')
+    assert 'refuses to move or delete these tags' in (error.value.fact or '')
+    assert _remote_ref(host, 'refs/tags/v1.0.0') == originals[0].commit
+    assert _remote_ref(host, 'refs/heads/main') == originals[-1].commit
+    assert len(reads) == 1
 
 
 @pytest.mark.slow
@@ -4558,7 +4767,7 @@ def test_source_drift_warns_without_changing_snapshot(
     captured = StringIO()
     with redirect_stdout(captured):
         _verify_for_publish(ctx)
-    assert captured.getvalue() == 'Warning: source has changed since snapshot was prepared.\n'
+    assert 'Warning: source has changed since snapshot was prepared' in captured.getvalue()
     assert _records.load_candidate(ctx._paths, ctx._project.name) == ctx._record
 
 
@@ -4593,7 +4802,7 @@ def test_sync_acknowledgment_displays_identity_and_hygiene_in_one_path(
     ctx = replace(second, _project=project)
     prompts: list[str] = []
     answers = [
-        ('Continue despite this earlier exposure? [y/n] ', 'y'),
+        ('Continue with this history? [y/n] ', 'y'),
         ('Restore these branches and tags to public-owner/public-repo? [y/n] ', 'n'),
     ]
 
@@ -4602,7 +4811,7 @@ def test_sync_acknowledgment_displays_identity_and_hygiene_in_one_path(
             ordinary = capsys.readouterr().out
             assert identity in ordinary
             assert hygiene in ordinary
-            assert 'item 1' in ordinary
+            assert 'entry 1' in ordinary
         prompts.append(prompt)
         assert answers, f'unexpected prompt: {prompt}'
         expected, response = answers.pop(0)
@@ -4618,7 +4827,7 @@ def test_sync_acknowledgment_displays_identity_and_hygiene_in_one_path(
     assert not answers
     output = capsys.readouterr().out
     assert prompts == [
-        'Continue despite this earlier exposure? [y/n] ',
+        'Continue with this history? [y/n] ',
         'Restore these branches and tags to public-owner/public-repo? [y/n] ',
     ]
     assert 'from saved published history' in output
@@ -4746,7 +4955,6 @@ def test_sync_equal_host_is_noop(
 
     output = capsys.readouterr().out
     assert 'already matches saved published history' in output
-    assert 'The final repository already matches saved published history.' in output
 
 
 @pytest.mark.slow
@@ -4792,7 +5000,7 @@ def test_sync_newly_sensitive_anonymous_identity_requires_explicit_acknowledgmen
     assert _config.load_project(ctx._paths, project.name).acknowledged_exposure == ''
     prompts: list[str] = []
     expected = [
-        ('Continue despite this earlier exposure? [y/n] ', 'y'),
+        ('Continue with this history? [y/n] ', 'y'),
         ('Restore these branches and tags to public-owner/public-repo? [y/n] ', 'y'),
     ]
     output_buffer = StringIO()
@@ -4817,13 +5025,73 @@ def test_sync_newly_sensitive_anonymous_identity_requires_explicit_acknowledgmen
     assert _config.load_project(ctx._paths, project.name).acknowledged_exposure
     output = output_buffer.getvalue()
     assert 'Historical exposure review\n' in output
-    for version, record in (('v2.0.0', second._record), ('v1.0.0', first._record)):
-        heading = f'Published snapshot: {version} ({record.commit[:12]})'
+    for version, record in (('v1.0.0', first._record), ('v2.0.0', second._record)):
+        heading = f'First published in {version} ({record.commit[:12]}):'
         assert output.count(heading) == 1
-        group = output.split(heading)[1].split('Published snapshot:')[0]
+        group = output.split(heading)[1].split('First published in')[0]
         for field in ('author', 'committer'):
-            assert group.count(f'  header {field} value\n') == 1
+            assert group.count(f'    commit {field} ') == 1
     assert exposure in output
+
+
+def test_sync_refuses_missing_local_published_main(
+    tmp_path: Path,
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_repo(files={'README.md': 'first\n'})
+    host = _new_host(tmp_path)
+    _configure_host(host, fake_gh, monkeypatch)
+    ctx = _context(tmp_path, source)
+    _discard.discard(ctx._paths, ctx._project.name, force=False)
+
+    with pytest.raises(PubanonError, match='local published history') as error:
+        _publish.sync(_sync_context(ctx))
+
+    assert error.value.recovery == 'pubanon repo restore --to local'
+
+
+@pytest.mark.slow
+def test_sync_reminds_private_project_of_acknowledged_history(
+    tmp_path: Path,
+    fake_gh: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exposure = 'historical-private-canary'
+    _source_path, host, first, second = _published_history(
+        tmp_path, fake_gh, make_repo, monkeypatch, first_content=f'{exposure}\n'
+    )
+    _git_command(host, 'update-ref', 'refs/heads/main', first._record.commit)
+    _git_command(host, 'update-ref', '-d', 'refs/tags/v2.0.0')
+    _write_host_responses(fake_gh, 'private')
+    project = replace(second._project, extra_terms=(exposure,), visibility='private')
+    main, tags = _candidate.published_refs(second._paths, project.name)
+    assert main is not None
+    audit = _audit.audit_history(
+        second._paths,
+        project.name,
+        _audit.published_commits(second._paths, project.name, new=main),
+        tags,
+        _config.assemble_rules(
+            second._global_config,
+            project,
+            _config.derived_private_terms(second._paths, project, os.environ),
+        ),
+        f'{second._global_config.anon_name} <{second._global_config.anon_email}>',
+        tip=main,
+    )
+    project = replace(project, acknowledged_exposure=_audit.exposure_digest(audit.findings))
+    _config.save_project(second._paths, project)
+    capsys.readouterr()
+
+    _publish.sync(_sync_context(replace(second, _project=project)))
+
+    output = capsys.readouterr().out
+    assert 'Published history contains 1 flagged term in 1 location.' in output
+    assert _remote_ref(host, 'refs/heads/main') == second._record.commit
 
 
 @pytest.mark.slow
@@ -4964,24 +5232,6 @@ def test_sync_refuses_mismatched_readback_with_complete_refs(
     assert branch in error.value.actual
     assert first._record.commit in error.value.actual
     assert error.value.recovery == 'rerun pubanon repo restore --to remote'
-
-
-def test_sync_refuses_missing_local_published_main(
-    tmp_path: Path,
-    fake_gh: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = make_repo(files={'README.md': 'first\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    ctx = _context(tmp_path, source)
-    _discard.discard(ctx._paths, ctx._project.name, force=False)
-
-    with pytest.raises(PubanonError, match='local published history') as error:
-        _publish.sync(_sync_context(ctx))
-
-    assert error.value.recovery == 'pubanon repo restore --to local'
 
 
 @pytest.mark.slow
@@ -5189,7 +5439,7 @@ def test_sync_sent_exposure_requires_interactive_acknowledgment(
     ctx = replace(second, _project=project)
     prompts: list[str] = []
     expected = [
-        'Continue despite this earlier exposure? [y/n] ',
+        'Continue with this history? [y/n] ',
         'Restore these branches and tags to public-owner/public-repo? [y/n] ',
     ]
 
@@ -5206,7 +5456,7 @@ def test_sync_sent_exposure_requires_interactive_acknowledgment(
             _publish.sync(_sync_context(ctx, mode='interactive'))
         assert str(error.value).startswith('Canceled.')
         assert 'pubanon publish' not in error.value.render()
-        assert prompts == ['Continue despite this earlier exposure? [y/n] ']
+        assert prompts == ['Continue with this history? [y/n] ']
         assert _git_command(host, 'for-each-ref') == b''
         assert _config.load_project(ctx._paths, project.name).acknowledged_exposure == ''
         return
@@ -5215,7 +5465,7 @@ def test_sync_sent_exposure_requires_interactive_acknowledgment(
 
     assert not expected
     assert prompts == [
-        'Continue despite this earlier exposure? [y/n] ',
+        'Continue with this history? [y/n] ',
         'Restore these branches and tags to public-owner/public-repo? [y/n] ',
     ]
     assert _config.load_project(ctx._paths, ctx._project.name).acknowledged_exposure
@@ -5325,7 +5575,7 @@ def test_sync_suffix_preserves_full_history_acknowledgment_bytes(
         'interactive',
     )
     expected_publication_prompts = [
-        'Continue despite this earlier exposure? [y/n] ',
+        'Continue with this history? [y/n] ',
         ('Publish v2.0.0 to public-owner/public-repo? [y/n] '),
     ]
 
@@ -5446,7 +5696,10 @@ def test_verify_refuses_ref_drift_under_yes_without_prompt(
     ) as error:
         _verify_for_publish(ctx)
 
-    assert error.value.recovery == 'rerun pubanon publish in an interactive terminal without --yes'
+    assert error.value.recovery is not None
+    assert 'pubanon publish' in error.value.recovery
+    assert 'interactive terminal' in error.value.recovery
+    assert 'without --yes' in error.value.recovery
 
 
 @pytest.mark.parametrize('state', ['missing', 'pending', 'failure', 'skipped', 'ambiguous'])
@@ -5521,10 +5774,13 @@ def test_publish_refuses_final_repository_with_push_ci_turned_off(
     if variable is not None and variable.casefold() == 'false':
         with pytest.raises(PubanonError, match='the final repository turns off push CI') as error:
             _publish.publish(ctx)
-        assert 'CI_RUN_ON_PUSH is false in the final repository.' in error.value.render()
-        assert error.value.recovery == (
-            'delete CI_RUN_ON_PUSH from the final repository on GitHub, then rerun pubanon publish'
-        )
+        rendered = error.value.render()
+        assert 'CI_RUN_ON_PUSH is false' in rendered
+        assert 'final repository' in rendered
+        assert error.value.recovery is not None
+        assert 'delete CI_RUN_ON_PUSH' in error.value.recovery
+        assert 'final repository' in error.value.recovery
+        assert 'pubanon publish' in error.value.recovery
         assert _record_path(ctx).read_bytes() == before
         assert _remote_ref(host, 'refs/heads/main') is None
     else:

@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.5.0 (2026-10-13)
+
+### Breaking changes
+
+- Upgrade GitHub CLI to 2.97.0 or newer. `repo reveal` and `audit --remote` need it to read Actions
+  logs and stop with older versions.
+
+### Added
+
+- `repo reveal` offers to turn on GitHub's immutable releases when it first records a repository as
+  public, and to make the existing release pages immutable.
+
+### Changed
+
+- When published history contains terms you added to `sensitive_terms` later, `repo reveal` lists
+  them and asks whether to make them public instead of refusing. `publish` and `audit` tell you in
+  advance.
+- `publish` refuses to move or remove the tag of an immutable release page.
+
+### Fixed
+
+- `repo reveal` waits up to 3 minutes for GitHub to apply the visibility change instead of
+  reporting drift.
+- Commands retry a GitHub read up to twice after a server error (HTTP 500, 502, 503, or 504)
+  instead of stopping. Requests that change GitHub are never retried.
+- Git and GitHub CLI errors show multiline output on separate lines instead of joining it with
+  `\x0a`.
+
+### Security
+
+- `repo reveal` checks workflow run details, job runners, and job logs for sensitive terms before
+  making a repository public, and offers to delete matching logs.
+- Run `audit --remote` on repositories revealed before 0.5.0. It checks their Actions history the
+  same way and offers to delete matching logs; it stops while a workflow run is still in progress.
+
 ## 0.4.1 (2026-10-11)
 
 ### Changed

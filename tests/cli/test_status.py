@@ -141,8 +141,9 @@ def test_status_changed_source_offers_existing_candidate_unless_settings_changed
     output = re.sub(r': +', ': ', capsys.readouterr().out)
     assert output.startswith('Project demo (direct route)\n')
     assert 'Prepared: v0.0.1' in output
-    assert 'Source revision changed since preparation: yes' in output
-    assert ('pubanon settings have changed since this snapshot was prepared.' in output) is blocked
+    assert re.search(r'The source (branch|tag) \S+ has changed', output)
+    assert 'Source revision changed since preparation' not in output
+    assert ('pubanon settings have changed' in output) is blocked
     assert any(line.split() == ['Published:', 'none'] for line in output.splitlines())
     assert output.endswith(expected_action)
     assert _records.load_candidate(paths, project.name) == record
@@ -199,7 +200,8 @@ def test_status_completed_rewrite_still_requires_cleanup(
     capsys.readouterr()
     assert _cli.main(['status', '--project', project.name]) == 0
     output = re.sub(r': +', ': ', capsys.readouterr().out)
-    assert 'Replacement preparation completed; local cleanup is pending.' in output
+    assert 'Replacement preparation completed' in output
+    assert 'local cleanup is pending' in output
     assert 'Prepared snapshot\n' not in output
     assert record.tip not in output
     assert output.rstrip().endswith('Next: pubanon prepare --project=demo --continue')
@@ -236,7 +238,8 @@ def test_status_confirmed_incomplete_publication_does_not_need_source(
     assert _cli.main(['status', '--project', project.name]) == 0
 
     output = re.sub(r': +', ': ', capsys.readouterr().out)
-    assert 'Snapshot published; local recording needs completion.' in output
+    assert 'Snapshot published' in output
+    assert 'local recording needs completion' in output
     assert output.rstrip().endswith('Next: pubanon publish --project=demo --resolve')
 
 
@@ -310,7 +313,7 @@ def test_status_invalidated_candidate_routes_to_discard_then_prepare(
     assert _cli.main(['status', '--project', project.name]) == 0
 
     output = re.sub(r': +', ': ', capsys.readouterr().out)
-    assert 'pubanon settings have changed since this snapshot was prepared.' in output
+    assert 'pubanon settings have changed' in output
     assert 'Next: pubanon discard --project=demo && pubanon prepare --project=demo' in output
     assert output.rstrip().splitlines()[-1].startswith('Next:')
 
@@ -457,7 +460,7 @@ def test_status_remote_refuses_unexpected_destination_branch_with_recovery(
     assert _cli.main(['status', '--project', project.name, '--remote']) == 1
     error = capsys.readouterr().err
     assert 'unexpected branch' in error
-    assert 'remove every destination branch except main, then rerun' in error
+    assert 'remove every destination branch except main' in error
 
 
 @pytest.mark.slow
@@ -589,6 +592,18 @@ def test_status_rewrite_progress_is_read_only(
     )
 
 
+@pytest.mark.parametrize(
+    ('selector', 'label'),
+    [
+        ('refs/heads/main\x1b[31m', 'source branch main'),
+        ('refs/tags/v1\x1b[31m', 'source tag v1'),
+        ('refs/custom/name\x1b[31m', 'source ref refs/custom/name'),
+    ],
+)
+def test_status_selector_text_escapes_hostile_names(selector: str, label: str) -> None:
+    assert _status._selector_text(selector) == f'{label}\\x1b[31m'
+
+
 def test_status_snapshot_fields_are_concise_and_verbose_adds_provenance(
     tmp_path: Path,
     make_repo: Callable[..., Path],
@@ -602,12 +617,19 @@ def test_status_snapshot_fields_are_concise_and_verbose_adds_provenance(
     concise = re.sub(r': +', ': ', capsys.readouterr().out)
     assert concise.startswith('Project demo (direct route)\n')
     assert 'Prepared: v1.2.3' in concise
-    assert 'Source revision changed since preparation:' not in concise
+    assert 'since preparation' not in concise
+    assert 'has changed since this snapshot was prepared' not in concise
     assert record.commit not in concise
     assert escape((source).as_posix()) not in concise
     assert '0 replayed' not in concise
     assert _cli.main(['status', '--project', project.name, '--verbose']) == 0
     verbose = re.sub(r': +', ': ', capsys.readouterr().out)
+    assert record.pinned.selector_kind == 'ref'
+    assert record.pinned.selector_name is not None
+    assert (
+        f'Source selector: {escape(record.pinned.selector_name)} (unchanged since preparation)'
+        in verbose
+    )
     assert record.commit in verbose
     assert record.pinned.commit in verbose
     assert escape((source).as_posix()) in verbose
@@ -720,7 +742,7 @@ def test_status_unknown_outcome_routes_to_resolution_before_invalidation(
     assert _cli.main(['status', '--project', project.name]) == 0
 
     output = re.sub(r': +', ': ', capsys.readouterr().out)
-    assert 'pubanon settings have changed since this snapshot was prepared.' in output
+    assert 'pubanon settings have changed' in output
     assert 'Snapshot with unknown publish outcome' in output
     assert 'Next: pubanon publish --project=demo --resolve\n' in output
     assert output.rstrip().splitlines()[-1].startswith('Next:')

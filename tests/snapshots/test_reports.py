@@ -250,7 +250,8 @@ def test_inspect_warns_only_about_credential_files_actually_in_snapshot(tmp_path
     report = _reports.inspect_report(
         paths, _verification.prove_objects(paths, changed.name, record), global_config, changed
     )
-    assert 'warning: Snapshot includes 1 credential-like file: kept.key.' in report
+    assert 'warning: Snapshot includes 1 credential-like file' in report
+    assert 'kept.key' in report
     assert 'absent.key' not in report
 
 

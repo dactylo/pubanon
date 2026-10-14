@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Literal, NamedTuple
 
 from pubanon._errors import ObservationTimeoutError, PubanonError
-from pubanon._terminal import escape
+from pubanon._terminal import escape, escape_lines
 
 OID_HEX = '[0-9a-f]{40}|[0-9a-f]{64}'
 
@@ -100,11 +100,11 @@ def check_floors() -> None:
 
 
 def git_failure_fact(result: GitResult) -> str:
-    """Return the exit status and terminal-escaped stderr of a Git result."""
-    stderr = result.stderr.decode(errors='surrogateescape').strip()
+    """Return the exit status and each terminal-escaped stderr line of a Git result."""
+    lines = escape_lines(result.stderr.decode(errors='surrogateescape'))
     fact = f'exit status {result.returncode}'
-    if stderr:
-        fact += f': {escape(stderr)}'
+    if lines:
+        fact += ': ' + '\n'.join(lines)
     return fact
 
 

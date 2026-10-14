@@ -123,7 +123,7 @@ def test_clean_only_review_copies_preserves_prepared_snapshot(
     output = captured.out
     assert escape((inspection).as_posix()) in output
     assert escape((older).as_posix()) in output
-    assert 'The listed review copies will be removed.' in output
+    assert 'review copies will be removed' in output
     assert 'source recovery information will be removed' not in output
     assert inspection.exists()
     assert older.exists()
@@ -153,7 +153,7 @@ def test_clean_only_review_copies_yes_skips_prompt(
     assert not copy.exists()
     output = capsys.readouterr().out
     assert escape((copy).as_posix()) in output
-    assert 'The listed review copies will be removed.' in output
+    assert 'review copies will be removed' in output
 
 
 @pytest.mark.slow

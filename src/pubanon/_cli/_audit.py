@@ -9,12 +9,36 @@ from pubanon import _config, _history_output
 from pubanon._cli import _context
 from pubanon._errors import PubanonError
 from pubanon._gate import RuleClass
-from pubanon._remote import _host
+from pubanon._remote import _actions, _host
 from pubanon._snapshots import _audit, _candidate, _records
-from pubanon._terminal import escape
+from pubanon._terminal import escape, output
 
 if TYPE_CHECKING:
     import argparse
+
+_AUDIT_COMMAND = 'pubanon audit --remote'
+
+
+def _audit_actions(ctx: _context.ProjectContext, destination: _host.Destination) -> None:
+    """Check the final repository's Actions content and offer to delete matching logs."""
+    g, p = ctx.global_config, ctx.project
+    account = g.accounts[p.host]
+    derived = _config.derived_private_terms(ctx.paths, p, os.environ)
+    review = _actions.check(
+        (p.owner, p.repo), account, _config.assemble_rules(g, p, derived), command=_AUDIT_COMMAND
+    )
+    if not review.findings:
+        output(_actions.clean_sentence(review))
+    _actions.offer_log_deletion(
+        review, (g, p), derived, account, already_public=destination.visibility == 'public'
+    )
+    inventory = _host.disclosure(p.owner, p.repo)
+    _actions.show_unchecked(
+        (p.owner, p.repo),
+        [entry.identifier for entry in inventory.runs],
+        artifacts=len(inventory.artifacts),
+        caches=_host.actions_cache_count(p.owner, p.repo),
+    )
 
 
 def _audit_report(
@@ -64,6 +88,10 @@ def _audit_report(
         lines.append(
             'Historical exposure unacknowledged; publish requires interactive acknowledgment.'
         )
+    if result.findings and not result.identity_problems and ctx.project.visibility == 'private':
+        lines.append(
+            'pubanon repo reveal lists these findings and asks before making them public.'
+        )
     if has_exposure:
         lines.append(
             'warning: if this history has been public, deleting or rewriting it does not erase '
@@ -73,7 +101,7 @@ def _audit_report(
 
 
 def command_audit(args: argparse.Namespace) -> None:
-    """Audit recorded published history, verifying host refs when requested."""
+    """Audit published history; with --remote, verify host refs and check Actions logs."""
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
@@ -83,6 +111,7 @@ def command_audit(args: argparse.Namespace) -> None:
         if args.remote:
             _context.require_advisory_store(paths, name)
         main, tags = _candidate.published_refs(ctx.paths, ctx.project.name)
+        destination = None
         if args.remote:
             destination = _host.verify_destination(ctx.paths, ctx.global_config, ctx.project)
             remote = _host.ls_remote(destination, paths, name)
@@ -97,3 +126,5 @@ def command_audit(args: argparse.Namespace) -> None:
                     'in the operator guide if GitHub changed outside pubanon',
                 )
         print('\n'.join(_audit_report(ctx, main, tags, verified_against_host=args.remote)))
+        if destination is not None:
+            _audit_actions(ctx, destination)

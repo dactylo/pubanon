@@ -604,7 +604,9 @@ def build_parser() -> _RootParser:
     )
     audit = _add_command_parser(commands, 'audit', _COMMAND_HELP['audit'])
     audit.add_argument(
-        '--remote', action='store_true', help='verify the recorded history against GitHub'
+        '--remote',
+        action='store_true',
+        help='verify the recorded history against GitHub and check its Actions logs',
     )
 
     _add_prepare_parser(commands)

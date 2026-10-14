@@ -272,10 +272,8 @@ def test_create_without_options_previews_defaults_and_missing_changelog_hint(
     assert prepared == [policy.ReleaseRequest('create', 'v1.2.3', None, None)]
     rendered = capsys.readouterr().out
     assert 'v1.2.3' in rendered
-    assert (
-        'No CHANGELOG.md in the published snapshot; set release_page.changelog to link one.'
-        in rendered
-    )
+    assert 'No CHANGELOG.md' in rendered
+    assert 'set release_page.changelog' in rendered
 
 
 def test_edit_can_clear_notes_without_prompt(

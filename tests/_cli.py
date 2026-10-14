@@ -181,5 +181,18 @@ def stub_remote(
         del timeout
         return refs
 
+    def _no_runs(_owner: str, _repo: str, *, command: str) -> tuple[_host.ActionsRun, ...]:
+        del command
+        return ()
+
+    def _no_disclosure(_owner: str, _repo: str) -> _host.Disclosure:
+        return _host.Disclosure((), ())
+
+    def _no_caches(_owner: str, _repo: str) -> int:
+        return 0
+
     monkeypatch.setattr(_host, 'verify_destination', _verified_destination)
     monkeypatch.setattr(_host, 'ls_remote', _remote_refs)
+    monkeypatch.setattr(_host, 'actions_runs', _no_runs)
+    monkeypatch.setattr(_host, 'disclosure', _no_disclosure)
+    monkeypatch.setattr(_host, 'actions_cache_count', _no_caches)

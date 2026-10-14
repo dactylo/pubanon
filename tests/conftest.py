@@ -9,6 +9,7 @@ from typing import cast
 import pytest
 
 from pubanon import _config, _terminal
+from pubanon._remote import _host
 from tests._git import git_env
 from tests._setup import configure
 
@@ -69,6 +70,14 @@ def _refuse_unscripted_input(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr('builtins.input', _refuse)
     monkeypatch.setattr(_terminal, '_read_key', _scripted_key)
     monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+
+
+@pytest.fixture(autouse=True)
+def _refuse_unscripted_read_pause(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _refuse(seconds: float) -> None:
+        pytest.fail(f'unscripted GitHub read pause: {seconds}')
+
+    monkeypatch.setattr(_host, '_sleep', _refuse)
 
 
 @pytest.fixture

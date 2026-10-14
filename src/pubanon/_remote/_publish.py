@@ -129,8 +129,11 @@ def _acknowledge_exposure(
 ) -> ProjectConfig:
     """Record an informed decision for current historical exposures."""
     _g, p = configs
+    commits, tags = history
     digest = _audit.exposure_digest(audit.findings)
     if not digest or digest == p.acknowledged_exposure:
+        if audit.findings and p.visibility == 'private':
+            output(_history_output.history_reminder(audit.findings), kind='warning')
         return p
     if unattended:
         raise PubanonError(
@@ -138,24 +141,27 @@ def _acknowledge_exposure(
             recovery=('run pubanon audit to review the findings, then rerun without --yes'),
         )
 
-    commits, tags = history
-    lines = _history_output.finding_groups(
-        audit,
-        configs,
-        derived_private_terms(paths, p, os.environ),
-        commits,
-        tags,
-    )
+    derived = derived_private_terms(paths, p, os.environ)
     heading('Historical exposure review', separate=True)
-    for line in lines:
+    for line in _history_output.finding_summary(audit, configs, derived, commits, tags):
         output(line)
-    output('Locations show the first match for each finding; more matches may exist.')
-    output(
-        'Acknowledgment accepts these existing identity-critical historical findings. '
-        'It does not remove published content or permit these terms in new snapshot content.',
-        kind='warning',
-    )
-    if not confirm('Continue despite this earlier exposure?'):
+    if p.visibility == 'private':
+        release = _history_output.earliest_release(audit, commits, tags)
+        output(
+            'These commits stay in the repository. pubanon repo reveal will list them again '
+            'and ask before making them public.'
+        )
+        output(
+            f'{_history_output.correction_text(release)} This is cheapest now, before more '
+            'releases and release pages build on this history.'
+        )
+    else:
+        output(
+            'These commits are already public. Replacing published history hides them from '
+            'new clones only; existing clones, forks, and caches keep them.'
+        )
+    output('New snapshots still may not contain these terms.', kind='warning')
+    if not confirm('Continue with this history?'):
         raise OperationCanceled('Canceled. Nothing was published.')
     updated = replace(p, acknowledged_exposure=digest)
     save_project(paths, updated)
@@ -474,6 +480,30 @@ def _push_args(record: CandidateRecord) -> list[str]:
     args.append('--no-follow-tags')
     args.extend(_refspecs(record))
     return args
+
+
+def _refuse_immutable_tag_changes(destination: Destination, record: CandidateRecord) -> None:
+    """Refuse moving or removing a published tag that has an immutable release page."""
+    changed = {tag for tag in _changed_tags(record) if tag in record.prestate_tags}
+    if not changed:
+        return
+    pages = sorted(
+        (
+            page
+            for page in _host.all_releases(destination)
+            if page.immutable and page.tag in changed
+        ),
+        key=lambda page: (page.created_at, page.identifier),
+    )
+    if pages:
+        raise PubanonError(
+            'published tags have immutable release pages',
+            fact=', '.join(escape(page.tag) for page in pages)
+            + '\nGitHub refuses to move or delete these tags.',
+            recovery=(
+                'keep the published history, or discard this replacement with pubanon discard'
+            ),
+        )
 
 
 def _refuse_sync_branches(remote: RemoteRefs) -> None:
@@ -1162,6 +1192,7 @@ def _verify_for_publish(ctx: PublishContext) -> _Verified:
         raise PubanonError('verified destination does not match the snapshot record')
     remote = _host.ls_remote(destination, ctx._paths, ctx._project.name)
     _verify_remote(ctx._record, remote)
+    _refuse_immutable_tag_changes(destination, ctx._record)
     return _Verified(destination, remote)
 
 

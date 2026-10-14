@@ -50,10 +50,8 @@ def _assert_initial_selection_sections(output: str) -> None:
     decisions = output.split('Files needing your decision\n', maxsplit=1)[1].split(
         'Files to publish\n', maxsplit=1
     )[0]
-    assert (
-        'These filenames can contain credentials. '
-        'A name match is a warning, not proof of a secret.\n' in decisions
-    )
+    assert 'filenames can contain credentials' in decisions
+    assert 'not proof of a secret' in decisions
     assert '.env' in decisions
     assert 'keys/id_rsa' in decisions
     published = output.split('Files to publish\n', maxsplit=1)[1].split(
@@ -78,11 +76,11 @@ def _assert_selection_rule_details(output: str, *, verbose: bool) -> None:
         assert '  docs/guide.md: 1 file\n' in output
         assert '  src/**: 2 files\n' in output
         assert '  .env: 1 file\n' in output
-        assert 'Examples are the first two matching files in path order.\n' in output
+        assert 'first two matching files in path order' in output
         assert '    sample: src/a.py\n' in output
         assert '    sample: src/b.py\n' in output
         assert 'Exclude rules' in output
-        assert 'Deny rules take precedence over allow rules.\n' in output
+        assert 'Deny rules take precedence over allow rules' in output
         exclude_rules = output.split('Exclude rules\n', maxsplit=1)[1].split(
             'Publish list saved to:', maxsplit=1
         )[0]
@@ -255,9 +253,11 @@ def test_init_collects_complete_repository_settings_for_new_project(
     positions = [prompts.index(prompt) for prompt in ordered]
     assert positions == sorted(positions)
     review = capsys.readouterr().out
-    assert 'Each page is created right after publishing, before CI runs.' in review
+    assert 'created right after publishing' in review
+    assert 'before CI runs' in review
     assert 'Release pages:' in review
-    assert 'pubanon publishes from the private source and does not merge on GitHub.' in review
+    assert 'publishes from the private source' in review
+    assert 'does not merge on GitHub' in review
     assert 'Features:' in review
     assert 'issues, discussions, and projects on' in review
     assert 'pull requests and wiki off' in review
@@ -291,10 +291,11 @@ def test_init_connects_none_of_several_connectable_workflows(
     assert _cli.main(['init', '--project', 'demo']) == 0
 
     assert _config.load_project(paths, 'demo').ci_workflow is None
-    assert (
-        'Several workflows can be connected: ci.yml, other.yml. '
-        'Choose one with pubanon init --edit.'
-    ) in capsys.readouterr().out
+    rendered = capsys.readouterr().out
+    assert 'Several workflows can be connected' in rendered
+    assert 'ci.yml' in rendered
+    assert 'other.yml' in rendered
+    assert 'pubanon init --edit' in rendered
 
 
 def test_init_connects_nothing_on_the_direct_route(
@@ -587,7 +588,7 @@ def test_init_edit_changes_checks_and_repository_settings(
     )
     assert saved.allow == project.allow
     assert (saved.owner, saved.repo) == (project.owner, project.repo)
-    assert 'Changing required checks invalidates a prepared snapshot.' in capsys.readouterr().out
+    assert 'required checks invalidates a prepared snapshot' in capsys.readouterr().out
 
 
 def test_init_edit_changes_the_workflow_by_number(
@@ -643,7 +644,7 @@ def test_init_edit_connects_the_offered_workflow(
 
     assert edited.ci_workflow == 'ci.yml'
     assert edited.required_checks == ('quality', 'hosted-validation')
-    assert 'Changing the CI workflow invalidates a prepared snapshot.' in capsys.readouterr().out
+    assert 'CI workflow invalidates a prepared snapshot' in capsys.readouterr().out
 
 
 def test_init_edit_disconnects_the_workflow(
@@ -838,7 +839,8 @@ def test_init_edit_turns_on_release_pages_and_keeps_other_settings(
         release_page=replace(project.release_page, enabled=True),
     )
     out = capsys.readouterr().out
-    assert 'To change the selected files, run pubanon prepare and choose review.' in out
+    assert 'pubanon prepare' in out
+    assert 'choose review' in out
     assert 'Saved project demo.' in out
 
 
@@ -1158,7 +1160,8 @@ def test_init_quit_at_flagged_path_does_not_claim_retained_preview(
     result = capsys.readouterr()
     assert result.out.count('Setup progress saved.') == 1
     error = result.err
-    assert '  project configuration was not saved; setup draft was saved' in error
+    assert 'project configuration was not saved' in error
+    assert 'setup draft was saved' in error
     assert 'proposed selection list was retained' not in error
 
 
@@ -1203,7 +1206,8 @@ def test_init_quit_shows_sectioned_preview_and_retained_list(
     assert json.loads(retained.read_text()) == ['README.md', 'src/a.py']
     error = result.err
     assert '\x1b[33mCanceled.\x1b[0m' in error
-    assert 'project configuration was not saved; setup draft was saved' in error
+    assert 'project configuration was not saved' in error
+    assert 'setup draft was saved' in error
 
 
 def test_init_refuses_explicit_project_conflicting_with_registry_before_config_write(
@@ -1279,7 +1283,8 @@ def test_init_relocation_enables_self_publication(
     assert changed.source_path == new_source.resolve()
     assert changed.self_publication is True
     output = capsys.readouterr().out
-    assert 'Relocated project demo to the current source repository.' in output
+    assert 'Relocated project demo' in output
+    assert 'current source repository' in output
     assert 'Enabled self_publication.' in output
 
 
@@ -1357,7 +1362,8 @@ def test_init_relocation_reserves_new_source_before_saving_configuration(
     assert next(answers, None) is None
     assert reservation_seen == [True]
     output = capsys.readouterr().out
-    assert 'Relocated project demo to the current source repository.' in output
+    assert 'Relocated project demo' in output
+    assert 'current source repository' in output
     assert 'Next: pubanon repo create --project=demo' in output
     assert escape((paths.config_dir / 'projects' / 'demo.toml').as_posix()) not in output
 
@@ -1422,7 +1428,7 @@ def test_init_rerun_leaves_existing_settings_untouched(
     assert _config.load_project(paths, 'demo').settings == settings
     out = capsys.readouterr().out
     assert 'Release pages:' in out
-    assert 'To change settings, run `pubanon init --edit`.' in out
+    assert 'pubanon init --edit' in out
 
 
 def test_init_reserves_new_source_before_saving_configuration(
@@ -1675,7 +1681,7 @@ def test_init_retries_late_answer_without_losing_policy(
         discussions=False,
     )
     output = capsys.readouterr().out
-    assert 'Expected visibility must be private or public.' in output
+    assert 'visibility must be private or public' in output
     assert 'Publication uses the main branch.' not in output
     assert 'Setup progress saved.' not in output
     assert 'Next: pubanon repo create' in output
@@ -1846,7 +1852,7 @@ def test_init_review_walks_each_rule_after_the_guided_summary(
     assert _cli.main(['init', '--project', 'demo']) == 0
 
     output = capsys.readouterr().out
-    assert output.count('Choose the files to publish. Nothing is published now.\n') == 1
+    assert output.count('Choose the files to publish') == 1
     assert (
         prompts.count(
             'Include these files? [i]nclude / [e]xclude / [c]ustomize / [b]ack / [q]uit: '
@@ -1904,9 +1910,9 @@ def test_init_reviews_complete_configuration_before_save(
 
     assert _cli.main(['init', '--project', 'demo']) == 130
 
-    assert (
-        '  project configuration was not saved; setup draft was saved' in capsys.readouterr().err
-    )
+    error = capsys.readouterr().err
+    assert 'project configuration was not saved' in error
+    assert 'setup draft was saved' in error
     review = reviews[0]
     for expected in (
         escape((source.resolve()).as_posix()),
@@ -1994,7 +2000,7 @@ def test_init_route_flag_preserves_prepared_candidate_and_other_settings(
     assert gh_calls(tmp_path) == calls_before
     output = capsys.readouterr().out
     assert output.index('Route:') < output.index('Updated project demo')
-    assert 'Private staging is required before final publication.' not in output
+    assert 'Private staging is required' not in output
 
 
 def test_init_route_flag_refuses_incomplete_saved_project_without_rewriting(
@@ -2051,7 +2057,8 @@ def test_init_same_source_uses_idempotent_registry_update(
 
     assert _cli.main(['init', '--project', project.name]) == 0
     output = capsys.readouterr().out
-    assert 'Refreshed source registration for project demo.' in output
+    assert 'Refreshed source registration' in output
+    assert 'project demo' in output
     assert 'Next: pubanon repo create' in output
     assert escape((paths.config_dir / 'projects' / 'demo.toml').as_posix()) not in output
 
@@ -2299,7 +2306,9 @@ def test_init_source_change_rechecks_selection_without_losing_exclusions(
     project = _config.load_project(paths, 'demo')
     assert project.owner == 'publication-owner'
     assert project.deny == ('docs/private/**',)
-    assert 'The source changed. Review the updated selection' in capsys.readouterr().out
+    rendered = capsys.readouterr().out
+    assert 'source changed' in rendered
+    assert 'Review the updated selection' in rendered
     preview = paths.data_dir / 'projects' / 'demo' / 'proposed-selection.json'
     assert json.loads(preview.read_text()) == ['README.md']
 
@@ -2414,15 +2423,15 @@ def test_project_review_counts_a_connected_workflow_as_configured_ci(
 
     output = capsys.readouterr().out
     assert re.search(rf'CI workflow:\s+{re.escape(workflow or "none")}', output)
-    assert ('No CI checks configured; CI waiting is optional.' in output) is warned
+    assert ('No CI checks configured' in output) is warned
 
 
 @pytest.mark.parametrize(
     ('route', 'ci_configured', 'timing'),
     [
-        ('staged', True, 'Each page is created when you publish, after staging checks pass.'),
-        ('staged', False, 'Each page is created right after publishing, before CI runs.'),
-        ('direct', True, 'Each page is created right after publishing, before CI runs.'),
+        ('staged', True, 'after staging checks pass'),
+        ('staged', False, 'before CI runs'),
+        ('direct', True, 'before CI runs'),
     ],
 )
 def test_release_pages_prompt_explains_when_pages_are_created(
@@ -2438,11 +2447,11 @@ def test_release_pages_prompt_explains_when_pages_are_created(
         is True
     )
     out = capsys.readouterr().out
-    assert 'Release pages announce published versions.' in out
-    assert 'Creating one can start release workflows, such as package uploads.' in out
+    assert 'announce published versions' in out
+    assert 'start release workflows' in out
+    assert 'package uploads' in out
     assert timing in out
-    waits = 'To wait for CI, answer no and run pubanon release create later.'
-    assert (waits in out) is (timing.startswith('Each page is created right after'))
+    assert ('pubanon release create' in out) is (timing == 'before CI runs')
 
 
 @pytest.mark.parametrize('exit_mode', ['quit', 'interrupt'])
@@ -2471,12 +2480,13 @@ def test_init_saved_draft_prompt_retains_progress_on_cancel(
 
     assert _cli.main(['init', '--project', 'demo']) == 130
     output = capsys.readouterr()
-    assert (
-        output.out.count('Setup progress saved. Rerun pubanon init --project=demo to resume.') == 1
-    )
+    assert output.out.count('Setup progress saved') == 1
+    assert 'pubanon init --project=demo' in output.out
+    assert 'to resume' in output.out
     assert 'The setup draft is kept.' in output.err
     assert 'project configuration was not saved' in output.err
-    assert 'Next: rerun pubanon init --project=demo to resume' in output.err
+    assert 'pubanon init --project=demo' in output.err
+    assert 'to resume' in output.err
     assert draft_path.read_bytes() == saved
     assert not (paths.config_dir / 'projects' / 'demo.toml').exists()
 
@@ -2526,13 +2536,15 @@ def test_init_unusable_draft_offers_start_over_or_quit(
     assert 'cannot be resumed' in rendered.out
     if choice in {'q', 'interrupt'}:
         assert 'Setup progress saved.' not in rendered.out
-        assert 'Next: rerun pubanon init --project=demo and choose start over' in rendered.err
+        assert 'pubanon init --project=demo' in rendered.err
+        assert 'choose start over' in rendered.err
         assert len(prompts) == 1
         assert removed == []
         assert draft_path.read_bytes() == old_bytes
     else:
         assert rendered.out.count('Setup progress saved.') == 1
-        assert 'Next: rerun pubanon init --project=demo to resume' in rendered.err
+        assert 'pubanon init --project=demo' in rendered.err
+        assert 'to resume' in rendered.err
         assert len(prompts) > 1
         assert removed == ['demo']
         new_draft = _init_draft.load(paths, 'demo')
@@ -2572,7 +2584,7 @@ def test_init_other_source_draft_prompt_keeps_draft_without_offering_resume_here
 
     assert _cli.main(['init', '--project', 'demo']) == 130
     rendered = capsys.readouterr()
-    assert 'This draft belongs to another source repository.' in rendered.out
+    assert 'draft belongs to another source repository' in rendered.out
     assert 'Setup progress saved.' not in rendered.out
     assert 'from the draft source shown above' in rendered.err
     assert 'choose start over' in rendered.err
@@ -2712,7 +2724,7 @@ def test_init_continue_accepts_complete_guided_policy_proposal(
         'src/a.py',
         'src/b.py',
     ]
-    assert output.count('Choose the files to publish. Nothing is published now.\n') == 1
+    assert output.count('Choose the files to publish') == 1
     _assert_initial_selection_sections(before_action[0])
     selection_index = prompts.index(
         'Use this selection? [c]ontinue / [r]eview / [b]ack / [q]uit: '

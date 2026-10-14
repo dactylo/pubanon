@@ -116,7 +116,7 @@ def _verify_repo_settings(
             fact='; '.join(escape(item) for item in mismatches),
             recovery=recovery,
         )
-    return 'Settings: match'
+    return 'Repository settings match your configuration.'
 
 
 def package_watch(args: argparse.Namespace) -> None:
@@ -271,7 +271,7 @@ def repo_restore(args: argparse.Namespace) -> None:
         settings = _verify_repo_settings(
             ctx, repaired=repair_changed, review_findings=bool(repaired.audit.findings)
         )
-        output(settings)
+        output(settings, kind='success')
         detail_fields(
             [
                 ('Repository', f'exists; visibility={destination.visibility}'),
@@ -417,7 +417,7 @@ def verify_repo(args: argparse.Namespace) -> None:
             f'({escape(destination.visibility)}) matches saved published history.',
             kind='success',
         )
-        output(settings)
+        output(settings, kind='success')
         detail_fields(
             [
                 ('Repository', f'exists; visibility={destination.visibility}'),

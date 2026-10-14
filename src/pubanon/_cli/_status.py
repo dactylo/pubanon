@@ -203,10 +203,28 @@ def _replacement_summary(record: _candidate.CandidateRecord) -> str:
     )
 
 
+def _selector_text(name: str) -> str:
+    """Name a source ref as a branch, a tag, or a full ref, escaped."""
+    for prefix, kind in (('refs/heads/', 'branch'), ('refs/tags/', 'tag')):
+        if name.startswith(prefix):
+            return f'source {kind} {escape(name.removeprefix(prefix))}'
+    return f'source ref {escape(name)}'
+
+
 def _snapshot_provenance(
-    ctx: _context.ProjectContext, record: _candidate.CandidateRecord
+    ctx: _context.ProjectContext,
+    record: _candidate.CandidateRecord,
+    *,
+    source_changed: bool,
 ) -> list[str]:
     """Render full identifiers and source coordinates for verbose snapshot status."""
+    selector = escape(record.pinned.selector_name or record.pinned.commit)
+    if (
+        record.pinned.selector_kind == 'ref'
+        and record.pinned.selector_name is not None
+        and not source_changed
+    ):
+        selector += ' (unchanged since preparation)'
     lines = [
         terminal_field('Operation', 'replacement' if record.replaces is not None else 'new'),
         terminal_field('Snapshot commit', record.commit),
@@ -216,9 +234,7 @@ def _snapshot_provenance(
             'Local store',
             display_path(_store.candidate_store_path(ctx.paths, ctx.project.name)),
         ),
-        terminal_field(
-            'Source selector', escape(record.pinned.selector_name or record.pinned.commit)
-        ),
+        terminal_field('Source selector', selector),
     ]
     if record.tip is not None and record.tip != record.commit:
         lines.append(terminal_field('Final snapshot ID', record.tip))
@@ -245,15 +261,22 @@ def rewrite_status(
         if verbose_enabled():
             details.append(terminal_field('Resulting tip', record.tip))
         return details
-    details.append(terminal_field('Preparation', 'incomplete', kind='warning'))
     if record.tip is not None:
-        details.append('Replacement preparation completed; local cleanup is pending.')
+        details.append(
+            style('Replacement preparation completed; local cleanup is pending.', 'warning')
+        )
     elif progress is None:
-        details.append('Replacement initialization incomplete; saved snapshot is available.')
+        details.append(
+            style('Replacement initialization incomplete; saved snapshot is available.', 'warning')
+        )
     elif progress.phase == 'replaying':
-        details.append('Preparation interrupted while rebuilding later snapshots.')
+        details.append(
+            style('Preparation interrupted while rebuilding later snapshots.', 'warning')
+        )
     elif progress.phase == 'exporting':
-        details.append('Conflict export incomplete; continuation restores the export.')
+        details.append(
+            style('Conflict export incomplete; continuation restores the export.', 'warning')
+        )
     else:
         directory = _records.rewrite_directory(paths, name)
         decisions = (
@@ -312,10 +335,6 @@ def _status_candidate(
         details.extend([style(title, 'warning')] if title != 'Prepared snapshot' else [])
         if record.replaces is not None and record.state != _candidate.STATE_UNKNOWN_OUTCOME:
             details.extend(rewrite_status(paths, name, record))
-        if verbose_enabled():
-            details.extend(_snapshot_provenance(ctx, record))
-        if _config.fingerprint(ctx.global_config, ctx.project) != record.fingerprint:
-            causes.append('pubanon settings have changed since this snapshot was prepared.')
         if record.pinned.selector_kind == 'ref' and record.pinned.selector_name is not None:
             current = _run.run_git(
                 ['rev-parse', '--verify', record.pinned.selector_name],
@@ -325,6 +344,10 @@ def _status_candidate(
             expected_selector = f'{record.pinned.selector_oid}\n'.encode()
             if current.returncode != 0 or current.stdout != expected_selector:
                 source_changed = True
+        if verbose_enabled():
+            details.extend(_snapshot_provenance(ctx, record, source_changed=source_changed))
+        if _config.fingerprint(ctx.global_config, ctx.project) != record.fingerprint:
+            causes.append('pubanon settings have changed since this snapshot was prepared.')
         exists = _run.run_git(
             ['cat-file', '-e', f'{record.pinned.commit}^{{commit}}'],
             cwd=ctx.project.source_path,
@@ -335,12 +358,12 @@ def _status_candidate(
             causes.append(
                 'The source commit used to prepare this snapshot is no longer available.'
             )
-        if source_changed or verbose_enabled():
+        if source_changed and record.pinned.selector_name is not None:
             details.append(
-                terminal_field(
-                    'Source revision changed since preparation',
-                    'yes' if source_changed else 'no',
-                    kind='warning' if source_changed else 'plain',
+                style(
+                    f'The {_selector_text(record.pinned.selector_name)} has changed since '
+                    'this snapshot was prepared.',
+                    'warning',
                 )
             )
         details.extend(causes)

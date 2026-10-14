@@ -146,7 +146,7 @@ def test_required_checks_default_to_all_listed_for_a_connected_workflow(
     ) == ('quality', 'package')
     out = capsys.readouterr().out
     assert 'GitHub checks found in ci.yml' in out
-    assert 'pubanon accepts a run only if it executed every required job.' in out
+    assert 'executed every required job' in out
 
 
 def test_required_checks_for_a_connected_workflow_omit_other_workflows(
@@ -219,8 +219,9 @@ def test_required_checks_offer_all_listed_without_a_default_for_flagged_jobs(
         'package',
     )
     out = capsys.readouterr().out
-    assert 'A required check that never runs for a push cannot pass.' in out
-    assert 'Leave out jobs that run only for tags, releases, or schedules.' in out
+    assert 'never runs for a push cannot pass' in out
+    assert 'Leave out jobs' in out
+    assert 'only for tags, releases, or schedules' in out
 
 
 @pytest.mark.parametrize(

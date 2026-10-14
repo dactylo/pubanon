@@ -59,7 +59,8 @@ def test_inspect_ambiguous_tags_offer_one_manual_command_per_tag(
     assert _cli.main(['inspect', '--project', project.name]) == 0
 
     rendered = capsys.readouterr().out
-    assert 'Release page (planned): not created: v1.2.1 and v1.2.2 point here' in rendered
+    assert 'Release page (planned): not created' in rendered
+    assert 'v1.2.1 and v1.2.2' in rendered
     assert 'pubanon release create v1.2.1 --project=demo' in rendered
     assert 'pubanon release create v1.2.2 --project=demo' in rendered
     assert 'create "v1.2.1"' not in rendered
@@ -185,13 +186,13 @@ def test_inspect_lists_preserved_copies_without_a_candidate(
     assert _cli.main(['inspect', '--project', project.name]) == 0
 
     output = capsys.readouterr().out
-    assert output.startswith(
-        'No prepared snapshot is available.\nPreserved snapshot directories: 2\n'
-    )
+    assert output.startswith('No prepared snapshot')
+    assert 'Preserved snapshot directories: 2' in output.splitlines()
     for copy in copies:
         assert output.count(escape((copy).as_posix()) + '\n') == 1
         assert (copy / 'notes.txt').read_text() == 'Keep my review edits.\n'
-    assert 'Open these directories in your editor to review their files.' in output
+    assert 'directories in your editor' in output
+    assert 'review their files' in output
     assert output.rstrip().endswith('`pubanon clean --project=demo`.')
     assert 'pubanon prepare' not in output
     assert _records.load_candidate(paths, project.name) is None

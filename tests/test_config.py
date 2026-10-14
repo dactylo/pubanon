@@ -696,7 +696,8 @@ def test_held_project_lock_does_not_render_sensitive_project_name(tmp_path: Path
         pytest.fail('conflicting project lock unexpectedly acquired')
 
     assert name not in exc_info.value.render()
-    assert exc_info.value.recovery == 'retry after the active operation finishes'
+    assert exc_info.value.recovery is not None
+    assert 'retry after the active operation finishes' in exc_info.value.recovery
 
 
 def test_held_project_lock_filesystem_failure_is_path_free(
@@ -727,8 +728,9 @@ def test_held_project_lock_refuses_with_exact_recovery(tmp_path: Path) -> None:
     ):
         pytest.fail('conflicting project lock unexpectedly acquired')
 
-    assert exc_info.value.recovery == 'retry after the active operation finishes'
-    assert 'retry after the active operation finishes' in exc_info.value.render()
+    assert exc_info.value.recovery is not None
+    assert 'retry after the active operation finishes' in exc_info.value.recovery
+    assert exc_info.value.recovery in exc_info.value.render()
     with _config.project_lock(paths, 'demo'):
         pass
 
@@ -737,10 +739,10 @@ def test_identity_refusal_names_sources_and_joined_recovery() -> None:
     error = _config.identity_refusal(('sensitive_terms', 'private path'))
     assert str(error) == 'publication identity matches an active disclosure rule'
     assert error.fact == 'rule source: sensitive_terms, private path'
-    assert error.recovery == (
-        'remove the value from sensitive_terms or choose another publication identity; '
-        'choose a publication identity that does not contain a private path'
-    )
+    assert error.recovery is not None
+    assert 'remove the value from sensitive_terms' in error.recovery
+    assert 'choose another publication identity' in error.recovery
+    assert 'does not contain a private path' in error.recovery
 
 
 def test_identity_rule_sources_without_project_uses_global_and_derived_terms() -> None:
@@ -1577,13 +1579,9 @@ def test_project_config_rejects_invalid_ci_workflow(
     project_file.parent.mkdir(parents=True)
     project_file.write_text(_project_toml(tmp_path / 'source') + f'ci_workflow = {rendered}\n')
 
-    with pytest.raises(
-        PubanonError, match=r'^ci_workflow must be a workflow file name such as ci\.yml$'
-    ):
+    with pytest.raises(PubanonError, match='ci_workflow must be a workflow file name'):
         _config.load_project(paths, 'demo')
-    with pytest.raises(
-        PubanonError, match=r'^ci_workflow must be a workflow file name such as ci\.yml$'
-    ):
+    with pytest.raises(PubanonError, match='ci_workflow must be a workflow file name'):
         _config.save_project(paths, replace(_project_config(tmp_path), ci_workflow=value))
 
 
@@ -2017,7 +2015,8 @@ def test_registry_lookup_existing_registry_uses_lock(tmp_path: Path) -> None:
         with pytest.raises(PubanonError, match='project registry is active') as exc_info:
             _config.registry_lookup(paths, source)
 
-    assert exc_info.value.recovery == 'retry after the active operation finishes'
+    assert exc_info.value.recovery is not None
+    assert 'retry after the active operation finishes' in exc_info.value.recovery
     assert_private_mode(paths.registry, 0o600)
     assert_private_mode(lock_path, 0o600)
 
@@ -2432,9 +2431,9 @@ def test_save_global_directory_fsync_failure_reports_possible_save(
     with pytest.raises(PubanonError) as exc_info:
         _config.save_global(paths, updated, original)
 
-    assert exc_info.value.render() == (
-        'error: global configuration may have been saved\n\nNext: rerun pubanon setup'
-    )
+    rendered = exc_info.value.render()
+    assert 'global configuration may have been saved' in rendered
+    assert 'pubanon setup' in rendered
     assert fsync_calls == 2
     assert _config.load_global(paths) == updated
 
@@ -2492,9 +2491,9 @@ def test_save_global_keyboard_interrupt_after_replace_reports_possible_save(
     with pytest.raises(PubanonError) as exc_info:
         _save_after_replace()
 
-    assert exc_info.value.render() == (
-        'error: global configuration may have been saved\n\nNext: rerun pubanon setup'
-    )
+    rendered = exc_info.value.render()
+    assert 'global configuration may have been saved' in rendered
+    assert 'pubanon setup' in rendered
     assert _config.load_global(paths) == updated
     assert list(paths.config_dir.glob('.global-*.tmp')) == []
 

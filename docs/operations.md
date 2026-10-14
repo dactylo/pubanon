@@ -260,6 +260,10 @@ re-verifies current facts and never silently selects new source content, rebuild
 snapshot, changes a planned tag mapping, reuses a package version, or adds a stage. A retained
 replacement may move or remove tags only as already reviewed in that snapshot.
 
+pubanon repeats a GitHub read up to twice, after 2 and then 4 seconds, when GitHub answers it with
+a server error (HTTP 500, 502, 503, or 504). It never repeats a change. When the error remains,
+check [GitHub's status page](https://www.githubstatus.com/), wait, and rerun the command.
+
 - If `prepare` fails before retaining a snapshot, rerunning it makes a new, reported source
   selection.
 - If replacement preparation pauses or is interrupted after retaining state, use `pubanon status`,
@@ -340,8 +344,8 @@ there is no committed package version to infer; see [version tags](guide.md#vers
 
 `--yes` confirms only the changes selected by the command. It cannot supply identity or sensitive
 terms, accept a changed source branch or tag, acknowledge new paths, approve first-use staging
-creation, or accept the reveal disclosure. If a command needs one of these decisions, it stops and
-tells you which interactive step to run.
+creation, accept sensitive terms in published history at reveal, or make the repository public. If
+a command needs one of these decisions, it stops and tells you which interactive step to run.
 
 ## Cleanup
 
@@ -461,7 +465,8 @@ title and notes, not its assets, and neither deletes pages.
 
 ## Post-publication verification
 
-Use these read-only checks after publication:
+Use these checks after publication. Both are read-only, except that `audit --remote` offers to
+delete Actions logs that match your terms and deletes nothing unless you confirm:
 
 ```sh
 pubanon repo verify
@@ -473,13 +478,15 @@ declared and retained publication state. `repo restore --to local` first verifie
 rebuilds the local published-history copy without changing the host.
 
 `audit` applies your current rules to the saved published history; `--remote` first checks that
-history against GitHub. Matches of your private terms are reported as historical exposure, and
-matches of hygiene terms as policy differences. Each finding names the rule and its entry number
-and, where relevant, the commit that contains it. Text findings show where the match is, such as a
-file and line number, with the surrounding text; binary content is located by byte range. Only the
-first match is shown; there may be more. You see every finding before any acknowledgment.
-Acknowledging an exposure neither removes published content nor relaxes the checks on new
-snapshots; declining leaves the previous acknowledgment unchanged.
+history against GitHub. With `--remote`, audit then checks Actions run details, runners, and job
+logs as reveal does, and names what it cannot check. Matches of your private terms are reported as
+historical exposure, and matches of hygiene terms as policy differences. Each finding names the
+rule and its entry number and, where relevant, the commit that contains it. Text findings show
+where the match is, such as a file and line number, with the surrounding text; binary content is
+located by byte range. Only the first match is shown; there may be more. Before an acknowledgment,
+publish and restore show a summary that lists at most 20 rows per category; `pubanon audit` lists
+every finding. Acknowledging an exposure neither removes published content nor relaxes the checks
+on new snapshots; declining leaves the previous acknowledgment unchanged.
 
 If `ci_workflow` or `required_checks` is configured, wait for CI on this release:
 
@@ -500,15 +507,22 @@ watches show what they are waiting for and report progress at least every 30 sec
 to interrupt and rerun with the same selection.
 
 Before making a private repository public, `repo reveal` verifies all branches and tags, required
-CI, optional package state, declared settings, sanitized Git content, and identity metadata. Reveal
-re-checks the tag, title, and notes of every non-draft release page under the current sensitive
-terms and refuses if any page matches. With `ci_workflow` configured, reveal requires the latest
-push run of that workflow for the release commit to pass, including any required checks, using the
-same evidence as `repo watch`. It separately lists Actions runs and artifacts, saves the complete
-list where only you can read it, and gives you exact run links plus the repository Actions page for
-manual review. pubanon does not scan Actions logs or artifact contents. Review the repository
-Activity page too; Git history checks do not cover these retained hosted records. After changing
-visibility, reveal verifies visibility, branches, tags, and settings again.
+CI, optional package state, declared settings, sanitized Git content, and identity metadata. If
+published Git content matches terms added after publication, reveal lists the matches and asks
+whether to make them public; identity problems still stop it. Reveal re-checks the tag, title, and
+notes of every non-draft release page under the current sensitive terms and refuses if any page
+matches. With `ci_workflow` configured, reveal requires the latest push run of that workflow for
+the release commit to pass, including any required checks, using the same evidence as `repo watch`.
+It also checks the details of every workflow run, the runner of every job, and every job log
+against the same terms, and offers to delete matching logs before making the repository public. If
+GitHub already shows it as public, deleting logs stops them being served but cannot undo earlier
+exposure. Reveal saves the run and artifact list where only you can read it, then names what it
+cannot check: artifact contents, Actions caches, job summaries, annotations, and earlier pushes on
+the Activity page. The Actions check is not an atomic snapshot; a run starting after its last read
+is not checked. After changing visibility, reveal verifies visibility, branches, tags, and settings
+again. When reveal first records the repository as public, including one GitHub already shows as
+public, it may offer to enable or apply [immutable releases](guide.md#immutable-releases) if
+release pages are enabled or pages already exist and the setting or eligible pages need action.
 
 When both the project declaration and host are already public, repeated reveal checks only current
 visibility, published refs, and repository settings. Run `pubanon audit --remote` to apply the

@@ -10,8 +10,9 @@ of files. You control what you publish; the
 
 ## Installation
 
-You need Python 3.13 or newer, Git 2.41.0 or newer, and the GitHub CLI (`gh`). pubanon targets
-Linux, macOS, and native Windows. See [platform requirements](docs/platforms.md) for details.
+You need Python 3.13 or newer, Git 2.41.0 or newer, and GitHub CLI (`gh`) 2.97.0 or newer. pubanon
+targets Linux, macOS, and native Windows. See [platform requirements](docs/platforms.md) for
+details.
 
 From a checkout of this repository, install the command with [uv](https://docs.astral.sh/uv/):
 
@@ -107,9 +108,9 @@ page defaults to the tag as its title and a link to a published root `CHANGELOG.
 or empty notes when that file is absent. Otherwise pubanon prints the command that adds one later.
 On the `staged` route, `publish` first checks that the staged snapshot passed its configured
 checks. `repo watch` waits for the final repository's own CI; skip it if neither `ci_workflow` nor
-checks are configured. `repo reveal` checks the published history and settings, links the
-repository's Activity and Actions pages for you to review, and asks before making the repository
-public. pubanon does not scan logs or artifact contents.
+checks are configured. `repo reveal` checks the published history, settings, and Actions logs,
+names what it cannot check, such as artifact contents, and asks before making the repository
+public.
 
 For the next release, commit your changes, updating the package version if you have one, and repeat
 these steps without `repo create` and `repo reveal`.

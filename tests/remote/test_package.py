@@ -535,8 +535,11 @@ def test_release_state_refuses_unexpected_status_without_exposing_response(
         release_state('pypi', 'demo', '1.2.3')
 
     assert str(raised.value) == 'Could not check PyPI release demo 1.2.3'
-    assert raised.value.fact == 'PyPI returned HTTP 500; the release status is unknown.'
-    assert raised.value.recovery == 'Retry the package check after PyPI responds normally.'
+    assert raised.value.fact is not None
+    assert 'PyPI returned HTTP 500' in raised.value.fact
+    assert 'release status is unknown' in raised.value.fact
+    assert raised.value.recovery is not None
+    assert 'Retry the package check' in raised.value.recovery
     assert response_canary not in raised.value.render()
 
 

@@ -219,6 +219,16 @@ def test_display_time_uses_local_seconds_and_zone(monkeypatch: pytest.MonkeyPatc
         time.tzset()
 
 
+def test_escape_lines_splits_only_at_line_feeds() -> None:
+    text = ' \t\n\nfirst\r\n\nvertical\x0btab\u2028separator\rreturn\x1c\n \n'
+
+    assert _terminal.escape_lines(text) == [
+        'first',
+        '',
+        'vertical\\x0btab\\u2028separator\\x0dreturn\\x1c',
+    ]
+
+
 def test_escape_renders_controls_and_backslashes_visibly() -> None:
     assert _terminal.escape('a\x1b[31mb\\c') == 'a\\x1b[31mb\\\\c'
 

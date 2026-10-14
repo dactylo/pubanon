@@ -156,6 +156,43 @@ rerun passes `--release-page`. With release pages on, `publish --resolve` report
 completed publication has its page, without creating one. If you are unsure whether a
 `release edit` took effect, check with `release show` before editing again.
 
+### Immutable releases
+
+GitHub's immutable releases setting keeps each published release's tag and attached files fixed and
+signs a record of the release, which `gh release verify` checks. Titles and notes stay editable.
+pubanon cannot replace published history that moves the tag of an immutable release. A deleted
+release's version can never be used again, even in a recreated repository.
+
+When `repo reveal` first records the final repository as public, whether reveal made it public or
+GitHub already did, pubanon considers immutable releases if release pages are enabled or the
+repository already has a page. After the visibility check, it asks to enable a setting that is off
+and not enforced by the owner, or to convert eligible pages if the setting is on and any remain
+mutable. You may still need to correct published history or recreate the repository before then.
+Answering yes turns the setting on if needed and converts existing non-draft release pages that
+have titles, including pages created while the repository was private. Pages without titles stay
+mutable; draft pages become immutable when published. Later runs of reveal on a repository already
+recorded as public do not ask again.
+
+To turn the setting on later, use the repository's settings on GitHub, or run:
+
+```sh
+gh api -X PUT repos/OWNER/REPO/immutable-releases
+```
+
+Turning on the setting through GitHub or the command alone does not change existing pages. To make
+an existing page immutable, edit it without changing its content. These commands send the page's
+current title back unchanged:
+
+```sh
+id=$(gh api repos/OWNER/REPO/releases/tags/v0.1.0 --jq .id)
+gh api repos/OWNER/REPO/releases/$id --jq '{name}' | gh api -X PATCH repos/OWNER/REPO/releases/$id --input -
+```
+
+A page without a title cannot be converted without changing it. Give it a title with
+`gh release edit v0.1.0 --title v0.1.0` to make it immutable. If pubanon reports that turning the
+setting on did not finish, check whether the setting is on and enable it if needed. Then use the
+PATCH commands above for listed pages with titles, or give an untitled page a title.
+
 ### Details
 
 - pubanon previews every page change and checks the tag, title, and notes against your content
@@ -264,12 +301,33 @@ pubanon repo reveal
 
 Reveal checks the published history, repository settings, required CI, and any configured
 [package observation](#package-observation). It re-checks the tag, title, and notes of every
-non-draft release page under the current sensitive terms and refuses if any page matches. It lists
-Actions runs and artifacts, with links to the Activity and Actions pages, for you to review:
-pubanon does not scan logs or artifact contents. After you acknowledge that and confirm, it makes
-the repository public and checks it again. A repository that is already public needs no reveal for
-later releases. See [post-publication verification](operations.md#post-publication-verification)
-for more checks.
+non-draft release page under the current sensitive terms and refuses if any page matches. If
+published history contains terms you added after publishing it, reveal lists them and asks whether
+to make them public; see
+[Sensitive terms in published history](#sensitive-terms-in-published-history).
+
+Reveal also checks your Actions history with the same terms: the details of every workflow run, the
+runner of every job, and every job log. It needs GitHub CLI 2.97.0 or newer, and it stops while any
+run is still running. If anything matches, reveal lists the matches by run. For matching logs, it
+offers to delete the logs of those runs, keep them, or cancel. Deleting asks again, cannot be
+undone, and keeps the runs and their results. Deleting logs cannot remove matching run or runner
+details; to remove those details, delete the run on GitHub, then rerun reveal.
+
+`pubanon audit --remote` runs the same check on a repository that is already public, such as one
+revealed before pubanon 0.5.0, and offers to delete matching logs.
+
+Reveal cannot check artifact contents, Actions caches, job summaries, annotations, or earlier
+pushes listed on the Activity page. It names what it could not check, with links to review it, and
+then asks to make the repository public. Its Actions check uses several requests rather than an
+atomic snapshot: a run that starts after the last check is not checked, so avoid starting workflows
+during reveal. If reveal cannot read the repository back right after the visibility change, it
+retries for up to 3 minutes, because GitHub may still be applying the change. If it still cannot,
+wait a minute and rerun it; the rerun records the repository as public without changing it again.
+On the first reveal that records the repository as public, it may offer to enable or apply
+[immutable releases](#immutable-releases) if release pages are enabled or pages already exist and
+the setting or eligible pages need action. A repository already recorded as public needs no reveal
+for later releases. See
+[post-publication verification](operations.md#post-publication-verification) for more checks.
 
 ## Version tags
 
@@ -827,7 +885,8 @@ With `--yes`, stages continue after their previews without asking, and the inspe
 not pause for you to review files. For a hands-on review, end the workflow at `inspect` or run the
 commands separately. `--yes` confirms only the declared stages. It cannot answer policy or new-path
 decisions, accept a changed source branch or tag, approve creating the staging repository,
-acknowledge a historical exposure, or accept the reveal disclosure.
+acknowledge a historical exposure, accept sensitive terms in published history at reveal, or make
+the repository public.
 
 ## Non-package workflows
 
@@ -904,6 +963,9 @@ Existing clones, caches, and host-retained objects may still contain the old con
 tags do not replace GitHub Release assets, Actions logs or artifacts, or packages already uploaded
 by your release workflow. To start a private repository over without them, see
 [Recreating the final repository](#recreating-the-final-repository).
+
+GitHub refuses to move or delete the tag of an [immutable release](#immutable-releases), so
+`publish` stops before pushing a replacement that would.
 
 First commit the intended correction in your private source. Select that committed revision when
 preparing:
@@ -1026,9 +1088,10 @@ not use or change a prepared snapshot. If that snapshot is a correction, see
 
 Run `pubanon audit` to check your saved published history, including the author and committer names
 and emails, against your current terms. `pubanon audit --remote` first checks that history against
-GitHub. If a name becomes sensitive after publication, `audit` reports the exposure, `repo reveal`
-refuses it, and `publish` and `repo restore --to remote` require you to acknowledge it; `--yes`
-alone cannot.
+GitHub. If a name becomes sensitive after publication, `audit` reports the exposure, `publish` and
+`repo restore --to remote` require you to acknowledge it, and `repo reveal` lists it and asks
+before making it public. `--yes` cannot answer either question. See
+[Sensitive terms in published history](#sensitive-terms-in-published-history).
 
 Findings identify the matched term and its location so you can correct it. Accepting a historical
 exposure does not remove published content or allow those terms in new snapshots. See
@@ -1058,6 +1121,9 @@ partial-success recovery, and limits.
 Replacing published history does not erase it from GitHub: the old commits can stay reachable, and
 their CI runs stay listed. While the final repository is private, you can delete and recreate it to
 start over without them.
+
+A recreated repository cannot reuse the version of a release page that was immutable, so restoring
+that tag fails.
 
 Publish any prepared correction first, so the saved history you restore is the corrected one:
 
@@ -1095,6 +1161,67 @@ pubanon repo create
 pubanon repo restore --to remote
 pubanon release create v0.1.0
 ```
+
+## Sensitive terms in published history
+
+A term you add after publishing can match commits already in the final repository. New snapshots
+cannot contain it, but those earlier commits still do.
+
+`publish` and `repo restore --to remote` summarize the matches and ask you to acknowledge them
+once; later runs for a private repository remind you in one line. `pubanon audit` lists every
+finding and shows its first match in context; additional occurrences may exist. `repo reveal` lists
+the findings again and asks before making them public. `--yes` answers none of these questions.
+
+The same terms can appear in Actions logs. `pubanon audit --remote` checks the details of every
+workflow run, the runner of every job, and every job log, lists matches by run, and offers to
+delete the logs of matching runs. Deleting asks again and cannot be undone. When the repository is
+already public, deleting stops GitHub from serving the logs, but copies made meanwhile remain.
+
+| Situation                               | Choice                                            | Cost                                                             |
+| --------------------------------------- | ------------------------------------------------- | ---------------------------------------------------------------- |
+| Private; the matches can be public      | Keep the history and answer yes at reveal         | The matches become public with the repository                    |
+| Private; the matches must not be public | Correct the history, then recreate the repository | Release pages, Actions history, and Activity are lost; tags move |
+| Already public                          | Replace history only if new clones matter         | Existing clones, forks, and caches keep the old history          |
+
+Immutable release pages can block these corrections: a replacement cannot move or remove an
+affected page's tag, and a recreated repository cannot reuse that page's version.
+
+Correcting is cheapest early, before more releases and release pages build on the affected history.
+To correct from the first affected release, here `v0.1.0`:
+
+1. Find its original source with `pubanon show v0.1.0 --verbose`.
+
+2. Commit the correction on top of that source revision, keeping the same package version.
+
+3. Prepare and publish the correction. Later releases are replayed on top of it; see
+   [Correcting published history](#correcting-published-history).
+
+   ```sh
+   pubanon prepare --replace v0.1.0 --source REV
+   pubanon inspect
+   pubanon publish
+   ```
+
+   On the staged route, stage and watch first, as inspection's next step shows.
+
+4. Save each release page's notes to a file before deleting anything. `pubanon release show` is for
+   reading, not backup: it adds metadata and escapes the text. Use GitHub's CLI instead:
+
+   ```sh
+   gh release view v0.1.0 --repo OWNER/REPO --json body --jq .body >notes-v0.1.0.md
+   ```
+
+5. Delete and recreate the final repository and restore the corrected history as in
+   [Recreating the final repository](#recreating-the-final-repository). Recreate each page from its
+   saved notes, adding `--title` if you had changed the title:
+
+   ```sh
+   pubanon release create v0.1.0 --notes-file notes-v0.1.0.md
+   ```
+
+Recreating starts a fresh repository with corrected history. It does not prove that the old content
+is erased: GitHub can restore some deleted repositories for 90 days, and copies may remain in
+clones, forks, caches, and package indexes. Packages already uploaded keep their contents.
 
 ## Accepting an outside fix
 

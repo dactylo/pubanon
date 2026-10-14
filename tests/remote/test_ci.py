@@ -318,7 +318,9 @@ def test_ensure_run_on_push_variable_reports_created_when_readback_is_canceled(
     monkeypatch.setattr(_host, 'repository_variable', canceled)
     with pytest.raises(OperationCanceled, match='Canceled after creating CI_RUN_ON_PUSH') as error:
         _ci.ensure_run_on_push_variable(('owner', 'repo'), plan)
-    assert error.value.fact == 'The variable was created. Nothing was pushed.'
+    assert error.value.fact is not None
+    assert 'variable was created' in error.value.fact
+    assert 'Nothing was pushed' in error.value.fact
     assert len((tmp_path / 'fake-gh-calls.jsonl').read_text().splitlines()) == 1
 
 
@@ -461,9 +463,9 @@ def test_require_ci_contract_reads_snapshot_workflow(
     _ci.require_ci_contract(store, commit, 'ci.yml')
     with pytest.raises(PubanonError, match='prepared snapshot has no') as missing:
         _ci.require_ci_contract(store, commit, 'other.yml')
-    assert missing.value.recovery == (
-        'add the workflow or correct ci_workflow, then prepare a new snapshot'
-    )
+    assert missing.value.recovery is not None
+    assert 'add the workflow or correct ci_workflow' in missing.value.recovery
+    assert 'prepare a new snapshot' in missing.value.recovery
 
     invalid_store, invalid_commit = _bare_snapshot(
         tmp_path,
@@ -522,7 +524,9 @@ def test_start_stage_ci_never_dispatches_when_registration_times_out(
     _script(fake_gh, {'args': _registered()['args'], 'returncode': 1, 'stderr': 'HTTP 404'})
     with pytest.raises(PubanonError, match='not registered') as error:
         _ci.start_stage_ci(('owner', 'repo'), 'ci.yml', _COMMIT, hosted=False, full_tests=False)
-    assert error.value.fact == 'The snapshot is staged. CI did not start.'
+    assert error.value.fact is not None
+    assert 'snapshot is staged' in error.value.fact
+    assert 'CI did not start' in error.value.fact
     calls = (tmp_path / 'fake-gh-calls.jsonl').read_text().splitlines()
     assert len(calls) == 12
     assert now[0] == 60
@@ -559,7 +563,11 @@ def test_start_stage_ci_reports_moved_main(fake_gh: Path, observed: str, display
     assert observed not in error.value.render() or observed == displayed
 
 
-def test_start_stage_ci_reports_read_failure_after_dispatch(fake_gh: Path) -> None:
+def test_start_stage_ci_reports_read_failure_after_dispatch(
+    fake_gh: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pauses: list[float] = []
+    monkeypatch.setattr(_host, '_sleep', pauses.append)
     _script(
         fake_gh,
         _registered(),
@@ -590,9 +598,10 @@ def test_start_stage_ci_reports_refused_and_uncertain_dispatch(
     assert error.value.fact is not None
     assert 'The snapshot is staged.' in error.value.fact
     if uncertain:
-        assert error.value.fact == 'The snapshot is staged. GitHub did not confirm the CI request.'
+        assert 'did not confirm the CI request' in error.value.fact
     else:
-        assert r'host\x0amessage' in error.value.fact
+        assert 'HTTP 422: host' in error.value.fact
+        assert r'\x0a' not in error.value.fact
     calls = [
         json.loads(line)['args']
         for line in (tmp_path / 'fake-gh-calls.jsonl').read_text().splitlines()

@@ -219,10 +219,10 @@ def _run_publish_stage(args: argparse.Namespace, state: _RunState) -> None:
 
 
 def _run_reveal_stage(args: argparse.Namespace, state: _RunState) -> None:
-    """Invoke reveal without covering its disclosure acknowledgment."""
+    """Invoke reveal without answering its final question."""
     if args.yes:
         raise PubanonError(
-            '--yes cannot answer the repository disclosure acknowledgment',
+            '--yes cannot make the repository public',
             recovery='run pubanon repo reveal interactively',
         )
     _lifecycle.reveal(state._ctx.paths, state._ctx.global_config, state._ctx.project)

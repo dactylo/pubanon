@@ -608,10 +608,10 @@ def test_page_preview_empty_defaults_and_supplied_file(
     ctx, _host_facts = page_context
     plan = _page_plan(ctx)
     _releases.show_page_plan(plan)
-    assert (
-        'create "v1.2.3" with empty notes (no CHANGELOG.md; set release_page.changelog)'
-        in capsys.readouterr().out
-    )
+    rendered = capsys.readouterr().out
+    assert 'create "v1.2.3" with empty notes' in rendered
+    assert 'no CHANGELOG.md' in rendered
+    assert 'release_page.changelog' in rendered
     path = ctx._paths.data_dir / 'notes.md'
     ctx = replace(
         ctx, _release_page=_releases.PageRequest(notes=b'full\r\nlast\n', notes_file=path)

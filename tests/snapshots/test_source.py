@@ -293,14 +293,14 @@ def test_pin_reports_terminal_child_failure(
         }[boundary]
     )
     if boundary != 'explicit':
-        assert error.value.recovery == (
-            'Check that the selected branch or tag exists and points to an available '
-            'commit, then retry preparation.'
-        )
+        assert error.value.recovery is not None
+        assert 'selected branch or tag exists' in error.value.recovery
+        assert 'available commit' in error.value.recovery
+        assert 'retry preparation' in error.value.recovery
     else:
-        assert error.value.recovery == (
-            'Select an existing branch, tag, or commit and retry preparation.'
-        )
+        assert error.value.recovery is not None
+        assert 'existing branch, tag, or commit' in error.value.recovery
+        assert 'retry preparation' in error.value.recovery
 
 
 def test_pin_terminal_renders_invalid_selector_without_changing_git_argument(

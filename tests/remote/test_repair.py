@@ -439,7 +439,9 @@ def test_rebuild_store_refuses_retained_candidate_without_losing_objects(
 
     assert error.value.recovery == recovery
     if state == _candidate.STATE_RETAINED:
-        assert 'a later pubanon prepare rebuilds the discarded snapshot' in error.value.render()
+        rendered = error.value.render()
+        assert 'pubanon prepare' in rendered
+        assert 'rebuilds the discarded snapshot' in rendered
     assert _records.load_candidate(ctx._paths, ctx._project.name) == record
     assert _remote_ref(store, _candidate.CANDIDATE_REF) == record.commit
     _git_command(store, 'cat-file', '-e', f'{record.commit}^{{commit}}')

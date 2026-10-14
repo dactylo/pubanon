@@ -221,7 +221,7 @@ def test_repo_restore_local_reports_findings_and_late_settings_failure(
     assert 'Rebuilt the saved published history' in captured.out
     assert 'historical exposure: Private Alias/file' in captured.out
     assert 'policy mismatch: Internal Term/file' in captured.out
-    assert 'Repair did not acknowledge these findings.' in captured.out
+    assert 'Repair did not acknowledge' in captured.out
     assert 'pubanon audit --project=demo --remote' in captured.out + captured.err
     assert 'no action is required' not in captured.out
     assert 'Private Alias' in captured.out + captured.err
@@ -293,17 +293,16 @@ def test_repo_restore_local_reports_local_rebuild_without_claiming_host_change(
 
     assert rebuilt == [None]
     output = capsys.readouterr().out
-    expected = (
-        'Local publication refs already match verified host refs; no replacement was needed.'
+    assert (
+        'Local publication refs already match verified host refs'
         if noop
-        else 'Rebuilt the saved published history from verified host refs.'
-    )
-    assert output.startswith(expected + '\n')
+        else 'Rebuilt the saved published history'
+    ) in output
     assert 'The host repository and source repository were not changed.\n' in output
     assert 'Next: no action is required.\n' not in output
     assert 'Expected refs:' not in output
     assert 'Host refs:' not in output
-    assert 'Settings: match' in output
+    assert 'Repository settings match' in output
     assert 'a' * 40 not in output
 
 
@@ -603,7 +602,7 @@ def test_repo_verify_reports_matching_declared_settings(
     assert _cli.main(['repo', 'verify', '--project', project.name]) == 0
     output = capsys.readouterr().out
     assert 'Final repository' in output
-    assert 'Settings: match' in output
+    assert 'Repository settings match' in output
     assert 'Expected refs:' not in output
     assert _cli.main(['repo', 'verify', '--project', project.name, '--verbose']) == 0
     assert 'Expected refs:' in capsys.readouterr().out

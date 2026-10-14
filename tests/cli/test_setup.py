@@ -75,7 +75,7 @@ def test_setup_cancels_at_save_menu_without_saving(
         else 'this step needs an interactive terminal'
     ) in output.err
     if isinstance(failure, KeyboardInterrupt):
-        assert 'any completed GitHub authentication remains in effect' in output.err
+        assert 'GitHub authentication remains in effect' in output.err
     else:
         assert 'rerun in an interactive terminal' in output.err
     assert 'Traceback' not in output.out + output.err

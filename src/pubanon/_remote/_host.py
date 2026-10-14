@@ -23,10 +23,11 @@ from pubanon._config import (
 from pubanon._errors import ObservationTimeoutError, OperationCanceled, PubanonError
 from pubanon._run import OID_HEX, GitResult, run_credential_child
 from pubanon._snapshots._store import store_path
-from pubanon._terminal import escape
+from pubanon._terminal import escape, escape_lines
 
 _ACTIONS_API_VERSION = '2026-03-10'
 _CHECK_RUN_PAGE_SIZE = 100
+_CREATED_PATTERN = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z')
 _CREDENTIAL_CONFIG = (
     '-c',
     'credential.helper=',
@@ -39,6 +40,7 @@ _GH: str = 'gh'
 _GH_HOST_ENV: dict[str, str] = {'GH_HOST': 'github.com'}
 _OID_PATTERN = re.compile(OID_HEX)
 _RELEASE_PAGE_SIZE = 100
+_REVEAL_COMMAND = 'pubanon repo reveal'
 _REPOSITORY_QUERY = '{owner: .owner.login, repo: .name, visibility: .visibility}'
 _REPOSITORY_SETTINGS_QUERY = (
     '{description: .description, default_branch: .default_branch, '
@@ -46,12 +48,70 @@ _REPOSITORY_SETTINGS_QUERY = (
     'pull_requests: .has_pull_requests, discussions: .has_discussions}'
 )
 _RUN_PAGE_SIZE = 100
+_SERVER_ERROR_PATTERN = re.compile(rb'\bHTTP 50[0234]\b')
+_SERVER_ERROR_PAUSES = (2, 4)
 _URL_TEMPLATE = 'https://github.com/{owner}/{repo}.git'
 _monotonic = time.monotonic
+_sleep = time.sleep
 
 type CheckState = Literal['missing', 'ambiguous', 'pending', 'success', 'unacceptable']
 
 type _CheckRun = tuple[str, str, str, str | None]
+type LogAbsence = Literal['api-404', 'storage-404']
+
+
+class ActionsJob(NamedTuple):
+    """Hold one workflow job from any attempt, classified by whether it ran.
+
+    Attributes:
+        identifier: Positive job identifier used to derive API paths.
+        run: Positive identifier of the job's run.
+        attempt: Positive attempt number that created the job.
+        name: Host-provided job name, requiring escaping for display.
+        runner_id: Positive runner identifier, or None when the job never
+            started.
+        runner: Runner name, group, and labels, newline-joined, checked for
+            terms for every job.
+    """
+
+    identifier: int
+    run: int
+    attempt: int
+    name: str
+    runner_id: int | None
+    runner: bytes
+
+    @property
+    def ran(self) -> bool:
+        """Whether GitHub assigned the job a runner."""
+        return self.runner_id is not None
+
+
+class ActionsRun(NamedTuple):
+    """Hold one workflow run's identity, state, and checked details.
+
+    Attributes:
+        identifier: Positive run identifier used to derive API paths.
+        attempt: Positive current attempt number.
+        status: Current execution status.
+        workflow: Host-provided workflow name, or the workflow path when the
+            name is null; requires escaping for display.
+        event: Host-provided triggering event, requiring escaping.
+        commit: Full commit ID the run tested.
+        created_at: Creation time as `YYYY-MM-DDTHH:MM:SSZ`.
+        details: Workflow name, display title, event, branch, path, head commit
+            message, author and committer names and emails, and actor and
+            triggering actor logins, newline-joined, checked for terms.
+    """
+
+    identifier: int
+    attempt: int
+    status: str
+    workflow: str
+    event: str
+    commit: str
+    created_at: str
+    details: bytes
 
 
 class CheckVerdict(NamedTuple):
@@ -104,6 +164,10 @@ class GitHubRelease:
         url: Browser URL of the release page.
         draft: Whether the page is a draft.
         prerelease: Whether the page is marked as a prerelease.
+        identifier: GitHub's numeric release identifier.
+        immutable: Whether GitHub has made the page immutable.
+        created_at: Creation time as GitHub's UTC timestamp.
+        published_at: Publication time, or None for a draft.
     """
 
     tag: str
@@ -112,6 +176,10 @@ class GitHubRelease:
     url: str
     draft: bool
     prerelease: bool
+    identifier: int = 0
+    immutable: bool = False
+    created_at: str = ''
+    published_at: str | None = None
 
 
 class DisclosureEntry(NamedTuple):
@@ -144,6 +212,18 @@ class DispatchRejectedError(PubanonError):
 
 class DispatchUncertainError(PubanonError):
     """Report an unknown dispatch outcome that must not be retried automatically."""
+
+
+class ImmutableReleases(NamedTuple):
+    """Hold a repository's immutable-release setting.
+
+    Attributes:
+        enabled: Whether releases become immutable when published.
+        enforced_by_owner: Whether the repository owner enforces the setting.
+    """
+
+    enabled: bool
+    enforced_by_owner: bool
 
 
 class RemoteRefs(NamedTuple):
@@ -241,42 +321,21 @@ class WorkflowRun(NamedTuple):
 
 
 def _gh_error(returncode: int, stdout: bytes, stderr: bytes) -> PubanonError:
-    """Return one escaped GitHub CLI error."""
-    output = stdout.decode(errors='replace') + stderr.decode(errors='replace')
-    return PubanonError(
-        escape(output.strip()) or 'GitHub CLI request failed',
-        fact=f'exit status {returncode}',
-    )
+    """Return a GitHub CLI error headed by its first output line, one fact line per line."""
+    lines = [
+        *escape_lines(stderr.decode(errors='replace')),
+        *escape_lines(stdout.decode(errors='replace')),
+    ]
+    if not lines:
+        return PubanonError('GitHub CLI request failed', fact=f'exit status {returncode}')
+    headline, *rest = lines
+    return PubanonError(headline, fact='\n'.join((f'exit status {returncode}', *rest)))
 
 
-@overload
-def _gh(
-    args: Sequence[str],
-    *,
-    check: Literal[True] = True,
-    timeout: float | None = None,
-    input_bytes: bytes | None = None,
-) -> bytes: ...
-
-
-@overload
-def _gh(
-    args: Sequence[str],
-    *,
-    check: Literal[False],
-    timeout: float | None = None,
-    input_bytes: bytes | None = None,
-) -> tuple[int, bytes, bytes]: ...
-
-
-def _gh(
-    args: Sequence[str],
-    *,
-    check: bool = True,
-    timeout: float | None = None,
-    input_bytes: bytes | None = None,
-) -> bytes | tuple[int, bytes, bytes]:
-    """Run one captured GitHub CLI command with escaped failures."""
+def _gh_once(
+    args: Sequence[str], *, timeout: float | None, input_bytes: bytes | None
+) -> tuple[int, bytes, bytes]:
+    """Run one captured GitHub CLI process."""
     try:
         completed = subprocess.run(  # noqa: S603
             [_GH, *args],
@@ -291,12 +350,71 @@ def _gh(
     except OSError as exc:
         raise PubanonError('cannot run GitHub CLI') from exc
     else:
-        if not check:
-            return completed.returncode, completed.stdout, completed.stderr
-        if completed.returncode != 0:
-            raise _gh_error(completed.returncode, completed.stdout, completed.stderr)
-        return completed.stdout
+        return completed.returncode, completed.stdout, completed.stderr
     raise ObservationTimeoutError
+
+
+@overload
+def _gh(
+    args: Sequence[str],
+    *,
+    check: Literal[True] = True,
+    timeout: float | None = None,
+    input_bytes: bytes | None = None,
+    read: bool = False,
+) -> bytes: ...
+
+
+@overload
+def _gh(
+    args: Sequence[str],
+    *,
+    check: Literal[False],
+    timeout: float | None = None,
+    input_bytes: bytes | None = None,
+    read: bool = False,
+) -> tuple[int, bytes, bytes]: ...
+
+
+def _gh(
+    args: Sequence[str],
+    *,
+    check: bool = True,
+    timeout: float | None = None,
+    input_bytes: bytes | None = None,
+    read: bool = False,
+) -> bytes | tuple[int, bytes, bytes]:
+    """Run one captured GitHub CLI command, repeating a read after a server error."""
+    deadline = _monotonic() + timeout if read and timeout is not None else None
+    remaining = timeout
+    pauses = iter(_SERVER_ERROR_PAUSES if read else ())
+    while True:
+        returncode, stdout, stderr = _gh_once(args, timeout=remaining, input_bytes=input_bytes)
+        if returncode == 0 or _SERVER_ERROR_PATTERN.search(stderr) is None:
+            break
+        pause = next(pauses, None)
+        if pause is None or (deadline is not None and _monotonic() + pause >= deadline):
+            break
+        _sleep(pause)
+        if deadline is not None:
+            remaining = deadline - _monotonic()
+            if remaining <= 0:
+                break
+    if not check:
+        return returncode, stdout, stderr
+    if returncode != 0:
+        raise _gh_error(returncode, stdout, stderr)
+    return stdout
+
+
+def _object_field(mapping: Mapping[str, object], key: str, label: str) -> dict[str, object] | None:
+    """Return a nested JSON object that may be null or absent."""
+    value = mapping.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise PubanonError(f'invalid {label} response')
+    return cast('dict[str, object]', value)
 
 
 def _parse_ref_line(line: str) -> tuple[str, str]:
@@ -327,6 +445,54 @@ def _record_direct_ref(refs: dict[str, str], name: str, oid: str) -> None:
     if not name or name in refs:
         raise PubanonError('invalid remote reference response')
     refs[name] = oid
+
+
+def _release_entry(raw: object) -> GitHubRelease:
+    """Validate one GitHub release object."""
+    if not isinstance(raw, dict):
+        raise PubanonError('invalid release response')
+    release = cast('dict[str, object]', raw)
+    identifier = release.get('id')
+    tag = release.get('tag_name')
+    title = release.get('name')
+    notes = release.get('body')
+    url = release.get('html_url')
+    draft = release.get('draft')
+    prerelease = release.get('prerelease')
+    immutable = release.get('immutable')
+    created = release.get('created_at')
+    published = release.get('published_at')
+    if (
+        type(identifier) is not int
+        or identifier <= 0
+        or not isinstance(tag, str)
+        or not tag
+        or 'name' not in release
+        or (title is not None and not isinstance(title, str))
+        or (notes is not None and not isinstance(notes, str))
+        or not isinstance(url, str)
+        or not url
+        or type(draft) is not bool
+        or type(prerelease) is not bool
+        or type(immutable) is not bool
+        or not isinstance(created, str)
+        or not created
+        or 'published_at' not in release
+        or (published is not None and not isinstance(published, str))
+    ):
+        raise PubanonError('invalid release response')
+    return GitHubRelease(
+        tag,
+        title or '',
+        notes or '',
+        url,
+        draft,
+        prerelease,
+        identifier=identifier,
+        immutable=immutable,
+        created_at=created,
+        published_at=published,
+    )
 
 
 def _remote_refs(output: bytes) -> RemoteRefs:
@@ -361,6 +527,115 @@ def _setting_value(value: str | bool) -> str:
     return str(value).lower() if isinstance(value, bool) else value
 
 
+def _text_fields(mapping: Mapping[str, object], keys: Sequence[str], label: str) -> list[str]:
+    """Return the present string values of fields that may be null."""
+    values: list[str] = []
+    for key in keys:
+        value = mapping.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise PubanonError(f'invalid {label} response')
+        values.append(value)
+    return values
+
+
+def _actions_job(raw: object, run_id: int, *, command: str) -> ActionsJob:
+    """Validate one job of a run and classify whether it ran."""
+    if not isinstance(raw, dict):
+        raise PubanonError('invalid workflow job response')
+    job = cast('dict[str, object]', raw)
+    identifier = job.get('id')
+    attempt = job.get('run_attempt')
+    name = job.get('name')
+    labels = job.get('labels')
+    steps = job.get('steps')
+    if (
+        type(identifier) is not int
+        or identifier <= 0
+        or type(job.get('run_id')) is not int
+        or job.get('run_id') != run_id
+        or type(attempt) is not int
+        or attempt <= 0
+        or not isinstance(name, str)
+        or job.get('status') != 'completed'
+        or not {'conclusion', 'runner_id', 'runner_name', 'runner_group_name'} <= job.keys()
+        or (job.get('runner_id') is not None and type(job.get('runner_id')) is not int)
+        or not isinstance(labels, list)
+        or (steps is not None and not isinstance(steps, list))
+    ):
+        raise PubanonError('invalid workflow job response')
+    runner = _text_fields(job, ('runner_name', 'runner_group_name'), 'workflow job')
+    _text_fields(job, ('conclusion',), 'workflow job')
+    texts = [label for label in cast('list[object]', labels) if isinstance(label, str)]
+    if len(texts) != len(cast('list[object]', labels)):
+        raise PubanonError('invalid workflow job response')
+    runner_id = job['runner_id']
+    details = '\n'.join((*runner, *texts)).encode()
+    if type(runner_id) is int and runner_id > 0:
+        return ActionsJob(identifier, run_id, attempt, name, runner_id, details)
+    if (
+        runner_id is None
+        and job['runner_name'] is None
+        and steps == []
+        and job['conclusion'] in {'skipped', 'cancelled'}
+    ):
+        return ActionsJob(identifier, run_id, attempt, name, None, details)
+    raise PubanonError(
+        'GitHub returned a workflow job pubanon cannot classify',
+        fact=f'job {identifier}',
+        recovery=f'rerun {command}',
+    )
+
+
+def _actions_run(raw: object) -> ActionsRun:
+    """Validate one listed workflow run and gather the details reveal checks."""
+    if not isinstance(raw, dict):
+        raise PubanonError('invalid workflow run response')
+    run = cast('dict[str, object]', raw)
+    identifier = run.get('id')
+    attempt = run.get('run_attempt')
+    required = [
+        run.get(key)
+        for key in ('status', 'event', 'path', 'head_sha', 'created_at', 'display_title')
+    ]
+    if (
+        type(identifier) is not int
+        or identifier <= 0
+        or type(attempt) is not int
+        or attempt <= 0
+        or not all(isinstance(value, str) for value in required)
+        or 'head_branch' not in run
+    ):
+        raise PubanonError('invalid workflow run response')
+    status, event, path, commit, created, title = cast('list[str]', required)
+    if _OID_PATTERN.fullmatch(commit) is None or _CREATED_PATTERN.fullmatch(created) is None:
+        raise PubanonError('invalid workflow run response')
+    name = _text_fields(run, ('name',), 'workflow run')
+    details = [*name, title, event, *_text_fields(run, ('head_branch',), 'workflow run'), path]
+    head = _object_field(run, 'head_commit', 'workflow run')
+    if head is not None:
+        details.extend(_text_fields(head, ('message',), 'workflow run'))
+        for role in ('author', 'committer'):
+            person = _object_field(head, role, 'workflow run')
+            if person is not None:
+                details.extend(_text_fields(person, ('name', 'email'), 'workflow run'))
+    for role in ('actor', 'triggering_actor'):
+        actor = _object_field(run, role, 'workflow run')
+        if actor is not None:
+            details.extend(_text_fields(actor, ('login',), 'workflow run'))
+    return ActionsRun(
+        identifier,
+        attempt,
+        status,
+        name[0] if name else path,
+        event,
+        commit,
+        created,
+        '\n'.join(details).encode(),
+    )
+
+
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     """Build a JSON object while refusing duplicate keys."""
     result: dict[str, object] = {}
@@ -390,6 +665,31 @@ def _actions_page(output: bytes, collection: str, label: str) -> tuple[int, list
     if type(total) is not int or total < 0 or not isinstance(entries, list):
         raise PubanonError(f'invalid {label} response')
     return total, cast('list[object]', entries)
+
+
+def _all_pages(path: str, collection: str, label: str, *, command: str) -> list[object]:
+    """Read every page of one Actions listing whose total must not change."""
+    entries: list[object] = []
+    expected_total: int | None = None
+    page = 1
+    while True:
+        output = _gh(['api', f'{path}per_page={_RUN_PAGE_SIZE}&page={page}'], read=True)
+        total, page_entries = _actions_page(output, collection, label)
+        if expected_total is None:
+            expected_total = total
+        elif total != expected_total:
+            raise PubanonError(
+                f'{label} listing changed while being read',
+                recovery=f'rerun {command}',
+            )
+        entries.extend(page_entries)
+        if len(entries) > expected_total:
+            raise PubanonError(f'invalid {label} response')
+        if len(entries) == expected_total:
+            return entries
+        if len(page_entries) < _RUN_PAGE_SIZE:
+            raise PubanonError(f'invalid {label} response')
+        page += 1
 
 
 def _check_runs_payload(output: bytes) -> tuple[int, list[_CheckRun]]:
@@ -478,6 +778,23 @@ def _http_status(stdout: bytes, stderr: bytes) -> int | None:
     return int(match[1]) if match is not None else None
 
 
+def _log_absence(stdout: bytes, stderr: bytes) -> LogAbsence | None:
+    """Classify GitHub's two not-found answers to a job log request."""
+    try:
+        payload = _actions_payload(stdout, 'job log')
+    except PubanonError:
+        if b'<Code>BlobNotFound</Code>' in stdout and re.fullmatch(rb'gh: HTTP 404\s*', stderr):
+            return 'storage-404'
+        return None
+    if (
+        payload.get('message') == 'Not Found'
+        and payload.get('status') in ('404', 404)
+        and re.fullmatch(rb'gh: Not Found \(HTTP 404\)\s*', stderr)
+    ):
+        return 'api-404'
+    return None
+
+
 def _parse_repository_facts(output: bytes) -> tuple[str, str, str]:
     """Parse strict projected repository facts."""
     try:
@@ -506,7 +823,9 @@ def _read_disclosure_page(
     label = 'workflow runs' if resource == 'runs' else 'artifacts'
     target = f'{escape(owner)}/{escape(repo)}'
     try:
-        output = _gh(['api', f'repos/{owner}/{repo}/actions/{resource}?per_page=100&page={page}'])
+        output = _gh(
+            ['api', f'repos/{owner}/{repo}/actions/{resource}?per_page=100&page={page}'], read=True
+        )
     except OperationCanceled:
         raise
     except PubanonError as exc:
@@ -596,31 +915,7 @@ def _release_page(output: bytes) -> tuple[GitHubRelease, ...]:
         raise PubanonError('invalid release response') from exc
     if not isinstance(parsed, list):
         raise PubanonError('invalid release response')
-    releases: list[GitHubRelease] = []
-    for raw_release in cast('list[object]', parsed):
-        if not isinstance(raw_release, dict):
-            raise PubanonError('invalid release response')
-        release = cast('dict[str, object]', raw_release)
-        tag = release.get('tag_name')
-        title = release.get('name')
-        notes = release.get('body')
-        url = release.get('html_url')
-        draft = release.get('draft')
-        prerelease = release.get('prerelease')
-        if (
-            not isinstance(tag, str)
-            or not tag
-            or 'name' not in release
-            or (title is not None and not isinstance(title, str))
-            or (notes is not None and not isinstance(notes, str))
-            or not isinstance(url, str)
-            or not url
-            or type(draft) is not bool
-            or type(prerelease) is not bool
-        ):
-            raise PubanonError('invalid release response')
-        releases.append(GitHubRelease(tag, title or '', notes or '', url, draft, prerelease))
-    return tuple(releases)
+    return tuple(_release_entry(raw) for raw in cast('list[object]', parsed))
 
 
 def _repository_not_found(stdout: bytes, stderr: bytes) -> bool:
@@ -680,6 +975,89 @@ def _workflow_run(raw: object) -> WorkflowRun:
     )
 
 
+def actions_cache_count(owner: str, repo: str) -> int:
+    """Count a repository's Actions caches.
+
+    Args:
+        owner: Configured repository owner.
+        repo: Configured repository name.
+
+    Returns:
+        GitHub's total number of caches.
+
+    Raises:
+        PubanonError: The read fails or the answer is invalid; never zero by
+            default.
+    """
+    output = _gh(['api', f'repos/{owner}/{repo}/actions/caches?per_page=1'], read=True)
+    total, entries = _actions_page(output, 'actions_caches', 'Actions cache')
+    if len(entries) > min(total, 1):
+        raise PubanonError('invalid Actions cache response')
+    return total
+
+
+def actions_jobs(
+    owner: str, repo: str, run_id: int, *, command: str = _REVEAL_COMMAND
+) -> tuple[ActionsJob, ...]:
+    """Read every job of every attempt of one workflow run.
+
+    Args:
+        owner: Configured repository owner.
+        repo: Configured repository name.
+        run_id: Validated run identifier.
+        command: Command that reruns the check, named in recovery text.
+
+    Returns:
+        Jobs in GitHub's order, each classified as ran or never started.
+
+    Raises:
+        PubanonError: A read fails, the listing changes, or a job is invalid or
+            cannot be classified.
+    """
+    jobs: list[ActionsJob] = []
+    for entry in _all_pages(
+        f'repos/{owner}/{repo}/actions/runs/{run_id}/jobs?filter=all&',
+        'jobs',
+        'workflow job',
+        command=command,
+    ):
+        job = _actions_job(entry, run_id, command=command)
+        if any(seen.identifier == job.identifier for seen in jobs):
+            raise PubanonError('invalid workflow job response')
+        jobs.append(job)
+    return tuple(jobs)
+
+
+def actions_runs(
+    owner: str, repo: str, *, command: str = _REVEAL_COMMAND
+) -> tuple[ActionsRun, ...]:
+    """Read every workflow run of a repository with the details reveal checks.
+
+    Args:
+        owner: Configured repository owner.
+        repo: Configured repository name.
+        command: Command that reruns the check, named in recovery text.
+
+    Returns:
+        Runs in GitHub's order.
+
+    Raises:
+        PubanonError: A read fails, the listing changes, or a run is invalid.
+    """
+    runs: list[ActionsRun] = []
+    for entry in _all_pages(
+        f'repos/{owner}/{repo}/actions/runs?',
+        'workflow_runs',
+        'workflow run',
+        command=command,
+    ):
+        run = _actions_run(entry)
+        if any(seen.identifier == run.identifier for seen in runs):
+            raise PubanonError('invalid workflow run response')
+        runs.append(run)
+    return tuple(runs)
+
+
 def blob_url(owner: str, repo: str, ref: str, path: str) -> str:
     """Build a GitHub browser URL for a file at an exact ref.
 
@@ -715,6 +1093,30 @@ def check_recovery(verdicts: Iterable[CheckVerdict], *, retry: str) -> str:
     else:
         action = 'wait for the check'
     return f'{action}, then {retry}'
+
+
+def convert_release(dest: Destination, release_id: int, title: str) -> None:
+    """Edit one release page without changing it, so GitHub makes it immutable.
+
+    Args:
+        dest: Verified final repository.
+        release_id: Identifier of the page to convert.
+        title: The page's current, nonempty title, sent unchanged.
+
+    Raises:
+        PubanonError: The edit fails; its outcome is unknown.
+    """
+    _gh(
+        [
+            'api',
+            '-X',
+            'PATCH',
+            f'repos/{dest.owner}/{dest.repo}/releases/{release_id}',
+            '--input',
+            '-',
+        ],
+        input_bytes=json.dumps({'name': title}).encode(),
+    )
 
 
 def create_repository_variable(coordinates: tuple[str, str], name: str, value: str) -> None:
@@ -773,6 +1175,30 @@ def delete_repository(owner: str, repo: str) -> None:
             recovery='verify repository access and state, then retry `pubanon stage delete`',
         )
     raise _gh_error(returncode, stdout, stderr)
+
+
+def delete_run_logs(owner: str, repo: str, run_id: int) -> None:
+    """Ask GitHub to delete the logs of every attempt of one run.
+
+    Args:
+        owner: Configured repository owner.
+        repo: Configured repository name.
+        run_id: Validated run identifier.
+
+    Raises:
+        PubanonError: GitHub did not confirm the deletion; the outcome is
+            unknown. The diagnostic names only the run and status.
+    """
+    returncode, stdout, stderr = _gh(
+        ['api', '-X', 'DELETE', f'repos/{owner}/{repo}/actions/runs/{run_id}/logs'], check=False
+    )
+    if returncode:
+        status = _http_status(stdout, stderr)
+        raise PubanonError(
+            'GitHub did not confirm deleting the logs',
+            fact=f'run {run_id}: '
+            + (f'HTTP {status}' if status is not None else f'exit status {returncode}'),
+        )
 
 
 def disclosure(owner: str, repo: str) -> Disclosure:
@@ -889,6 +1315,19 @@ def edit_release(dest: Destination, tag: str, *, title: str, notes: bytes) -> No
     )
 
 
+def enable_immutable_releases(owner: str, repo: str) -> None:
+    """Turn on immutable releases for one repository.
+
+    Args:
+        owner: Configured repository owner.
+        repo: Configured repository name.
+
+    Raises:
+        PubanonError: The request fails; its outcome is unknown.
+    """
+    _gh(['api', '-X', 'PUT', f'repos/{owner}/{repo}/immutable-releases'])
+
+
 def fetch(dest: Destination, cwd: Path, refspecs: Iterable[str]) -> GitResult:
     """Fetch managed refs from a verified destination.
 
@@ -921,6 +1360,90 @@ def fetch(dest: Destination, cwd: Path, refspecs: Iterable[str]) -> GitResult:
         cwd=cwd,
         env_extra=_GH_HOST_ENV,
         operation='fetch',
+    )
+
+
+def immutable_releases(owner: str, repo: str) -> ImmutableReleases:
+    """Read a repository's immutable-release setting.
+
+    GitHub documents 404 for a disabled setting but answered 200 with `enabled:
+    false` in testing; both mean off.
+
+    Args:
+        owner: Configured repository owner.
+        repo: Configured repository name.
+
+    Returns:
+        Whether the setting is on and whether the owner enforces it.
+
+    Raises:
+        PubanonError: The read fails otherwise or the answer is invalid.
+    """
+    returncode, stdout, stderr = _gh(
+        ['api', f'repos/{owner}/{repo}/immutable-releases'],
+        check=False,
+        read=True,
+    )
+    if returncode:
+        if _http_status(stdout, stderr) == HTTPStatus.NOT_FOUND:
+            return ImmutableReleases(enabled=False, enforced_by_owner=False)
+        raise _gh_error(returncode, stdout, stderr)
+    payload = _actions_payload(stdout, 'immutable releases')
+    enabled = payload.get('enabled')
+    enforced = payload.get('enforced_by_owner')
+    if (
+        set(payload) != {'enabled', 'enforced_by_owner'}
+        or type(enabled) is not bool
+        or type(enforced) is not bool
+    ):
+        raise PubanonError('invalid immutable releases response')
+    return ImmutableReleases(enabled, enforced)
+
+
+def job_log(
+    owner: str, repo: str, job_id: int, *, command: str = _REVEAL_COMMAND
+) -> bytes | LogAbsence:
+    """Read one job's complete log without ever quoting GitHub's response.
+
+    GitHub answers with a redirect to a storage service. Terminal escape
+    sequences stay in the returned bytes.
+
+    Args:
+        owner: Configured repository owner.
+        repo: Configured repository name.
+        job_id: Validated job identifier.
+        command: Command that reruns the check, named in recovery text.
+
+    Returns:
+        The log; `api-404` when GitHub's API answers not found, as for a
+        deleted log or an unknown job; or `storage-404` when the storage
+        service has no log, as for a job that never started.
+
+    Raises:
+        PubanonError: GitHub CLI is older than 2.97.0, or the request failed in
+            any other way. Diagnostics name only the job and status.
+    """
+    returncode, stdout, stderr = _gh(
+        ['api', '--allow-escape-sequences', f'repos/{owner}/{repo}/actions/jobs/{job_id}/logs'],
+        check=False,
+        read=True,
+    )
+    if returncode == 0:
+        return stdout
+    if b'unknown flag: --allow-escape-sequences' in stderr:
+        raise PubanonError(
+            'GitHub CLI is too old to read Actions logs',
+            recovery=f'upgrade GitHub CLI to 2.97.0 or later, then rerun {command}',
+        )
+    absence = _log_absence(stdout, stderr)
+    if absence is not None:
+        return absence
+    status = _http_status(stdout, stderr)
+    raise PubanonError(
+        'cannot check Actions logs',
+        fact=f'job {job_id}: '
+        + (f'HTTP {status}' if status is not None else f'exit status {returncode}'),
+        recovery=f'rerun {command}',
     )
 
 
@@ -979,6 +1502,48 @@ def push(dest: Destination, cwd: Path, args: Iterable[str]) -> GitResult:
         env_extra=_GH_HOST_ENV,
         operation='push',
     )
+
+
+def read_actions_job(owner: str, repo: str, job_id: int, run_id: int) -> ActionsJob:
+    """Read one job and confirm it belongs to the expected run.
+
+    Args:
+        owner: Configured repository owner.
+        repo: Configured repository name.
+        job_id: Validated job identifier.
+        run_id: Run the job must belong to.
+
+    Returns:
+        The job, classified as ran or never started.
+
+    Raises:
+        PubanonError: The read fails or returns another job or run.
+    """
+    output = _gh(['api', f'repos/{owner}/{repo}/actions/jobs/{job_id}'], read=True)
+    job = _actions_job(_actions_payload(output, 'workflow job'), run_id, command=_REVEAL_COMMAND)
+    if job.identifier != job_id:
+        raise PubanonError('invalid workflow job response')
+    return job
+
+
+def read_release_by_id(dest: Destination, release_id: int) -> GitHubRelease:
+    """Read one release page by identifier.
+
+    Args:
+        dest: Verified final repository.
+        release_id: Identifier of the page.
+
+    Returns:
+        The page as GitHub stores it now.
+
+    Raises:
+        PubanonError: The read fails or returns another page.
+    """
+    output = _gh(['api', f'repos/{dest.owner}/{dest.repo}/releases/{release_id}'], read=True)
+    release = _release_entry(_actions_payload(output, 'release'))
+    if release.identifier != release_id:
+        raise PubanonError('invalid release response')
+    return release
 
 
 def remaining_timeout(timeout: float, started: float, now: float) -> float:
@@ -1045,6 +1610,7 @@ def repository_variable(
         ['api', f'repos/{owner}/{repo}/actions/variables/{name}'],
         check=False,
         timeout=timeout,
+        read=True,
     )
     if returncode:
         status = _http_status(stdout, stderr)
@@ -1078,7 +1644,9 @@ def repository_visible(owner: str, repo: str) -> bool:
             nor a classified HTTP 404.
     """
     returncode, stdout, stderr = _gh(
-        ['api', f'repos/{owner}/{repo}', '--jq', _REPOSITORY_QUERY], check=False
+        ['api', f'repos/{owner}/{repo}', '--jq', _REPOSITORY_QUERY],
+        check=False,
+        read=True,
     )
     if returncode == 0:
         _parse_repository_facts(stdout)
@@ -1142,7 +1710,7 @@ def settings_differences(
 
 def _authenticated_account(*, timeout: float | None = None) -> str:
     """Read the authenticated GitHub account."""
-    output = _gh(['api', 'user', '--jq', '.login'], timeout=timeout)
+    output = _gh(['api', 'user', '--jq', '.login'], timeout=timeout, read=True)
     if not output.endswith(b'\n') or b'\n' in output[:-1]:
         raise PubanonError('invalid authenticated account response')
     try:
@@ -1201,7 +1769,9 @@ def repository_settings(
         ObservationTimeoutError: The supplied host-read timeout expires.
     """
     output = _gh(
-        ['api', f'repos/{owner}/{repo}', '--jq', _REPOSITORY_SETTINGS_QUERY], timeout=timeout
+        ['api', f'repos/{owner}/{repo}', '--jq', _REPOSITORY_SETTINGS_QUERY],
+        timeout=timeout,
+        read=True,
     )
     try:
         parsed = json.loads(output, object_pairs_hook=_unique_object)
@@ -1293,6 +1863,7 @@ def _read_release_page(
             f'repos/{dest.owner}/{dest.repo}/releases?per_page={per_page}&page={page}',
         ],
         timeout=timeout,
+        read=True,
     )
     return _release_page(output)
 
@@ -1314,6 +1885,7 @@ def _read_workflow_runs_page(
         ],
         check=False,
         timeout=timeout,
+        read=True,
     )
     if returncode:
         if _http_status(stdout, stderr) == HTTPStatus.NOT_FOUND:
@@ -1453,6 +2025,7 @@ def list_run_jobs(
                 ),
             ],
             timeout=remaining() if remaining is not None else None,
+            read=True,
         )
         total, entries = _actions_page(output, 'jobs', 'workflow job')
         if expected_total is None:
@@ -1558,7 +2131,9 @@ def read_workflow_run(
         ObservationTimeoutError: The host request expired.
     """
     owner, repo = coordinates
-    output = _gh(['api', f'repos/{owner}/{repo}/actions/runs/{run_id}'], timeout=timeout)
+    output = _gh(
+        ['api', f'repos/{owner}/{repo}/actions/runs/{run_id}'], timeout=timeout, read=True
+    )
     run = _workflow_run(_actions_payload(output, 'workflow run'))
     if run.identifier != run_id:
         raise PubanonError('invalid workflow run response')
@@ -1686,6 +2261,7 @@ def workflow_registered(
         ['api', f'repos/{owner}/{repo}/actions/workflows/{workflow}'],
         check=False,
         timeout=timeout,
+        read=True,
     )
     if returncode:
         if _http_status(stdout, stderr) == HTTPStatus.NOT_FOUND:
@@ -1761,7 +2337,7 @@ def check_result(
         {'check_name': name, 'filter': 'latest', 'per_page': str(_CHECK_RUN_PAGE_SIZE)}
     )
     args = ['api', f'repos/{owner}/{repo}/commits/{commit}/check-runs?{query}']
-    output = _gh(args, timeout=timeout)
+    output = _gh(args, timeout=timeout, read=True)
     total_count, runs = _check_runs_payload(output)
     if total_count == 0:
         if runs:
@@ -1811,7 +2387,7 @@ def create_repository(
     if dest.owner == dest.account:
         args.append('user/repos')
     else:
-        owner_type = _gh(['api', f'users/{dest.owner}', '--jq', '.type'])
+        owner_type = _gh(['api', f'users/{dest.owner}', '--jq', '.type'], read=True)
         if owner_type != b'Organization\n':
             raise PubanonError('account cannot create under the configured owner')
         args.append(f'orgs/{dest.owner}/repos')
@@ -1931,7 +2507,7 @@ def repository_facts(
         ObservationTimeoutError: The supplied host-read timeout expires.
     """
     args = ['api', f'repos/{owner}/{repo}', '--jq', _REPOSITORY_QUERY]
-    returncode, stdout, stderr = _gh(args, check=False, timeout=timeout)
+    returncode, stdout, stderr = _gh(args, check=False, timeout=timeout, read=True)
     if returncode == 0:
         return _parse_repository_facts(stdout)
     target = f'{escape(owner)}/{escape(repo)}'
@@ -1947,9 +2523,10 @@ def repository_facts(
                 'If it has not been created, run `pubanon repo create`, then retry.'
             ),
         )
+    error = _gh_error(returncode, stdout, stderr)
     raise PubanonError(
         f'Could not check GitHub repository {target}',
-        fact=str(_gh_error(returncode, stdout, stderr)),
+        fact=f'{error}\n{error.fact}',
         recovery='Check GitHub access and connectivity, then retry.',
     )
 

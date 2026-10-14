@@ -515,7 +515,8 @@ def test_prepare_replacement_refuses_inferred_version_outside_moved_tags(
     assert _cli.main(['prepare', '--project', project.name, '--replace', 'latest', '--yes']) == 1
     error = capsys.readouterr().err
     assert 'replacement version must match a moved tag' in error
-    assert 'commit the version correction or publish a new version' in error
+    assert 'commit the version correction' in error
+    assert 'publish a new version' in error
     assert _records.load_candidate(paths, project.name) is None
 
 
@@ -865,7 +866,8 @@ def test_prepare_rewrite_pause_and_continue_uses_saved_source(
     assert progress.pause is not None
     directory = _records.rewrite_directory(paths, project.name)
     output = capsys.readouterr().out
-    assert 'Preparation: incomplete\n' in output
+    assert 'Preparation: incomplete' not in output
+    assert 'Snapshot preparation incomplete\n' in output
     assert 'Rebuilding snapshot: v1.0.1\n' in output
     for conflict in progress.pause.conflicts:
         assert f'{escape(conflict.conflict_type)}: {escape(conflict.message)}' in output

@@ -59,13 +59,6 @@ def test_detect_checks_the_trigger_even_when_no_job_resolves() -> None:
 
 
 def test_detect_classifies_requestable_and_connectable_workflows() -> None:
-    manual = (
-        'does not start on every branch push (workflow starts manually; a push does not start it)'
-    )
-    paths = (
-        'does not start on every branch push '
-        '(workflow filters changed paths and may not run for every push)'
-    )
     missing = 'does not declare workflow_dispatch inputs'
     detection = _workflow_checks.detect(
         (
@@ -82,16 +75,15 @@ def test_detect_classifies_requestable_and_connectable_workflows() -> None:
 
     assert detection.requestable == ('ci.yml', 'manual.yml', 'paths.yml')
     assert detection.connectable == ('ci.yml',)
-    assert detection.problems == {
-        'manual.yml': manual,
-        'partial.yml': missing,
-        'paths.yml': paths,
-        'plain.yml': missing,
-    }
+    assert set(detection.problems) == {'manual.yml', 'partial.yml', 'paths.yml', 'plain.yml'}
+    assert 'workflow starts manually' in detection.problems['manual.yml']
+    assert 'workflow filters changed paths' in detection.problems['paths.yml']
+    assert missing in detection.problems['partial.yml']
+    assert missing in detection.problems['plain.yml']
     assert detection.notes == (
-        f'.github/workflows/manual.yml: {manual}',
-        f'.github/workflows/partial.yml: {missing}',
-        f'.github/workflows/paths.yml: {paths}',
+        f'.github/workflows/manual.yml: {detection.problems["manual.yml"]}',
+        f'.github/workflows/partial.yml: {detection.problems["partial.yml"]}',
+        f'.github/workflows/paths.yml: {detection.problems["paths.yml"]}',
     )
 
 

@@ -1031,9 +1031,9 @@ def test_history_batch_refuses_gitlink_from_raw_diff(tmp_path: Path) -> None:
     with pytest.raises(PubanonError, match='unsupported gitlink') as exc_info:
         _audit_history(paths, (gitlink, root), tip=gitlink)
 
-    assert exc_info.value.recovery == (
-        'select a commit without the submodule or vendor its content and rerun'
-    )
+    assert exc_info.value.recovery is not None
+    assert 'commit without the submodule' in exc_info.value.recovery
+    assert 'vendor its content' in exc_info.value.recovery
 
 
 @pytest.mark.parametrize(

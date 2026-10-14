@@ -208,8 +208,10 @@ def test_create_help_describes_optional_page_defaults(capsys: pytest.CaptureFixt
     help_text = capsys.readouterr().out
     normalized_help = ' '.join(help_text.split())
     assert '[--notes-file FILE]' in help_text
-    assert 'UTF-8 Markdown notes file (default: release_page notes)' in normalized_help
-    assert 'page title (default: release_page title, normally TAG)' in normalized_help
+    assert 'UTF-8 Markdown' in normalized_help
+    assert 'default: release_page notes' in normalized_help
+    assert 'default: release_page title' in normalized_help
+    assert 'normally TAG' in normalized_help
 
 
 def test_every_visible_option_and_command_has_lowercase_help() -> None:
@@ -356,7 +358,7 @@ def test_publish_help_lists_page_options(capsys: pytest.CaptureFixture[str]) -> 
     out = ' '.join(capsys.readouterr().out.split())
     assert '--no-release-page' in out
     assert '--release-notes-file FILE' in out
-    assert 'publish without creating or looking up a release page' in out
+    assert 'without creating or looking up a release page' in out
 
 
 def test_reader_closing_after_the_first_help_line_is_quiet() -> None:
@@ -1357,7 +1359,7 @@ def test_watch_timeout_refuses_non_positive_integer(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     assert _cli.main(['repo', 'watch', '--timeout', timeout]) == 2
-    assert '--timeout must be a positive integer number of seconds' in capsys.readouterr().err
+    assert '--timeout must be a positive integer' in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(

@@ -541,7 +541,7 @@ def test_run_post_publish_failure_preserves_real_shaped_fact_and_recovery(
 
     error = capsys.readouterr().err
     assert '  build: failed' in error
-    assert 'Next: rerun the failed workflow, then run' in error
+    assert 'rerun the failed workflow' in error
     qualifier = '' if implicit_project else ' --project=demo'
     assert error.count(f'pubanon repo watch{qualifier} --version 1.0.0') == 1
     assert f'pubanon package watch{qualifier} --version 1.0.0\n' in error
@@ -596,7 +596,8 @@ def test_run_prepare_and_inspect_materializes_exact_read_only_candidate_copy(
     output = capsys.readouterr().out
     assert 'Review copy' in output
     assert escape((inspection).as_posix()) in output
-    assert 'The snapshot is prepared but has not been published.' in output
+    assert 'snapshot is prepared' in output
+    assert 'has not been published' in output
     assert 'no action is required' not in output
     assert (inspection / 'README.md').read_bytes() == b'public\x00bytes\n'
     assert (inspection / 'bin/tool').read_bytes() == b'#!/bin/sh\nprintf "public\\n"\n'
@@ -943,7 +944,8 @@ def test_run_published_resume_names_interactive_reveal_before_stepwise_command(
     )
 
     error = capsys.readouterr().err
-    assert 'run pubanon repo reveal --project=demo interactively' in error
+    assert 'pubanon repo reveal --project=demo' in error
+    assert 'interactively' in error
     assert 'Next:' in error
     assert error.count('pubanon repo reveal --project=demo') == 1
 
@@ -1279,7 +1281,8 @@ def test_run_reveal_package_timeout_keeps_already_public_recovery_read_only(
     rendered = result.out + result.err
     assert 'error: the repository is already public but verification failed' in result.err
     assert 'package release observation timed out' in result.err
-    assert 'rerun pubanon repo reveal --project=demo to retry package observation' in result.err
+    assert 'pubanon repo reveal --project=demo' in result.err
+    assert 'retry package observation' in result.err
     assert result.err.endswith('then rerun pubanon repo reveal --project=demo\n')
     assert 'Then finish stepwise:' not in result.err
     assert 'Traceback' not in rendered

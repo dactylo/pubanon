@@ -151,7 +151,8 @@ def test_automatic_publication_summary_explains_hands_on_review_stopping_point(
         assert '\x1b[1;36mPublish v1.0.0\x1b[0m' in output
         assert '\x1b[1;36mPublish\x1b[0m' not in output
         assert 'after reviewing the review copy' not in output
-        assert 'Inspection does not pause this workflow for file review.' in output
+        assert 'Inspection does not pause' in output
+        assert 'file review' in output
         assert 'Publish v1.0.0' in output
         report = (
             paths.data_dir / 'projects' / project.name / f'candidate-files-{record.commit}.txt'

@@ -2,11 +2,13 @@
 
 import json
 import os
-from collections import Counter
+import time
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
+from typing import NamedTuple
 
-from pubanon import _filesystem
+from pubanon import _filesystem, _history_output
 from pubanon._config import (
     GlobalConfig,
     Paths,
@@ -21,7 +23,7 @@ from pubanon._config import (
 )
 from pubanon._errors import ObservationTimeoutError, OperationCanceled, PubanonError
 from pubanon._gate import gate_unit
-from pubanon._remote import _host, _package, _releases, _stage, _watch
+from pubanon._remote import _actions, _host, _immutable, _package, _releases, _stage, _watch
 from pubanon._remote._ci import RunQuery, run_evidence
 from pubanon._remote._host import (
     Destination,
@@ -47,14 +49,96 @@ from pubanon._terminal import (
     heading,
     next_step,
     output,
-    style,
 )
+
+_INTERRUPTED = (
+    'Interrupted. The repository may already be public; rerun pubanon repo reveal to verify '
+    'and record it.'
+)
+_PAIR_SIZE = 2
+_POST_FLIP_FAILURE_MESSAGE = 'the repository is now public but post-flip verification failed'
+_POST_FLIP_POLL_SECONDS = 5
+_POST_FLIP_RECOVERY = 'fix the reported drift, then rerun pubanon repo reveal'
+_POST_FLIP_WAIT_MINUTES = 3
+_SECONDS_PER_MINUTE = 60
+_monotonic = time.monotonic
+_sleep = time.sleep
+
+
+class _HistoryReview(NamedTuple):
+    """Carry one pre-reveal history audit to the reveal decision."""
+
+    audit: _audit.HistoryAudit
+    commits: tuple[str, ...]
+    tags: dict[str, str]
+    derived: tuple[str, ...]
+
+
+class _PostFlipReadError(PubanonError):
+    """Report a post-flip read that failed, rather than a difference it observed."""
 
 
 def _ensure_candidate_outcome_known(paths: Paths, project: str) -> None:
     """Refuse reveal while a candidate publication outcome is unknown."""
     candidate = load_candidate(paths, project)
     require_known_outcome(candidate)
+
+
+def _joined(names: Sequence[str]) -> str:
+    """Join names as `a`, `a and b`, or `a, b, and c`."""
+    if len(names) <= _PAIR_SIZE:
+        return ' and '.join(names)
+    return ', '.join(names[:-1]) + f', and {names[-1]}'
+
+
+def _immutable_advice(tags: Sequence[str]) -> str:
+    """Explain what immutable release pages block when correcting history."""
+    names = _joined([escape(tag) for tag in tags])
+    if len(tags) == 1:
+        return (
+            f'Release page {names} is immutable: pubanon cannot replace history that moves its '
+            'tag, and a recreated repository cannot reuse that version.'
+        )
+    return (
+        f'Release pages {names} are immutable: pubanon cannot replace history that moves their '
+        'tags, and a recreated repository cannot reuse those versions.'
+    )
+
+
+def _decide_history(
+    configs: tuple[GlobalConfig, ProjectConfig],
+    review: _HistoryReview,
+    *,
+    already_public: bool,
+    immutable: Sequence[str] = (),
+) -> str:
+    """Ask whether history findings may be public and return the accepted digest."""
+    if not review.audit.findings:
+        return ''
+    for line in _history_output.finding_summary(
+        review.audit, configs, review.derived, review.commits, review.tags
+    ):
+        output(line)
+    if already_public:
+        output(
+            'These matches are already public. Replacing published history hides them from '
+            'new clones only; existing clones, forks, and caches keep them.'
+        )
+        question = 'Record the repository as public with this history?'
+    else:
+        release = _history_output.earliest_release(review.audit, review.commits, review.tags)
+        output('Making the repository public publishes these matches.')
+        output(
+            f'{_history_output.correction_text(release)} Recreating removes release pages, '
+            'Actions history, and the Activity log; it does not change packages or other '
+            'copies published elsewhere.'
+        )
+        question = 'Make these public with the repository?'
+    if immutable:
+        output(_immutable_advice(immutable))
+    if not confirm(question):
+        raise OperationCanceled('Canceled. Nothing was changed.')
+    return _audit.exposure_digest(review.audit.findings)
 
 
 def _require_configured_coordinates(
@@ -71,6 +155,27 @@ def _require_configured_coordinates(
             actual=(f'{escape(owner)}/{escape(repo)}'),
             recovery='pubanon repo verify',
         )
+
+
+def _post_flip_repository_facts(p: ProjectConfig) -> tuple[str, str, str]:
+    """Read repository facts while distinguishing a failed read from coordinate drift."""
+    try:
+        owner, repo, visibility = _host.repository_facts(p.owner, p.repo)
+    except PubanonError as exc:
+        raise _PostFlipReadError(
+            _POST_FLIP_FAILURE_MESSAGE,
+            fact=exc.render(),
+            recovery=_POST_FLIP_RECOVERY,
+        ) from exc
+    try:
+        _require_configured_coordinates(p, owner, repo)
+    except PubanonError as exc:
+        raise PubanonError(
+            _POST_FLIP_FAILURE_MESSAGE,
+            fact=exc.render(),
+            recovery=_POST_FLIP_RECOVERY,
+        ) from exc
+    return owner, repo, visibility
 
 
 def _require_supported_settings(paths: Paths, p: ProjectConfig) -> None:
@@ -97,6 +202,35 @@ def _save_disclosure(
     except (OSError, UnicodeError) as exc:
         raise PubanonError('cannot write complete disclosure list') from exc
     return path
+
+
+def _confirm_disclosure(
+    paths: Paths,
+    p: ProjectConfig,
+    deleted: Sequence[int],
+    *,
+    already_public: bool,
+) -> None:
+    """Save the inventory, name what stays unchecked, and ask the final question."""
+    inventory = _host.disclosure(p.owner, p.repo)
+    path = _save_disclosure(paths, p.name, inventory)
+    caches = _host.actions_cache_count(p.owner, p.repo)
+    _actions.show_unchecked(
+        (p.owner, p.repo),
+        [entry.identifier for entry in inventory.runs],
+        artifacts=len(inventory.artifacts),
+        caches=caches,
+    )
+    detail(f'Saved inventory: {display_path(path)}')
+    repository = f'{escape(p.owner)}/{escape(p.repo)}'
+    question = f'Record {repository} as public?' if already_public else 'Make it public?'
+    canceled = _actions.cancel_message(deleted)
+    try:
+        accepted = confirm(question)
+    except OperationCanceled:
+        raise OperationCanceled(canceled) from None
+    if not accepted:
+        raise OperationCanceled(canceled)
 
 
 def _set_public_visibility(p: ProjectConfig) -> None:
@@ -141,51 +275,6 @@ def _verify_checks(p: ProjectConfig, commit: str) -> str:
     return 'passed'
 
 
-def _verify_disclosure(
-    paths: Paths,
-    p: ProjectConfig,
-    *,
-    already_public: bool,
-) -> None:
-    """Persist, summarize, and acknowledge the complete disclosure list."""
-    inventory = _host.disclosure(p.owner, p.repo)
-    path = _save_disclosure(paths, p.name, inventory)
-    run_counts = Counter(entry.name for entry in inventory.runs)
-    run_label = 'workflow run' if len(inventory.runs) == 1 else 'workflow runs'
-    artifact_label = 'artifact' if len(inventory.artifacts) == 1 else 'artifacts'
-    output(
-        f'{style("Not checked by pubanon:")} {len(inventory.runs)} {run_label} and '
-        f'{len(inventory.artifacts)} {artifact_label}'
-    )
-    for name, count in sorted(run_counts.items()):
-        output(f'  {style(escape(name) + ":")} {count}')
-    for entry in inventory.artifacts:
-        output(f'  {escape(entry.name)} (id {entry.identifier})')
-    output(
-        'warning: pubanon has not scanned Actions logs, artifact contents, '
-        'or other retained GitHub objects.',
-        kind='warning',
-    )
-    review_links = {
-        f'Workflow run link {index}': (
-            f'https://github.com/{p.owner}/{p.repo}/actions/runs/{entry.identifier}'
-        )
-        for index, entry in enumerate(inventory.runs, start=1)
-    }
-    actions_url = f'https://github.com/{p.owner}/{p.repo}/actions'
-    review_links['Activity'] = f'https://github.com/{p.owner}/{p.repo}/activity'
-    review_links['Review'] = actions_url
-    fields(list(review_links.items()), indent=2)
-    detail(f'Saved inventory: {display_path(path)}')
-    prompt = (
-        'These runs, logs, and artifacts are already public. Continue?'
-        if already_public
-        else 'These runs, logs, and artifacts become public with the repository. Continue?'
-    )
-    if not confirm(prompt):
-        raise OperationCanceled('Canceled. Nothing was changed.')
-
-
 def _verify_existing_empty_repository(paths: Paths, g: GlobalConfig, p: ProjectConfig) -> None:
     """Verify a pre-created destination without changing it or recording history."""
     dest = _host.verify_destination(paths, g, p)
@@ -224,8 +313,8 @@ def _verify_history(
     g: GlobalConfig,
     p: ProjectConfig,
     published: tuple[str, dict[str, str]],
-) -> None:
-    """Verify all published history under current sanitization rules."""
+) -> _HistoryReview:
+    """Audit all published history under current rules and refuse identity problems."""
     commit, tags = published
     commits = _audit.published_commits(paths, p.name, new=commit)
     derived = derived_private_terms(paths, p, os.environ)
@@ -233,24 +322,16 @@ def _verify_history(
     result = _audit.audit_history(
         paths, p.name, commits, tags, rules, f'{g.anon_name} <{g.anon_email}>', tip=commit
     )
-    if result.findings or result.identity_problems:
-        details = _audit.history_details(result, g, p, derived)
-        findings = [escape(detail.description) for detail in details]
+    if result.identity_problems:
         raise PubanonError(
-            'published history failed sanitization and identity verification',
-            fact='; '.join(
-                [
-                    *findings,
-                    *(escape(problem) for problem in result.identity_problems),
-                ]
-            ),
+            'published history has identity problems',
+            fact='\n'.join(escape(problem) for problem in result.identity_problems),
             recovery=(
-                'pubanon audit shows the findings; adjust the configuration or the '
-                'published content decision. To replace all published history under the current '
-                'publication identity, use `pubanon prepare --replace all`; existing clones and '
-                'caches may retain the old history'
+                'pubanon audit shows the problems; to replace published history under the '
+                'current identity, use `pubanon prepare --replace all`'
             ),
         )
+    return _HistoryReview(result, commits, tags, derived)
 
 
 def _verify_package_observation(
@@ -336,8 +417,8 @@ def _verify_refs(
 
 def _verify_release_pages(
     paths: Paths, g: GlobalConfig, p: ProjectConfig, dest: Destination
-) -> str:
-    """Gate every non-draft release page under the current rules."""
+) -> tuple[str, tuple[str, ...]]:
+    """Gate non-draft release pages; return the table text and immutable tags, oldest first."""
     pages = [page for page in _host.all_releases(dest) if not page.draft]
     rules = assemble_rules(g, p, derived_private_terms(paths, p, os.environ))
     blocked = [
@@ -354,7 +435,12 @@ def _verify_release_pages(
             recovery='edit or delete the listed release pages on GitHub, '
             'then rerun pubanon repo reveal',
         )
-    return 'no sensitive terms' if pages else 'none'
+    immutable = tuple(
+        page.tag
+        for page in sorted(pages, key=lambda page: (page.created_at, page.identifier))
+        if page.immutable
+    )
+    return ('no sensitive terms' if pages else 'none'), immutable
 
 
 def feature_summary(settings: Settings) -> str:
@@ -544,30 +630,27 @@ def _verify_after_flip(
     p: ProjectConfig,
 ) -> str:
     """Verify the public repository and return its published commit."""
-    recovery = 'fix the reported drift, then rerun pubanon repo reveal'
 
     def _partial_failure(
         *,
         fact: str | None = None,
         expected: str | None = None,
         actual: str | None = None,
+        unread: bool = False,
     ) -> PubanonError:
-        return PubanonError(
-            'the repository is now public but post-flip verification failed',
+        error_class = (PubanonError, _PostFlipReadError)[unread]
+        return error_class(
+            _POST_FLIP_FAILURE_MESSAGE,
             fact=fact,
             expected=expected,
             actual=actual,
-            recovery=recovery,
+            recovery=_POST_FLIP_RECOVERY,
         )
 
     if p.settings is None:
         raise _partial_failure(fact='repository settings are missing')
 
-    try:
-        owner, repo, visibility = _host.repository_facts(p.owner, p.repo)
-        _require_configured_coordinates(p, owner, repo)
-    except PubanonError as exc:
-        raise _partial_failure(fact=exc.render()) from exc
+    owner, repo, visibility = _post_flip_repository_facts(p)
     if visibility != 'public':
         raise _partial_failure(
             fact='repository visibility',
@@ -589,9 +672,9 @@ def _verify_after_flip(
         raise _partial_failure(fact=exc.render()) from exc
     expected_refs = RemoteRefs(local_main, local_tags, ())
     try:
-        remote = _host.ls_remote(destination, paths, p.name)
+        remote = _host.read_remote_refs(destination)
     except PubanonError as exc:
-        raise _partial_failure(fact=exc.render()) from exc
+        raise _partial_failure(fact=exc.render(), unread=True) from exc
     if remote != expected_refs:
         raise _partial_failure(
             fact='published refs changed after the visibility flip',
@@ -602,11 +685,44 @@ def _verify_after_flip(
     try:
         actual_settings = _host.repository_settings(p.owner, p.repo)
     except PubanonError as exc:
-        raise _partial_failure(fact=exc.render()) from exc
+        raise _partial_failure(fact=exc.render(), unread=True) from exc
     mismatches = settings_mismatches(p.settings, actual_settings)
     if mismatches:
         raise _partial_failure(fact='; '.join(escape(item) for item in mismatches))
     return local_main or 'absent'
+
+
+def _verify_after_visibility_change(paths: Paths, g: GlobalConfig, p: ProjectConfig) -> str:
+    """Verify after reveal's own flip, rereading while GitHub finishes applying it."""
+    try:
+        return _verify_after_flip(paths, g, p)
+    except _PostFlipReadError as exc:
+        failure = exc
+    started = _monotonic()
+    output('The repository is public, but pubanon could not read it back yet.')
+    output(
+        'GitHub may still be applying the change. '
+        f'Retrying for up to {_POST_FLIP_WAIT_MINUTES} minutes.'
+    )
+    limit = _POST_FLIP_WAIT_MINUTES * _SECONDS_PER_MINUTE
+    while _monotonic() - started + _POST_FLIP_POLL_SECONDS <= limit:
+        _sleep(_POST_FLIP_POLL_SECONDS)
+        if _monotonic() - started > limit:
+            break
+        try:
+            return _verify_after_flip(paths, g, p)
+        except _PostFlipReadError as exc:
+            failure = exc
+            elapsed = round(_monotonic() - started)
+            detail(f'After {elapsed} s: {escape(str(exc.__cause__ or exc))}')
+    raise PubanonError(
+        'the repository is now public, but GitHub may still be applying the change',
+        fact=(
+            f'pubanon could not read the repository back within {_POST_FLIP_WAIT_MINUTES} '
+            f'minutes.\n{failure.fact}'
+        ),
+        recovery='wait a minute, then rerun pubanon repo reveal',
+    ) from failure
 
 
 def _converge_public(
@@ -615,11 +731,19 @@ def _converge_public(
     p: ProjectConfig,
     *,
     host_changed: bool,
+    accepted_exposure: str = '',
 ) -> None:
     """Verify and persist one completed public-state transition."""
-    commit = _verify_after_flip(paths, g, p)
+    commit = (
+        _verify_after_visibility_change(paths, g, p)
+        if host_changed
+        else _verify_after_flip(paths, g, p)
+    )
+    updated = replace(p, visibility='public')
+    if accepted_exposure:
+        updated = replace(updated, acknowledged_exposure=accepted_exposure)
     try:
-        save_project(paths, replace(p, visibility='public'))
+        save_project(paths, updated)
     except PubanonError as exc:
         raise PubanonError(
             'the repository is public and verified but configuration update failed',
@@ -633,7 +757,6 @@ def _converge_public(
         else f'Recorded public visibility for {repository}; it was already public.',
         kind='success',
     )
-    output('warning: its earlier Actions history and logs are now public too.', kind='warning')
     detail(f'Verified commit: {escape(commit)}')
 
 
@@ -664,25 +787,48 @@ def _verify_before_flip(
     dest: Destination,
     *,
     already_public: bool = False,
-) -> str:
-    """Run the complete ordered verification before recording public visibility."""
+) -> tuple[str, str]:
+    """Verify, ask, and recheck before recording public visibility; return commit and digest."""
     commit, tags = _verify_refs(paths, p, dest)
     checks = _verify_checks(p, commit)
     package = _verify_package_observation(paths, p, dest)
     _verify_settings(paths, g, p)
-    _verify_history(paths, g, p, (commit, tags))
-    pages = _verify_release_pages(paths, g, p, dest)
+    review = _verify_history(paths, g, p, (commit, tags))
+    pages, immutable = _verify_release_pages(paths, g, p, dest)
+    account = g.accounts[p.host]
+    actions = _actions.check((p.owner, p.repo), account, assemble_rules(g, p, review.derived))
+    history = (
+        'matches GitHub; findings listed below'
+        if review.audit.findings
+        else 'matches GitHub; no sensitive terms or identity problems'
+    )
     fields(
         [
-            ('Published history', 'matches GitHub; no sensitive terms or identity problems'),
+            ('Published history', history),
             ('Release pages', pages),
+            ('Actions logs', _actions.row(actions)),
             ('Required checks', checks),
             ('Package', package),
             ('Settings', 'match your configuration'),
         ]
     )
-    _verify_disclosure(paths, p, already_public=already_public)
-    return commit
+    accepted = _decide_history((g, p), review, already_public=already_public, immutable=immutable)
+    deleted = _actions.decide(
+        actions, (g, p), review.derived, account, already_public=already_public
+    )
+    try:
+        _confirm_disclosure(paths, p, deleted, already_public=already_public)
+        _actions.require_unchanged(actions)
+    except KeyboardInterrupt:
+        raise OperationCanceled(_actions.cancel_message(deleted)) from None
+    except OperationCanceled:
+        raise
+    except PubanonError as exc:
+        if deleted:
+            note = _actions.deletion_note(deleted)
+            exc.fact = f'{exc.fact}\n{note}' if exc.fact else note
+        raise
+    return commit, accepted
 
 
 def reveal(
@@ -693,10 +839,13 @@ def reveal(
     """Reveal or reverify the configured repository from durable facts.
 
     Before recording a private-to-public transition, verify published refs,
-    checks, optional package state, settings, history, and an interactively
-    acknowledged disclosure inventory. Persist public visibility after
+    checks, optional package state, settings, history, release pages, and
+    Actions content. Ask before publishing history findings, offer to delete
+    matching Actions logs, name what stays unchecked, and ask the final
+    question. Save the accepted digest with public visibility after
     verification. If host and configuration are already public, recheck refs
-    and settings without repeating the full pre-reveal audit.
+    and settings without repeating the full pre-reveal audit. After recording
+    public visibility, offer once to turn on immutable releases.
 
     The caller must hold the project lock for the complete operation.
 
@@ -722,11 +871,13 @@ def reveal(
     if host_visibility == 'private' and p.visibility == 'private':
         destination = _host.verify_destination(paths, g, p)
         heading(f'Make {escape(owner)}/{escape(repo)} public')
-        _verify_before_flip(paths, g, p, destination)
-        if not confirm('Make it public?'):
-            raise OperationCanceled('Canceled. Nothing was changed.')
-        _set_public_visibility(p)
-        _converge_public(paths, g, p, host_changed=True)
+        _commit, accepted = _verify_before_flip(paths, g, p, destination)
+        try:
+            _set_public_visibility(p)
+            _converge_public(paths, g, p, host_changed=True, accepted_exposure=accepted)
+        except KeyboardInterrupt:
+            raise OperationCanceled(_INTERRUPTED) from None
+        _immutable.offer(p, destination)
         return
 
     if host_visibility == 'public' and p.visibility == 'private':
@@ -745,14 +896,17 @@ def reveal(
             visibility=host_visibility,
         )
         try:
-            _verify_before_flip(paths, g, p, destination, already_public=True)
+            _commit, accepted = _verify_before_flip(paths, g, p, destination, already_public=True)
+        except OperationCanceled:
+            raise
         except PubanonError as exc:
             raise PubanonError(
                 'the repository is already public but verification failed',
                 fact=exc.render(),
                 recovery='fix the reported issue, then rerun pubanon repo reveal',
             ) from exc
-        _converge_public(paths, g, p, host_changed=False)
+        _converge_public(paths, g, p, host_changed=False, accepted_exposure=accepted)
+        _immutable.offer(p, destination)
         return
 
     if host_visibility == 'public' and p.visibility == 'public':
