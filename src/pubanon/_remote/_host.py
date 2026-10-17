@@ -58,6 +58,7 @@ type CheckState = Literal['missing', 'ambiguous', 'pending', 'success', 'unaccep
 
 type _CheckRun = tuple[str, str, str, str | None]
 type LogAbsence = Literal['api-404', 'storage-404']
+type ReleaseCreationMode = Literal['draft', 'latest', 'not-latest']
 
 
 class ActionsJob(NamedTuple):
@@ -1924,7 +1925,12 @@ def all_releases(dest: Destination, *, deadline: float | None = None) -> tuple[G
 
 
 def create_release(
-    dest: Destination, tag: str, *, title: str, notes: bytes, mark_latest: bool = True
+    dest: Destination,
+    tag: str,
+    *,
+    title: str,
+    notes: bytes,
+    mode: ReleaseCreationMode = 'latest',
 ) -> None:
     """Create a release page for an existing tag in a verified repository.
 
@@ -1933,12 +1939,18 @@ def create_release(
         tag: Existing tag for the new release page.
         title: Exact title prepared by the caller.
         notes: Exact UTF-8 notes prepared by the caller.
-        mark_latest: Let GitHub choose the latest page when true; otherwise
-            explicitly prevent this page from becoming latest.
+        mode: Create a hidden draft, let GitHub select latest, or explicitly
+            prevent a published page from becoming latest.
 
     Raises:
         PubanonError: GitHub CLI cannot complete the mutation.
     """
+    if mode == 'draft':
+        flags = ['--draft']
+    elif mode == 'latest':
+        flags = []
+    else:
+        flags = ['--latest=false']
     _gh(
         [
             'release',
@@ -1950,7 +1962,7 @@ def create_release(
             f'--title={title}',
             '--notes-file',
             '-',
-            *([] if mark_latest else ['--latest=false']),
+            *flags,
         ],
         input_bytes=notes,
     )

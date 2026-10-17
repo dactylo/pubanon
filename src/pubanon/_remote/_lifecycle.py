@@ -418,11 +418,11 @@ def _verify_refs(
 def _verify_release_pages(
     paths: Paths, g: GlobalConfig, p: ProjectConfig, dest: Destination
 ) -> tuple[str, tuple[str, ...]]:
-    """Gate non-draft release pages; return the table text and immutable tags, oldest first."""
-    pages = [page for page in _host.all_releases(dest) if not page.draft]
+    """Gate every release page; return the table text and immutable tags."""
+    pages = _host.all_releases(dest)
     rules = assemble_rules(g, p, derived_private_terms(paths, p, os.environ))
     blocked = [
-        f'{escape(page.tag)}: {finding}'
+        f'{escape(page.tag)}{" (draft)" if page.draft else ""}: {finding}'
         for page in pages
         for finding in _releases.release_metadata_findings(
             rules, tag=page.tag, title=page.title, notes=page.notes.encode()
@@ -438,7 +438,7 @@ def _verify_release_pages(
     immutable = tuple(
         page.tag
         for page in sorted(pages, key=lambda page: (page.created_at, page.identifier))
-        if page.immutable
+        if page.immutable and not page.draft
     )
     return ('no sensitive terms' if pages else 'none'), immutable
 

@@ -14,7 +14,13 @@ from pubanon._remote import _host
 from pubanon._snapshots import _candidate, _records, _store
 from pubanon._terminal import display_path, escape, field, output, project_fallback, shell_command
 
+_DRAFT_GUIDANCE = (
+    'It appears when your release workflow publishes it after the package upload. '
+    'If it is still a draft after that workflow finishes, rerun the workflow or publish the '
+    'page on GitHub.'
+)
 _EXCERPT_LIMIT = 120
+_PAIR_SIZE = 2
 _VERIFY_FIRST_WAIT = 0.5
 _VERIFY_SECONDS = 10.0
 _monotonic = time.monotonic
@@ -58,6 +64,9 @@ class ReleaseChange:
         notes_file: Supplied notes path retained for creation recovery.
         changelog_missing: Whether default notes lack a changelog link.
         title_override: Explicit supplied title retained for creation recovery.
+        draft: Whether a creation requests a draft page. A matching published
+            page then also counts as the same page, because the release
+            workflow may already have published it.
     """
 
     operation: Literal['create', 'edit', 'existing']
@@ -70,6 +79,7 @@ class ReleaseChange:
     notes_file: Path | None = None
     changelog_missing: bool = False
     title_override: str | None = None
+    draft: bool = False
 
 
 @dataclass(frozen=True)
@@ -80,10 +90,12 @@ class PageOutcome:
         kind: No page work, a new creation, a matching page that appeared, or
             an existing page retained without modification.
         url: Verified hosted page URL, or None when no page work was planned.
+        draft: Whether the page read back from GitHub is still a draft.
     """
 
     kind: Literal['none', 'created', 'existing', 'kept']
     url: str | None
+    draft: bool = False
 
 
 @dataclass(frozen=True)
@@ -99,6 +111,8 @@ class PagePlan:
         change: Retained request content for creation or a matching keep;
             its notes path remains available for recovery.
         project: Registered project for qualified recovery commands.
+        waiting: Lower strict version tags whose pages are still drafts, in
+            version order; only creation plans list them.
     """
 
     action: Literal['none', 'keep', 'create']
@@ -108,6 +122,7 @@ class PagePlan:
     existing: _host.GitHubRelease | None = None
     change: ReleaseChange | None = None
     project: str = ''
+    waiting: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -187,7 +202,7 @@ def _command(project: str, *args: str) -> str:
 
 
 def _differences(page: _host.GitHubRelease | None, change: ReleaseChange) -> tuple[str, ...]:
-    """Name every requested field that differs from the observed page."""
+    """Name each requested field that differs; a requested draft may already be published."""
     if page is None:
         return ('page',)
     previous = change.previous
@@ -200,8 +215,11 @@ def _differences(page: _host.GitHubRelease | None, change: ReleaseChange) -> tup
     )
     actual = (page.tag, page.title, page.notes.encode(), page.draft, page.prerelease)
     names = ('tag', 'title', 'notes', 'draft', 'prerelease')
+    either_status = previous is None and change.draft
     return tuple(
-        name for name, want, got in zip(names, expected, actual, strict=True) if want != got
+        name
+        for name, want, got in zip(names, expected, actual, strict=True)
+        if want != got and not (name == 'draft' and either_status)
     )
 
 
@@ -254,28 +272,6 @@ def _conflict_error(
     )
 
 
-def _creation_scan(
-    p: _config.ProjectConfig, change: ReleaseChange
-) -> tuple[_host.GitHubRelease | None, bool]:
-    """Scan once for a matching page and higher published numeric versions."""
-    pages = _host.all_releases(change.destination)
-    current = next((page for page in pages if page.tag == change.tag), None)
-    if current is not None and _differences(current, change):
-        raise _conflict_error(p, current, change)
-    version = _candidate.version_from_tag(change.tag)
-    if version is None:
-        raise PubanonError('release page requires a strict vX.Y.Z tag')
-    wanted = tuple(int(part) for part in version.split('.'))
-    higher = any(
-        tuple(int(part) for part in version.split('.')) > wanted
-        for page in pages
-        if not page.draft
-        and not page.prerelease
-        and (version := _candidate.version_from_tag(page.tag)) is not None
-    )
-    return current, not higher
-
-
 def _not_yet_visible(page: _host.GitHubRelease | None, change: ReleaseChange) -> bool:
     """Recognize only absent creations or an unchanged previous edit page."""
     return page is None if change.operation == 'create' else page == change.previous
@@ -312,9 +308,12 @@ def _require_remote_tag(
         )
 
 
-def _show_creation(change: ReleaseChange | _PlannedPage, *, label: str = 'Release page') -> None:
+def _show_creation(
+    change: ReleaseChange | _PlannedPage, *, draft: bool, label: str = 'Release page'
+) -> None:
     """Show the exact creation title, source, and full escaped notes."""
-    row = f'create "{escape(change.title)}"'
+    action = 'create draft' if draft else 'create'
+    row = f'{action} "{escape(change.title)}"'
     if change.notes_file is not None:
         row += f' with notes from {display_path(change.notes_file)}'
     elif change.changelog_missing:
@@ -368,7 +367,7 @@ def _keep_publication_page(
     page = next((page for page in _host.all_releases(destination) if page.tag == tag), None)
     if page is None:
         raise PubanonError('the previously existing release page disappeared')
-    return PageOutcome('kept', page.url)
+    return PageOutcome('kept', page.url, page.draft)
 
 
 def _verify_result(
@@ -397,6 +396,62 @@ def _verify_result(
         _sleep(min(wait, remaining))
         wait *= 2
     raise PubanonError('the release page was not visible within 10 seconds')
+
+
+def _version_key(tag: str) -> tuple[int, ...] | None:
+    """Return a strict `vX.Y.Z` tag's numeric version for ordering, or None."""
+    version = _candidate.version_from_tag(tag)
+    return None if version is None else tuple(int(part) for part in version.split('.'))
+
+
+def _creation_scan(
+    p: _config.ProjectConfig, change: ReleaseChange
+) -> tuple[_host.GitHubRelease | None, bool]:
+    """Scan once for a matching page and higher published numeric versions."""
+    pages = _host.all_releases(change.destination)
+    current = next((page for page in pages if page.tag == change.tag), None)
+    if current is not None and _differences(current, change):
+        raise _conflict_error(p, current, change)
+    wanted = _version_key(change.tag)
+    if wanted is None:
+        raise PubanonError('release page requires a strict vX.Y.Z tag')
+    higher = any(
+        key > wanted
+        for page in pages
+        if not page.draft and not page.prerelease and (key := _version_key(page.tag)) is not None
+    )
+    return current, not higher
+
+
+def _waiting_drafts(pages: tuple[_host.GitHubRelease, ...], tag: str) -> tuple[str, ...]:
+    """Return lower strict-version tags whose pages are still drafts, oldest first."""
+    current = _version_key(tag)
+    if current is None:
+        return ()
+    waiting = {
+        page.tag: key
+        for page in pages
+        if page.draft and (key := _version_key(page.tag)) is not None and key < current
+    }
+    return tuple(sorted(waiting, key=waiting.__getitem__))
+
+
+def _waiting_warning(tags: tuple[str, ...]) -> str:
+    """Name earlier versions whose release pages are still drafts."""
+    names = escape(
+        ' and '.join(tags)
+        if len(tags) <= _PAIR_SIZE
+        else ', '.join(tags[:-1]) + f', and {tags[-1]}'
+    )
+    if len(tags) == 1:
+        return (
+            f'warning: The release page for {names} is still a draft. '
+            'Rerun its release workflow, or publish the page on GitHub.'
+        )
+    return (
+        f'warning: The release pages for {names} are still drafts. '
+        'Rerun their release workflows, or publish the pages on GitHub.'
+    )
 
 
 def create_command(
@@ -545,7 +600,7 @@ def apply_change(
                 change.tag,
                 title=change.title,
                 notes=change.notes,
-                mark_latest=mark_latest,
+                mode='draft' if change.draft else ('latest' if mark_latest else 'not-latest'),
             )
         else:
             _host.edit_release(destination, change.tag, title=change.title, notes=change.notes)
@@ -602,7 +657,9 @@ def complete_publication_page(
         if plan.change is None:
             raise ValueError('creation page plan has no retained change')
         result = apply_change(paths, g, p, plan.change)
-        return PageOutcome('created' if result.written else 'existing', result.page.url)
+        return PageOutcome(
+            'created' if result.written else 'existing', result.page.url, result.page.draft
+        )
     except (PubanonError, OSError, ObservationTimeoutError, KeyboardInterrupt) as exc:
         interrupted = isinstance(exc, (OperationCanceled, KeyboardInterrupt))
         uncertain = isinstance(exc, (ReleaseOutcomeUnknownError, OperationCanceled))
@@ -698,6 +755,19 @@ def _inactive_page_plan(
     if request.notes is None and not request.requested and not _config.release_pages_enabled(p):
         return PagePlan('none', 'disabled', tag=tag, project=p.name)
     return None
+
+
+def page_url_text(url: str, *, draft: bool) -> str:
+    """Render a page URL for display, marking a page that is still a draft.
+
+    Args:
+        url: Page URL as GitHub reported it.
+        draft: Whether the observed page is a draft.
+
+    Returns:
+        The escaped URL, followed by ` (draft)` for a draft.
+    """
+    return escape(url) + (' (draft)' if draft else '')
 
 
 def release_metadata_findings(
@@ -826,6 +896,7 @@ def plan_publication_page(
         None,
         notes_file=rendered.notes_file,
         changelog_missing=rendered.changelog_missing,
+        draft=_config.draft_release_pages(p),
     )
     if previous is not None:
         if _differences(previous, change):
@@ -834,7 +905,14 @@ def plan_publication_page(
             'keep', 'matches', tag=tag, existing=previous, change=change, project=p.name
         )
     _gate_metadata(paths, g, p, tag, rendered)
-    return PagePlan('create', 'new', tag=tag, change=change, project=p.name)
+    return PagePlan(
+        'create',
+        'new',
+        tag=tag,
+        change=change,
+        project=p.name,
+        waiting=_waiting_drafts(pages, tag),
+    )
 
 
 def prepare_change(
@@ -896,6 +974,7 @@ def prepare_change(
         notes_file=request.notes_file,
         changelog_missing=planned.changelog_missing if planned is not None else False,
         title_override=request.title,
+        draft=operation == 'create' and _config.draft_release_pages(p),
     )
     if operation == 'create' and previous is not None:
         if _differences(previous, change):
@@ -909,6 +988,37 @@ def prepare_change(
         _PlannedPage(final_title, final_notes, request.notes_file, changelog_missing=False),
     )
     return change
+
+
+def show_draft_guidance(p: _config.ProjectConfig, *, draft: bool) -> None:
+    """Explain how a reported draft becomes public, when the project creates drafts.
+
+    Another project's draft is not its release workflow's to publish, so
+    nothing is shown unless `release_page.draft` is true.
+
+    Args:
+        p: Project whose `release_page.draft` setting applies.
+        draft: Whether the reported page is still a draft.
+    """
+    if draft and _config.draft_release_pages(p):
+        output(_DRAFT_GUIDANCE)
+
+
+def show_page_outcome(p: _config.ProjectConfig, outcome: PageOutcome) -> None:
+    """Report the page that completed publication observed on GitHub.
+
+    Args:
+        p: Project whose `release_page.draft` setting applies.
+        outcome: Completed page work with a verified URL.
+
+    Raises:
+        ValueError: The outcome has no page URL.
+    """
+    if outcome.url is None:
+        raise ValueError('page outcome has no URL')
+    label = 'Release page already exists' if outcome.kind == 'existing' else 'Release page'
+    output(field(label, page_url_text(outcome.url, draft=outcome.draft)))
+    show_draft_guidance(p, draft=outcome.draft)
 
 
 def show_page_plan(plan: PagePlan, *, published: bool = False) -> None:
@@ -941,7 +1051,9 @@ def show_page_plan(plan: PagePlan, *, published: bool = False) -> None:
         status = 'draft' if plan.existing.draft else 'published'
         output(field('Release page', f'keep existing page ({status}) {escape(plan.existing.url)}'))
     elif plan.change is not None:
-        _show_creation(plan.change)
+        _show_creation(plan.change, draft=plan.change.draft)
+        if plan.waiting:
+            output(_waiting_warning(plan.waiting), kind='warning')
 
 
 def show_planned_page(
@@ -971,4 +1083,4 @@ def show_planned_page(
     except PubanonError as exc:
         output(field(label, f'cannot be planned: {escape(str(exc))}'))
         return
-    _show_creation(planned, label=label)
+    _show_creation(planned, draft=_config.draft_release_pages(p), label=label)

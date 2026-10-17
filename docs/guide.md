@@ -75,14 +75,16 @@ reads it automatically. Otherwise, choose a version tag with `pubanon prepare --
 
 A release page announces a published version on GitHub. Release pages are off unless you turn them
 on: `pubanon init` asks whether to create one for each published version, and `pubanon init --edit`
-changes that answer later. When they are on, pubanon creates the page right after a tagged version
-is published and shows it in the publish preview first. Untagged publications have no page.
+changes that answer later. Answer draft to have your release workflow publish each page after
+uploading the package. When pages are on, pubanon creates the page right after a tagged version is
+published and shows it in the publish preview first. Untagged publications have no page.
 
 A page can notify watchers and start workflows that run on new releases, including package uploads.
 On the staged route with required checks, the page is created after staging checks pass. On the
 direct route, or without checks, it is created before any CI runs. To create a page only after the
 final repository's CI passes, leave release pages off and run `pubanon release create` after
-`pubanon repo watch`.
+`pubanon repo watch`. A draft notifies no one and starts no release workflows until it is
+published; see [Publish pages after the package upload](#publish-pages-after-the-package-upload).
 
 By default, the page title is the tag, such as `v0.2.0`, and the notes are one line linking to
 `CHANGELOG.md` at that tag in the final repository. If the published snapshot has no root
@@ -91,11 +93,17 @@ By default, the page title is the tag, such as `v0.2.0`, and the notes are one l
 ### Change the defaults
 
 Add a `[release_page]` table to your [project configuration](#edit-an-existing-project). `init`
-saves only `enabled`; the other keys change the page itself. Each example is independent:
+saves `enabled` and `draft`; the other keys change the page itself. Each example is independent:
 
 ```toml
 [release_page]
 enabled = true
+```
+
+```toml
+[release_page]
+enabled = true
+draft = true
 ```
 
 ```toml
@@ -115,9 +123,50 @@ Install with `pip install example=={version}`.
 
 `title` and `notes` are templates. `{tag}` is the tag, `{version}` is the tag without its leading
 `v`, and notes can also use `{changelog_url}`. Write `{{` and `}}` for literal braces, and
-`notes = ""` for empty notes. Without the table, `enabled` is `false`, `title` is `"{tag}"`, and
-the notes link to `CHANGELOG.md` when it exists. A `changelog` you set must be a file in the
-published snapshot whenever the notes link to it.
+`notes = ""` for empty notes. Without the table, `enabled` and `draft` are `false`, `title` is
+`"{tag}"`, and the notes link to `CHANGELOG.md` when it exists. A `changelog` you set must be a
+file in the published snapshot whenever the notes link to it.
+
+### Publish pages after the package upload
+
+With `draft = true`, every page pubanon creates is a draft: in `publish`, in a `run` publish stage,
+with `--release-page`, and in `release create`. Only people with write access to the repository can
+see a draft. Your release workflow publishes it after uploading the package, so the page and the
+package appear together. pubanon never publishes or deletes a page, and `release edit` keeps a
+page's status. Its results mark a page that is still a draft with `(draft)`.
+
+The starter workflows [release-start.yml](examples/release-start.yml) and
+[release.yml](examples/release.yml) do this for a Python package on PyPI. Copy both to
+`.github/workflows/` beside the [starter CI workflow](examples/ci.yml), and follow their comments
+to add a PyPI Trusted Publisher. After each successful push run of CI on `main` in a public
+repository, the start workflow checks whether the commit carries the `vX.Y.Z` tag for the version
+in `pyproject.toml`. If it does, it starts the release workflow on that tag, which builds and
+uploads the package and then publishes the tag's draft. The page becomes GitHub's latest release
+unless a published, non-prerelease page has a higher version. Commits without the tag start
+nothing. Because every release run starts on its tag, its checks, such as `Publish to PyPI`, appear
+on the tagged commit, where `pubanon package watch` looks for them.
+
+Running the release workflow again for the same version is safe: files already on PyPI are skipped,
+and a waiting draft is published. To publish a tagged commit by hand, run the release workflow from
+the Actions tab on its tag. If a release run fails, rerun that run rather than starting a new one:
+a new run leaves the failed run's skipped checks on the tagged commit, and `pubanon package watch`
+refuses skipped checks.
+
+To approve each upload, open the repository's settings on GitHub, then Environments, then `pypi`,
+and add required reviewers. The release workflow then waits for approval before uploading, and the
+page appears after the approved upload. Later release runs wait until you approve or reject the
+waiting one. Release runs start on tags, so if the environment limits deployments to selected
+branches and tags, allow your version tags.
+
+A draft created after the release workflow finished stays a draft. This happens when page creation
+failed and `release create` or a `run` rerun finished it later, or when you add a page for an
+earlier version. The workflow's summary then says it found no page. Rerun the workflow, or publish
+the page on GitHub. The next publication's preview also warns about earlier versions whose pages
+are still drafts.
+
+A page published by the workflow does not start other workflows that listen for release events,
+because GitHub starts no workflows for changes made with a workflow's own token. pubanon checks the
+tag, title, and notes of every page it creates, but not files a workflow attaches to a page.
 
 ### For one publication
 
@@ -142,10 +191,11 @@ pubanon release edit v0.2.0 --title "Version 0.2.0" --notes-file revised-notes.m
 ```
 
 `release create` uses your configured title and notes unless you pass `--title` or `--notes-file`,
-and it works even when `enabled = false`. If a matching page already exists, it reports the page
-and changes nothing. If a different page exists, it shows the differences and points to
-`release show` and `release edit`. `edit` changes only what you pass; an empty notes file clears
-the notes. `pubanon release list` shows up to 30 pages; `--limit` changes the count.
+and it works even when `enabled = false`. With `draft = true`, it creates a draft. If a matching
+page already exists, it reports the page and changes nothing. If a different page exists, it shows
+the differences and points to `release show` and `release edit`. `edit` changes only what you pass;
+an empty notes file clears the notes. `pubanon release list` shows up to 30 pages; `--limit`
+changes the count.
 
 ### If something goes wrong
 
@@ -200,7 +250,8 @@ PATCH commands above for listed pages with titles, or give an untitled page a ti
   history and points to the same commit on GitHub.
 - A page can notify GitHub watchers and trigger workflows that listen for release events. It is
   created while the final repository's CI may still be running, so it does not certify CI or a
-  package upload.
+  package upload. A draft published by the
+  [starter release workflows](#publish-pages-after-the-package-upload) appears only after both.
 - Backfilling an older version never makes it GitHub's latest release when a higher version already
   has a published, non-prerelease page. Otherwise GitHub chooses the latest release.
 - A replacement that moves several version tags gets no automatic page. pubanon prints a
@@ -301,9 +352,9 @@ pubanon repo reveal
 
 Reveal checks the published history, repository settings, required CI, and any configured
 [package observation](#package-observation). It re-checks the tag, title, and notes of every
-non-draft release page under the current sensitive terms and refuses if any page matches. If
-published history contains terms you added after publishing it, reveal lists them and asks whether
-to make them public; see
+release page, including drafts, under the current sensitive terms and refuses if any page matches.
+A draft can become public later without passing reveal. If published history contains terms you
+added after publishing it, reveal lists them and asks whether to make them public; see
 [Sensitive terms in published history](#sensitive-terms-in-published-history).
 
 Reveal also checks your Actions history with the same terms: the details of every workflow run, the
@@ -567,8 +618,9 @@ workflows are marked unresolved, so enter their names yourself: separate names w
 quote a name that contains one, such as `quality, "test (ubuntu-24.04, 3.13)"`. An empty list means
 there are no checks to wait for; on the staged route, review the staging repository yourself.
 
-Initialization also asks whether to create a release page for each published version; the answer
-starts as no. The prompt explains when pages are created on your route. See
+Initialization also asks whether to create a release page for each published version: yes, draft,
+or no. The answer starts as no. Answer draft when your release workflow publishes each page after
+uploading the package. The prompt explains when pages are created on your route. See
 [GitHub release pages](#github-release-pages).
 
 Initialization also offers local source tags, on by default for new projects. They show a marker
@@ -675,9 +727,9 @@ tag-only workflows don't run there. Keep deployment and package-upload triggers 
 repository that should run them.
 
 Use the optional [`[release_page]` table](#change-the-defaults) to change the page created for a
-tagged publication. `init` and `init --edit` save only its `enabled` key. Use the optional
-[per-project `[commit_message]` table](#commit-messages) to override either global message default
-for new preparations.
+tagged publication. `init` and `init --edit` save only its `enabled` and `draft` keys. Use the
+optional [per-project `[commit_message]` table](#commit-messages) to override either global message
+default for new preparations.
 
 After saving, run `pubanon status` to check the project and any retained snapshot. Changes to file
 selection, publication identity, destination, required checks, or `ci_workflow` require a fresh
@@ -916,7 +968,8 @@ gates the package upload, by its job or check name rather than the workflow titl
 it selects the highest `X.Y.Z` release tag, even if a newer commit has a lower version; `--version`
 selects that exact release. A version with no uploaded files is incomplete: the watch keeps
 waiting, and `repo reveal` refuses to make the repository public until files appear. When the files
-arrive, the watch lists them.
+arrive, the watch lists them. If the watch reports a check from the
+[starter release workflows](#publish-pages-after-the-package-upload) as skipped, see that section.
 
 ## Correcting published history
 

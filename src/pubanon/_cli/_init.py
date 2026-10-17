@@ -41,6 +41,7 @@ if TYPE_CHECKING:
 
 from pubanon._cli import _context, _init_draft, _selection
 
+_RELEASE_PAGE_SUMMARY = {'draft': 'yes, as drafts', 'no': 'no', 'yes': 'yes'}
 _UNSELECTED_SHOWN = 5
 
 
@@ -181,20 +182,6 @@ def _draft_flagged_choice(paths: list[str], draft: _init_draft.Draft) -> _init_d
     return replace(draft, flagged=(*draft.flagged, (remaining[0], choice)))
 
 
-def _edited_release_pages(
-    project: _config.ProjectConfig, *, enabled: bool
-) -> _config.ProjectConfig:
-    """Keep the saved page settings when their effective enablement is unchanged."""
-    if enabled == _config.release_pages_enabled(project):
-        return project
-    return replace(
-        project,
-        release_page=replace(
-            project.release_page or _config.ReleasePageSettings(), enabled=enabled
-        ),
-    )
-
-
 def _feature_prompt(step: str, default: bool | None) -> bool:
     """Ask whether one repository feature is enabled, starting from its saved value."""
     if step == 'pull_requests':
@@ -242,60 +229,6 @@ def _manual_required_checks(default: tuple[str, ...]) -> tuple[str, ...]:
                 if item.strip() and item.strip().casefold() != 'none'
             )
         )
-
-
-def _project_review(
-    project: _config.ProjectConfig,
-    snapshot: _source.Snapshot,
-    global_config: _config.GlobalConfig,
-) -> None:
-    """Display the complete project snapshot before its save decision."""
-    membership = _policy.evaluate_membership(
-        [entry.path for entry in snapshot],
-        project.allow,
-        project.deny,
-        global_deny=_config.global_deny(global_config),
-    )
-    settings = project.settings
-    if settings is None:
-        raise PubanonError('repository settings are missing')
-    checks = '\n'.join(escape(name) for name in project.required_checks) or 'none'
-    included_count = len(membership.allowed)
-    excluded_count = len(membership.denied) + len(membership.reserved)
-    values = [
-        ('Source', display_path(project.source_path)),
-        ('Files', f'{included_count} included, {excluded_count} excluded'),
-        (
-            'Final repository',
-            f'{escape(project.owner)}/{escape(project.repo)} ({escape(project.visibility)})',
-        ),
-        ('Description', escape(settings.description or '(empty)')),
-        ('Features', _lifecycle.feature_summary(settings)),
-        ('Route', escape(project.publication_route)),
-    ]
-    if project.publication_route == 'staged':
-        values.append(
-            (
-                'Staging repository',
-                f'{escape(project.owner)}/{escape(stage_repository(project))} (private)',
-            )
-        )
-    values.extend(
-        [
-            ('CI workflow', escape(project.ci_workflow or 'none')),
-            ('Required checks', checks),
-            ('Release pages', 'yes' if _config.release_pages_enabled(project) else 'no'),
-            ('Source tags', 'yes' if project.source_tags else 'no'),
-        ]
-    )
-    heading('Project configuration to save', separate=True)
-    fields(values)
-    if (
-        project.publication_route == 'staged'
-        and not project.required_checks
-        and project.ci_workflow is None
-    ):
-        output('No CI checks configured; CI waiting is optional.', kind='warning')
 
 
 def _publication_route_prompt(*, default: str) -> str:
@@ -373,16 +306,99 @@ def _load_init_draft(
     return _checkpoint_init(ctx, draft)
 
 
-def _release_pages_prompt(*, route: str, ci_configured: bool, default: bool) -> bool:
-    """Explain when release pages are created, then ask whether to create them."""
+def _release_pages_answer(project: _config.ProjectConfig) -> str:
+    """Return the init answer that matches a project's saved release page settings."""
+    if not _config.release_pages_enabled(project):
+        return 'no'
+    return 'draft' if _config.draft_release_pages(project) else 'yes'
+
+
+def _edited_release_pages(project: _config.ProjectConfig, answer: str) -> _config.ProjectConfig:
+    """Save a release page answer, keeping the saved table when the answer is unchanged."""
+    if answer == _release_pages_answer(project):
+        return project
+    return replace(
+        project,
+        release_page=replace(
+            project.release_page or _config.ReleasePageSettings(),
+            enabled=answer != 'no',
+            draft=True if answer == 'draft' else None,
+        ),
+    )
+
+
+def _project_review(
+    project: _config.ProjectConfig,
+    snapshot: _source.Snapshot,
+    global_config: _config.GlobalConfig,
+) -> None:
+    """Display the complete project snapshot before its save decision."""
+    membership = _policy.evaluate_membership(
+        [entry.path for entry in snapshot],
+        project.allow,
+        project.deny,
+        global_deny=_config.global_deny(global_config),
+    )
+    settings = project.settings
+    if settings is None:
+        raise PubanonError('repository settings are missing')
+    checks = '\n'.join(escape(name) for name in project.required_checks) or 'none'
+    included_count = len(membership.allowed)
+    excluded_count = len(membership.denied) + len(membership.reserved)
+    values = [
+        ('Source', display_path(project.source_path)),
+        ('Files', f'{included_count} included, {excluded_count} excluded'),
+        (
+            'Final repository',
+            f'{escape(project.owner)}/{escape(project.repo)} ({escape(project.visibility)})',
+        ),
+        ('Description', escape(settings.description or '(empty)')),
+        ('Features', _lifecycle.feature_summary(settings)),
+        ('Route', escape(project.publication_route)),
+    ]
+    if project.publication_route == 'staged':
+        values.append(
+            (
+                'Staging repository',
+                f'{escape(project.owner)}/{escape(stage_repository(project))} (private)',
+            )
+        )
+    values.extend(
+        [
+            ('CI workflow', escape(project.ci_workflow or 'none')),
+            ('Required checks', checks),
+            ('Release pages', _RELEASE_PAGE_SUMMARY[_release_pages_answer(project)]),
+            ('Source tags', 'yes' if project.source_tags else 'no'),
+        ]
+    )
+    heading('Project configuration to save', separate=True)
+    fields(values)
+    if (
+        project.publication_route == 'staged'
+        and not project.required_checks
+        and project.ci_workflow is None
+    ):
+        output('No CI checks configured; CI waiting is optional.', kind='warning')
+
+
+def _release_pages_prompt(*, route: str, ci_configured: bool, default: str) -> str:
+    """Explain when release pages are created, then ask whether and how to create them."""
+    after_checks = route == 'staged' and ci_configured
     print('\nRelease pages announce published versions.')
     print('Creating one can start release workflows, such as package uploads.')
-    if route == 'staged' and ci_configured:
-        print('Each page is created when you publish, after staging checks pass.')
-    else:
-        print('Each page is created right after publishing, before CI runs.')
-        print('To wait for CI, answer no and run pubanon release create later.')
-    return confirm('Create a release page for each published version?', default=default)
+    print(
+        'Each page is created when you publish, after staging checks pass.'
+        if after_checks
+        else 'Each page is created right after publishing, before CI runs.'
+    )
+    print('Answer draft if your release workflow publishes the page after uploading the package.')
+    if not after_checks:
+        print('Otherwise, to wait for CI, answer no and run pubanon release create later.')
+    return ask(
+        'Create a release page for each published version?',
+        choices=['yes', 'draft', 'no'],
+        default=default,
+    )
 
 
 def _replace_project_context(
@@ -468,6 +484,7 @@ def _project_from_draft(
         release_page=replace(
             ctx.project.release_page or _config.ReleasePageSettings(),
             enabled=draft.release_pages,
+            draft=True if draft.release_page_drafts else None,
         ),
         settings=settings,
         self_publication=draft.self_publication,
@@ -580,7 +597,7 @@ def _report_existing_project_init(
     fields(
         [
             ('Route', escape(project.publication_route)),
-            ('Release pages', 'yes' if _config.release_pages_enabled(project) else 'no'),
+            ('Release pages', _RELEASE_PAGE_SUMMARY[_release_pages_answer(project)]),
             ('Source tags', 'yes' if project.source_tags else 'no'),
         ]
     )
@@ -909,16 +926,12 @@ def _draft_field(
         )
     elif step == 'release_pages':
         proposed = _connect_workflow(_project_from_draft(ctx, snapshot, draft), snapshot)
-        draft = replace(
-            draft,
-            release_pages=_release_pages_prompt(
-                route=proposed.project.publication_route,
-                ci_configured=bool(
-                    proposed.project.required_checks or proposed.project.ci_workflow
-                ),
-                default=draft.release_pages,
-            ),
+        answer = _release_pages_prompt(
+            route=proposed.project.publication_route,
+            ci_configured=bool(proposed.project.required_checks or proposed.project.ci_workflow),
+            default=_release_pages_answer(proposed.project),
         )
+        draft = replace(draft, release_pages=answer != 'no', release_page_drafts=answer == 'draft')
     else:
         draft = replace(draft, **{step: _feature_prompt(step, getattr(draft, step))})
     return _checkpoint_init(ctx, replace(draft, pending=draft.pending[1:]))
@@ -950,12 +963,12 @@ def _edit_project_section(
     elif action == 'tags':
         project = replace(project, source_tags=_source_tags_prompt(default=project.source_tags))
     elif action == 'release pages':
-        enabled = _release_pages_prompt(
+        answer = _release_pages_prompt(
             route=project.publication_route,
             ci_configured=bool(project.required_checks or project.ci_workflow),
-            default=_config.release_pages_enabled(project),
+            default=_release_pages_answer(project),
         )
-        project = _edited_release_pages(project, enabled=enabled)
+        project = _edited_release_pages(project, answer)
     elif action == 'checks':
         project = _edit_checks_section(ctx, snapshot, project)
     elif action == 'settings':

@@ -342,7 +342,7 @@ def _init_answers(
         ('Enable wiki? [y/N] ', 'n'),
         ('Publication route (staged/direct) [direct]: ', ''),
         ('Required CI checks (comma separated, blank for none): ', checks),
-        ('Create a release page for each published version? [y/N] ', ''),
+        ('Create a release page for each published version? [y]es / [d]raft / [n]o [no]: ', ''),
         ('Create local tags marking the source of each publication? [Y/n] ', ''),
         ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
     ]

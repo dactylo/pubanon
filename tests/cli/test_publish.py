@@ -707,7 +707,8 @@ def test_publish_resolve_reports_page_without_writing(
     assert _records.load_candidate(paths, project.name) is None
     assert reads == ([] if page_state == 'disabled' else ['v1.2.3'])
     if page_state == 'present':
-        assert f'Release page: {page.url}' in captured.out
+        assert f'Release page: {page.url} (draft)' in captured.out
+        assert 'rerun the workflow' not in captured.out
     elif page_state == 'absent':
         assert 'no page exists' in captured.out
         assert 'pubanon release create v1.2.3 --project=demo' in captured.out

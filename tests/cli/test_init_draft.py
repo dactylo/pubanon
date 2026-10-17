@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -35,6 +36,7 @@ def _draft(tmp_path: Path, *, commit: str = 'a' * 40) -> _init_draft.Draft:
         pull_requests=False,
         discussions=True,
         release_pages=True,
+        release_page_drafts=True,
     )
 
 
@@ -66,6 +68,20 @@ def test_directory_sync_failure_reports_possible_save(
     assert list(draft_path.parent.glob('.pubanon-write-*.tmp')) == []
 
 
+def test_load_reads_a_draft_saved_without_release_page_drafts_as_false(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    draft = _draft(tmp_path)
+    _init_draft.save(paths, 'demo', draft)
+    draft_path = _init_draft._path(paths, 'demo')
+    payload = cast('dict[str, object]', json.loads(draft_path.read_text(encoding='utf-8')))
+    del payload['release_page_drafts']
+    draft_path.write_text(json.dumps(payload), encoding='utf-8')
+
+    assert _init_draft.load(paths, 'demo') == replace(draft, release_page_drafts=False)
+
+
 @pytest.mark.parametrize(
     ('key', 'value'),
     [
@@ -77,6 +93,9 @@ def test_directory_sync_failure_reports_possible_save(
         ('source_tags', 'yes'),
         ('release_pages', 'yes'),
         ('release_pages', _MISSING),
+        ('release_page_drafts', 'yes'),
+        # Drafts without pages cannot come from an answer.
+        ('release_pages', False),
         ('phase', _MISSING),
         ('phase', 'done'),
         ('pending', ['selection', 1]),

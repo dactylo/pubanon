@@ -16,7 +16,7 @@ from pubanon import (
 from pubanon._cli import _prepare, _workflow
 from pubanon._cli._context import load_context
 from pubanon._errors import ObservationTimeoutError, OperationCanceled, PubanonError
-from pubanon._remote import _host, _lifecycle, _package, _stage, _watch
+from pubanon._remote import _host, _lifecycle, _package, _releases, _stage, _watch
 from pubanon._remote import _publish as _publish_module
 from pubanon._snapshots import _candidate, _discard, _records, _store, _verification
 from pubanon._terminal import escape, next_step
@@ -892,6 +892,8 @@ def test_run_published_resume_allows_public_host_partial_to_reach_reveal(
     monkeypatch.setattr(_host, 'read_release', host._read)
     monkeypatch.setattr(_host, 'all_releases', host._all)
     monkeypatch.setattr(_host, 'create_release', host._create)
+    monkeypatch.setattr(_releases, '_monotonic', host.clock._monotonic)
+    monkeypatch.setattr(_releases, '_sleep', host.clock._sleep)
     monkeypatch.setattr(_lifecycle, 'reveal', _reveal)
     monkeypatch.setattr('builtins.input', _approve)
 

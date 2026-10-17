@@ -44,6 +44,7 @@ class _Host:
     pages: tuple[_host.GitHubRelease, ...] = ()
     scans: int = 0
     latest: list[bool] = field(default_factory=list[bool])
+    drafts: list[bool] = field(default_factory=list[bool])
     stale: list[_host.GitHubRelease | None] = field(
         default_factory=list[_host.GitHubRelease | None]
     )
@@ -105,7 +106,7 @@ class _Host:
             title,
             notes.decode(),
             'https://example.invalid/release',
-            previous.draft if previous else False,
+            previous.draft if previous else (self.drafts[-1] if self.drafts else False),
             previous.prerelease if previous else False,
         )
         if self.after_write == 'missing':
@@ -124,10 +125,11 @@ class _Host:
         *,
         title: str,
         notes: bytes,
-        mark_latest: bool = True,
+        mode: _host.ReleaseCreationMode = 'latest',
     ) -> None:
         assert self.page is None, 'create requires an absent release'
-        self.latest.append(mark_latest)
+        self.latest.append(mode == 'latest')
+        self.drafts.append(mode == 'draft')
         self._write(dest, tag, title=title, notes=notes)
 
     def _edit(self, dest: _host.Destination, tag: str, *, title: str, notes: bytes) -> None:
@@ -144,6 +146,12 @@ class _PageContext:
     _release_page: _releases.PageRequest = field(default_factory=_releases.PageRequest)
 
 
+def _drafting(context: _Context) -> _Context:
+    paths, g, p, host = context
+    page = _config.ReleasePageSettings(enabled=True, draft=True)
+    return paths, g, replace(p, release_page=page), host
+
+
 def _git(store: Path, *args: str, data: bytes | None = None) -> str:
     return (
         subprocess.run(
@@ -155,6 +163,12 @@ def _git(store: Path, *args: str, data: bytes | None = None) -> str:
         )
         .stdout.decode()
         .strip()
+    )
+
+
+def _listed(tag: str, *, draft: bool) -> _host.GitHubRelease:
+    return _host.GitHubRelease(
+        tag, tag, '', f'https://example.invalid/{tag}', draft=draft, prerelease=False
     )
 
 
@@ -327,6 +341,27 @@ def test_complete_conflicting_page_recommends_show_and_edit(release_context: _Co
     assert host.writes == []
 
 
+@pytest.mark.parametrize('published_first', [False, True])
+def test_complete_draft_creation_reports_the_observed_status(
+    release_context: _Context, *, published_first: bool
+) -> None:
+    context = _drafting(release_context)
+    paths, g, p, host = context
+    change = _prepare(context)
+    if published_first:
+        # The release workflow published the draft before pubanon read it back.
+        host.after_write = 'status'
+
+    outcome = _releases.complete_publication_page(
+        paths, g, p, _releases.PagePlan('create', 'new', tag=_TAG, change=change)
+    )
+
+    assert host.drafts == [True]
+    assert outcome == _releases.PageOutcome(
+        'created', 'https://example.invalid/release', draft=not published_first
+    )
+
+
 def test_complete_inactive_page_does_not_access_host(
     literal_release_context: _Context, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -347,7 +382,7 @@ def test_complete_kept_page_retains_custom_draft(release_context: _Context) -> N
     host.page = replace(_matching(_prepare(release_context)), title='Custom', draft=True)
     plan = _releases.PagePlan('keep', 'exists', tag=_TAG, existing=host.page)
     assert _releases.complete_publication_page(paths, g, p, plan) == _releases.PageOutcome(
-        'kept', host.page.url
+        'kept', host.page.url, draft=True
     )
     assert host.writes == []
 
@@ -374,90 +409,6 @@ def test_conflicting_page_appearing_before_write_refuses(release_context: _Conte
     assert f'release edit {_TAG}' in (caught.value.recovery or '')
     assert host.scans == 1
     assert host.writes == []
-
-
-@pytest.mark.parametrize('enabled', [None, False])
-def test_create_defaults_render_published_page_without_notes_file(
-    release_context: _Context, enabled: bool | None
-) -> None:
-    paths, g, p, host = release_context
-    if enabled is False:
-        p = replace(p, release_page=_config.ReleasePageSettings(enabled=False))
-    missing = _releases.prepare_change(
-        paths, g, p, _releases.ReleaseRequest('create', _TAG, None, None)
-    )
-    assert missing.title == _TAG
-    assert missing.notes == b''
-    assert missing.changelog_missing
-    _publish_changelog(release_context)
-    present = _releases.prepare_change(
-        paths, g, p, _releases.ReleaseRequest('create', _TAG, None, None)
-    )
-    assert present.notes == (
-        b'See the [changelog](https://github.com/public-owner/public-repo/blob/'
-        b'v1.2.3/CHANGELOG.md).\n'
-    )
-    assert not present.changelog_missing
-    host.page = _host.GitHubRelease(
-        _TAG,
-        present.title,
-        present.notes.decode(),
-        'https://example.invalid/page',
-        draft=False,
-        prerelease=False,
-    )
-    assert (
-        _releases.prepare_change(
-            paths, g, p, _releases.ReleaseRequest('create', _TAG, None, None)
-        ).operation
-        == 'existing'
-    )
-    assert host.writes == []
-
-
-@pytest.mark.parametrize(
-    ('project', 'filename', 'title'),
-    [
-        ('line\nbreak', 'notes.md', 'Explicit title'),
-        ('demo', 'notes\nfile.md', 'Explicit title'),
-        ('demo', 'notes.md', 'Explicit\ttitle'),
-        ('my project', 'notes file.md', 'Explicit title'),
-    ],
-)
-def test_create_command_preserves_explicit_overrides(
-    tmp_path: Path, project: str, filename: str, title: str
-) -> None:
-    notes_file = tmp_path / filename
-    command = _releases.create_command(project, 'v1.2.3', title=title, notes_file=notes_file)
-    if project == 'my project':
-        assert shlex.split(command) == [
-            'pubanon',
-            'release',
-            'create',
-            'v1.2.3',
-            '--title',
-            title,
-            '--notes-file',
-            str(notes_file),
-            '--project=my project',
-        ]
-        return
-    assert command.startswith('Choose project ')
-    assert 'release create v1.2.3 --title ' + title.replace('\t', r'\x09') in command
-    displayed_path = str(notes_file).replace('\\', '\\\\').replace('\n', r'\x0a')
-    assert '--notes-file ' + displayed_path in command
-    assert '\n' not in command
-    assert '\t' not in command
-
-
-@pytest.mark.parametrize(
-    'args', [('release', 'show', 'v1.2.3'), ('repo', 'restore', '--to', 'local')]
-)
-def test_command_fallback_preserves_required_arguments(args: tuple[str, ...]) -> None:
-    command = _releases._command('line\nbreak', *args)
-    assert ' '.join(args) in command
-    assert 'line\\x0abreak' in command
-    assert '\n' not in command
 
 
 def test_create_preserves_checked_bytes_and_verifies_result(release_context: _Context) -> None:
@@ -505,6 +456,35 @@ def test_create_refuses_existing_page_and_edit_requires_page(release_context: _C
     assert 'release show' in (caught.value.recovery or '')
     assert 'release edit' in (caught.value.recovery or '')
     assert host.writes == []
+
+
+def test_draft_creation_requests_a_draft_and_reads_it_back(release_context: _Context) -> None:
+    context = _drafting(release_context)
+    paths, g, p, host = context
+    change = _prepare(context)
+    assert change.draft
+
+    result = _releases.apply_change(paths, g, p, change)
+
+    assert host.drafts == [True]
+    assert result.written
+    assert result.page.draft
+
+
+def test_draft_ignores_higher_published_page_when_choosing_create_mode(
+    release_context: _Context,
+) -> None:
+    context = _drafting(release_context)
+    paths, g, p, host = context
+    host.tag = 'v0.9.0'
+    _git(_store.candidate_store_path(paths, p.name), 'update-ref', 'refs/tags/v0.9.0', host.commit)
+    host.pages = (_host.GitHubRelease('v0.10.0', 'Title', '', '', draft=False, prerelease=False),)
+    change = _prepare(context, tag=host.tag)
+
+    result = _releases.apply_change(paths, g, p, change)
+
+    assert result.page.draft
+    assert host.drafts == [True]
 
 
 def test_edit_rechecks_previous_page(release_context: _Context) -> None:
@@ -600,6 +580,195 @@ def test_page_lookup_failure_has_skip_recovery(
     assert 'rerun with --no-release-page' in recovery
     assert 'pubanon release create v1.2.3 --project=example' in recovery
     assert 'pubanon publish' not in recovery
+
+
+@pytest.mark.parametrize(
+    'case',
+    [
+        (True, True, 'created', 'Release page: https://example.invalid/page (draft)', True),
+        (True, False, 'created', 'Release page: https://example.invalid/page', False),
+        (
+            True,
+            True,
+            'existing',
+            'Release page already exists: https://example.invalid/page (draft)',
+            True,
+        ),
+        (False, True, 'kept', 'Release page: https://example.invalid/page (draft)', False),
+        (False, False, 'kept', 'Release page: https://example.invalid/page', False),
+    ],
+)
+def test_page_outcome_marks_drafts_and_guides_only_draft_projects(
+    literal_release_context: _Context,
+    capsys: pytest.CaptureFixture[str],
+    case: tuple[bool, bool, Literal['created', 'existing', 'kept'], str, bool],
+) -> None:
+    drafts, draft, kind, line, guided = case
+    _paths, _g, p, _host_facts = literal_release_context
+    p = replace(p, release_page=_config.ReleasePageSettings(enabled=True, draft=drafts))
+
+    _releases.show_page_outcome(
+        p, _releases.PageOutcome(kind, 'https://example.invalid/page', draft=draft)
+    )
+
+    out = capsys.readouterr().out
+    guidance = (
+        'It appears when your release workflow publishes it after the package upload. If it is '
+        'still a draft after that workflow finishes, rerun the workflow or publish the page on '
+        'GitHub.'
+    )
+    assert f'{line}\n' in out
+    assert (guidance in out) is guided
+
+
+@pytest.mark.parametrize('enabled', [None, False])
+def test_create_defaults_render_published_page_without_notes_file(
+    release_context: _Context, enabled: bool | None
+) -> None:
+    paths, g, p, host = release_context
+    if enabled is False:
+        p = replace(p, release_page=_config.ReleasePageSettings(enabled=False))
+    missing = _releases.prepare_change(
+        paths, g, p, _releases.ReleaseRequest('create', _TAG, None, None)
+    )
+    assert missing.title == _TAG
+    assert missing.notes == b''
+    assert missing.changelog_missing
+    _publish_changelog(release_context)
+    present = _releases.prepare_change(
+        paths, g, p, _releases.ReleaseRequest('create', _TAG, None, None)
+    )
+    assert present.notes == (
+        b'See the [changelog](https://github.com/public-owner/public-repo/blob/'
+        b'v1.2.3/CHANGELOG.md).\n'
+    )
+    assert not present.changelog_missing
+    host.page = _host.GitHubRelease(
+        _TAG,
+        present.title,
+        present.notes.decode(),
+        'https://example.invalid/page',
+        draft=False,
+        prerelease=False,
+    )
+    assert (
+        _releases.prepare_change(
+            paths, g, p, _releases.ReleaseRequest('create', _TAG, None, None)
+        ).operation
+        == 'existing'
+    )
+    assert host.writes == []
+
+
+@pytest.mark.parametrize(
+    ('project', 'filename', 'title'),
+    [
+        ('line\nbreak', 'notes.md', 'Explicit title'),
+        ('demo', 'notes\nfile.md', 'Explicit title'),
+        ('demo', 'notes.md', 'Explicit\ttitle'),
+        ('my project', 'notes file.md', 'Explicit title'),
+    ],
+)
+def test_create_command_preserves_explicit_overrides(
+    tmp_path: Path, project: str, filename: str, title: str
+) -> None:
+    notes_file = tmp_path / filename
+    command = _releases.create_command(project, 'v1.2.3', title=title, notes_file=notes_file)
+    if project == 'my project':
+        assert shlex.split(command) == [
+            'pubanon',
+            'release',
+            'create',
+            'v1.2.3',
+            '--title',
+            title,
+            '--notes-file',
+            str(notes_file),
+            '--project=my project',
+        ]
+        return
+    assert command.startswith('Choose project ')
+    assert 'release create v1.2.3 --title ' + title.replace('\t', r'\x09') in command
+    displayed_path = str(notes_file).replace('\\', '\\\\').replace('\n', r'\x0a')
+    assert '--notes-file ' + displayed_path in command
+    assert '\n' not in command
+    assert '\t' not in command
+
+
+@pytest.mark.parametrize(
+    'args', [('release', 'show', 'v1.2.3'), ('repo', 'restore', '--to', 'local')]
+)
+def test_command_fallback_preserves_required_arguments(args: tuple[str, ...]) -> None:
+    command = _releases._command('line\nbreak', *args)
+    assert ' '.join(args) in command
+    assert 'line\\x0abreak' in command
+    assert '\n' not in command
+
+
+@pytest.mark.parametrize(
+    ('drafts', 'existing_draft', 'same'),
+    [(True, True, True), (True, False, True), (False, True, False), (False, False, True)],
+)
+def test_existing_page_matches_by_content_and_the_draft_setting(
+    page_context: tuple[_PageContext, _Host],
+    *,
+    drafts: bool,
+    existing_draft: bool,
+    same: bool,
+) -> None:
+    ctx, host = page_context
+    project = replace(
+        ctx._project, release_page=_config.ReleasePageSettings(enabled=True, draft=drafts)
+    )
+    ctx = replace(ctx, _project=project, _release_page=_releases.PageRequest(notes=b'Notes\n'))
+    paths, g = ctx._paths, ctx._global_config
+    request = _releases.ReleaseRequest('create', _TAG, None, b'Notes\n')
+    change = _releases.prepare_change(paths, g, project, request)
+    host.page = replace(_matching(change), draft=existing_draft)
+
+    if same:
+        assert _page_plan(ctx).reason == 'matches'
+        assert _releases.prepare_change(paths, g, project, request).operation == 'existing'
+        assert not _releases.apply_change(paths, g, project, change).written
+    else:
+        with pytest.raises(PubanonError, match='different content or status'):
+            _page_plan(ctx)
+        with pytest.raises(PubanonError, match='different content or status'):
+            _releases.prepare_change(paths, g, project, request)
+        with pytest.raises(PubanonError, match='different content or status'):
+            _releases.apply_change(paths, g, project, change)
+    assert host.writes == []
+
+
+def test_page_plan_keeping_a_page_lists_no_waiting_drafts(
+    page_context: tuple[_PageContext, _Host],
+) -> None:
+    ctx, host = page_context
+    host.pages = (_listed('v1.0.0', draft=True),)
+    host.page = _listed(_TAG, draft=False)
+
+    plan = _page_plan(ctx)
+
+    assert (plan.action, plan.waiting) == ('keep', ())
+
+
+def test_page_plan_lists_lower_version_drafts_oldest_first(
+    page_context: tuple[_PageContext, _Host],
+) -> None:
+    ctx, host = page_context
+    host.pages = (
+        _listed('v1.0.0', draft=True),
+        _listed('v2.0.0', draft=True),
+        _listed('v0.10.0', draft=True),
+        _listed('v1.1.0', draft=False),
+        _listed('v0.9.0', draft=True),
+        _listed('nightly', draft=True),
+    )
+
+    plan = _page_plan(ctx)
+
+    assert (plan.action, plan.waiting) == ('create', ('v0.9.0', 'v0.10.0', 'v1.0.0'))
+    assert host.scans == 1
 
 
 def test_page_preview_empty_defaults_and_supplied_file(
@@ -866,6 +1035,7 @@ def test_gates_complete_result(release_context: _Context, field_name: str) -> No
 def test_edit_preserves_omitted_field_and_status(
     release_context: _Context, title_only: bool
 ) -> None:
+    release_context = _drafting(release_context)
     paths, g, p, host = release_context
     host.page = _host.GitHubRelease(
         _TAG, 'Old title', 'Retained\r\n', 'https://example.invalid', draft=True, prerelease=True
@@ -876,6 +1046,7 @@ def test_edit_preserves_omitted_field_and_status(
         title='New title' if title_only else None,
         notes=None if title_only else b'',
     )
+    assert not change.draft
     result = _releases.apply_change(paths, g, p, change)
     assert result.written
     assert result.page.title == ('New title' if title_only else 'Old title')
@@ -1177,6 +1348,63 @@ def test_finished_publication_without_page_shows_create_command(
     assert 'not created' in out
     assert 'Add one later with: ' in out
     assert 'release create v1.0.0 --project=example' in out
+
+
+@pytest.mark.parametrize('draft', [False, True])
+def test_page_preview_names_a_draft_creation(
+    draft: bool, capsys: pytest.CaptureFixture[str]
+) -> None:
+    destination = _host.Destination('github', 'owner', 'repo', 'url', 'account', 'public')
+    change = _releases.ReleaseChange(
+        'create', destination, _TAG, 'a' * 40, 'Version 1.2.3', b'', None, draft=draft
+    )
+
+    _releases.show_page_plan(_releases.PagePlan('create', 'new', tag=_TAG, change=change))
+
+    out = capsys.readouterr().out
+    assert ('create draft "Version 1.2.3"' if draft else 'create "Version 1.2.3"') in out
+    assert ('create draft' in out) is draft
+
+
+@pytest.mark.parametrize(
+    ('waiting', 'expected'),
+    [
+        (
+            ('v0.6.0',),
+            (
+                'warning: The release page for v0.6.0 is still a draft. '
+                'Rerun its release workflow, or publish the page on GitHub.'
+            ),
+        ),
+        (
+            ('v0.6.0', 'v0.6.1'),
+            (
+                'warning: The release pages for v0.6.0 and v0.6.1 are still drafts. '
+                'Rerun their release workflows, or publish the pages on GitHub.'
+            ),
+        ),
+        (
+            ('v0.5.0', 'v0.6.0', 'v0.6.1'),
+            (
+                'warning: The release pages for v0.5.0, v0.6.0, and v0.6.1 are still drafts. '
+                'Rerun their release workflows, or publish the pages on GitHub.'
+            ),
+        ),
+    ],
+)
+def test_page_preview_warns_about_waiting_drafts(
+    waiting: tuple[str, ...], expected: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    destination = _host.Destination('github', 'owner', 'repo', 'url', 'account', 'public')
+    change = _releases.ReleaseChange(
+        'create', destination, 'v0.7.0', 'a' * 40, 'v0.7.0', b'', None
+    )
+
+    _releases.show_page_plan(
+        _releases.PagePlan('create', 'new', tag='v0.7.0', change=change, waiting=waiting)
+    )
+
+    assert f'{expected}\n' in capsys.readouterr().out
 
 
 @pytest.mark.parametrize('draft', [False, True])

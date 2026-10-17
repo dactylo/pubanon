@@ -54,11 +54,15 @@ def _report_resolved_page(
             output(
                 field(
                     'Release page',
-                    escape(page.url) if page else f'no page exists for {escape(tag)}',
+                    _releases.page_url_text(page.url, draft=page.draft)
+                    if page
+                    else f'no page exists for {escape(tag)}',
                 )
             )
             if page is None:
                 output(_releases.create_command(ctx.project.name, tag))
+            else:
+                _releases.show_draft_guidance(ctx.project, draft=page.draft)
 
 
 def _report_store_repair(

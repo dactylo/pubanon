@@ -1,4 +1,6 @@
+from dataclasses import replace
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -130,9 +132,9 @@ def test_create_keeps_checked_bytes_and_lock_through_confirmation(
         *,
         title: str,
         notes: bytes,
-        mark_latest: bool = True,
+        mode: _host.ReleaseCreationMode = 'latest',
     ) -> None:
-        assert mark_latest
+        assert mode == 'latest'
         seen.append(notes)
         with (
             pytest.raises(PubanonError, match='another pubanon command is running'),
@@ -188,6 +190,26 @@ def test_create_keeps_checked_bytes_and_lock_through_confirmation(
     assert commit in capsys.readouterr().out
 
 
+@pytest.mark.parametrize('draft', [False, True])
+def test_create_preview_says_whether_the_page_is_a_draft(
+    draft: bool, capsys: pytest.CaptureFixture[str]
+) -> None:
+    change = policy.ReleaseChange(
+        'create', _destination(), 'v1.2.3', 'a' * 40, 'Title', b'', None, draft=draft
+    )
+
+    _releases._preview(change)
+
+    out = capsys.readouterr().out
+    if draft:
+        assert (
+            'Confirmation creates a draft, non-prerelease release page. It stays hidden until '
+            'your release workflow, or you, publish it.'
+        ) in out
+    else:
+        assert 'Confirmation creates a published, non-prerelease release page.' in out
+
+
 def test_create_reports_matching_page_without_claiming_write(
     configured_project: tuple[_config.Paths, _config.GlobalConfig, _config.ProjectConfig],
     tmp_path: Path,
@@ -235,6 +257,65 @@ def test_create_reports_matching_page_without_claiming_write(
     output = capsys.readouterr().out
     assert 'Release page already exists: https://example.invalid/page' in output
     assert 'Release page created:' not in output
+
+
+@pytest.mark.parametrize(
+    'case',
+    [
+        (True, 'create', True, 'Release page created: https://example.invalid/page (draft)', True),
+        (True, 'create', False, 'Release page created: https://example.invalid/page', False),
+        (
+            True,
+            'existing',
+            True,
+            'Release page already exists: https://example.invalid/page (draft)',
+            True,
+        ),
+        (
+            False,
+            'existing',
+            True,
+            'Release page already exists: https://example.invalid/page (draft)',
+            False,
+        ),
+    ],
+)
+def test_create_reports_the_observed_page_status(
+    configured_project: tuple[_config.Paths, _config.GlobalConfig, _config.ProjectConfig],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    case: tuple[bool, Literal['create', 'existing'], bool, str, bool],
+) -> None:
+    drafts, operation, draft, message, guided = case
+    paths, _global, project = configured_project
+    _config.save_project(
+        paths,
+        replace(project, release_page=_config.ReleasePageSettings(enabled=True, draft=drafts)),
+    )
+    page = _page(draft=draft)
+
+    def _prepare(*_args: object) -> policy.ReleaseChange:
+        return policy.ReleaseChange(
+            operation,
+            _destination(),
+            'v1.2.3',
+            'a' * 40,
+            'Title',
+            b'old',
+            page if operation == 'existing' else None,
+            draft=drafts,
+        )
+
+    def _apply(*_args: object) -> policy.ReleaseResult:
+        return policy.ReleaseResult(page, written=True)
+
+    monkeypatch.setattr(policy, 'prepare_change', _prepare)
+    monkeypatch.setattr(policy, 'apply_change', _apply)
+    assert _cli.main(['release', 'create', 'v1.2.3', '--project', project.name, '--yes']) == 0
+
+    out = capsys.readouterr().out
+    assert f'{message}\n' in out
+    assert ('rerun the workflow or publish the page on GitHub' in out) is guided
 
 
 def test_create_without_options_previews_defaults_and_missing_changelog_hint(

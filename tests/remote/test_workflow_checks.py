@@ -26,6 +26,7 @@ jobs:
         os: ${{ fromJSON(vars.OSES) }}
     runs-on: linux
 """
+_EXAMPLES = Path(__file__).parents[2] / 'docs/examples'
 _JOB = 'jobs:\n  test:\n    runs-on: linux\n'
 _PLAIN_LINT = 'on: push\njobs:\n  lint:\n    runs-on: linux\n'
 _PLAIN_TEST = 'on: push\njobs:\n  test:\n    runs-on: linux\n'
@@ -502,6 +503,25 @@ def test_only_requestable_checks_requires_evidence(
     snapshot = tuple(_workflow(data, f'.github/workflows/{name}') for name, data in files.items())
 
     assert _workflow_checks.only_requestable_checks(snapshot, checks) is expected
+
+
+def test_starter_release_workflows_do_not_run_on_branch_pushes() -> None:
+    snapshot = tuple(
+        Entry(f'.github/workflows/{name}', 0o100644, 'blob', (_EXAMPLES / name).read_bytes())
+        for name in ('release-start.yml', 'release.yml')
+    )
+    discovered = _workflow_checks.discover(snapshot)
+
+    assert discovered.names == (
+        'Start release',
+        'Verify release',
+        'Build distributions',
+        'Publish to PyPI',
+        'Publish release page',
+    )
+    assert discovered.notes == ()
+    # init flags these checks instead of selecting them as required by default.
+    assert {caution.name for caution in discovered.cautions} == set(discovered.names)
 
 
 def test_starter_workflow_is_connectable_and_lists_every_job() -> None:

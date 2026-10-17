@@ -115,7 +115,7 @@ def test_guided_policy_exposes_nested_internal_groups(
             'Publication route (staged/direct) [staged]: ',
             'Create local tags marking the source of each publication? [Y/n] ',
             'Required CI checks (comma separated, blank for none): ',
-            'Create a release page for each published version? [y/N] ',
+            'Create a release page for each published version? [y]es / [d]raft / [n]o [no]: ',
             'Repository description (blank for none): ',
             'Enable issues? [Y/n] ',
             'Enable wiki? [y/N] ',

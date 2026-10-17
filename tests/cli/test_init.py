@@ -42,7 +42,7 @@ _EDIT = (
 _KEEP_CHECKS = (
     'Require checks: [a]ll listed / [s]elect / [n]one / [m]anual / [k]eep current [keep current]: '
 )
-_PAGES = 'Create a release page for each published version? [y/N] '
+_PAGES = 'Create a release page for each published version? [y]es / [d]raft / [n]o [no]: '
 _SAVE = 'Save this configuration? [s]ave / [e]dit / [c]ancel: '
 
 
@@ -101,7 +101,7 @@ def _default_route(answer: Callable[[str], str]) -> Callable[[str], str]:
             return ''
         if prompt in {'Enable pull requests? [y/N] ', 'Enable discussions? [y/N] '}:
             return ''
-        if prompt == 'Create a release page for each published version? [y/N] ':
+        if prompt == _PAGES:
             return ''
         return answer(prompt)
 
@@ -136,6 +136,22 @@ def _unselected_project(
     monkeypatch.chdir(source)
     monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
     return paths, paths.config_dir / 'projects' / 'demo.toml'
+
+
+def test_existing_project_report_shows_release_page_drafts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = tmp_path / 'source'
+    source.mkdir()
+    paths, _global_config, project = configure(tmp_path, monkeypatch, source)
+    assert project is not None
+    project = replace(project, release_page=_config.ReleasePageSettings(enabled=True, draft=True))
+
+    _init._report_existing_project_init(
+        paths, project, relocated=False, project_changed=True, self_publication_enabled=False
+    )
+
+    assert re.search(r'Release pages:\s+yes, as drafts\n', capsys.readouterr().out)
 
 
 def test_init_back_corrects_flagged_and_group_choices(
@@ -191,7 +207,7 @@ def test_init_collects_complete_repository_settings_for_new_project(
         'Repository visibility (private/public) [private]: ': '',
         'Publication route (staged/direct) [staged]: ': '',
         'Required CI checks (comma separated, blank for none): ': '',
-        'Create a release page for each published version? [y/N] ': 'y',
+        _PAGES: 'y',
         'Repository description (blank for none): ': 'Example project',
         'Enable issues? [Y/n] ': '',
         'Enable wiki? [y/N] ': '',
@@ -243,7 +259,7 @@ def test_init_collects_complete_repository_settings_for_new_project(
         'Enable wiki? [y/N] ',
         'Publication route (staged/direct) [staged]: ',
         'Required CI checks (comma separated, blank for none): ',
-        'Create a release page for each published version? [y/N] ',
+        _PAGES,
         *(
             ['Create local tags marking the source of each publication? [Y/n] ']
             if tag_answer is not None
@@ -917,7 +933,7 @@ def test_init_final_review_can_change_release_pages(
         if prompt.startswith('Edit: '):
             assert 're[l]ease pages' in prompt
             return 'l'
-        if prompt == 'Create a release page for each published version? [y/N] ':
+        if prompt == _PAGES:
             return next(page_answers)
         return ''
 
@@ -2063,6 +2079,94 @@ def test_init_same_source_uses_idempotent_registry_update(
     assert escape((paths.config_dir / 'projects' / 'demo.toml').as_posix()) not in output
 
 
+@pytest.mark.parametrize(
+    'case',
+    [
+        ('y', _config.ReleasePageSettings(enabled=True), 'yes'),
+        ('d', _config.ReleasePageSettings(enabled=True, draft=True), 'yes, as drafts'),
+        ('n', _config.ReleasePageSettings(enabled=False), 'no'),
+    ],
+)
+def test_init_saves_each_release_page_answer(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    case: tuple[str, _config.ReleasePageSettings, str],
+) -> None:
+    key, saved, summary = case
+    source = make_repo(files={'README.md': 'public\n'})
+    paths, _global_config, _project = configure(tmp_path, monkeypatch)
+    monkeypatch.chdir(source)
+
+    def _answer(prompt: str) -> str:
+        if prompt.startswith('Use this selection?'):
+            return 'c'
+        if prompt == _SAVE:
+            return 's'
+        if prompt == _PAGES:
+            return key
+        return ''
+
+    monkeypatch.setattr('builtins.input', _answer)
+    assert _cli.main(['init', '--project', 'demo']) == 0
+    assert _config.load_project(paths, 'demo').release_page == saved
+    assert re.search(rf'Release pages:\s+{re.escape(summary)}\n', capsys.readouterr().out)
+
+
+@pytest.mark.parametrize(
+    'case',
+    [
+        (
+            _config.ReleasePageSettings(enabled=True, title='Version {version}'),
+            'yes',
+            'd',
+            _config.ReleasePageSettings(enabled=True, title='Version {version}', draft=True),
+        ),
+        (
+            _config.ReleasePageSettings(enabled=True, title='Version {version}', draft=True),
+            'draft',
+            'y',
+            _config.ReleasePageSettings(enabled=True, title='Version {version}'),
+        ),
+        (
+            _config.ReleasePageSettings(enabled=True, title='Version {version}', draft=True),
+            'draft',
+            'n',
+            _config.ReleasePageSettings(enabled=False, title='Version {version}'),
+        ),
+        (
+            _config.ReleasePageSettings(enabled=True, title='Version {version}', draft=True),
+            'draft',
+            '',
+            _config.ReleasePageSettings(enabled=True, title='Version {version}', draft=True),
+        ),
+        # The same answer keeps the saved table unchanged, even an unused draft key.
+        (
+            _config.ReleasePageSettings(enabled=False, draft=True),
+            'no',
+            'n',
+            _config.ReleasePageSettings(enabled=False, draft=True),
+        ),
+    ],
+)
+def test_init_edit_release_pages_starts_from_the_saved_answer(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    answers: _Script,
+    case: tuple[_config.ReleasePageSettings, str, str, _config.ReleasePageSettings],
+) -> None:
+    saved, default, key, expected = case
+    ctx, snapshot, project = _edit_checks(tmp_path, make_repo, monkeypatch, {}, release_page=saved)
+    prompt = (
+        f'Create a release page for each published version? [y]es / [d]raft / [n]o [{default}]: '
+    )
+    answers([(_EDIT, 'l'), (prompt, key)])
+
+    assert _init._edit_project_section(ctx, snapshot, project).release_page == expected
+
+
 def test_init_self_publication_flag_enables_existing_project(
     tmp_path: Path,
     make_repo: Callable[..., Path],
@@ -2088,7 +2192,7 @@ def test_init_self_publication_flag_enables_existing_project(
             ('Enable wiki? [y/N] ', ''),
             ('Publication route (staged/direct) [staged]: ', ''),
             ('Required CI checks (comma separated, blank for none): ', ''),
-            ('Create a release page for each published version? [y/N] ', ''),
+            (_PAGES, ''),
             ('Create local tags marking the source of each publication? [Y/n] ', ''),
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
         ]
@@ -2130,7 +2234,7 @@ def test_init_self_publication_flag_sets_project_field(
             ('Enable wiki? [y/N] ', ''),
             ('Publication route (staged/direct) [staged]: ', ''),
             ('Required CI checks (comma separated, blank for none): ', ''),
-            ('Create a release page for each published version? [y/N] ', ''),
+            (_PAGES, ''),
             ('Create local tags marking the source of each publication? [Y/n] ', ''),
             ('Save this configuration? [s]ave / [e]dit / [c]ancel: ', 's'),
         ]
@@ -2441,16 +2545,17 @@ def test_release_pages_prompt_explains_when_pages_are_created(
     answers: _Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    answers([('Create a release page for each published version? [y/N] ', 'y')])
+    answers([(_PAGES, 'd')])
     assert (
-        _init._release_pages_prompt(route=route, ci_configured=ci_configured, default=False)
-        is True
+        _init._release_pages_prompt(route=route, ci_configured=ci_configured, default='no')
+        == 'draft'
     )
     out = capsys.readouterr().out
     assert 'announce published versions' in out
     assert 'start release workflows' in out
     assert 'package uploads' in out
     assert timing in out
+    assert 'Answer draft if your release workflow publishes the page' in out
     assert ('pubanon release create' in out) is (timing == 'before CI runs')
 
 
@@ -2615,7 +2720,7 @@ def test_new_project_uses_global_route_or_explicit_override(
         'GitHub repository [demo]: ': '',
         'Repository visibility (private/public) [private]: ': '',
         'Required CI checks (comma separated, blank for none): ': '',
-        'Create a release page for each published version? [y/N] ': '',
+        _PAGES: '',
         'Create local tags marking the source of each publication? [Y/n] ': '',
         'Repository description (blank for none): ': '',
         'Enable issues? [Y/n] ': '',
@@ -2969,7 +3074,7 @@ def test_resumed_route_and_source_tags_choices_survive_global_default_change(
         'Enable wiki? [y/N] ': '',
         'Publication route (staged/direct) [staged]: ': '',
         'Required CI checks (comma separated, blank for none): ': '',
-        'Create a release page for each published version? [y/N] ': '',
+        _PAGES: '',
         'Create local tags marking the source of each publication? [Y/n] ': 'y'
         if source_tags
         else 'n',

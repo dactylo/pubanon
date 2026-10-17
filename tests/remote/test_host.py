@@ -2714,9 +2714,18 @@ def test_release_write_uses_verified_tag_and_retained_stdin(
     assert kwargs['input'] == notes
 
 
-@pytest.mark.parametrize('mark_latest', [True, False])
-def test_create_release_sets_latest_only_when_disabled(
-    mark_latest: bool, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ('mode', 'flags'),
+    [
+        ('latest', []),
+        ('not-latest', ['--latest=false']),
+        ('draft', ['--draft']),
+    ],
+)
+def test_create_release_sets_latest_only_for_published_pages(
+    mode: _host.ReleaseCreationMode,
+    flags: list[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[list[str], dict[str, object]]] = []
 
@@ -2726,7 +2735,11 @@ def test_create_release_sets_latest_only_when_disabled(
 
     monkeypatch.setattr(_host.subprocess, 'run', _run)
     _host.create_release(
-        _destination(), 'v1.0.0', title='Page', notes=b'Exact notes\n', mark_latest=mark_latest
+        _destination(),
+        'v1.0.0',
+        title='Page',
+        notes=b'Exact notes\n',
+        mode=mode,
     )
 
     assert len(calls) == 1
@@ -2742,7 +2755,7 @@ def test_create_release_sets_latest_only_when_disabled(
         '--title=Page',
         '--notes-file',
         '-',
-        *(['--latest=false'] if not mark_latest else []),
+        *flags,
     ]
     assert kwargs['input'] == b'Exact notes\n'
 

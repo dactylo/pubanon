@@ -1371,8 +1371,7 @@ def publish(ctx: PublishContext) -> None:
         ctx._paths, ctx._global_config, ctx._project, page
     )
     if outcome.url is not None:
-        label = 'Release page already exists' if outcome.kind == 'existing' else 'Release page'
-        output(field(label, escape(outcome.url)))
+        _releases.show_page_outcome(ctx._project, outcome)
     else:
         _releases.show_page_plan(page, published=True)
     output()

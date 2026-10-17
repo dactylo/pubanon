@@ -53,7 +53,12 @@ def _preview(change: _releases.ReleaseChange) -> None:
             'No CHANGELOG.md in the published snapshot; set release_page.changelog to link one.'
         )
     if change.operation == 'create':
-        output('Confirmation creates a published, non-prerelease release page.')
+        output(
+            'Confirmation creates a draft, non-prerelease release page. It stays hidden until '
+            'your release workflow, or you, publish it.'
+            if change.draft
+            else 'Confirmation creates a published, non-prerelease release page.'
+        )
     else:
         previous = change.previous
         if previous is not None:
@@ -120,14 +125,20 @@ def create_page(
         page = change.previous
         if page is None:
             raise ValueError('existing release change has no page')
-        output(f'Release page already exists: {escape(page.url)}', kind='success')
+        output(
+            f'Release page already exists: {_releases.page_url_text(page.url, draft=page.draft)}',
+            kind='success',
+        )
+        _releases.show_draft_guidance(ctx.project, draft=page.draft)
         return
     _preview(change)
     if not yes and not confirm('Create this release page?'):
         raise OperationCanceled('Canceled. Nothing was changed.')
     result = _releases.apply_change(ctx.paths, ctx.global_config, ctx.project, change)
     message = 'created' if result.written else 'already exists'
-    output(f'Release page {message}: {escape(result.page.url)}', kind='success')
+    url = _releases.page_url_text(result.page.url, draft=result.page.draft)
+    output(f'Release page {message}: {url}', kind='success')
+    _releases.show_draft_guidance(ctx.project, draft=result.page.draft)
 
 
 def read_notes_file(path: str) -> bytes:

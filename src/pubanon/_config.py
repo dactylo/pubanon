@@ -85,7 +85,7 @@ _PROJECT_OPTIONAL_KEYS = frozenset(
         'workflow',
     }
 )
-_RELEASE_PAGE_KEYS = frozenset({'changelog', 'enabled', 'notes', 'title'})
+_RELEASE_PAGE_KEYS = frozenset({'changelog', 'draft', 'enabled', 'notes', 'title'})
 _RELEASE_PAGE_NOTES_FIELDS = frozenset({'changelog_url', 'tag', 'version'})
 _RELEASE_PAGE_TITLE_FIELDS = frozenset({'tag', 'version'})
 _SETTINGS_KEYS = frozenset(
@@ -213,12 +213,14 @@ class ReleasePageSettings:
         title: One-line page title template.
         changelog: Repository-relative POSIX changelog path.
         notes: Page notes template.
+        draft: Whether pubanon creates each page as a draft; None means no.
     """
 
     enabled: bool | None = None
     title: str | None = None
     changelog: str | None = None
     notes: str | None = None
+    draft: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -603,6 +605,8 @@ def _release_page_content(page: ReleasePageSettings | None) -> str:
     content = '[release_page]\n'
     if page.enabled is not None:
         content += f'enabled = {str(page.enabled).lower()}\n'
+    if page.draft is not None:
+        content += f'draft = {str(page.draft).lower()}\n'
     for key, value in (
         ('title', page.title),
         ('changelog', page.changelog),
@@ -693,6 +697,7 @@ def _release_page_from_mapping(data: Mapping[str, object]) -> ReleasePageSetting
     if unknown:
         raise PubanonError(f'unknown release_page key: {", ".join(unknown)}')
     enabled = _require_boolean(data, 'enabled') if 'enabled' in data else None
+    draft = _require_boolean(data, 'draft') if 'draft' in data else None
     title = _require_string(data, 'title') if 'title' in data else None
     changelog = _require_string(data, 'changelog') if 'changelog' in data else None
     notes = _require_string(data, 'notes') if 'notes' in data else None
@@ -714,7 +719,9 @@ def _release_page_from_mapping(data: Mapping[str, object]) -> ReleasePageSetting
         _validate_template(
             notes, _RELEASE_PAGE_NOTES_FIELDS, 'release_page.notes', 'project configuration'
         )
-    return ReleasePageSettings(enabled=enabled, title=title, changelog=changelog, notes=notes)
+    return ReleasePageSettings(
+        enabled=enabled, title=title, changelog=changelog, notes=notes, draft=draft
+    )
 
 
 def _validate_commit_message_settings(settings: object, scope: str) -> None:
@@ -978,6 +985,22 @@ def derive_paths(env: Mapping[str, str]) -> Paths:
     config_dir = config_root / 'pubanon'
     data_dir = data_root / 'pubanon'
     return Paths(config_dir, data_dir, config_dir / 'config.toml', data_dir / 'registry.json')
+
+
+def draft_release_pages(p: ProjectConfig) -> bool:
+    """Report whether pubanon creates a project's release pages as drafts.
+
+    The project's release workflow, or the user, publishes each draft. The
+    setting applies to every page pubanon creates, including one requested
+    while release pages are off.
+
+    Args:
+        p: Project configuration to inspect.
+
+    Returns:
+        True only when `release_page.draft` is explicitly true.
+    """
+    return p.release_page is not None and p.release_page.draft is True
 
 
 def fingerprint(g: GlobalConfig, p: ProjectConfig) -> str:

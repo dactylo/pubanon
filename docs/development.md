@@ -65,8 +65,12 @@ visible CPU count exceeds its CPU quota. For the same scheduling locally, run:
 make test TEST_FLAGS='-n auto --dist worksteal --durations=15'
 ```
 
-The manual [Release workflow](../.github/workflows/release.yml) publishes the package to PyPI after
-checking its version tag and a successful push CI run for the tagged commit.
+The [Start release workflow](../.github/workflows/release-start.yml) runs after each successful
+push run of CI on `main`. When that commit carries its version tag, it starts the
+[Release workflow](../.github/workflows/release.yml) on the tag, which publishes CI's distributions
+to PyPI and then the version's draft release page. To publish a tagged commit by hand, run the
+Release workflow from the Actions tab on its tag. If a release run fails, rerun that run instead of
+starting a new one.
 
 ## Dependency updates
 

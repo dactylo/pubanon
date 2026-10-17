@@ -77,6 +77,11 @@ def test_inspect_ambiguous_tags_offer_one_manual_command_per_tag(
         ),
         (
             {'README.md': 'public\n'},
+            _config.ReleasePageSettings(enabled=True, draft=True),
+            'create draft "v1.2.3" with empty notes (no CHANGELOG.md; set release_page.changelog)',
+        ),
+        (
+            {'README.md': 'public\n'},
             None,
             'not created; release pages are off for this project',
         ),

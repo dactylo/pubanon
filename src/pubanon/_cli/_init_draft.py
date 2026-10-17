@@ -40,6 +40,7 @@ _DRAFT_KEYS = frozenset(
         'publication_route',
         'projects',
         'pull_requests',
+        'release_page_drafts',
         'release_pages',
         'discussions',
         'repo',
@@ -53,6 +54,7 @@ _DRAFT_KEYS = frozenset(
         'wiki',
     }
 )
+_OPTIONAL_DRAFT_KEYS = frozenset({'release_page_drafts'})
 _PAIR_LENGTH = 2
 _PHASES = frozenset({'flagged', 'groups', 'preview'})
 _STEPS = frozenset(_DEFAULT_PENDING)
@@ -90,6 +92,7 @@ class Draft:
         pull_requests: Selected pull requests setting, when answered.
         discussions: Selected discussions setting, when answered.
         release_pages: Whether tagged publications create release pages.
+        release_page_drafts: Whether those pages are created as drafts.
     """
 
     source: Path
@@ -113,6 +116,7 @@ class Draft:
     pull_requests: bool | None = None
     discussions: bool | None = None
     release_pages: bool = False
+    release_page_drafts: bool = False
 
 
 class InvalidDraftError(PubanonError):
@@ -178,6 +182,7 @@ def _payload(draft: Draft) -> dict[str, object]:
         'self_publication': draft.self_publication,
         'source_tags': draft.source_tags,
         'release_pages': draft.release_pages,
+        'release_page_drafts': draft.release_page_drafts,
         'pending': list(draft.pending),
         'phase': draft.phase,
         'reviewing': draft.reviewing,
@@ -233,7 +238,7 @@ def _draft(data: object) -> Draft:
         raise InvalidDraftError('invalid init draft')
     if values['version'] != _VERSION:
         raise InvalidDraftError('invalid init draft version')
-    if values.keys() != _DRAFT_KEYS:
+    if not _DRAFT_KEYS - _OPTIONAL_DRAFT_KEYS <= values.keys() <= _DRAFT_KEYS:
         raise InvalidDraftError('invalid init draft')
     pending = _strings(values, 'pending')
     phase = _string(values, 'phase')
@@ -241,6 +246,10 @@ def _draft(data: object) -> Draft:
     groups = _pairs(values, 'groups')
     publication_route = _optional_string(values, 'publication_route')
     source_tags = _boolean(values, 'source_tags')
+    release_pages = _boolean(values, 'release_pages')
+    release_page_drafts = (
+        _boolean(values, 'release_page_drafts') if 'release_page_drafts' in values else False
+    )
     if (
         not pending
         or pending[-1] != 'review'
@@ -249,6 +258,7 @@ def _draft(data: object) -> Draft:
         or any(action not in _ACTIONS for _pattern, action in (*flagged, *groups))
         or (publication_route is None and 'publication_route' not in pending)
         or (publication_route is not None and publication_route not in PUBLICATION_ROUTES)
+        or (release_page_drafts and not release_pages)
     ):
         raise InvalidDraftError('invalid init draft')
     return Draft(
@@ -272,7 +282,8 @@ def _draft(data: object) -> Draft:
         projects=_optional_boolean(values, 'projects'),
         pull_requests=_optional_boolean(values, 'pull_requests'),
         discussions=_optional_boolean(values, 'discussions'),
-        release_pages=_boolean(values, 'release_pages'),
+        release_pages=release_pages,
+        release_page_drafts=release_page_drafts,
     )
 
 

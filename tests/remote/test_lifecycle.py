@@ -1896,51 +1896,6 @@ def test_reveal_interrupted_after_the_visibility_change_says_it_may_be_public(
     assert _config.load_project(paths, project.name).visibility == 'private'
 
 
-def test_reveal_leaves_sensitive_draft_release_page_private(
-    fake_gh: Path,
-    tmp_path: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    paths, global_config, project, destination, _commit = _published_fixture(tmp_path, make_repo)
-    project = replace(project, extra_terms=('later-sensitive',))
-    assert project.settings is not None
-    _config.save_project(paths, project)
-    monkeypatch.setattr(_host, '_URL_TEMPLATE', destination.url)
-    _responses(
-        fake_gh,
-        [
-            {'args': _ACCOUNT_ARGS, 'stdout': 'anonymous-account\n'},
-            _repository_response('private'),
-            _settings_response(project.settings),
-            *_disclosure_responses(),
-        ],
-    )
-    page = _host.GitHubRelease(
-        tag='v1.0.0',
-        title='later-sensitive',
-        notes='later-sensitive',
-        url='https://github.com/anonymous-account/public-repo/releases/tag/v1.0.0',
-        draft=True,
-        prerelease=False,
-    )
-
-    def _all_releases(_destination: _host.Destination) -> tuple[_host.GitHubRelease, ...]:
-        return (page,)
-
-    def _answer(_prompt: str) -> str:
-        return 'n'
-
-    monkeypatch.setattr(_host, 'all_releases', _all_releases)
-    monkeypatch.setattr('builtins.input', _answer)
-
-    with pytest.raises(OperationCanceled, match='Canceled'):
-        _lifecycle.reveal(paths, global_config, project)
-
-    assert _SET_VISIBILITY_ARGS not in gh_calls(tmp_path)
-    assert _config.load_project(paths, project.name).visibility == 'private'
-
-
 def test_reveal_package_timeout_refuses_without_visibility_mutation(
     fake_gh: Path,
     tmp_path: Path,
@@ -2383,6 +2338,47 @@ def test_reveal_read_failure_right_after_the_flip_says_github_may_still_be_apply
     assert 'wait a minute' in error.value.recovery
     assert 'pubanon repo reveal' in error.value.recovery
     assert len(clock.sleeps) == 36
+    assert _config.load_project(paths, project.name).visibility == 'private'
+
+
+def test_reveal_refuses_a_sensitive_draft_release_page(
+    fake_gh: Path,
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, global_config, project, destination, _commit = _published_fixture(tmp_path, make_repo)
+    project = replace(project, extra_terms=('later-sensitive',))
+    assert project.settings is not None
+    _config.save_project(paths, project)
+    monkeypatch.setattr(_host, '_URL_TEMPLATE', destination.url)
+    _responses(
+        fake_gh,
+        [
+            {'args': _ACCOUNT_ARGS, 'stdout': 'anonymous-account\n'},
+            _repository_response('private'),
+            _settings_response(project.settings),
+        ],
+    )
+    page = _host.GitHubRelease(
+        tag='v1.0.0',
+        title='v1.0.0',
+        notes='Thanks to later-sensitive.\n',
+        url='https://github.com/anonymous-account/public-repo/releases/tag/untagged-1',
+        draft=True,
+        prerelease=False,
+    )
+
+    def _all_releases(_destination: _host.Destination) -> tuple[_host.GitHubRelease, ...]:
+        return (page,)
+
+    monkeypatch.setattr(_host, 'all_releases', _all_releases)
+
+    with pytest.raises(PubanonError, match='release pages are blocked') as error:
+        _lifecycle.reveal(paths, global_config, project)
+
+    assert 'v1.0.0 (draft): notes line 1:' in (error.value.fact or '')
+    assert _SET_VISIBILITY_ARGS not in gh_calls(tmp_path)
     assert _config.load_project(paths, project.name).visibility == 'private'
 
 

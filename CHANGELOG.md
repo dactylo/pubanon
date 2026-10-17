@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.0 (2026-10-16)
+
+### Added
+
+- Release pages can start as drafts that your release workflow publishes after it uploads the
+  package, so the page and the package appear together. Answer `draft` when `init` asks about
+  release pages, or set `draft = true` under `[release_page]`.
+- Starter workflows `release-start.yml` and `release.yml` in `docs/examples/` upload a Python
+  package to PyPI after CI passes on its tagged commit, then publish the version's draft page. See
+  "Publish pages after the package upload" in the guide.
+
+### Changed
+
+- `repo reveal` also checks draft release pages for sensitive terms, because a release workflow can
+  publish them later.
+
 ## 0.5.0 (2026-10-13)
 
 ### Breaking changes

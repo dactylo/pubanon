@@ -1000,6 +1000,7 @@ def test_load_project_defaults_other_optional_fields(tmp_path: Path) -> None:
     ('line', 'expected'),
     [
         ('enabled = false', {'enabled': False}),
+        ('draft = true', {'draft': True}),
         ('title = "Version {version}"', {'title': 'Version {version}'}),
         ('changelog = "docs/CHANGES.md"', {'changelog': 'docs/CHANGES.md'}),
         ('notes = "See {changelog_url}"', {'notes': 'See {changelog_url}'}),
@@ -1160,6 +1161,15 @@ def test_load_project_refuses_missing_settings_table(tmp_path: Path) -> None:
 
     with pytest.raises(PubanonError, match='missing project configuration key: settings'):
         _config.load_project(paths, 'demo')
+
+
+def test_load_project_refuses_non_boolean_draft(tmp_path: Path) -> None:
+    paths = _write_project_config(tmp_path)
+    project_file = paths.config_dir / 'projects' / 'proj.toml'
+    project_file.write_text(project_file.read_text() + '[release_page]\ndraft = "true"\n')
+
+    with pytest.raises(PubanonError, match='draft must be a boolean'):
+        _config.load_project(paths, 'proj')
 
 
 def test_load_project_refuses_relative_source_path(tmp_path: Path) -> None:
@@ -2768,7 +2778,11 @@ def test_save_project_orders_release_page_after_package_before_workflow(tmp_path
         _project_config(tmp_path),
         package=_config.PackageObservation('pypi', 'example', ('test',)),
         release_page=_config.ReleasePageSettings(
-            enabled=False, title='{tag}', changelog='docs/CHANGES.md', notes='Notes'
+            enabled=False,
+            title='{tag}',
+            changelog='docs/CHANGES.md',
+            notes='Notes',
+            draft=True,
         ),
         workflows={'default': ('prepare',)},
     )
@@ -2779,7 +2793,8 @@ def test_save_project_orders_release_page_after_package_before_workflow(tmp_path
     assert saved.index('[package]') < saved.index('[release_page]') < saved.index('[workflow.')
     page = saved.split('[release_page]\n', 1)[1].split('[workflow.', 1)[0]
     assert page == (
-        'enabled = false\ntitle = "{tag}"\nchangelog = "docs/CHANGES.md"\nnotes = "Notes"\n'
+        'enabled = false\ndraft = true\ntitle = "{tag}"\nchangelog = "docs/CHANGES.md"\n'
+        'notes = "Notes"\n'
     )
 
 
@@ -2897,6 +2912,24 @@ def test_save_project_refuses_unsafe_host_segments(
         _config.save_project(paths, project)
 
     assert not (paths.config_dir / 'projects' / 'demo.toml').exists()
+
+
+@pytest.mark.parametrize(
+    ('page', 'expected'),
+    [
+        (None, False),
+        (_config.ReleasePageSettings(enabled=True), False),
+        (_config.ReleasePageSettings(draft=False), False),
+        # A draft also applies to a page requested with --release-page.
+        (_config.ReleasePageSettings(enabled=False, draft=True), True),
+        (_config.ReleasePageSettings(enabled=True, draft=True), True),
+    ],
+)
+def test_draft_release_pages_requires_an_explicit_true(
+    tmp_path: Path, page: _config.ReleasePageSettings | None, *, expected: bool
+) -> None:
+    project = replace(_project_config(tmp_path), release_page=page)
+    assert _config.draft_release_pages(project) is expected
 
 
 @pytest.mark.parametrize(
@@ -3043,6 +3076,8 @@ def test_save_project_round_trips_non_bmp_and_del(tmp_path: Path) -> None:
         None,
         _config.ReleasePageSettings(),
         _config.ReleasePageSettings(enabled=False),
+        _config.ReleasePageSettings(draft=False),
+        _config.ReleasePageSettings(enabled=True, draft=True),
         _config.ReleasePageSettings(title='Version {version}'),
         _config.ReleasePageSettings(changelog='docs/CHANGES.md'),
         _config.ReleasePageSettings(notes='See {changelog_url}'),

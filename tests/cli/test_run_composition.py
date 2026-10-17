@@ -606,6 +606,30 @@ def test_run_reads_notes_once_before_lock_and_keeps_exact_bytes(
     assert host.writes == [('v1.2.3', 'v1.2.3', notes)]
 
 
+def test_run_resume_creates_a_missing_draft_page_with_guidance(
+    workflow_page: tuple[_config.Paths, _config.ProjectConfig, _ReleaseHost],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A rerun can create the draft after the release workflow finished (spec section 5.4).
+    paths, project, host = workflow_page
+    assert project.release_page is not None
+    save_workflows(
+        paths,
+        replace(project, release_page=replace(project.release_page, draft=True)),
+        ship=('publish',),
+    )
+
+    assert (
+        _cli.main(['run', 'ship', '--project', project.name, '--version', '1.2.3', '--yes']) == 0
+    )
+
+    assert host.drafts == [True]
+    output = capsys.readouterr().out
+    assert 'create draft release page v1.2.3 if none exists' in output
+    assert 'Release page created: https://example.invalid/release (draft)' in output
+    assert 'rerun the workflow or publish the page on GitHub' in output
+
+
 def test_run_resume_existing_page_ignores_current_defaults(
     workflow_page: tuple[_config.Paths, _config.ProjectConfig, _ReleaseHost],
     monkeypatch: pytest.MonkeyPatch,
@@ -674,7 +698,7 @@ def test_run_resume_previews_and_creates_missing_page_under_lock(
         *,
         title: str,
         notes: bytes,
-        mark_latest: bool = True,
+        mode: _host.ReleaseCreationMode = 'latest',
     ) -> None:
         with (
             pytest.raises(PubanonError, match='another pubanon command is running'),
@@ -682,7 +706,7 @@ def test_run_resume_previews_and_creates_missing_page_under_lock(
         ):
             pass
         events.append('create')
-        host._create(dest, tag, title=title, notes=notes, mark_latest=mark_latest)
+        host._create(dest, tag, title=title, notes=notes, mode=mode)
 
     def _watch_ci(*_args: object, **_kwargs: object) -> None:
         assert host.page is not None

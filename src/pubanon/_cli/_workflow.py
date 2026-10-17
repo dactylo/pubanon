@@ -280,7 +280,8 @@ def _resume_run_page(args: argparse.Namespace, plan: _RunPlan) -> None:
 def _run_mutations(plan: _RunPlan) -> list[str]:
     """Return every external mutation in the remaining declared stages."""
     mutations: list[str] = []
-    page_change = f'create release page {plan._intended} if none exists'
+    draft = 'draft ' if _config.draft_release_pages(plan._ctx.project) else ''
+    page_change = f'create {draft}release page {plan._intended} if none exists'
     if plan._published_ctx is not None and _run_wants_page(plan):
         mutations.append(page_change)
     for stage in plan._remaining_stages:

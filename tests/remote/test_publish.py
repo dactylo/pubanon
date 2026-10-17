@@ -535,6 +535,8 @@ def page_context(
     host = _ReleaseHost(_publish._destination_from_record(ctx._record), ctx._record.commit)
     monkeypatch.setattr(_host, 'all_releases', host._all)
     monkeypatch.setattr(_host, 'create_release', host._create)
+    monkeypatch.setattr(_releases, '_monotonic', host.clock._monotonic)
+    monkeypatch.setattr(_releases, '_sleep', host.clock._sleep)
     return ctx, host
 
 
@@ -5903,10 +5905,10 @@ def test_page_completion_follows_finalized_publication(
         *,
         title: str,
         notes: bytes,
-        mark_latest: bool = True,
+        mode: _host.ReleaseCreationMode = 'latest',
     ) -> None:
         assert pushed
-        host._create(destination, tag, title=title, notes=notes, mark_latest=mark_latest)
+        host._create(destination, tag, title=title, notes=notes, mode=mode)
 
     monkeypatch.setattr(_publish, '_push_candidate', _push)
     monkeypatch.setattr(_host, 'create_release', _create)
