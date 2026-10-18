@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.0 (2026-10-18)
+
+### Added
+
+- `release edit TAG --refresh-notes` replaces a page's notes with the ones pubanon would create
+  now, from the changelog at that tag. Use it to add changelog sections to pages that already
+  exist.
+- Notes templates can use `{changelog_section}` to place the version's section. A template that
+  uses it refuses the page when the section is missing, which stops `publish` before anything is
+  pushed.
+- Set `changelog_heading` under `[release_page]` when your changelog headings put other text before
+  the version, such as `changelog_heading = "## Version {version}"`.
+- `init` reports which versions it recognizes in your changelog and asks whether to copy their
+  sections into release notes.
+
+### Changed
+
+- By default, release page notes contain the version's section of `CHANGELOG.md`, followed by a
+  link to the whole file. When pubanon finds no section, the notes only link to the file and the
+  preview says why. Set `changelog_section = false` under `[release_page]` to keep link-only notes.
+
 ## 0.6.0 (2026-10-16)
 
 ### Added

@@ -4,6 +4,8 @@ name: Release
 # draft release page. release-start.yml runs it on the version tag after CI
 # passes on main; to publish a tagged commit by hand, run it from the Actions
 # tab on its tag. If a run fails, rerun that run instead of starting a new one.
+# If the fault is in this file, every rerun fails the same way; see "Publish
+# pages after the package upload" in docs/guide.md.
 # Configure the PyPI Trusted Publisher with release.yml and environment pypi.
 # docs/examples/release.yml is the starter version of this workflow; keep the
 # verify and page steps identical in both files.
@@ -33,13 +35,13 @@ jobs:
       tag: ${{ steps.verify.outputs.tag }}
     steps:
       - name: Check out release commit
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
       - name: Verify version tag and successful CI
@@ -126,7 +128,7 @@ jobs:
       contents: write
     steps:
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
       - name: Publish the draft release page

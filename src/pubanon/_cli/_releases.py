@@ -17,9 +17,9 @@ if TYPE_CHECKING:
     import argparse
 
 
-def _print_notes(notes: str) -> None:
+def _print_notes(notes: str, *, label: str = 'Notes', source: str = '') -> None:
     """Print every notes line while visibly escaping control characters."""
-    print(terminal_field('Notes', ''))
+    print(terminal_field(label, source))
     for line in notes.split('\n'):
         print(escape(line))
 
@@ -47,8 +47,14 @@ def _preview(change: _releases.ReleaseChange) -> None:
             ('Title', escape(change.title)),
         ]
     )
-    _print_notes(change.notes.decode('utf-8'))
-    if change.changelog_missing:
+    source = _releases.notes_source(change.origin, change.notes_file)
+    if change.operation == 'edit' and change.origin is not None and change.previous is not None:
+        _print_notes(change.previous.notes, label='Current notes')
+        _print_notes(change.notes.decode('utf-8'), label='New notes', source=source)
+    else:
+        _print_notes(change.notes.decode('utf-8'), source=source)
+    _releases.show_notes_warning(change.origin)
+    if change.origin is not None and change.origin.kind == 'empty':
         output(
             'No CHANGELOG.md in the published snapshot; set release_page.changelog to link one.'
         )
@@ -177,11 +183,22 @@ def _write(args: argparse.Namespace, operation: Literal['create', 'edit']) -> No
             args.title,
             notes,
             Path(args.notes_file).absolute() if args.notes_file is not None else None,
+            refresh_notes=operation == 'edit' and args.refresh_notes,
         )
         if operation == 'create':
             create_page(ctx, request, yes=args.yes)
             return
         change = _releases.prepare_change(ctx.paths, ctx.global_config, ctx.project, request)
+        previous = change.previous
+        if (
+            request.refresh_notes
+            and previous is not None
+            and change.title == previous.title
+            and change.notes == previous.notes.encode('utf-8')
+        ):
+            _releases.show_notes_warning(change.origin)
+            output('Nothing to change: the release page already has these notes and this title.')
+            return
         _preview(change)
         if not args.yes and not confirm(f'{operation.capitalize()} this release page?'):
             raise OperationCanceled('Canceled. Nothing was changed.')

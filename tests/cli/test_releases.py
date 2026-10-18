@@ -1,3 +1,4 @@
+import re
 from dataclasses import replace
 from pathlib import Path
 from typing import Literal
@@ -22,6 +23,19 @@ def _page(
 ) -> _host.GitHubRelease:
     return _host.GitHubRelease(
         'v1.2.3', 'Title', notes, 'https://example.invalid/page', draft, prerelease
+    )
+
+
+def _refresh_change(previous: _host.GitHubRelease, notes: bytes) -> policy.ReleaseChange:
+    return policy.ReleaseChange(
+        'edit',
+        _destination(),
+        'v1.2.3',
+        'a' * 40,
+        previous.title,
+        notes,
+        previous,
+        origin=policy.NotesOrigin('section', 'CHANGELOG.md', '1.2.3'),
     )
 
 
@@ -190,6 +204,46 @@ def test_create_keeps_checked_bytes_and_lock_through_confirmation(
     assert commit in capsys.readouterr().out
 
 
+def test_create_preview_names_the_notes_source_and_shows_hints(
+    configured_project: tuple[_config.Paths, _config.GlobalConfig, _config.ProjectConfig],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _paths, _global, project = configured_project
+    origin = policy.NotesOrigin(
+        'link',
+        'CHANGELOG.md',
+        '1.2.3',
+        warning='warning: CHANGELOG.md has no heading for 1.2.3, so the notes only link to it.',
+        hints=('line 3 mentions 1.2.3: ## Version 1.2.3',),
+    )
+
+    def _prepare(*_args: object) -> policy.ReleaseChange:
+        return policy.ReleaseChange(
+            'create',
+            _destination(),
+            'v1.2.3',
+            'a' * 40,
+            'v1.2.3',
+            b'See the [changelog](url).\n',
+            None,
+            origin=origin,
+        )
+
+    def _apply(*_args: object) -> policy.ReleaseResult:
+        return policy.ReleaseResult(_page(notes='See the [changelog](url).\n'), written=True)
+
+    monkeypatch.setattr(policy, 'prepare_change', _prepare)
+    monkeypatch.setattr(policy, 'apply_change', _apply)
+    assert _cli.main(['release', 'create', 'v1.2.3', '--project', project.name, '--yes']) == 0
+    rendered = capsys.readouterr().out
+    assert re.search(r'Notes:\s+a changelog link only\n', rendered)
+    assert (
+        'warning: CHANGELOG.md has no heading for 1.2.3, so the notes only link to it.\n'
+        '  line 3 mentions 1.2.3: ## Version 1.2.3\n'
+    ) in rendered
+
+
 @pytest.mark.parametrize('draft', [False, True])
 def test_create_preview_says_whether_the_page_is_a_draft(
     draft: bool, capsys: pytest.CaptureFixture[str]
@@ -341,7 +395,7 @@ def test_create_without_options_previews_defaults_and_missing_changelog_hint(
             request.tag,
             b'',
             None,
-            changelog_missing=True,
+            origin=policy.NotesOrigin('empty'),
         )
 
     def _apply(*_args: object) -> policy.ReleaseResult:
@@ -410,6 +464,106 @@ def test_edit_can_clear_notes_without_prompt(
         == 0
     )
     assert seen == [b'']
+
+
+def test_edit_refresh_notes_changes_nothing_but_explains_link_only_notes(
+    configured_project: tuple[_config.Paths, _config.GlobalConfig, _config.ProjectConfig],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _paths, _global, project = configured_project
+    link = 'See the [changelog](url).\n'
+    origin = policy.NotesOrigin(
+        'link',
+        'CHANGELOG.md',
+        '1.2.3',
+        warning='warning: CHANGELOG.md has no heading for 1.2.3, so the notes only link to it.',
+        hints=('line 3 mentions 1.2.3: ## Version 1.2.3',),
+    )
+
+    def _prepare(*_args: object) -> policy.ReleaseChange:
+        return replace(_refresh_change(_page(notes=link), link.encode()), origin=origin)
+
+    def _unexpected_apply(*_args: object) -> policy.ReleaseResult:
+        pytest.fail('an unchanged page was edited')
+
+    monkeypatch.setattr(policy, 'prepare_change', _prepare)
+    monkeypatch.setattr(policy, 'apply_change', _unexpected_apply)
+    assert (
+        _cli.main(['release', 'edit', 'v1.2.3', '--project', project.name, '--refresh-notes']) == 0
+    )
+    assert (
+        'warning: CHANGELOG.md has no heading for 1.2.3, so the notes only link to it.\n'
+        '  line 3 mentions 1.2.3: ## Version 1.2.3\n'
+        'Nothing to change: the release page already has these notes and this title.\n'
+    ) in capsys.readouterr().out
+
+
+def test_edit_refresh_notes_shows_current_and_new_notes(
+    configured_project: tuple[_config.Paths, _config.GlobalConfig, _config.ProjectConfig],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _paths, _global, project = configured_project
+    requests: list[policy.ReleaseRequest] = []
+
+    def _prepare(
+        _paths: _config.Paths,
+        _g: _config.GlobalConfig,
+        _p: _config.ProjectConfig,
+        request: policy.ReleaseRequest,
+    ) -> policy.ReleaseChange:
+        requests.append(request)
+        return _refresh_change(_page(notes='old'), b'- A thing.\n')
+
+    def _apply(*_args: object) -> policy.ReleaseResult:
+        return policy.ReleaseResult(_page(notes='- A thing.\n'), written=True)
+
+    monkeypatch.setattr(policy, 'prepare_change', _prepare)
+    monkeypatch.setattr(policy, 'apply_change', _apply)
+    assert (
+        _cli.main(
+            ['release', 'edit', 'v1.2.3', '--project', project.name, '--refresh-notes', '--yes']
+        )
+        == 0
+    )
+    assert requests == [
+        policy.ReleaseRequest('edit', 'v1.2.3', None, None, None, refresh_notes=True)
+    ]
+    rendered = capsys.readouterr().out
+    assert re.search(r'Current notes:\s*\nold\n', rendered)
+    assert re.search(
+        r'New notes:\s+the 1\.2\.3 section of CHANGELOG\.md and a changelog link\n- A thing\.\n',
+        rendered,
+    )
+    assert 'Release page edited:' in rendered
+
+
+def test_edit_refresh_notes_still_changes_a_requested_title(
+    configured_project: tuple[_config.Paths, _config.GlobalConfig, _config.ProjectConfig],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _paths, _global, project = configured_project
+    applied: list[str] = []
+
+    def _prepare(*_args: object) -> policy.ReleaseChange:
+        return replace(_refresh_change(_page(notes='same\n'), b'same\n'), title='New title')
+
+    def _apply(
+        _paths: _config.Paths,
+        _g: _config.GlobalConfig,
+        _p: _config.ProjectConfig,
+        change: policy.ReleaseChange,
+    ) -> policy.ReleaseResult:
+        applied.append(change.title)
+        return policy.ReleaseResult(_page(notes='same\n'), written=True)
+
+    monkeypatch.setattr(policy, 'prepare_change', _prepare)
+    monkeypatch.setattr(policy, 'apply_change', _apply)
+    argv = ['release', 'edit', 'v1.2.3', '--project', project.name]
+    argv += ['--title', 'New title', '--refresh-notes', '--yes']
+    assert _cli.main(argv) == 0
+    assert applied == ['New title']
 
 
 def test_empty_list_is_success(

@@ -41,6 +41,7 @@ _DRAFT_KEYS = frozenset(
         'projects',
         'pull_requests',
         'release_page_drafts',
+        'release_page_sections',
         'release_pages',
         'discussions',
         'repo',
@@ -54,7 +55,7 @@ _DRAFT_KEYS = frozenset(
         'wiki',
     }
 )
-_OPTIONAL_DRAFT_KEYS = frozenset({'release_page_drafts'})
+_OPTIONAL_DRAFT_KEYS = frozenset({'release_page_drafts', 'release_page_sections'})
 _PAIR_LENGTH = 2
 _PHASES = frozenset({'flagged', 'groups', 'preview'})
 _STEPS = frozenset(_DEFAULT_PENDING)
@@ -93,6 +94,8 @@ class Draft:
         discussions: Selected discussions setting, when answered.
         release_pages: Whether tagged publications create release pages.
         release_page_drafts: Whether those pages are created as drafts.
+        release_page_sections: Whether default notes include changelog
+            sections, when answered.
     """
 
     source: Path
@@ -117,6 +120,7 @@ class Draft:
     discussions: bool | None = None
     release_pages: bool = False
     release_page_drafts: bool = False
+    release_page_sections: bool | None = None
 
 
 class InvalidDraftError(PubanonError):
@@ -183,6 +187,7 @@ def _payload(draft: Draft) -> dict[str, object]:
         'source_tags': draft.source_tags,
         'release_pages': draft.release_pages,
         'release_page_drafts': draft.release_page_drafts,
+        'release_page_sections': draft.release_page_sections,
         'pending': list(draft.pending),
         'phase': draft.phase,
         'reviewing': draft.reviewing,
@@ -284,6 +289,11 @@ def _draft(data: object) -> Draft:
         discussions=_optional_boolean(values, 'discussions'),
         release_pages=release_pages,
         release_page_drafts=release_page_drafts,
+        release_page_sections=(
+            _optional_boolean(values, 'release_page_sections')
+            if 'release_page_sections' in values
+            else None
+        ),
     )
 
 

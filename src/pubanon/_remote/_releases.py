@@ -8,12 +8,14 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
-from pubanon import _config, _gate
+from pubanon import _changelog, _config, _gate
 from pubanon._errors import ObservationTimeoutError, OperationCanceled, PubanonError
 from pubanon._remote import _host
 from pubanon._snapshots import _candidate, _records, _store
 from pubanon._terminal import display_path, escape, field, output, project_fallback, shell_command
+from pubanon._toml import toml_string
 
+_CHANGELOG_FIELDS = frozenset({'changelog_section', 'changelog_url'})
 _DRAFT_GUIDANCE = (
     'It appears when your release workflow publishes it after the package upload. '
     'If it is still a draft after that workflow finishes, rerun the workflow or publish the '
@@ -36,13 +38,35 @@ class _PublishedTag:
 
 
 @dataclass(frozen=True)
+class NotesOrigin:
+    """Describe where a page's rendered notes came from, for previews.
+
+    Attributes:
+        kind: A supplied notes file, the `release_page.notes` template, a
+            changelog section followed by a link, a changelog link alone, or
+            empty notes because no changelog exists.
+        changelog: Changelog path for section and link notes.
+        version: Version whose section was looked up.
+        warning: Escaped warning shown when a section was wanted but not found;
+            empty otherwise.
+        hints: Escaped lines that follow the warning.
+    """
+
+    kind: Literal['file', 'template', 'section', 'link', 'empty']
+    changelog: str = ''
+    version: str = ''
+    warning: str = ''
+    hints: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class _PlannedPage:
     """Hold rendered page content and its source for a publication preview."""
 
     title: str
     notes: bytes
     notes_file: Path | None
-    changelog_missing: bool
+    origin: NotesOrigin
 
 
 @dataclass(frozen=True)
@@ -62,7 +86,8 @@ class ReleaseChange:
         previous: Previewed page for edit or a matching existing page;
             `None` for a new creation.
         notes_file: Supplied notes path retained for creation recovery.
-        changelog_missing: Whether default notes lack a changelog link.
+        origin: Where rendered notes came from; None when an edit supplies or
+            keeps the notes.
         title_override: Explicit supplied title retained for creation recovery.
         draft: Whether a creation requests a draft page. A matching published
             page then also counts as the same page, because the release
@@ -77,7 +102,7 @@ class ReleaseChange:
     notes: bytes
     previous: _host.GitHubRelease | None
     notes_file: Path | None = None
-    changelog_missing: bool = False
+    origin: NotesOrigin | None = None
     title_override: str | None = None
     draft: bool = False
 
@@ -171,6 +196,8 @@ class ReleaseRequest:
         notes: Supplied UTF-8 bytes, or `None` for creation defaults or to
             retain edit notes; empty bytes explicitly clear them.
         notes_file: Source path for supplied notes bytes, when applicable.
+        refresh_notes: For an edit, replace the notes with the ones page
+            creation would render now from the changelog at the tag.
     """
 
     operation: Literal['create', 'edit']
@@ -178,6 +205,7 @@ class ReleaseRequest:
     title: str | None
     notes: bytes | None
     notes_file: Path | None = None
+    refresh_notes: bool = False
 
 
 @dataclass(frozen=True)
@@ -272,6 +300,46 @@ def _conflict_error(
     )
 
 
+def _final_release_content(
+    request: ReleaseRequest,
+    planned: _PlannedPage | None,
+    previous: _host.GitHubRelease | None,
+) -> tuple[str, bytes]:
+    """Select the resulting title and notes from creation, refresh, or edits."""
+    if request.operation == 'create' and planned is not None:
+        return planned.title, planned.notes
+    if previous is None:
+        raise ValueError('edit release change has no page')
+    title = request.title if request.title is not None else previous.title
+    if planned is not None:
+        notes = planned.notes
+    elif request.notes is not None:
+        notes = request.notes
+    else:
+        notes = previous.notes.encode()
+    return title, notes
+
+
+def _line_numbers(lines: tuple[int, ...]) -> str:
+    """Name line numbers in prose, such as `lines 5 and 9`."""
+    names = [str(line) for line in lines]
+    if len(names) <= _PAIR_SIZE:
+        return 'lines ' + ' and '.join(names)
+    return 'lines ' + ', '.join(names[:-1]) + f', and {names[-1]}'
+
+
+def _missing_reason(lookup: _changelog.Lookup, changelog: str, version: str) -> str:
+    """Say, already escaped, why a changelog has no usable section for a version."""
+    path = escape(changelog)
+    if lookup.reason == 'several headings':
+        return f'{path} has several headings for {version}, on {_line_numbers(lookup.lines)}'
+    if lookup.reason == 'empty section':
+        return f'{path} has an empty section for {version}'
+    if lookup.reason == 'not UTF-8':
+        return f'{path} is not UTF-8 text'
+    return f'{path} has no heading for {version}'
+
+
 def _not_yet_visible(page: _host.GitHubRelease | None, change: ReleaseChange) -> bool:
     """Recognize only absent creations or an unchanged previous edit page."""
     return page is None if change.operation == 'create' else page == change.previous
@@ -283,6 +351,32 @@ def _page_option(request: PageRequest) -> str | None:
         return '--release-notes-file'
     if request.requested:
         return '--release-page'
+    return None
+
+
+def _read_changelog(
+    paths: _config.Paths, p: _config.ProjectConfig, commit: str, used: frozenset[str]
+) -> bytes | None:
+    """Read the required changelog or explain why a missing file prevents notes."""
+    settings = p.release_page or _config.ReleasePageSettings()
+    path = settings.changelog or 'CHANGELOG.md'
+    data = _candidate.regular_file_bytes(paths, p.name, commit, path)
+    if data is not None:
+        return data
+    if settings.changelog is not None:
+        raise PubanonError(
+            f'changelog {escape(path)} is not a file in the published snapshot',
+            fact='release_page.changelog names this file, and the notes use it.',
+            recovery='point release_page.changelog at a file in the published snapshot, '
+            'or remove the setting',
+        )
+    if settings.notes is not None:
+        needed = '{changelog_url}' if 'changelog_url' in used else '{changelog_section}'
+        raise PubanonError(
+            f'release_page.notes uses {needed}, but CHANGELOG.md is not in the published snapshot',
+            recovery="set release_page.changelog to your changelog's path, "
+            f'or remove {needed} from release_page.notes',
+        )
     return None
 
 
@@ -308,20 +402,30 @@ def _require_remote_tag(
         )
 
 
-def _show_creation(
-    change: ReleaseChange | _PlannedPage, *, draft: bool, label: str = 'Release page'
-) -> None:
-    """Show the exact creation title, source, and full escaped notes."""
-    action = 'create draft' if draft else 'create'
-    row = f'{action} "{escape(change.title)}"'
-    if change.notes_file is not None:
-        row += f' with notes from {display_path(change.notes_file)}'
-    elif change.changelog_missing:
-        row += ' with empty notes (no CHANGELOG.md; set release_page.changelog)'
-    output(field(label, row))
-    output(field('Notes', ''))
-    for line in change.notes.decode('utf-8').split('\n'):
-        output(escape(line))
+def _template_fields(template: str) -> frozenset[str]:
+    """Return the field names that a validated template uses."""
+    return frozenset(
+        name
+        for _literal, name, _spec, _conversion in string.Formatter().parse(template)
+        if name is not None
+    )
+
+
+def _validate_release_request(request: ReleaseRequest) -> None:
+    """Reject invalid tag, title, and refresh combinations before host work."""
+    if request.refresh_notes and (request.operation != 'edit' or request.notes is not None):
+        raise PubanonError('--refresh-notes works only with release edit and without notes')
+    if _candidate.version_from_tag(request.tag) is None:
+        raise PubanonError('release tag must have vX.Y.Z form')
+    if (
+        request.operation == 'edit'
+        and request.title is None
+        and request.notes is None
+        and not request.refresh_notes
+    ):
+        raise PubanonError('release edit requires a title or notes')
+    if request.title == '':
+        raise PubanonError('release title must not be empty')
 
 
 def _verify_publication(
@@ -454,6 +558,268 @@ def _waiting_warning(tags: tuple[str, ...]) -> str:
     )
 
 
+def changelog_hints(
+    near_misses: tuple[_changelog.NearMiss, ...],
+    suggestion: str | None,
+    *,
+    version: str | None = None,
+) -> tuple[str, ...]:
+    """Explain near-miss headings and suggest a heading template.
+
+    Args:
+        near_misses: Headings that mention a version without matching.
+        suggestion: Unvalidated template for the first usable near miss.
+        version: Version the headings were checked for, or None when they were
+            checked for any strict version.
+
+    Returns:
+        Escaped hint lines. The suggestion appears only when the configuration
+        validator accepts it, written as a TOML string.
+    """
+    lines = [
+        f'line {miss.line} mentions {version}: {escape(miss.text)}'
+        if version is not None
+        else f'line {miss.line}: {escape(miss.text)}'
+        for miss in near_misses
+    ]
+    if suggestion is None:
+        return tuple(lines)
+    try:
+        _config.validate_changelog_heading(suggestion)
+        setting = toml_string(suggestion)
+    except (PubanonError, ValueError):
+        return tuple(lines)
+    lines.append(
+        f'to use headings like this, add changelog_heading = {escape(setting)} to [release_page]'
+    )
+    return tuple(lines)
+
+
+def _link_origin(lookup: _changelog.Lookup | None, changelog: str, version: str) -> NotesOrigin:
+    """Describe link-only default notes and any failed section lookup."""
+    if lookup is None:
+        return NotesOrigin('link', changelog, version)
+    return NotesOrigin(
+        'link',
+        changelog,
+        version,
+        warning=f'warning: {_missing_reason(lookup, changelog, version)}, '
+        'so the notes only link to it.',
+        hints=changelog_hints(lookup.near_misses, lookup.suggestion, version=version),
+    )
+
+
+def changelog_report(changelog: str, data: bytes | None, template: str | None) -> tuple[str, ...]:
+    """Describe the versions that a source changelog's headings name, for setup.
+
+    Args:
+        changelog: Changelog path in the source.
+        data: The changelog's bytes in the source's current commit, or None
+            when there is no such regular file.
+        template: Saved `changelog_heading`, or None for the built-in rule.
+
+    Returns:
+        Escaped report lines, ending with any indented hints.
+    """
+    path = escape(changelog)
+    if data is None:
+        return (f'No {path} in your source.',)
+    recognition = _changelog.recognize(data, template)
+    if not recognition.readable:
+        return (f'{path} is not UTF-8 text.',)
+    versions = recognition.versions
+    if len(versions) == 1:
+        return (f'{path} has a section for version {versions[0]}.',)
+    if versions:
+        return (f'{path} has sections for {len(versions)} versions, newest {versions[0]}.',)
+    hints = changelog_hints(recognition.near_misses, recognition.suggestion)
+    return (
+        f'{path} has no version headings pubanon recognizes.',
+        *(f'  {hint}' for hint in hints),
+    )
+
+
+def notes_source(origin: NotesOrigin | None, notes_file: Path | None) -> str:
+    """Name where notes came from, already escaped, for a preview.
+
+    Args:
+        origin: Rendered notes origin, or None for notes an edit supplies or
+            keeps.
+        notes_file: Supplied notes path, when there is one.
+
+    Returns:
+        A phrase such as `a changelog link`, or an empty string when there is
+        nothing to say.
+    """
+    if notes_file is not None:
+        return f'notes from {display_path(notes_file)}'
+    if origin is None:
+        return ''
+    if origin.kind == 'section':
+        return f'the {origin.version} section of {escape(origin.changelog)} and a changelog link'
+    if origin.kind == 'link':
+        return 'a changelog link only' if origin.warning else 'a changelog link'
+    return {
+        'empty': 'empty notes (no CHANGELOG.md; set release_page.changelog)',
+        'file': 'supplied notes',
+        'template': 'notes from release_page.notes',
+    }[origin.kind]
+
+
+def page_status(
+    paths: _config.Paths,
+    g: _config.GlobalConfig,
+    p: _config.ProjectConfig,
+    tag: str,
+) -> _host.GitHubRelease | None:
+    """Read a page after verifying its locally published tag on the host.
+
+    Args:
+        paths: Local configuration and published history locations.
+        g: Current global identity and content rules.
+        p: Selected project's final repository configuration.
+        tag: Published version tag to look up without any write.
+
+    Returns:
+        Hosted page, or None only after a successful absent-page lookup.
+
+    Raises:
+        PubanonError: Publication verification or page lookup failed.
+        ObservationTimeoutError: A host observation timed out.
+    """
+    destination, _commit = _verify_publication(paths, g, p, tag)
+    return _host.read_release(destination, tag)
+
+
+def page_tags(record: _records.CandidateRecord) -> tuple[str, ...]:
+    """Return the explicit tag or sorted strict tags at the candidate commit.
+
+    Args:
+        record: Complete retained publication, including replacement poststate.
+
+    Returns:
+        Explicit tag alone, or all strict version tags pointing at the
+        correction commit; replayed descendant tags are excluded.
+    """
+    if record.tag_intent is not None:
+        return (record.tag_intent,)
+    return tuple(
+        sorted(
+            tag
+            for tag, commit in _records.candidate_poststate(record)[1].items()
+            if commit == record.commit and _candidate.version_from_tag(tag) is not None
+        )
+    )
+
+
+def page_url_text(url: str, *, draft: bool) -> str:
+    """Render a page URL for display, marking a page that is still a draft.
+
+    Args:
+        url: Page URL as GitHub reported it.
+        draft: Whether the observed page is a draft.
+
+    Returns:
+        The escaped URL, followed by ` (draft)` for a draft.
+    """
+    return escape(url) + (' (draft)' if draft else '')
+
+
+def release_metadata_findings(
+    rules: Mapping[_gate.RuleClass, Collection[str]],
+    *,
+    tag: str,
+    title: str,
+    notes: bytes,
+) -> list[str]:
+    """Return rendered findings for release metadata under the current rules.
+
+    Args:
+        rules: Current content rules, including derived private terms.
+        tag: Release tag to scan in full.
+        title: Release title to scan in full.
+        notes: UTF-8 release notes to scan in full.
+
+    Returns:
+        Finding lines in tag, title, then notes order; empty when clean.
+    """
+    findings: list[str] = []
+    for name, data in (
+        ('tag', tag.encode()),
+        ('title', title.encode()),
+        ('notes', notes),
+    ):
+        for hit in _gate.gate_unit(name, data, rules):
+            span = _gate.first_match(data, hit.term)
+            if span is None:
+                raise PubanonError('gate match location could not be determined')
+            start, end = span
+            location = name
+            if name == 'notes':
+                location += f' line {data[:start].count(b"\n") + 1}'
+            excerpt, _span = _gate.match_excerpt(data, start, end)
+            context = f': {escape(excerpt)}'
+            findings.append(
+                f'{location}: {hit.rule_class.name.lower()} match {escape(hit.term)}{context}'
+            )
+    return findings
+
+
+def _gate_metadata(
+    paths: _config.Paths,
+    g: _config.GlobalConfig,
+    p: _config.ProjectConfig,
+    tag: str,
+    page: _PlannedPage,
+) -> None:
+    """Refuse either rule class in the entire resulting release metadata."""
+    rules = _config.assemble_rules(g, p, _config.derived_private_terms(paths, p, os.environ))
+    findings = release_metadata_findings(rules, tag=tag, title=page.title, notes=page.notes)
+    if findings:
+        raise PubanonError('release content is blocked', fact='\n'.join(findings))
+
+
+def show_draft_guidance(p: _config.ProjectConfig, *, draft: bool) -> None:
+    """Explain how a reported draft becomes public, when the project creates drafts.
+
+    Another project's draft is not its release workflow's to publish, so
+    nothing is shown unless `release_page.draft` is true.
+
+    Args:
+        p: Project whose `release_page.draft` setting applies.
+        draft: Whether the reported page is still a draft.
+    """
+    if draft and _config.draft_release_pages(p):
+        output(_DRAFT_GUIDANCE)
+
+
+def show_notes_warning(origin: NotesOrigin | None) -> None:
+    """Print why notes only link to the changelog, followed by any hints.
+
+    Args:
+        origin: Rendered notes origin, or None when notes were not rendered.
+    """
+    if origin is None or not origin.warning:
+        return
+    output(origin.warning, kind='warning')
+    for hint in origin.hints:
+        output(f'  {hint}')
+
+
+def _show_creation(
+    change: ReleaseChange | _PlannedPage, *, draft: bool, label: str = 'Release page'
+) -> None:
+    """Show the exact creation title, source, and full escaped notes."""
+    action = 'create draft' if draft else 'create'
+    source = notes_source(change.origin, change.notes_file)
+    row = f'{action} "{escape(change.title)}"' + (f' with {source}' if source else '')
+    output(field(label, row))
+    output(field('Notes', ''))
+    for line in change.notes.decode('utf-8').split('\n'):
+        output(escape(line))
+    show_notes_warning(change.origin)
+
+
 def create_command(
     project: str, tag: str, *, title: str | None = None, notes_file: Path | None = None
 ) -> str:
@@ -476,6 +842,33 @@ def create_command(
     return _command(project, *args)
 
 
+def _inactive_page_plan(
+    p: _config.ProjectConfig, record: _records.CandidateRecord, request: PageRequest
+) -> PagePlan | None:
+    """Choose local-only outcomes before any lookup or rendering."""
+    tags = page_tags(record)
+    option = _page_option(request)
+    if not tags:
+        if option is not None:
+            raise PubanonError(f'{option} requires a tagged publication')
+        return PagePlan('none', 'untagged', project=p.name)
+    if len(tags) > 1:
+        if option is not None:
+            raise PubanonError(
+                f'{option} requires one unambiguous publication tag',
+                recovery='\n'.join(
+                    create_command(p.name, tag, notes_file=request.notes_file) for tag in tags
+                ),
+            )
+        return PagePlan('none', 'ambiguous', candidates=tags, project=p.name)
+    tag = next(iter(tags))
+    if request.skip:
+        return PagePlan('none', 'skipped', tag=tag, project=p.name)
+    if request.notes is None and not request.requested and not _config.release_pages_enabled(p):
+        return PagePlan('none', 'disabled', tag=tag, project=p.name)
+    return None
+
+
 def _render_page(
     paths: _config.Paths,
     p: _config.ProjectConfig,
@@ -492,35 +885,25 @@ def _render_page(
     title = request.title if request is not None else None
     notes = request.notes if request is not None else None
     template = settings.notes
-    needs_changelog = notes is None and (
-        template is None
-        or any(
-            field == 'changelog_url'
-            for _text, field, _spec, _conversion in string.Formatter().parse(template)
-        )
+    used = _template_fields(template) if template is not None else frozenset[str]()
+    needs_changelog = notes is None and (template is None or bool(used & _CHANGELOG_FIELDS))
+    wants_section = notes is None and (
+        'changelog_section' in used
+        if template is not None
+        else _config.changelog_sections_enabled(p)
     )
+    path = settings.changelog or 'CHANGELOG.md'
+    data: bytes | None = None
     changelog_url = ''
-    changelog_missing = False
     if needs_changelog:
-        path = settings.changelog or 'CHANGELOG.md'
-        if _candidate.regular_file_at(paths, p.name, commit, path):
+        data = _read_changelog(paths, p, commit, used)
+        if data is not None:
             changelog_url = _host.blob_url(p.owner, p.repo, tag, path)
-        elif settings.changelog is not None:
-            raise PubanonError(
-                f'changelog {escape(path)} is not a file in the published snapshot',
-                fact='release_page.changelog names this file, and the notes link to it.',
-                recovery='point release_page.changelog at a file in the published snapshot, '
-                'or remove the setting',
-            )
-        elif template is not None:
-            raise PubanonError(
-                'release_page.notes uses {changelog_url}, but CHANGELOG.md is not in the '
-                'published snapshot',
-                recovery="set release_page.changelog to your changelog's path, "
-                'or remove {changelog_url} from release_page.notes',
-            )
-        else:
-            changelog_missing = True
+    lookup = (
+        _changelog.find_section(data, version, settings.changelog_heading)
+        if wants_section and data is not None
+        else None
+    )
 
     rendered_title = (
         title
@@ -531,21 +914,44 @@ def _render_page(
         raise PubanonError('release page title must be one nonempty line')
 
     if notes is not None:
-        rendered_notes = notes
-    elif template is None:
-        rendered_notes = (
-            f'See the [changelog]({changelog_url}).\n'.encode() if changelog_url else b''
-        )
-    else:
+        rendered_notes, origin = notes, NotesOrigin('file')
+    elif template is not None:
+        if lookup is not None and lookup.section is None:
+            raise PubanonError(
+                'release_page.notes uses {changelog_section}, but '
+                + _missing_reason(lookup, path, version),
+                fact='\n'.join(
+                    changelog_hints(lookup.near_misses, lookup.suggestion, version=version)
+                )
+                or None,
+                recovery=f'add or correct the {version} section, use a notes file, '
+                'or remove {changelog_section} from release_page.notes',
+            )
         content = template.format_map(
-            {'tag': tag, 'version': version, 'changelog_url': changelog_url}
+            {
+                'tag': tag,
+                'version': version,
+                'changelog_url': changelog_url,
+                'changelog_section': (lookup.section or '') if lookup is not None else '',
+            }
         ).rstrip('\r\n')
         rendered_notes = (content + '\n').encode('utf-8') if content else b''
+        origin = NotesOrigin('template')
+    elif data is None:
+        rendered_notes, origin = b'', NotesOrigin('empty')
+    elif lookup is not None and lookup.section is not None:
+        rendered_notes = (
+            f'{lookup.section}\n\nSee the [changelog]({changelog_url}) for all versions.\n'
+        ).encode()
+        origin = NotesOrigin('section', path, version)
+    else:
+        rendered_notes = f'See the [changelog]({changelog_url}).\n'.encode()
+        origin = _link_origin(lookup, path, version)
     return _PlannedPage(
         rendered_title,
         rendered_notes,
         request.notes_file if request is not None else None,
-        changelog_missing,
+        origin,
     )
 
 
@@ -684,146 +1090,6 @@ def complete_publication_page(
         ) from exc
 
 
-def page_status(
-    paths: _config.Paths,
-    g: _config.GlobalConfig,
-    p: _config.ProjectConfig,
-    tag: str,
-) -> _host.GitHubRelease | None:
-    """Read a page after verifying its locally published tag on the host.
-
-    Args:
-        paths: Local configuration and published history locations.
-        g: Current global identity and content rules.
-        p: Selected project's final repository configuration.
-        tag: Published version tag to look up without any write.
-
-    Returns:
-        Hosted page, or None only after a successful absent-page lookup.
-
-    Raises:
-        PubanonError: Publication verification or page lookup failed.
-        ObservationTimeoutError: A host observation timed out.
-    """
-    destination, _commit = _verify_publication(paths, g, p, tag)
-    return _host.read_release(destination, tag)
-
-
-def page_tags(record: _records.CandidateRecord) -> tuple[str, ...]:
-    """Return the explicit tag or sorted strict tags at the candidate commit.
-
-    Args:
-        record: Complete retained publication, including replacement poststate.
-
-    Returns:
-        Explicit tag alone, or all strict version tags pointing at the
-        correction commit; replayed descendant tags are excluded.
-    """
-    if record.tag_intent is not None:
-        return (record.tag_intent,)
-    return tuple(
-        sorted(
-            tag
-            for tag, commit in _records.candidate_poststate(record)[1].items()
-            if commit == record.commit and _candidate.version_from_tag(tag) is not None
-        )
-    )
-
-
-def _inactive_page_plan(
-    p: _config.ProjectConfig, record: _records.CandidateRecord, request: PageRequest
-) -> PagePlan | None:
-    """Choose local-only outcomes before any lookup or rendering."""
-    tags = page_tags(record)
-    option = _page_option(request)
-    if not tags:
-        if option is not None:
-            raise PubanonError(f'{option} requires a tagged publication')
-        return PagePlan('none', 'untagged', project=p.name)
-    if len(tags) > 1:
-        if option is not None:
-            raise PubanonError(
-                f'{option} requires one unambiguous publication tag',
-                recovery='\n'.join(
-                    create_command(p.name, tag, notes_file=request.notes_file) for tag in tags
-                ),
-            )
-        return PagePlan('none', 'ambiguous', candidates=tags, project=p.name)
-    tag = next(iter(tags))
-    if request.skip:
-        return PagePlan('none', 'skipped', tag=tag, project=p.name)
-    if request.notes is None and not request.requested and not _config.release_pages_enabled(p):
-        return PagePlan('none', 'disabled', tag=tag, project=p.name)
-    return None
-
-
-def page_url_text(url: str, *, draft: bool) -> str:
-    """Render a page URL for display, marking a page that is still a draft.
-
-    Args:
-        url: Page URL as GitHub reported it.
-        draft: Whether the observed page is a draft.
-
-    Returns:
-        The escaped URL, followed by ` (draft)` for a draft.
-    """
-    return escape(url) + (' (draft)' if draft else '')
-
-
-def release_metadata_findings(
-    rules: Mapping[_gate.RuleClass, Collection[str]],
-    *,
-    tag: str,
-    title: str,
-    notes: bytes,
-) -> list[str]:
-    """Return rendered findings for release metadata under the current rules.
-
-    Args:
-        rules: Current content rules, including derived private terms.
-        tag: Release tag to scan in full.
-        title: Release title to scan in full.
-        notes: UTF-8 release notes to scan in full.
-
-    Returns:
-        Finding lines in tag, title, then notes order; empty when clean.
-    """
-    findings: list[str] = []
-    for name, data in (
-        ('tag', tag.encode()),
-        ('title', title.encode()),
-        ('notes', notes),
-    ):
-        for hit in _gate.gate_unit(name, data, rules):
-            span = _gate.first_match(data, hit.term)
-            if span is None:
-                raise PubanonError('gate match location could not be determined')
-            start, end = span
-            location = name
-            if name == 'notes':
-                location += f' line {data[:start].count(b"\n") + 1}'
-            excerpt, _span = _gate.match_excerpt(data, start, end)
-            context = f': {escape(excerpt)}'
-            findings.append(
-                f'{location}: {hit.rule_class.name.lower()} match {escape(hit.term)}{context}'
-            )
-    return findings
-
-
-def _gate_metadata(
-    paths: _config.Paths,
-    g: _config.GlobalConfig,
-    p: _config.ProjectConfig,
-    tag: str,
-    page: _PlannedPage,
-) -> None:
-    """Refuse either rule class in the entire resulting release metadata."""
-    rules = _config.assemble_rules(g, p, _config.derived_private_terms(paths, p, os.environ))
-    findings = release_metadata_findings(rules, tag=tag, title=page.title, notes=page.notes)
-    if findings:
-        raise PubanonError('release content is blocked', fact='\n'.join(findings))
-
-
 def plan_publication_page(
     paths: _config.Paths,
     g: _config.GlobalConfig,
@@ -895,7 +1161,7 @@ def plan_publication_page(
         rendered.notes,
         None,
         notes_file=rendered.notes_file,
-        changelog_missing=rendered.changelog_missing,
+        origin=rendered.origin,
         draft=_config.draft_release_pages(p),
     )
     if previous is not None:
@@ -937,28 +1203,21 @@ def prepare_change(
         PubanonError: Inputs, publication evidence, host facts, or content
             rules prevent the requested write. No mutation is attempted.
     """
-    operation, tag, title, notes = request.operation, request.tag, request.title, request.notes
-    if _candidate.version_from_tag(tag) is None:
-        raise PubanonError('release tag must have vX.Y.Z form')
-    if operation == 'edit' and title is None and notes is None:
-        raise PubanonError('release edit requires a title or notes')
-    if title == '':
-        raise PubanonError('release title must not be empty')
+    _validate_release_request(request)
+    operation, tag = request.operation, request.tag
     destination, commit = _verify_publication(paths, g, p, tag)
-    planned = (
-        _render_page(paths, p, tag, commit, request=request) if operation == 'create' else None
-    )
+    if operation == 'create':
+        planned = _render_page(paths, p, tag, commit, request=request)
+    else:
+        planned = None
     previous = _host.read_release(destination, tag)
     if operation == 'edit' and previous is None:
         raise PubanonError('release page does not exist', fact=escape(tag))
+    if request.refresh_notes and previous is not None:
+        title = request.title if request.title is not None else previous.title
+        planned = _render_page(paths, p, tag, commit, request=replace(request, title=title))
     try:
-        if planned is not None:
-            final_title, final_notes = planned.title, planned.notes
-        else:
-            if previous is None:
-                raise ValueError('edit release change has no page')
-            final_title = title if title is not None else previous.title
-            final_notes = notes if notes is not None else previous.notes.encode()
+        final_title, final_notes = _final_release_content(request, planned, previous)
         final_title.encode('utf-8')
         final_notes.decode('utf-8')
     except UnicodeError as exc:
@@ -972,7 +1231,7 @@ def prepare_change(
         final_notes,
         previous if operation == 'edit' else None,
         notes_file=request.notes_file,
-        changelog_missing=planned.changelog_missing if planned is not None else False,
+        origin=planned.origin if planned is not None else None,
         title_override=request.title,
         draft=operation == 'create' and _config.draft_release_pages(p),
     )
@@ -985,23 +1244,9 @@ def prepare_change(
         g,
         p,
         tag,
-        _PlannedPage(final_title, final_notes, request.notes_file, changelog_missing=False),
+        _PlannedPage(final_title, final_notes, request.notes_file, NotesOrigin('file')),
     )
     return change
-
-
-def show_draft_guidance(p: _config.ProjectConfig, *, draft: bool) -> None:
-    """Explain how a reported draft becomes public, when the project creates drafts.
-
-    Another project's draft is not its release workflow's to publish, so
-    nothing is shown unless `release_page.draft` is true.
-
-    Args:
-        p: Project whose `release_page.draft` setting applies.
-        draft: Whether the reported page is still a draft.
-    """
-    if draft and _config.draft_release_pages(p):
-        output(_DRAFT_GUIDANCE)
 
 
 def show_page_outcome(p: _config.ProjectConfig, outcome: PageOutcome) -> None:
@@ -1082,5 +1327,8 @@ def show_planned_page(
         planned = _render_page(paths, p, next(iter(tags)), record.commit)
     except PubanonError as exc:
         output(field(label, f'cannot be planned: {escape(str(exc))}'))
+        for detail in (exc.fact, exc.recovery):
+            for line in detail.split('\n') if detail else ():
+                output(f'  {line}')
         return
     _show_creation(planned, draft=_config.draft_release_pages(p), label=label)

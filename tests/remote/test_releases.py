@@ -15,6 +15,13 @@ from pubanon._snapshots import _candidate, _records, _store
 from pubanon._snapshots._source import PinnedSource
 from tests._git import git_env
 
+_LINK = 'https://github.com/public-owner/public-repo/blob/v1.2.3/CHANGELOG.md'
+_NO_HEADING = 'warning: CHANGELOG.md has no heading for 1.2.3, so the notes only link to it.'
+_SECTIONED = (
+    b'# Changelog\n\n## 1.2.3 (2026-10-20)\n\n### Added\n\n- A thing.\n\n'
+    b'## 1.2.2 (2026-10-01)\n\n- Older.\n'
+)
+
 _TAG = 'v1.2.3'
 type _Context = tuple[_config.Paths, _config.GlobalConfig, _config.ProjectConfig, _Host]
 type _Outcome = Literal['normal', 'missing', 'notes', 'status', 'tag', 'read-error']
@@ -288,10 +295,12 @@ def _prepare(
     )
 
 
-def _publish_changelog(context: _Context, path: str = 'CHANGELOG.md') -> None:
+def _publish_changelog(
+    context: _Context, path: str = 'CHANGELOG.md', data: bytes = b'Published notes\n'
+) -> None:
     paths, _g, p, host = context
     store = _store.candidate_store_path(paths, p.name)
-    blob = _git(store, 'hash-object', '-w', '--stdin', data=b'Published notes\n')
+    blob = _git(store, 'hash-object', '-w', '--stdin', data=data)
     tree = _git(store, 'mktree', data=f'100644 blob {blob}\t{path}\n'.encode())
     host.commit = _git(store, 'commit-tree', tree, data=b'Published snapshot\n')
     _git(store, 'update-ref', 'refs/heads/main', host.commit)
@@ -456,6 +465,22 @@ def test_create_refuses_existing_page_and_edit_requires_page(release_context: _C
     assert 'release show' in (caught.value.recovery or '')
     assert 'release edit' in (caught.value.recovery or '')
     assert host.writes == []
+
+
+def test_creation_preview_names_the_notes_source_and_warns(
+    release_context: _Context, capsys: pytest.CaptureFixture[str]
+) -> None:
+    paths, _g, p, host = release_context
+    _publish_changelog(release_context, data=_SECTIONED)
+    _releases._show_creation(_releases._render_page(paths, p, _TAG, host.commit), draft=False)
+    out = capsys.readouterr().out
+    assert 'create "v1.2.3" with the 1.2.3 section of CHANGELOG.md and a changelog link' in out
+
+    _publish_changelog(release_context, data=b'## Version 1.2.3\n- a\n')
+    _releases._show_creation(_releases._render_page(paths, p, _TAG, host.commit), draft=True)
+    out = capsys.readouterr().out
+    assert 'create draft "v1.2.3" with a changelog link only' in out
+    assert f'{_NO_HEADING}\n  line 1 mentions 1.2.3: ## Version 1.2.3\n' in out
 
 
 def test_draft_creation_requests_a_draft_and_reads_it_back(release_context: _Context) -> None:
@@ -633,7 +658,7 @@ def test_create_defaults_render_published_page_without_notes_file(
     )
     assert missing.title == _TAG
     assert missing.notes == b''
-    assert missing.changelog_missing
+    assert missing.origin == _releases.NotesOrigin('empty')
     _publish_changelog(release_context)
     present = _releases.prepare_change(
         paths, g, p, _releases.ReleaseRequest('create', _TAG, None, None)
@@ -642,7 +667,9 @@ def test_create_defaults_render_published_page_without_notes_file(
         b'See the [changelog](https://github.com/public-owner/public-repo/blob/'
         b'v1.2.3/CHANGELOG.md).\n'
     )
-    assert not present.changelog_missing
+    assert present.origin == _releases.NotesOrigin(
+        'link', 'CHANGELOG.md', '1.2.3', warning=_NO_HEADING
+    )
     host.page = _host.GitHubRelease(
         _TAG,
         present.title,
@@ -815,6 +842,73 @@ def test_page_replacement_uses_correction_tag_not_replayed_tags(
     assert _releases.page_tags(replace(record, tag_intent='v3.0.0')) == ('v3.0.0',)
 
 
+def test_refresh_notes_cannot_take_notes(release_context: _Context) -> None:
+    paths, g, p, _host_facts = release_context
+    with pytest.raises(PubanonError, match='--refresh-notes'):
+        _releases.prepare_change(
+            paths, g, p, _releases.ReleaseRequest('edit', _TAG, None, b'x', refresh_notes=True)
+        )
+
+
+@pytest.mark.parametrize('title', [None, 'New title'])
+def test_refresh_notes_ignores_the_configured_creation_title(
+    release_context: _Context, title: str | None
+) -> None:
+    paths, g, p, host = release_context
+    _publish_changelog(release_context, data=_SECTIONED)
+    p = replace(p, release_page=_config.ReleasePageSettings(title='   '))
+    host.page = _host.GitHubRelease(
+        _TAG,
+        'Kept title',
+        'Old notes',
+        'https://example.invalid/page',
+        draft=True,
+        prerelease=False,
+    )
+
+    change = _releases.prepare_change(
+        paths, g, p, _releases.ReleaseRequest('edit', _TAG, title, None, refresh_notes=True)
+    )
+
+    assert change.title == (title or 'Kept title')
+    assert change.notes == (
+        f'### Added\n\n- A thing.\n\nSee the [changelog]({_LINK}) for all versions.\n'.encode()
+    )
+    assert change.previous == host.page
+    assert host.writes == []
+
+
+def test_refresh_notes_renders_the_changelog_at_the_tag(release_context: _Context) -> None:
+    paths, g, p, host = release_context
+    _publish_changelog(release_context, data=_SECTIONED)
+    host.page = _host.GitHubRelease(
+        _TAG,
+        'Kept title',
+        'Old notes',
+        'https://example.invalid/page',
+        draft=True,
+        prerelease=False,
+    )
+
+    change = _releases.prepare_change(
+        paths, g, p, _releases.ReleaseRequest('edit', _TAG, None, None, refresh_notes=True)
+    )
+
+    assert (change.operation, change.title) == ('edit', 'Kept title')
+    assert change.notes == (
+        f'### Added\n\n- A thing.\n\nSee the [changelog]({_LINK}) for all versions.\n'.encode()
+    )
+    assert change.origin == _releases.NotesOrigin('section', 'CHANGELOG.md', '1.2.3')
+    titled = _releases.prepare_change(
+        paths,
+        g,
+        p,
+        _releases.ReleaseRequest('edit', _TAG, 'New title', None, refresh_notes=True),
+    )
+    assert titled.title == 'New title'
+    assert _releases.apply_change(paths, g, p, change).page.draft
+
+
 def test_rejects_invalid_utf8_metadata_after_publication_verification(
     release_context: _Context,
 ) -> None:
@@ -823,12 +917,37 @@ def test_rejects_invalid_utf8_metadata_after_publication_verification(
     assert release_context[3].writes == []
 
 
+def test_render_page_default_notes_include_the_section(release_context: _Context) -> None:
+    paths, _g, p, host = release_context
+    _publish_changelog(release_context, data=_SECTIONED)
+
+    page = _releases._render_page(paths, p, _TAG, host.commit)
+
+    assert page.notes == (
+        f'### Added\n\n- A thing.\n\nSee the [changelog]({_LINK}) for all versions.\n'.encode()
+    )
+    assert page.origin == _releases.NotesOrigin('section', 'CHANGELOG.md', '1.2.3')
+
+
+def test_render_page_default_notes_link_only_when_sections_are_off(
+    release_context: _Context,
+) -> None:
+    paths, _g, p, host = release_context
+    _publish_changelog(release_context, data=_SECTIONED)
+    p = replace(p, release_page=_config.ReleasePageSettings(changelog_section=False))
+
+    page = _releases._render_page(paths, p, _TAG, host.commit)
+
+    assert page.notes == f'See the [changelog]({_LINK}).\n'.encode()
+    assert page.origin == _releases.NotesOrigin('link', 'CHANGELOG.md', '1.2.3')
+
+
 def test_render_page_defaults_use_only_published_tree(release_context: _Context) -> None:
     paths, _g, p, host = release_context
     p.source_path.mkdir()
     (p.source_path / 'CHANGELOG.md').write_text('Unpublished\n')
     missing = _releases._render_page(paths, p, _TAG, host.commit)
-    assert missing == _releases._PlannedPage(_TAG, b'', None, changelog_missing=True)
+    assert missing == _releases._PlannedPage(_TAG, b'', None, _releases.NotesOrigin('empty'))
 
     _publish_changelog(release_context)
     (p.source_path / 'CHANGELOG.md').write_text('Changed again\n')
@@ -837,8 +956,39 @@ def test_render_page_defaults_use_only_published_tree(release_context: _Context)
         _TAG,
         b'See the [changelog](https://github.com/public-owner/public-repo/blob/v1.2.3/CHANGELOG.md).\n',
         None,
-        changelog_missing=False,
+        _releases.NotesOrigin('link', 'CHANGELOG.md', '1.2.3', warning=_NO_HEADING),
     )
+
+
+def test_render_page_hints_name_near_misses_and_a_valid_setting(
+    release_context: _Context,
+) -> None:
+    paths, _g, p, host = release_context
+    _publish_changelog(release_context, data=b"# Changelog\n\n## What's new in 1.2.3\n- a\n")
+
+    origin = _releases._render_page(paths, p, _TAG, host.commit).origin
+
+    assert origin.warning == _NO_HEADING
+    assert origin.hints == (
+        "line 3 mentions 1.2.3: ## What's new in 1.2.3",
+        (
+            'to use headings like this, add changelog_heading = '
+            '"## What\'s new in {version}" to [release_page]'
+        ),
+    )
+
+
+def test_render_page_hints_omit_a_suggestion_the_validator_refuses(
+    release_context: _Context,
+) -> None:
+    paths, _g, p, host = release_context
+    _publish_changelog(release_context, data=b'#\tVersion 1.2.3\n- a\n')
+
+    origin = _releases._render_page(paths, p, _TAG, host.commit).origin
+
+    assert len(origin.hints) == 1
+    assert origin.hints[0].startswith('line 1 mentions 1.2.3: ')
+    assert 'changelog_heading' not in origin.hints[0]
 
 
 def test_render_page_rejects_blank_rendered_title(literal_release_context: _Context) -> None:
@@ -867,6 +1017,43 @@ def test_render_page_requires_explicit_changelog_when_link_needed(
     assert 'release_page.changelog' not in str(caught.value)
 
 
+def test_render_page_template_inserts_the_section(release_context: _Context) -> None:
+    paths, _g, p, host = release_context
+    _publish_changelog(release_context, data=_SECTIONED)
+    p = replace(
+        p,
+        release_page=_config.ReleasePageSettings(notes='## What changed\n\n{changelog_section}\n'),
+    )
+
+    page = _releases._render_page(paths, p, _TAG, host.commit)
+
+    assert page.notes == b'## What changed\n\n### Added\n\n- A thing.\n'
+    assert page.origin == _releases.NotesOrigin('template')
+
+
+def test_render_page_template_refuses_a_missing_section(release_context: _Context) -> None:
+    paths, _g, p, host = release_context
+    _publish_changelog(release_context, data=b'# Changelog\n\n## Version 1.2.3\n- a\n')
+    p = replace(p, release_page=_config.ReleasePageSettings(notes='{changelog_section}'))
+
+    with pytest.raises(
+        PubanonError,
+        match=r'release_page\.notes uses \{changelog_section\}, '
+        r'but CHANGELOG\.md has no heading for 1\.2\.3',
+    ) as caught:
+        _releases._render_page(paths, p, _TAG, host.commit)
+    assert 'line 3 mentions 1.2.3: ## Version 1.2.3' in (caught.value.fact or '')
+    assert 'use a notes file' in (caught.value.recovery or '')
+
+
+def test_render_page_template_section_requires_a_changelog(release_context: _Context) -> None:
+    paths, _g, p, host = release_context
+    p = replace(p, release_page=_config.ReleasePageSettings(notes='{changelog_section}'))
+
+    with pytest.raises(PubanonError, match=r'\{changelog_section\}.*CHANGELOG\.md'):
+        _releases._render_page(paths, p, _TAG, host.commit)
+
+
 def test_render_page_templates_and_overrides(literal_release_context: _Context) -> None:
     paths, _g, p, host = literal_release_context
     one_line = replace(
@@ -884,7 +1071,10 @@ def test_render_page_templates_and_overrides(literal_release_context: _Context) 
         ),
     )
     expected = _releases._PlannedPage(
-        'Version 1.2.3 {stable}', b'Release v1.2.3: 1.2.3.\n', None, changelog_missing=False
+        'Version 1.2.3 {stable}',
+        b'Release v1.2.3: 1.2.3.\n',
+        None,
+        _releases.NotesOrigin('template'),
     )
     assert _releases._render_page(paths, one_line, _TAG, host.commit) == expected
     assert _releases._render_page(paths, block, _TAG, host.commit) == expected
@@ -897,7 +1087,19 @@ def test_render_page_templates_and_overrides(literal_release_context: _Context) 
         _TAG,
         host.commit,
         request=_releases.ReleaseRequest('create', _TAG, 'Supplied', b'CRLF\r\nNo LF', notes_file),
-    ) == _releases._PlannedPage('Supplied', b'CRLF\r\nNo LF', notes_file, changelog_missing=False)
+    ) == _releases._PlannedPage(
+        'Supplied', b'CRLF\r\nNo LF', notes_file, _releases.NotesOrigin('file')
+    )
+
+
+def test_render_page_uses_the_configured_heading_template(release_context: _Context) -> None:
+    paths, _g, p, host = release_context
+    _publish_changelog(release_context, data=b'## Version 1.2.3 (2026-10-20)\n- a\n')
+    p = replace(
+        p, release_page=_config.ReleasePageSettings(changelog_heading='## Version {version}')
+    )
+
+    assert _releases._render_page(paths, p, _TAG, host.commit).notes.startswith(b'- a\n\n')
 
 
 def test_render_page_without_link_never_reads_changelog(
@@ -909,10 +1111,10 @@ def test_render_page_without_link_never_reads_changelog(
         release_page=_config.ReleasePageSettings(changelog='MISSING.md', notes='Release {tag}'),
     )
 
-    def _unexpected_lookup(*_args: object) -> bool:
+    def _unexpected_lookup(*_args: object) -> bytes | None:
         pytest.fail('unused changelog was inspected')
 
-    monkeypatch.setattr(_candidate, 'regular_file_at', _unexpected_lookup)
+    monkeypatch.setattr(_candidate, 'regular_file_bytes', _unexpected_lookup)
     assert _releases._render_page(paths, p, _TAG, host.commit).notes == b'Release v1.2.3\n'
     assert (
         _releases._render_page(
@@ -1522,3 +1724,31 @@ def test_metadata_findings_bound_context_and_escape_controls_once(field_name: st
         + 'y' * 60
         + '...'
     ]
+
+
+@pytest.mark.parametrize(
+    ('data', 'reason'),
+    [
+        (
+            b'## 1.2.3\n- a\n## 1.2.3\n- b\n',
+            'CHANGELOG.md has several headings for 1.2.3, on lines 1 and 3',
+        ),
+        (b'## 1.2.3\n\n## 1.2.2\n- b\n', 'CHANGELOG.md has an empty section for 1.2.3'),
+        (b'## 1.2.3\n\xff\n', 'CHANGELOG.md is not UTF-8 text'),
+    ],
+)
+def test_render_page_explains_why_default_notes_only_link(
+    release_context: _Context, data: bytes, reason: str
+) -> None:
+    paths, _g, p, host = release_context
+    _publish_changelog(release_context, data=data)
+
+    page = _releases._render_page(paths, p, _TAG, host.commit)
+
+    assert page.notes == f'See the [changelog]({_LINK}).\n'.encode()
+    assert page.origin == _releases.NotesOrigin(
+        'link',
+        'CHANGELOG.md',
+        '1.2.3',
+        warning=f'warning: {reason}, so the notes only link to it.',
+    )

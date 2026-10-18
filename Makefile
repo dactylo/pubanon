@@ -1,6 +1,7 @@
 .DEFAULT_GOAL := all
 
 MARKDOWN_FILES := $(wildcard *.md docs/*.md)
+WORKFLOW_FILES := $(wildcard .github/workflows/*.yml docs/examples/*.yml)
 PYTHON_INPUTS := src tests
 PYTHON ?= python
 VENV_BIN := .venv/bin
@@ -10,13 +11,13 @@ endif
 DEV_PYTHON := $(VENV_BIN)/python
 export PATH := $(abspath $(VENV_BIN)):$(PATH)
 export UV_SYSTEM_PYTHON := 0
-UV_VERSION := 0.12.23
+UV_VERSION := 0.13.1
 CI_PYTHON := 3.13
 CI_EXTRAS :=
 CI_BUILD_REQUIREMENTS = $(DEV_PYTHON) -c 'import tomllib; print("\n".join(tomllib.load(open("pyproject.toml", "rb"))["build-system"]["requires"]))'
 CI_COMPILE = uv pip compile pyproject.toml - $(CI_EXTRAS) --universal --python-version $(CI_PYTHON) --no-python-downloads --no-sources --no-build --generate-hashes --no-annotate --custom-compile-command 'make lock-update'
 
-.PHONY: all check env-check format format-check install lock-check lock-update quality reinstall setup test type-check uv-check venv-check whitespace-check
+.PHONY: all check env-check format format-check install lock-check lock-update quality reinstall setup test type-check uv-check venv-check whitespace-check workflow-check
 
 uv-check:
 	@test "$$(uv --version | cut -d ' ' -f 2)" = "$(UV_VERSION)" || \
@@ -79,7 +80,10 @@ test: env-check
 whitespace-check:
 	git diff --check HEAD
 
-quality: format-check lock-check type-check whitespace-check
+workflow-check: env-check
+	$(VENV_BIN)/zizmor --offline --no-progress --quiet $(WORKFLOW_FILES)
+
+quality: format-check lock-check type-check whitespace-check workflow-check
 
 check: quality test
 

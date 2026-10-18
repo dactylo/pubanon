@@ -18,7 +18,7 @@ from pubanon import (
 )
 from pubanon._config import stage_repository
 from pubanon._errors import OperationCanceled, PubanonError
-from pubanon._remote import _lifecycle, _workflow_checks
+from pubanon._remote import _lifecycle, _releases, _workflow_checks
 from pubanon._snapshots import _candidate, _source
 from pubanon._terminal import (
     ask,
@@ -53,6 +53,31 @@ def _back_init_selection(draft: _init_draft.Draft) -> _init_draft.Draft:
         return replace(draft, flagged=draft.flagged[:-1], phase='flagged')
     output('There is no earlier file choice.', kind='note')
     return draft
+
+
+def _changelog_sections_prompt(
+    project: _config.ProjectConfig, snapshot: _source.Snapshot, *, default: bool
+) -> bool | None:
+    """Report the source changelog, then ask whether default notes include its sections."""
+    page = project.release_page or _config.ReleasePageSettings()
+    if page.notes is not None:
+        output(
+            'release_page.notes decides the notes; use {changelog_section} in it to include the '
+            'section.',
+            kind='note',
+        )
+        return None
+    changelog = page.changelog or 'CHANGELOG.md'
+    data = next(
+        (entry.data for entry in snapshot if entry.path == changelog and entry.kind == 'blob'),
+        None,
+    )
+    print()
+    for line in _releases.changelog_report(changelog, data, page.changelog_heading):
+        print(line)
+    return confirm(
+        "Copy each version's changelog section into its release notes?", default=default
+    )
 
 
 def _check_names_csv(names: tuple[str, ...]) -> str:
@@ -180,6 +205,18 @@ def _draft_flagged_choice(paths: list[str], draft: _init_draft.Draft) -> _init_d
         output('There is no earlier file choice.', kind='note')
         return draft
     return replace(draft, flagged=(*draft.flagged, (remaining[0], choice)))
+
+
+def _edited_changelog_sections(
+    project: _config.ProjectConfig, *, enabled: bool
+) -> _config.ProjectConfig:
+    """Save the changelog section answer in the release page table."""
+    return replace(
+        project,
+        release_page=replace(
+            project.release_page or _config.ReleasePageSettings(), changelog_section=enabled
+        ),
+    )
 
 
 def _feature_prompt(step: str, default: bool | None) -> bool:
@@ -401,6 +438,25 @@ def _release_pages_prompt(*, route: str, ci_configured: bool, default: str) -> s
     )
 
 
+def _edit_release_pages_section(
+    project: _config.ProjectConfig, snapshot: _source.Snapshot
+) -> _config.ProjectConfig:
+    """Edit release-page creation and its default changelog notes together."""
+    answer = _release_pages_prompt(
+        route=project.publication_route,
+        ci_configured=bool(project.required_checks or project.ci_workflow),
+        default=_release_pages_answer(project),
+    )
+    project = _edited_release_pages(project, answer)
+    if answer != 'no':
+        sections = _changelog_sections_prompt(
+            project, snapshot, default=_config.changelog_sections_enabled(project)
+        )
+        if sections is not None:
+            project = _edited_changelog_sections(project, enabled=sections)
+    return project
+
+
 def _replace_project_context(
     ctx: _context.ProjectContext,
     project: _config.ProjectConfig,
@@ -470,6 +526,13 @@ def _project_from_draft(
             draft.pull_requests,
             draft.discussions,
         )
+    release_page = replace(
+        ctx.project.release_page or _config.ReleasePageSettings(),
+        enabled=draft.release_pages,
+        draft=True if draft.release_page_drafts else None,
+    )
+    if draft.release_page_sections is not None:
+        release_page = replace(release_page, changelog_section=draft.release_page_sections)
     project = replace(
         ctx.project,
         allow=tuple(allow),
@@ -481,11 +544,7 @@ def _project_from_draft(
         publication_route=draft.publication_route or ctx.project.publication_route,
         required_checks=draft.required_checks or (),
         source_tags=draft.source_tags,
-        release_page=replace(
-            ctx.project.release_page or _config.ReleasePageSettings(),
-            enabled=draft.release_pages,
-            draft=True if draft.release_page_drafts else None,
-        ),
+        release_page=release_page,
         settings=settings,
         self_publication=draft.self_publication,
     )
@@ -931,7 +990,21 @@ def _draft_field(
             ci_configured=bool(proposed.project.required_checks or proposed.project.ci_workflow),
             default=_release_pages_answer(proposed.project),
         )
-        draft = replace(draft, release_pages=answer != 'no', release_page_drafts=answer == 'draft')
+        sections = draft.release_page_sections
+        if answer != 'no':
+            asked = _changelog_sections_prompt(
+                proposed.project,
+                snapshot,
+                default=_config.changelog_sections_enabled(proposed.project),
+            )
+            if asked is not None:
+                sections = asked
+        draft = replace(
+            draft,
+            release_pages=answer != 'no',
+            release_page_drafts=answer == 'draft',
+            release_page_sections=sections,
+        )
     else:
         draft = replace(draft, **{step: _feature_prompt(step, getattr(draft, step))})
     return _checkpoint_init(ctx, replace(draft, pending=draft.pending[1:]))
@@ -963,12 +1036,7 @@ def _edit_project_section(
     elif action == 'tags':
         project = replace(project, source_tags=_source_tags_prompt(default=project.source_tags))
     elif action == 'release pages':
-        answer = _release_pages_prompt(
-            route=project.publication_route,
-            ci_configured=bool(project.required_checks or project.ci_workflow),
-            default=_release_pages_answer(project),
-        )
-        project = _edited_release_pages(project, answer)
+        project = _edit_release_pages_section(project, snapshot)
     elif action == 'checks':
         project = _edit_checks_section(ctx, snapshot, project)
     elif action == 'settings':

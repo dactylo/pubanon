@@ -11,7 +11,9 @@
 # commit's push CI run, builds and uploads the package, then publishes the
 # tag's draft release page. Running it again for the same version is safe. To
 # publish a tagged commit by hand, run it from the Actions tab on its tag. If a
-# run fails, rerun that run instead of starting a new one.
+# run fails, rerun that run instead of starting a new one. If the fault is in
+# this file, every rerun fails the same way; see "Publish pages after the
+# package upload" in pubanon's guide.
 #
 # If your CI workflow file is not ci.yml, change CI_WORKFLOW_FILE. If your
 # version is dynamic, change how the verify step reads it. To approve each
@@ -44,13 +46,13 @@ jobs:
       tag: ${{ steps.verify.outputs.tag }}
     steps:
       - name: Check out release commit
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
       - name: Verify version tag and successful CI
@@ -114,12 +116,12 @@ jobs:
       contents: read
     steps:
       - name: Check out release commit
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
       - name: Build sdist and wheel
@@ -127,7 +129,7 @@ jobs:
           python -m pip install build==1.6.1
           python -m build
       - name: Save distributions
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: python-distributions
           path: dist/
@@ -161,7 +163,7 @@ jobs:
       contents: write
     steps:
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
       - name: Publish the draft release page

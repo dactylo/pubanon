@@ -481,6 +481,11 @@ def _add_release_parser(commands: _Commands) -> None:
     edit.add_argument('tag', metavar='TAG', help='existing vX.Y.Z publication tag')
     edit.add_argument('--title', help='replacement page title')
     edit.add_argument('--notes-file', metavar='FILE', help='replacement UTF-8 Markdown notes')
+    edit.add_argument(
+        '--refresh-notes',
+        action='store_true',
+        help='replace the notes with the ones pubanon would create now',
+    )
     edit.add_argument('--yes', action='store_true', help='skip the confirmation prompt')
     listing = _add_command_parser(subcommands, 'list', 'list pages in the final repository')
     listing.add_argument(
@@ -550,6 +555,17 @@ def _add_stage_observation_parsers(commands: _Commands) -> None:
     _add_watch_timeout(
         _add_command_parser(commands, 'watch', 'wait for checks on the recorded staged snapshot')
     )
+
+
+def _validate_release_options(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Reject conflicting release title and notes options before dispatch."""
+    if args.release_command in {'create', 'edit'} and args.title == '':
+        parser.error('--title must not be empty')
+    if args.release_command == 'edit':
+        if args.refresh_notes and args.notes_file is not None:
+            parser.error('--refresh-notes cannot be combined with --notes-file')
+        if args.title is None and args.notes_file is None and not args.refresh_notes:
+            parser.error('release edit requires --title, --notes-file, or --refresh-notes')
 
 
 def build_parser() -> _RootParser:
@@ -731,10 +747,7 @@ def validate_options(parser: argparse.ArgumentParser, args: argparse.Namespace) 
     ):
         parser.error('--resolve cannot be combined with release page options')
     if args.command == 'release':
-        if args.release_command in {'create', 'edit'} and args.title == '':
-            parser.error('--title must not be empty')
-        if args.release_command == 'edit' and args.title is None and args.notes_file is None:
-            parser.error('release edit requires --title or --notes-file')
+        _validate_release_options(parser, args)
     if (
         args.command == 'prepare'
         and args.continue_rewrite

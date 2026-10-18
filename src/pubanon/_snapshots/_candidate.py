@@ -486,25 +486,29 @@ def published_refs(paths: Paths, project: str) -> tuple[str | None, dict[str, st
     return read_ref(store, 'refs/heads/main'), _read_tags(store)
 
 
-def regular_file_at(paths: Paths, project: str, commit: str, path: str) -> bool:
-    """Check whether an exact path is a regular file in a store commit.
+def regular_file_bytes(paths: Paths, project: str, commit: str, path: str) -> bytes | None:
+    """Read an exact regular file from a store commit.
 
     Args:
         paths: Derived pubanon configuration and data paths.
         project: Registered project name.
         commit: Published commit object ID in the advisory store.
-        path: Repository-relative POSIX path to inspect.
+        path: Repository-relative POSIX path to read.
+
+    Returns:
+        The file's bytes, or None when the path is not a regular file there.
 
     Raises:
         PubanonError: The store read fails or returns malformed tree data.
     """
+    store = _store.candidate_store_path(paths, project)
     output = git_result(
         ['ls-tree', '-z', '--full-tree', commit, '--', path],
-        store=_store.candidate_store_path(paths, project),
+        store=store,
         failure='cannot read published file',
     )
     if not output:
-        return False
+        return None
     if not output.endswith(b'\0') or b'\0' in output[:-1]:
         raise PubanonError('cannot read published file')
     metadata, separator, actual_path = output[:-1].partition(b'\t')
@@ -518,8 +522,14 @@ def regular_file_at(paths: Paths, project: str, commit: str, path: str) -> bool:
         or any(character not in b'0123456789abcdef' for character in oid)
     ):
         raise PubanonError('cannot read published file')
-    return (
+    if not (
         actual_path == path.encode('utf-8') and mode in {b'100644', b'100755'} and kind == b'blob'
+    ):
+        return None
+    return git_result(
+        ['cat-file', 'blob', oid.decode('ascii')],
+        store=store,
+        failure='cannot read published file',
     )
 
 

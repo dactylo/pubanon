@@ -28,6 +28,7 @@ PUBLICATION_ROUTES = frozenset({'direct', 'staged'})
 VISIBILITIES = frozenset({'private', 'public'})
 
 _ADAPTER_KEYS = frozenset({DEFAULT_HOST})
+_CHANGELOG_HEADING_START = re.compile(r'#{1,6} ')
 _CI_WORKFLOW_PATTERN = re.compile(r'[A-Za-z0-9_-][A-Za-z0-9._-]*\.ya?ml')
 _COMMIT_MESSAGE_KEYS = frozenset({'tagged', 'untagged'})
 _COMMIT_MESSAGE_TAGGED_DEFAULT = 'release: {tag}'
@@ -85,8 +86,11 @@ _PROJECT_OPTIONAL_KEYS = frozenset(
         'workflow',
     }
 )
-_RELEASE_PAGE_KEYS = frozenset({'changelog', 'draft', 'enabled', 'notes', 'title'})
-_RELEASE_PAGE_NOTES_FIELDS = frozenset({'changelog_url', 'tag', 'version'})
+_RELEASE_PAGE_HEADING_FIELDS = frozenset({'version'})
+_RELEASE_PAGE_KEYS = frozenset(
+    {'changelog', 'changelog_heading', 'changelog_section', 'draft', 'enabled', 'notes', 'title'}
+)
+_RELEASE_PAGE_NOTES_FIELDS = frozenset({'changelog_section', 'changelog_url', 'tag', 'version'})
 _RELEASE_PAGE_TITLE_FIELDS = frozenset({'tag', 'version'})
 _SETTINGS_KEYS = frozenset(
     {'default_branch', 'description', 'discussions', 'issues', 'projects', 'pull_requests', 'wiki'}
@@ -214,6 +218,10 @@ class ReleasePageSettings:
         changelog: Repository-relative POSIX changelog path.
         notes: Page notes template.
         draft: Whether pubanon creates each page as a draft; None means no.
+        changelog_section: Whether notes without a template include the
+            version's changelog section; None means yes.
+        changelog_heading: Template describing version headings, with
+            `{version}` where the version goes; None uses the built-in rule.
     """
 
     enabled: bool | None = None
@@ -221,6 +229,8 @@ class ReleasePageSettings:
     changelog: str | None = None
     notes: str | None = None
     draft: bool | None = None
+    changelog_section: bool | None = None
+    changelog_heading: str | None = None
 
 
 @dataclass(frozen=True)
@@ -607,9 +617,12 @@ def _release_page_content(page: ReleasePageSettings | None) -> str:
         content += f'enabled = {str(page.enabled).lower()}\n'
     if page.draft is not None:
         content += f'draft = {str(page.draft).lower()}\n'
+    if page.changelog_section is not None:
+        content += f'changelog_section = {str(page.changelog_section).lower()}\n'
     for key, value in (
         ('title', page.title),
         ('changelog', page.changelog),
+        ('changelog_heading', page.changelog_heading),
         ('notes', page.notes),
     ):
         if value is not None:
@@ -691,39 +704,6 @@ def _commit_message_from_mapping(data: Mapping[str, object], scope: str) -> Comm
     return CommitMessageSettings(**values)
 
 
-def _release_page_from_mapping(data: Mapping[str, object]) -> ReleasePageSettings:
-    """Validate and return optional release page settings."""
-    unknown = sorted(data.keys() - _RELEASE_PAGE_KEYS)
-    if unknown:
-        raise PubanonError(f'unknown release_page key: {", ".join(unknown)}')
-    enabled = _require_boolean(data, 'enabled') if 'enabled' in data else None
-    draft = _require_boolean(data, 'draft') if 'draft' in data else None
-    title = _require_string(data, 'title') if 'title' in data else None
-    changelog = _require_string(data, 'changelog') if 'changelog' in data else None
-    notes = _require_string(data, 'notes') if 'notes' in data else None
-    if title is not None:
-        if not title or '\r' in title or '\n' in title:
-            raise PubanonError('release_page.title must be one nonempty line')
-        _validate_template(
-            title, _RELEASE_PAGE_TITLE_FIELDS, 'release_page.title', 'project configuration'
-        )
-    if changelog is not None and (
-        not changelog
-        or changelog.startswith('/')
-        or '\\' in changelog
-        or any(unicodedata.category(character) == 'Cc' for character in changelog)
-        or any(part in {'', '.', '..'} for part in changelog.split('/'))
-    ):
-        raise PubanonError('release_page.changelog must be a repository-relative POSIX path')
-    if notes is not None:
-        _validate_template(
-            notes, _RELEASE_PAGE_NOTES_FIELDS, 'release_page.notes', 'project configuration'
-        )
-    return ReleasePageSettings(
-        enabled=enabled, title=title, changelog=changelog, notes=notes, draft=draft
-    )
-
-
 def _validate_commit_message_settings(settings: object, scope: str) -> None:
     """Apply parsed-table rules to optional in-memory message templates."""
     if settings is None:
@@ -733,18 +713,6 @@ def _validate_commit_message_settings(settings: object, scope: str) -> None:
     _commit_message_from_mapping(
         {key: value for key, value in vars(settings).items() if value is not None}, scope
     )
-
-
-def _validate_release_page_settings(page: object) -> None:
-    """Apply the parsed-table rules to optional in-memory settings."""
-    if page is None:
-        return
-    if not isinstance(page, ReleasePageSettings):
-        raise PubanonError('release_page must be a table')
-    data: dict[str, object] = {
-        'release_page': {key: value for key, value in vars(page).items() if value is not None}
-    }
-    _release_page_from_mapping(_require_table(data, 'release_page'))
 
 
 def _validate_windows_project_name(name: str) -> None:
@@ -866,6 +834,18 @@ def assemble_rules(
         RuleClass.IDENTITY_CRITICAL: (*g.sensitive_terms, *p.extra_terms, *derived),
         RuleClass.HYGIENE: hygiene,
     }
+
+
+def changelog_sections_enabled(p: ProjectConfig) -> bool:
+    """Report whether default release notes include each version's changelog section.
+
+    Args:
+        p: Project configuration to inspect.
+
+    Returns:
+        False only when `release_page.changelog_section` is explicitly false.
+    """
+    return p.release_page is None or p.release_page.changelog_section is not False
 
 
 def check_publication_state_paths(
@@ -1513,6 +1493,99 @@ def stage_repository(p: ProjectConfig) -> str:
         Staging repository name.
     """
     return p._stage_repo or f'{p.repo}-stage'
+
+
+def validate_changelog_heading(value: str) -> None:
+    """Refuse a `release_page.changelog_heading` template that cannot match version headings.
+
+    Args:
+        value: Template text, such as `## Version {version}`.
+
+    Raises:
+        PubanonError: The value is not one line that starts with one to six `#`
+            and a space, or does not use `{version}` exactly once and no other
+            field.
+    """
+    key = 'release_page.changelog_heading'
+    if '\r' in value or '\n' in value or _CHANGELOG_HEADING_START.match(value) is None:
+        raise PubanonError(f'{key} must be one line starting with one to six # and a space')
+    _validate_template(value, _RELEASE_PAGE_HEADING_FIELDS, key, 'project configuration')
+    fields = [
+        name
+        for _literal, name, _spec, _conversion in string.Formatter().parse(value)
+        if name is not None
+    ]
+    if len(fields) != 1:
+        raise PubanonError(f'{key} must contain {{version}} exactly once')
+
+
+def _release_page_from_mapping(data: Mapping[str, object]) -> ReleasePageSettings:
+    """Validate and return optional release page settings."""
+    unknown = sorted(data.keys() - _RELEASE_PAGE_KEYS)
+    if unknown:
+        raise PubanonError(f'unknown release_page key: {", ".join(unknown)}')
+    enabled = _require_boolean(data, 'enabled') if 'enabled' in data else None
+    draft = _require_boolean(data, 'draft') if 'draft' in data else None
+    changelog_section = (
+        _require_boolean(data, 'changelog_section') if 'changelog_section' in data else None
+    )
+    changelog_heading = (
+        _require_string(data, 'changelog_heading') if 'changelog_heading' in data else None
+    )
+    title = _require_string(data, 'title') if 'title' in data else None
+    changelog = _require_string(data, 'changelog') if 'changelog' in data else None
+    notes = _require_string(data, 'notes') if 'notes' in data else None
+    if title is not None:
+        if not title or '\r' in title or '\n' in title:
+            raise PubanonError('release_page.title must be one nonempty line')
+        _validate_template(
+            title, _RELEASE_PAGE_TITLE_FIELDS, 'release_page.title', 'project configuration'
+        )
+    if changelog is not None and (
+        not changelog
+        or changelog.startswith('/')
+        or '\\' in changelog
+        or any(unicodedata.category(character) == 'Cc' for character in changelog)
+        or any(part in {'', '.', '..'} for part in changelog.split('/'))
+    ):
+        raise PubanonError('release_page.changelog must be a repository-relative POSIX path')
+    if changelog_heading is not None:
+        validate_changelog_heading(changelog_heading)
+    if notes is not None:
+        _validate_template(
+            notes, _RELEASE_PAGE_NOTES_FIELDS, 'release_page.notes', 'project configuration'
+        )
+        if changelog_section is False and any(
+            name == 'changelog_section'
+            for _literal, name, _spec, _conversion in string.Formatter().parse(notes)
+        ):
+            raise PubanonError(
+                'release_page.notes uses {changelog_section}, '
+                'but release_page.changelog_section is false',
+                recovery='remove {changelog_section} from release_page.notes, '
+                'or set changelog_section = true',
+            )
+    return ReleasePageSettings(
+        enabled=enabled,
+        title=title,
+        changelog=changelog,
+        notes=notes,
+        draft=draft,
+        changelog_section=changelog_section,
+        changelog_heading=changelog_heading,
+    )
+
+
+def _validate_release_page_settings(page: object) -> None:
+    """Apply the parsed-table rules to optional in-memory settings."""
+    if page is None:
+        return
+    if not isinstance(page, ReleasePageSettings):
+        raise PubanonError('release_page must be a table')
+    data: dict[str, object] = {
+        'release_page': {key: value for key, value in vars(page).items() if value is not None}
+    }
+    _release_page_from_mapping(_require_table(data, 'release_page'))
 
 
 def validate_host_segment(field: str, value: object) -> str:

@@ -44,6 +44,10 @@ _KEEP_CHECKS = (
 )
 _PAGES = 'Create a release page for each published version? [y]es / [d]raft / [n]o [no]: '
 _SAVE = 'Save this configuration? [s]ave / [e]dit / [c]ancel: '
+_SECTIONS = "Copy each version's changelog section into its release notes? [Y/n] "
+_TWO_VERSIONS = (
+    '# Changelog\n\n## 0.2.0 (2026-01-02)\n\n- Two.\n\n## 0.1.0 (2026-01-01)\n\n- One.\n'
+)
 
 
 def _assert_initial_selection_sections(output: str) -> None:
@@ -138,6 +142,91 @@ def _unselected_project(
     return paths, paths.config_dir / 'projects' / 'demo.toml'
 
 
+def test_changelog_sections_prompt_defers_to_a_notes_template(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _ctx, snapshot, project = _edit_checks(
+        tmp_path,
+        make_repo,
+        monkeypatch,
+        {},
+        release_page=_config.ReleasePageSettings(enabled=True, notes='Release {tag}'),
+    )
+
+    def _unexpected_prompt(_prompt: object = '') -> str:
+        pytest.fail('a notes template still asked about changelog sections')
+
+    monkeypatch.setattr('builtins.input', _unexpected_prompt)
+    assert _init._changelog_sections_prompt(project, snapshot, default=True) is None
+    assert (
+        'release_page.notes decides the notes; use {changelog_section} in it to include the '
+        'section.'
+    ) in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    'case',
+    [
+        ({}, _config.ReleasePageSettings(), ['No CHANGELOG.md in your source.']),
+        (
+            {'CHANGELOG.md': b'\xff'},
+            _config.ReleasePageSettings(),
+            ['CHANGELOG.md is not UTF-8 text.'],
+        ),
+        (
+            {'CHANGELOG.md': '## 0.1.0\n- One.\n'},
+            _config.ReleasePageSettings(),
+            ['CHANGELOG.md has a section for version 0.1.0.'],
+        ),
+        (
+            {'docs/CHANGES.md': '# Changes\n## Version 0.1.0\n- One.\n'},
+            _config.ReleasePageSettings(changelog='docs/CHANGES.md'),
+            [
+                'docs/CHANGES.md has no version headings pubanon recognizes.',
+                '  line 2: ## Version 0.1.0',
+                (
+                    '  to use headings like this, add changelog_heading = "## Version {version}" '
+                    'to [release_page]'
+                ),
+            ],
+        ),
+        (
+            {'docs/CHANGES.md': '# Changes\n## Version 0.1.0\n- One.\n'},
+            _config.ReleasePageSettings(
+                changelog='docs/CHANGES.md', changelog_heading='## Version {version}'
+            ),
+            ['docs/CHANGES.md has a section for version 0.1.0.'],
+        ),
+    ],
+)
+def test_changelog_sections_prompt_reports_the_source_changelog(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    case: tuple[dict[str, str | bytes], _config.ReleasePageSettings, list[str]],
+) -> None:
+    files, page, lines = case
+    source = make_repo(files={'README.md': 'public\n', **files})
+    _paths, _global_config, configured = configure(tmp_path, monkeypatch, source)
+    assert configured is not None
+    project = replace(configured, release_page=page)
+    snapshot = _source.read_snapshot(source, _source.pin(source, 'HEAD').commit)
+
+    def _answer(prompt: str) -> str:
+        assert prompt == _SECTIONS
+        return 'n'
+
+    monkeypatch.setattr('builtins.input', _answer)
+
+    assert _init._changelog_sections_prompt(project, snapshot, default=True) is False
+    out = capsys.readouterr().out
+    assert '\n'.join(lines) + '\n' in out
+
+
 def test_existing_project_report_shows_release_page_drafts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -208,6 +297,7 @@ def test_init_collects_complete_repository_settings_for_new_project(
         'Publication route (staged/direct) [staged]: ': '',
         'Required CI checks (comma separated, blank for none): ': '',
         _PAGES: 'y',
+        _SECTIONS: '',
         'Repository description (blank for none): ': 'Example project',
         'Enable issues? [Y/n] ': '',
         'Enable wiki? [y/N] ': '',
@@ -241,7 +331,9 @@ def test_init_collects_complete_repository_settings_for_new_project(
         discussions=True,
     )
     assert project.source_tags is source_tags
-    assert project.release_page == _config.ReleasePageSettings(enabled=True)
+    assert project.release_page == _config.ReleasePageSettings(
+        enabled=True, changelog_section=True
+    )
     assert prompts.count('Create local tags marking the source of each publication? [Y/n] ') == (
         tag_answer is not None
     )
@@ -260,6 +352,7 @@ def test_init_collects_complete_repository_settings_for_new_project(
         'Publication route (staged/direct) [staged]: ',
         'Required CI checks (comma separated, blank for none): ',
         _PAGES,
+        _SECTIONS,
         *(
             ['Create local tags marking the source of each publication? [Y/n] ']
             if tag_answer is not None
@@ -940,7 +1033,7 @@ def test_init_final_review_can_change_release_pages(
     monkeypatch.setattr('builtins.input', _answer)
     assert _cli.main(['init', '--project', 'demo']) == 0
     saved = _config.load_project(paths, 'demo')
-    assert saved.release_page == _config.ReleasePageSettings(enabled=True)
+    assert saved.release_page == _config.ReleasePageSettings(enabled=True, changelog_section=True)
 
 
 def test_init_final_review_revises_resolved_policy_membership(
@@ -1412,6 +1505,38 @@ def test_init_renders_registered_project_with_its_configured_terms(
     assert suffix not in rendered
     assert term in rendered
     assert _config.registry_lookup(paths, source) == registered
+
+
+@pytest.mark.parametrize('case', [('', True), ('n', False)])
+def test_init_reports_changelog_versions_and_saves_the_sections_answer(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    case: tuple[str, bool],
+) -> None:
+    reply, saved = case
+    source = make_repo(files={'README.md': 'public\n', 'CHANGELOG.md': _TWO_VERSIONS})
+    paths, _global_config, _project = configure(tmp_path, monkeypatch)
+    monkeypatch.chdir(source)
+
+    def _answer(prompt: str) -> str:
+        if prompt.startswith('Use this selection?'):
+            return 'c'
+        if prompt == _SAVE:
+            return 's'
+        if prompt == _PAGES:
+            return 'y'
+        if prompt == _SECTIONS:
+            return reply
+        return ''
+
+    monkeypatch.setattr('builtins.input', _answer)
+    assert _cli.main(['init', '--project', 'demo']) == 0
+    assert _config.load_project(paths, 'demo').release_page == _config.ReleasePageSettings(
+        enabled=True, changelog_section=saved
+    )
+    assert 'CHANGELOG.md has sections for 2 versions, newest 0.2.0.\n' in capsys.readouterr().out
 
 
 def test_init_rerun_leaves_existing_settings_untouched(
@@ -2082,8 +2207,12 @@ def test_init_same_source_uses_idempotent_registry_update(
 @pytest.mark.parametrize(
     'case',
     [
-        ('y', _config.ReleasePageSettings(enabled=True), 'yes'),
-        ('d', _config.ReleasePageSettings(enabled=True, draft=True), 'yes, as drafts'),
+        ('y', _config.ReleasePageSettings(enabled=True, changelog_section=True), 'yes'),
+        (
+            'd',
+            _config.ReleasePageSettings(enabled=True, draft=True, changelog_section=True),
+            'yes, as drafts',
+        ),
         ('n', _config.ReleasePageSettings(enabled=False), 'no'),
     ],
 )
@@ -2121,13 +2250,17 @@ def test_init_saves_each_release_page_answer(
             _config.ReleasePageSettings(enabled=True, title='Version {version}'),
             'yes',
             'd',
-            _config.ReleasePageSettings(enabled=True, title='Version {version}', draft=True),
+            _config.ReleasePageSettings(
+                enabled=True, title='Version {version}', draft=True, changelog_section=True
+            ),
         ),
         (
             _config.ReleasePageSettings(enabled=True, title='Version {version}', draft=True),
             'draft',
             'y',
-            _config.ReleasePageSettings(enabled=True, title='Version {version}'),
+            _config.ReleasePageSettings(
+                enabled=True, title='Version {version}', changelog_section=True
+            ),
         ),
         (
             _config.ReleasePageSettings(enabled=True, title='Version {version}', draft=True),
@@ -2139,7 +2272,9 @@ def test_init_saves_each_release_page_answer(
             _config.ReleasePageSettings(enabled=True, title='Version {version}', draft=True),
             'draft',
             '',
-            _config.ReleasePageSettings(enabled=True, title='Version {version}', draft=True),
+            _config.ReleasePageSettings(
+                enabled=True, title='Version {version}', draft=True, changelog_section=True
+            ),
         ),
         # The same answer keeps the saved table unchanged, even an unused draft key.
         (
@@ -2147,6 +2282,24 @@ def test_init_saves_each_release_page_answer(
             'no',
             'n',
             _config.ReleasePageSettings(enabled=False, draft=True),
+        ),
+        # Accepting the prompt keeps an explicitly saved opt-out.
+        (
+            _config.ReleasePageSettings(enabled=True, changelog_section=False),
+            'yes',
+            '',
+            _config.ReleasePageSettings(enabled=True, changelog_section=False),
+        ),
+        # A hand-written heading template survives the edit.
+        (
+            _config.ReleasePageSettings(enabled=True, changelog_heading='## Version {version}'),
+            'yes',
+            'y',
+            _config.ReleasePageSettings(
+                enabled=True,
+                changelog_section=True,
+                changelog_heading='## Version {version}',
+            ),
         ),
     ],
 )
@@ -2162,7 +2315,11 @@ def test_init_edit_release_pages_starts_from_the_saved_answer(
     prompt = (
         f'Create a release page for each published version? [y]es / [d]raft / [n]o [{default}]: '
     )
-    answers([(_EDIT, 'l'), (prompt, key)])
+    turned_off = key == 'n' or (key == '' and default == 'no')
+    sections_prompt = (
+        _SECTIONS.replace('[Y/n]', '[y/N]') if saved.changelog_section is False else _SECTIONS
+    )
+    answers([(_EDIT, 'l'), (prompt, key), *([] if turned_off else [(sections_prompt, '')])])
 
     assert _init._edit_project_section(ctx, snapshot, project).release_page == expected
 
@@ -2481,6 +2638,34 @@ def test_init_yes_refuses_policy_proposals_without_writing_project(
     assert not (paths.config_dir / 'projects' / 'demo.toml').exists()
     assert not paths.registry.exists()
     assert not (paths.data_dir / 'projects' / 'demo').exists()
+
+
+@pytest.mark.parametrize('answer', [None, False, True])
+def test_project_from_draft_keeps_or_replaces_the_saved_sections_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, answer: bool | None
+) -> None:
+    source = tmp_path / 'source'
+    source.mkdir()
+    paths, global_config, project = configure(tmp_path, monkeypatch, source)
+    assert project is not None
+    saved = _config.ReleasePageSettings(
+        enabled=True, changelog_section=False, changelog_heading='## Version {version}'
+    )
+    project = replace(project, release_page=saved)
+    draft = _init_draft.Draft(
+        source,
+        'a' * 40,
+        self_publication=False,
+        release_pages=True,
+        release_page_sections=answer,
+    )
+
+    proposed = _init._project_from_draft(
+        _context.ProjectContext(paths, global_config, project), (), draft
+    )
+
+    expected = saved if answer is None else replace(saved, changelog_section=answer)
+    assert proposed.project.release_page == expected
 
 
 def test_project_from_draft_omits_reserved_case_variants_from_proposed_groups(

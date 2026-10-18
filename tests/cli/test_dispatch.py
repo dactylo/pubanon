@@ -773,7 +773,7 @@ def test_color_option_controls_help_on_a_terminal(
             ],
         ),
         (['release', 'create'], ['--title', '--notes-file', '--yes']),
-        (['release', 'edit'], ['--title', '--notes-file', '--yes']),
+        (['release', 'edit'], ['--title', '--notes-file', '--refresh-notes', '--yes']),
         (['forget'], ['--force', '--yes']),
     ],
 )
@@ -1034,6 +1034,7 @@ def test_history_and_inspect_usage_errors_precede_side_effects(
         ['release'],
         ['release', 'create', 'v1.2.3', '--notes-file', 'notes', '--title', ''],
         ['release', 'edit', 'v1.2.3'],
+        ['release', 'edit', 'v1.2.3', '--notes-file', 'notes', '--refresh-notes'],
         ['release', 'edit', 'v1.2.3', '--title', ''],
         ['release', 'list', '--limit', '0'],
         ['release', 'list', '--limit', 'invalid'],
@@ -1049,6 +1050,26 @@ def test_release_usage_errors_precede_dispatch(
     monkeypatch.setattr(_cli, '_dispatch', _unexpected_dispatch)
     assert _cli.main(argv) == 2
     assert 'error:' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ('argv', 'message'),
+    [
+        (
+            ['release', 'edit', 'v1.2.3'],
+            'release edit requires --title, --notes-file, or --refresh-notes',
+        ),
+        (
+            ['release', 'edit', 'v1.2.3', '--notes-file', 'notes', '--refresh-notes'],
+            '--refresh-notes cannot be combined with --notes-file',
+        ),
+    ],
+)
+def test_release_edit_usage_errors_name_the_options(
+    argv: list[str], message: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _cli.main(argv) == 2
+    assert message in capsys.readouterr().err
 
 
 @pytest.mark.parametrize('selector', [None, 'v1.2.3'])

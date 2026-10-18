@@ -510,3 +510,30 @@ def test_inspect_rewrite_delegates_selector_and_refresh(
         == 1
     )
     assert calls == [('v1.0.0', True)]
+
+
+def test_inspect_shows_hints_for_a_refused_notes_template(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = make_repo(
+        files={'README.md': 'public\n', 'CHANGELOG.md': '# Changelog\n\n## Version 1.2.3\n- a\n'}
+    )
+    paths, project, _record = prepare(tmp_path, source, monkeypatch, version='1.2.3')
+    settings = _config.ReleasePageSettings(enabled=True, notes='{changelog_section}')
+    _config.save_project(paths, replace(project, release_page=settings))
+    capsys.readouterr()
+
+    assert _cli.main(['inspect', '--project', project.name]) == 0
+
+    assert (
+        'Release page (planned): cannot be planned: release_page.notes uses '
+        '{changelog_section}, but CHANGELOG.md has no heading for 1.2.3\n'
+        '  line 3 mentions 1.2.3: ## Version 1.2.3\n'
+        '  to use headings like this, add changelog_heading = "## Version {version}" '
+        'to [release_page]\n'
+        '  add or correct the 1.2.3 section, use a notes file, '
+        'or remove {changelog_section} from release_page.notes\n'
+    ) in capsys.readouterr().out

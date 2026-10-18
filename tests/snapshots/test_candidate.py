@@ -1175,7 +1175,7 @@ def test_record_write_failure_leaves_rerunnable_anchor(
     assert _records.load_candidate(paths, project_config.name) == record
 
 
-def test_regular_file_at_checks_exact_published_tree_entry(tmp_path: Path) -> None:
+def test_regular_file_bytes_reads_only_exact_regular_files(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     store = _store.candidate_store_path(paths, 'example')
     store.mkdir(parents=True)
@@ -1204,14 +1204,14 @@ def test_regular_file_at_checks_exact_published_tree_entry(tmp_path: Path) -> No
     )
     commit = _git_input(store, 'commit-tree', tree, input_bytes=b'Published\n').decode().strip()
 
-    assert _candidate.regular_file_at(paths, 'example', commit, 'plain')
-    assert _candidate.regular_file_at(paths, 'example', commit, 'executable')
-    assert _candidate.regular_file_at(paths, 'example', commit, 'directory/child')
+    assert _candidate.regular_file_bytes(paths, 'example', commit, 'plain') == b'content'
+    assert _candidate.regular_file_bytes(paths, 'example', commit, 'executable') == b'content'
+    assert _candidate.regular_file_bytes(paths, 'example', commit, 'directory/child') == b'content'
     for path in ('missing', 'link', 'submodule', 'directory', 'link/child'):
-        assert not _candidate.regular_file_at(paths, 'example', commit, path)
+        assert _candidate.regular_file_bytes(paths, 'example', commit, path) is None
 
 
-def test_regular_file_at_rejects_malformed_store_read(
+def test_regular_file_bytes_rejects_malformed_store_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def _malformed(*_args: object, **_kwargs: object) -> bytes:
@@ -1219,7 +1219,7 @@ def test_regular_file_at_rejects_malformed_store_read(
 
     monkeypatch.setattr(_candidate, 'git_result', _malformed)
     with pytest.raises(PubanonError, match='cannot read published file'):
-        _candidate.regular_file_at(_paths(tmp_path), 'example', 'a' * 40, 'plain')
+        _candidate.regular_file_bytes(_paths(tmp_path), 'example', 'a' * 40, 'plain')
 
 
 @pytest.mark.parametrize('visibility', ['public', 'private'])

@@ -86,14 +86,16 @@ final repository's CI passes, leave release pages off and run `pubanon release c
 `pubanon repo watch`. A draft notifies no one and starts no release workflows until it is
 published; see [Publish pages after the package upload](#publish-pages-after-the-package-upload).
 
-By default, the page title is the tag, such as `v0.2.0`, and the notes are one line linking to
-`CHANGELOG.md` at that tag in the final repository. If the published snapshot has no root
-`CHANGELOG.md`, the notes are empty and the preview shows how to link a changelog elsewhere.
+By default, the page title is the tag, such as `v0.2.0`, and the notes are that version's section
+of `CHANGELOG.md`, followed by a link to the whole file at that tag in the final repository. See
+[Changelog sections](#changelog-sections). If the published snapshot has no root `CHANGELOG.md`,
+the notes are empty and the preview shows how to link a changelog elsewhere.
 
 ### Change the defaults
 
 Add a `[release_page]` table to your [project configuration](#edit-an-existing-project). `init`
-saves `enabled` and `draft`; the other keys change the page itself. Each example is independent:
+saves `enabled`, `draft`, and `changelog_section`; the other keys change the page itself. Each
+example is independent:
 
 ```toml
 [release_page]
@@ -122,10 +124,71 @@ Install with `pip install example=={version}`.
 ```
 
 `title` and `notes` are templates. `{tag}` is the tag, `{version}` is the tag without its leading
-`v`, and notes can also use `{changelog_url}`. Write `{{` and `}}` for literal braces, and
-`notes = ""` for empty notes. Without the table, `enabled` and `draft` are `false`, `title` is
-`"{tag}"`, and the notes link to `CHANGELOG.md` when it exists. A `changelog` you set must be a
-file in the published snapshot whenever the notes link to it.
+`v`, and notes can also use `{changelog_url}` and `{changelog_section}`. Write `{{` and `}}` for
+literal braces, and `notes = ""` for empty notes. Without the table, `enabled` and `draft` are
+`false`, `changelog_section` is `true`, `title` is `"{tag}"`, and the notes contain the version's
+changelog section and a link to `CHANGELOG.md` when it exists. A `changelog` you set must be a file
+in the published snapshot whenever the notes use it.
+
+### Changelog sections
+
+When the changelog has a section for the version, the notes are that section, followed by
+`See the [changelog](URL) for all versions.` pubanon reads the changelog as published at the tag,
+leaves out the version heading, because the page title names the version and GitHub shows the
+page's date, and copies everything else as written.
+
+pubanon recognizes a `#` or `##` heading that starts with the version, bare, in square brackets, or
+after a `v`:
+
+| Format                             | Heading                                                                   |
+| ---------------------------------- | ------------------------------------------------------------------------- |
+| Keep a Changelog, Common Changelog | `## [0.7.0] - 2026-10-20`                                                 |
+| release-please                     | `## [0.7.0](https://github.com/o/r/compare/v0.6.0...v0.7.0) (2026-10-20)` |
+| semantic-release                   | `# [0.7.0](https://github.com/o/r/compare/v0.6.0...v0.7.0) (2026-10-20)`  |
+| Version and date                   | `## 0.7.0 (2026-10-20)`                                                   |
+| Version only                       | `## 0.7.0`                                                                |
+
+A section runs to the next version heading, or the next heading at the same or a higher level. Two
+kinds of links break on a release page: relative links, such as `[guide](docs/guide.md)`, and
+reference links, such as `[text][label]`, whose definitions sit elsewhere in the changelog.
+
+If the changelog has no heading for the version, several, or an empty section, the notes only link
+to the changelog, and the preview says why. It names headings that mention the version without
+matching and, when it can, suggests a `changelog_heading` setting.
+
+`pubanon init` reports which versions it recognizes in your changelog and asks whether to copy
+sections. To turn them off, answer no under release pages in `pubanon init --edit`, or set:
+
+```toml
+[release_page]
+changelog_section = false
+```
+
+If your headings put other text before the version, describe them with `changelog_heading`, a
+template with `{version}` where the version goes. A heading matches when it starts with the
+template's text, with the version in place of `{version}`:
+
+| Headings                        | Setting                                      |
+| ------------------------------- | -------------------------------------------- |
+| `## Version 0.7.0 (2026-10-20)` | `changelog_heading = "## Version {version}"` |
+| `### 0.7.0`                     | `changelog_heading = "### {version}"`        |
+| `## mytool v0.7.0`              | `changelog_heading = "## mytool v{version}"` |
+
+A heading that puts something that changes, such as a date, before the version cannot be described;
+use a notes file for those versions.
+
+In a `notes` template, `{changelog_section}` inserts the section. Unlike the default notes, a
+template that uses it refuses the page when the section is missing, which stops `publish` before
+anything is pushed.
+
+To fill in pages that already exist, refresh their notes one tag at a time. Each refresh reads the
+changelog as published at that tag, keeps the page's title and status, and shows the current and
+new notes before asking:
+
+```sh
+pubanon release edit v0.6.0 --refresh-notes
+for tag in v0.1.0 v0.2.0 v0.2.1; do pubanon release edit "$tag" --refresh-notes; done
+```
 
 ### Publish pages after the package upload
 
@@ -151,6 +214,15 @@ and a waiting draft is published. To publish a tagged commit by hand, run the re
 the Actions tab on its tag. If a release run fails, rerun that run rather than starting a new one:
 a new run leaves the failed run's skipped checks on the tagged commit, and `pubanon package watch`
 refuses skipped checks.
+
+Rerunning does not help when the fault is in the release workflow itself, because every run uses
+the workflow file of the tagged commit. If the run failed before the upload, the page is still a
+draft, so the tag can still move. Commit the fix in your source without changing the version,
+replace the latest publication with `pubanon prepare --replace`, and follow `pubanon inspect` to
+publish as usual. CI runs on the corrected commit and starts the release workflow on the moved tag.
+If only the page step failed, the package is already uploaded; publish the draft on GitHub instead.
+This depends on draft pages: with immutable releases on, a published page locks its tag, so without
+drafts you would publish a new version instead.
 
 To approve each upload, open the repository's settings on GitHub, then Environments, then `pypi`,
 and add required reviewers. The release workflow then waits for approval before uploading, and the
@@ -188,14 +260,16 @@ workflow includes `publish`. When a tagged publication finishes without a page, 
 pubanon release create v0.2.0
 pubanon release show v0.2.0
 pubanon release edit v0.2.0 --title "Version 0.2.0" --notes-file revised-notes.md
+pubanon release edit v0.2.0 --refresh-notes
 ```
 
 `release create` uses your configured title and notes unless you pass `--title` or `--notes-file`,
 and it works even when `enabled = false`. With `draft = true`, it creates a draft. If a matching
 page already exists, it reports the page and changes nothing. If a different page exists, it shows
 the differences and points to `release show` and `release edit`. `edit` changes only what you pass;
-an empty notes file clears the notes. `pubanon release list` shows up to 30 pages; `--limit`
-changes the count.
+an empty notes file clears the notes. `--refresh-notes` replaces the notes with the ones pubanon
+would create now, from the changelog at that tag; it cannot be combined with `--notes-file`.
+`pubanon release list` shows up to 30 pages; `--limit` changes the count.
 
 ### If something goes wrong
 
@@ -727,9 +801,9 @@ tag-only workflows don't run there. Keep deployment and package-upload triggers 
 repository that should run them.
 
 Use the optional [`[release_page]` table](#change-the-defaults) to change the page created for a
-tagged publication. `init` and `init --edit` save only its `enabled` and `draft` keys. Use the
-optional [per-project `[commit_message]` table](#commit-messages) to override either global message
-default for new preparations.
+tagged publication. `init` and `init --edit` save only its `enabled`, `draft`, and
+`changelog_section` keys. Use the optional [per-project `[commit_message]` table](#commit-messages)
+to override either global message default for new preparations.
 
 After saving, run `pubanon status` to check the project and any retained snapshot. Changes to file
 selection, publication identity, destination, required checks, or `ci_workflow` require a fresh

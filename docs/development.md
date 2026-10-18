@@ -2,7 +2,7 @@
 
 ## Local environment
 
-Provide Python 3.13 or newer, uv 0.12.23, Taplo 0.10.0, and shfmt 3.14.1 on `PATH`. These native
+Provide Python 3.13 or newer, uv 0.13.1, Taplo 0.10.0, and shfmt 3.14.1 on `PATH`. These native
 tools remain separate from the Python environment; use the same versions as CI when checking
 publication readiness.
 
@@ -12,8 +12,10 @@ make check
 ```
 
 Use `make install` to install the command-line tool with `uv tool`, or `make reinstall` to replace
-an existing installation. `make format-check`, `make lock-check`, `make type-check`, and
-`make whitespace-check` run the corresponding read-only checks; `make quality` combines them.
+an existing installation. `make format-check`, `make lock-check`, `make type-check`,
+`make whitespace-check`, and `make workflow-check` run the corresponding read-only checks;
+`make quality` combines them. `make workflow-check` audits the GitHub Actions workflows and the
+starter workflows in `docs/examples/` with zizmor, offline.
 
 `make setup` creates `.venv` with the available `python`, syncs the exact packages and hashes in
 `requirements-ci.txt`, and installs pubanon in editable mode using the locked build backend. To

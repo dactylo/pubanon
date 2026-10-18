@@ -104,13 +104,13 @@ anything reaches the final repository.
 
 `publish` asks for confirmation, then sends the snapshot to the final repository. If you turned on
 release pages, a tagged publication also gets a release page, shown in the preview first. A new
-page defaults to the tag as its title and a link to a published root `CHANGELOG.md` as its notes,
-or empty notes when that file is absent. Otherwise pubanon prints the command that adds one later.
-On the `staged` route, `publish` first checks that the staged snapshot passed its configured
-checks. `repo watch` waits for the final repository's own CI; skip it if neither `ci_workflow` nor
-checks are configured. `repo reveal` checks the published history, settings, and Actions logs,
-names what it cannot check, such as artifact contents, and asks before making the repository
-public.
+page defaults to the tag as its title and, as its notes, that version's section of a published root
+`CHANGELOG.md` followed by a link to the file, or empty notes when that file is absent. Otherwise
+pubanon prints the command that adds one later. On the `staged` route, `publish` first checks that
+the staged snapshot passed its configured checks. `repo watch` waits for the final repository's own
+CI; skip it if neither `ci_workflow` nor checks are configured. `repo reveal` checks the published
+history, settings, and Actions logs, names what it cannot check, such as artifact contents, and
+asks before making the repository public.
 
 For the next release, commit your changes, updating the package version if you have one, and repeat
 these steps without `repo create` and `repo reveal`.
