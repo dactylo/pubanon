@@ -41,6 +41,12 @@ class Membership(NamedTuple):
     reserved: list[str]
 
 
+def _is_reserved_path(path: str) -> bool:
+    """Return whether a posix path has an NFC/casefold-equivalent reserved basename."""
+    basename = path.rsplit('/', maxsplit=1)[-1]
+    return unicodedata.normalize('NFC', basename).casefold() in RESERVED_DENY
+
+
 def _is_secret_like(path: str) -> bool:
     """Return whether a path matches a credential-like convention."""
     candidates = (path, *path.split('/'))
@@ -49,12 +55,6 @@ def _is_secret_like(path: str) -> bool:
         for candidate in candidates
         for pattern in _SECRET_FILE_PATTERNS
     )
-
-
-def is_reserved_path(path: str) -> bool:
-    """Return whether a posix path has an NFC/casefold-equivalent reserved basename."""
-    basename = path.rsplit('/', maxsplit=1)[-1]
-    return unicodedata.normalize('NFC', basename).casefold() in RESERVED_DENY
 
 
 def evaluate_membership(
@@ -88,7 +88,7 @@ def evaluate_membership(
     reserved: list[str] = []
     folded_global_deny = tuple(pattern.casefold() for pattern in global_deny)
     for path in paths:
-        if is_reserved_path(path):
+        if _is_reserved_path(path):
             reserved.append(path)
         elif any(
             fnmatch.fnmatchcase(path.casefold(), pattern) for pattern in folded_global_deny

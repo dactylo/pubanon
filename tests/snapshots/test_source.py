@@ -3,7 +3,7 @@ import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path, PureWindowsPath
-from typing import NotRequired, TypedDict, Unpack
+from typing import Unpack
 
 import pytest
 
@@ -12,31 +12,14 @@ from pubanon._run import GitResult
 from pubanon._snapshots import _source
 from pubanon._snapshots._source import check_source_safety
 from pubanon._terminal import escape
-from tests._git import git_env
-
-
-class _RunGitOptions(TypedDict):
-    check: NotRequired[bool]
-    cwd: Path | None
-    env_extra: NotRequired[Mapping[str, str] | None]
-    input_bytes: NotRequired[bytes | None]
-
-
-def _git(repo: Path, *args: str, input_bytes: bytes | None = None) -> bytes:
-    return subprocess.run(
-        ['git', '-C', repo, *args],
-        check=True,
-        capture_output=True,
-        input=input_bytes,
-        env=git_env(),
-    ).stdout
+from tests._git import RunGitOptions, git_bytes, git_env
 
 
 def _commit_file(repo: Path, path: str, content: str) -> str:
     (repo / path).write_text(content)
-    _git(repo, 'add', path)
+    git_bytes(repo, 'add', path)
     return (
-        _git(
+        git_bytes(
             repo,
             '-c',
             'user.name=Test User',
@@ -52,9 +35,9 @@ def _commit_file(repo: Path, path: str, content: str) -> str:
 
 
 def _commit_tree(repo: Path, records: bytes) -> str:
-    tree = _git(repo, 'mktree', '-z', input_bytes=records).strip().decode()
+    tree = git_bytes(repo, 'mktree', '-z', input_bytes=records).strip().decode()
     return (
-        _git(
+        git_bytes(
             repo,
             '-c',
             'user.name=Test User',
@@ -126,7 +109,9 @@ def test_documented_bundle_restore_preserves_branches_without_remote(
 ) -> None:
     source = _source_with_branches(make_repo)
     commit = (
-        _git(source, 'commit-tree', 'HEAD^{tree}', '-p', 'HEAD', '-m', 'bookmark-only revision')
+        git_bytes(
+            source, 'commit-tree', 'HEAD^{tree}', '-p', 'HEAD', '-m', 'bookmark-only revision'
+        )
         .strip()
         .decode()
     )
@@ -176,8 +161,8 @@ def test_pin_records_annotated_tag_name_and_original_oid(
     make_repo: Callable[..., Path],
 ) -> None:
     repo = make_repo()
-    commit = _git(repo, 'rev-parse', 'HEAD').strip().decode()
-    _git(
+    commit = git_bytes(repo, 'rev-parse', 'HEAD').strip().decode()
+    git_bytes(
         repo,
         '-c',
         'user.name=Test User',
@@ -189,7 +174,7 @@ def test_pin_records_annotated_tag_name_and_original_oid(
         '-m',
         'release',
     )
-    tag_oid = _git(repo, 'rev-parse', 'refs/tags/release').strip().decode()
+    tag_oid = git_bytes(repo, 'rev-parse', 'refs/tags/release').strip().decode()
 
     pinned = _source.pin(repo, 'release')
 
@@ -200,8 +185,8 @@ def test_pin_records_detached_head_as_explicit(
     make_repo: Callable[..., Path],
 ) -> None:
     repo = make_repo()
-    oid = _git(repo, 'rev-parse', 'HEAD').strip().decode()
-    _git(repo, 'checkout', '--detach', '-q', oid)
+    oid = git_bytes(repo, 'rev-parse', 'HEAD').strip().decode()
+    git_bytes(repo, 'checkout', '--detach', '-q', oid)
 
     pinned = _source.pin(repo, 'HEAD')
 
@@ -210,7 +195,7 @@ def test_pin_records_detached_head_as_explicit(
 
 def test_pin_records_explicit_oid(make_repo: Callable[..., Path]) -> None:
     repo = make_repo()
-    oid = _git(repo, 'rev-parse', 'HEAD').strip().decode()
+    oid = git_bytes(repo, 'rev-parse', 'HEAD').strip().decode()
 
     pinned = _source.pin(repo, oid)
 
@@ -224,7 +209,7 @@ def test_pin_records_parent_expression_as_explicit(
     make_repo: Callable[..., Path],
 ) -> None:
     repo = make_repo()
-    parent = _git(repo, 'rev-parse', 'HEAD').strip().decode()
+    parent = git_bytes(repo, 'rev-parse', 'HEAD').strip().decode()
     _commit_file(repo, 'second.txt', 'second')
 
     pinned = _source.pin(repo, 'HEAD~1')
@@ -234,8 +219,8 @@ def test_pin_records_parent_expression_as_explicit(
 
 def test_pin_records_ref_name_and_oid(make_repo: Callable[..., Path]) -> None:
     repo = make_repo()
-    oid = _git(repo, 'rev-parse', 'HEAD').strip().decode()
-    ref_name = _git(repo, 'symbolic-ref', 'HEAD').strip().decode()
+    oid = git_bytes(repo, 'rev-parse', 'HEAD').strip().decode()
+    ref_name = git_bytes(repo, 'symbolic-ref', 'HEAD').strip().decode()
 
     pinned = _source.pin(repo, 'HEAD')
 
@@ -247,7 +232,7 @@ def test_pin_records_ref_name_and_oid(make_repo: Callable[..., Path]) -> None:
 
 def test_pin_records_short_oid_as_explicit(make_repo: Callable[..., Path]) -> None:
     repo = make_repo()
-    oid = _git(repo, 'rev-parse', 'HEAD').strip().decode()
+    oid = git_bytes(repo, 'rev-parse', 'HEAD').strip().decode()
 
     pinned = _source.pin(repo, oid[:12])
 
@@ -311,7 +296,7 @@ def test_pin_terminal_renders_invalid_selector_without_changing_git_argument(
     seen: list[str] = []
     real_run_git = _source.run_git
 
-    def _record_run(args: Sequence[str], **kwargs: Unpack[_RunGitOptions]) -> GitResult:
+    def _record_run(args: Sequence[str], **kwargs: Unpack[RunGitOptions]) -> GitResult:
         seen.extend(args)
         return real_run_git(args, **kwargs)
 
@@ -334,7 +319,7 @@ def test_read_snapshot_accepts_contained_parent_relative_link(
     repo = make_repo(
         'ok-link', files={'README.md': 'x'}, symlinks={'docs/current': '../README.md'}
     )
-    commit = _git(repo, 'rev-parse', 'HEAD').strip().decode()
+    commit = git_bytes(repo, 'rev-parse', 'HEAD').strip().decode()
     snapshot = _source.read_snapshot(repo, commit)
     assert any(entry.kind == 'symlink' for entry in snapshot)
 
@@ -343,7 +328,7 @@ def test_read_snapshot_refuses_empty_symlink_target(
     make_repo: Callable[..., Path],
 ) -> None:
     repo = make_repo('empty-link')
-    blob = _git(repo, 'hash-object', '-w', '--stdin', input_bytes=b'').strip().decode()
+    blob = git_bytes(repo, 'hash-object', '-w', '--stdin', input_bytes=b'').strip().decode()
     commit = _commit_tree(repo, f'120000 blob {blob}\tlink\0'.encode())
     with pytest.raises(PubanonError, match='symlink'):
         _source.read_snapshot(repo, commit)
@@ -351,7 +336,7 @@ def test_read_snapshot_refuses_empty_symlink_target(
 
 def test_read_snapshot_refuses_symlink_chain(make_repo: Callable[..., Path]) -> None:
     repo = make_repo('chain', files={'c': 'x'}, symlinks={'b': 'c', 'a': 'b'})
-    commit = _git(repo, 'rev-parse', 'HEAD').strip().decode()
+    commit = git_bytes(repo, 'rev-parse', 'HEAD').strip().decode()
     with pytest.raises(PubanonError, match='symlink'):
         _source.read_snapshot(repo, commit)
 
@@ -361,12 +346,12 @@ def test_read_snapshot_selects_store_for_tree_and_blob_reads(
 ) -> None:
     source = make_repo(files={'source.txt': 'source'})
     store = source / '.git'
-    commit = _git(source, 'rev-parse', 'HEAD').decode().strip()
+    commit = git_bytes(source, 'rev-parse', 'HEAD').decode().strip()
     expected = _source.read_snapshot(source, commit)
     calls: list[list[str]] = []
     original = _source.run_git
 
-    def _record(args: Sequence[str], **kwargs: Unpack[_RunGitOptions]) -> GitResult:
+    def _record(args: Sequence[str], **kwargs: Unpack[RunGitOptions]) -> GitResult:
         calls.append(list(args))
         return original(args, **kwargs)
 
@@ -442,19 +427,23 @@ def test_snapshot_digest_changes_for_one_byte() -> None:
     assert _source.snapshot_digest(original) != _source.snapshot_digest(changed)
 
 
-def test_snapshot_digest_orders_records_by_path_bytes() -> None:
-    first = _source.Entry('a', 0o100644, 'blob', b'a')
-    second = _source.Entry('b', 0o100755, 'blob', b'b')
-
-    assert _source.snapshot_digest((second, first)) == _source.snapshot_digest((first, second))
+def test_snapshot_digest_preserves_length_framing_and_path_byte_order() -> None:
+    first = _source.Entry('a', 0o100644, 'blob', b'\x00\xff')
+    link = _source.Entry('link', 0o120000, 'symlink', b'./a')
+    last = _source.Entry('z', 0o100755, 'blob', b'go\n')
+    # Fixed SHA-256 vector of path, octal mode, kind, and data, each prefixed
+    # by its eight-byte big-endian length, in a/link/z path order.
+    expected = 'e9d0e7ea21fcde769febac58de3c796a3a19f816574dbc01ef698a49a5e53d16'
+    assert _source.snapshot_digest((first, link, last)) == expected
+    assert _source.snapshot_digest((last, first, link)) == expected
 
 
 def test_snapshot_preserves_blob_bytes_and_exact_file_modes(
     make_repo: Callable[..., Path],
 ) -> None:
     repo = make_repo(files={'regular.bin': b'\x00\xff', 'script.sh': '#!/bin/sh\n'})
-    _git(repo, 'update-index', '--chmod=+x', 'script.sh')
-    _git(
+    git_bytes(repo, 'update-index', '--chmod=+x', 'script.sh')
+    git_bytes(
         repo,
         '-c',
         'user.name=Test User',
@@ -464,7 +453,7 @@ def test_snapshot_preserves_blob_bytes_and_exact_file_modes(
         '--amend',
         '--no-edit',
     )
-    commit = _git(repo, 'rev-parse', 'HEAD').strip().decode()
+    commit = git_bytes(repo, 'rev-parse', 'HEAD').strip().decode()
 
     snapshot = _source.read_snapshot(repo, commit)
 
@@ -494,7 +483,7 @@ def test_snapshot_preserves_in_tree_symlink_target_bytes(
         files={'nested/target.txt': 'content'},
         symlinks={'nested/link': target},
     )
-    commit = _git(repo, 'rev-parse', 'HEAD').strip().decode()
+    commit = git_bytes(repo, 'rev-parse', 'HEAD').strip().decode()
 
     snapshot = _source.read_snapshot(repo, commit)
 
@@ -506,7 +495,7 @@ def test_snapshot_preserves_in_tree_symlink_target_bytes(
 
 def test_snapshot_refuses_absolute_symlink(make_repo: Callable[..., Path]) -> None:
     repo = make_repo(symlinks={'link': '/canaryx/private'})
-    commit = _git(repo, 'rev-parse', 'HEAD').strip().decode()
+    commit = git_bytes(repo, 'rev-parse', 'HEAD').strip().decode()
 
     with pytest.raises(PubanonError) as exc_info:
         _source.read_snapshot(repo, commit)
@@ -520,7 +509,7 @@ def test_snapshot_refuses_gitlink_with_both_recovery_choices(
     make_repo: Callable[..., Path],
 ) -> None:
     repo = make_repo()
-    oid = _git(repo, 'rev-parse', 'HEAD').strip()
+    oid = git_bytes(repo, 'rev-parse', 'HEAD').strip()
     commit = _commit_tree(repo, b'160000 commit ' + oid + b'\tvendor\0')
 
     with pytest.raises(PubanonError) as exc_info:
@@ -546,7 +535,7 @@ def test_snapshot_refuses_mismatched_batch_object(
 
     monkeypatch.setattr(_source, 'run_git', _fake_run_git)
 
-    with pytest.raises(PubanonError, match='ambiguous object response'):
+    with pytest.raises(PubanonError, match='mismatched source object'):
         _source.read_snapshot(repo, 'c' * 40)
 
 
@@ -554,7 +543,7 @@ def test_snapshot_refuses_non_utf8_tree_name(
     make_repo: Callable[..., Path],
 ) -> None:
     repo = make_repo()
-    blob = _git(repo, 'hash-object', '-w', '--stdin', input_bytes=b'content').strip()
+    blob = git_bytes(repo, 'hash-object', '-w', '--stdin', input_bytes=b'content').strip()
     commit = _commit_tree(repo, b'100644 blob ' + blob + b'\tbad-\xff.txt\0')
 
     with pytest.raises(PubanonError) as exc_info:
@@ -570,7 +559,7 @@ def test_snapshot_refuses_nul_containing_symlink_target(
 ) -> None:
     repo = make_repo()
     target_canary = b'canaryx-private-target'
-    blob = _git(
+    blob = git_bytes(
         repo,
         'hash-object',
         '-w',
@@ -593,7 +582,7 @@ def test_snapshot_refuses_root_escaping_symlink(
     make_repo: Callable[..., Path],
 ) -> None:
     repo = make_repo(symlinks={'nested/link': '../../canaryx-private'})
-    commit = _git(repo, 'rev-parse', 'HEAD').strip().decode()
+    commit = git_bytes(repo, 'rev-parse', 'HEAD').strip().decode()
 
     with pytest.raises(PubanonError) as exc_info:
         _source.read_snapshot(repo, commit)
@@ -690,8 +679,8 @@ def test_snapshot_reports_unreadable_object_path(
     make_repo: Callable[..., Path],
 ) -> None:
     repo = make_repo('canaryx-private', files={'canaryx.txt': 'private'})
-    commit = _git(repo, 'rev-parse', 'HEAD').strip().decode()
-    blob = _git(repo, 'rev-parse', 'HEAD:canaryx.txt').strip().decode()
+    commit = git_bytes(repo, 'rev-parse', 'HEAD').strip().decode()
+    blob = git_bytes(repo, 'rev-parse', 'HEAD:canaryx.txt').strip().decode()
     object_path = repo / '.git' / 'objects' / blob[:2] / blob[2:]
     object_path.chmod(0o600)
     object_path.unlink()
@@ -716,9 +705,9 @@ def test_source_alternates_recovery_preserves_branches_and_tags(
     subprocess.run(
         ['git', 'clone', '-q', '--shared', str(origin), str(source)], check=True, env=git_env()
     )
-    _git(source, 'branch', 'topic', 'origin/topic')
-    _git(source, 'remote', 'remove', 'origin')
-    _git(
+    git_bytes(source, 'branch', 'topic', 'origin/topic')
+    git_bytes(source, 'remote', 'remove', 'origin')
+    git_bytes(
         source,
         '-c',
         'user.name=Test User',
@@ -755,11 +744,11 @@ def test_source_alternates_recovery_preserves_branches_and_tags(
     assert not saved.exists()
     assert _refs(source) == before
     for oid in before.values():
-        _git(source, 'cat-file', '-e', oid)
+        git_bytes(source, 'cat-file', '-e', oid)
         objects = _git_out(source, 'rev-list', '--objects', oid).splitlines()
         for item in objects:
-            _git(source, 'cat-file', '-e', item.split(' ', maxsplit=1)[0])
-    _git(source, 'fsck', '--full')
+            git_bytes(source, 'cat-file', '-e', item.split(' ', maxsplit=1)[0])
+    git_bytes(source, 'fsck', '--full')
     if not verification_fails:
         check_source_safety(source)
 
@@ -778,7 +767,7 @@ def test_source_bookmark_encodes_existing_project_names(
     make_repo: Callable[..., Path], project: str, encoded: str
 ) -> None:
     repo = make_repo()
-    original = _git(repo, 'rev-parse', 'HEAD').strip().decode()
+    original = git_bytes(repo, 'rev-parse', 'HEAD').strip().decode()
     publication = '1' * 40
     bookmark = _source.describe_bookmark(repo, project, publication)
     assert bookmark.refname == f'refs/pubanon/publications/{encoded}/{publication}'
@@ -791,15 +780,15 @@ def test_bookmark_release_check_matches_release_safety(
     make_repo: Callable[..., Path], state: str
 ) -> None:
     repo = make_repo()
-    original = _git(repo, 'rev-parse', 'HEAD').strip().decode()
+    original = git_bytes(repo, 'rev-parse', 'HEAD').strip().decode()
     bookmark = _source.describe_bookmark(repo, 'project', 'a' * 40)
     if state == 'matching':
         _source.ensure_bookmark(bookmark, original)
     elif state == 'moved':
-        other = _git(repo, 'commit-tree', 'HEAD^{tree}', '-m', 'other').strip().decode()
-        _git(repo, 'update-ref', bookmark.refname, other)
+        other = git_bytes(repo, 'commit-tree', 'HEAD^{tree}', '-m', 'other').strip().decode()
+        git_bytes(repo, 'update-ref', bookmark.refname, other)
     elif state == 'symbolic':
-        _git(repo, 'symbolic-ref', bookmark.refname, 'refs/heads/master')
+        git_bytes(repo, 'symbolic-ref', bookmark.refname, 'refs/heads/master')
     elif state == 'invalid':
         bookmark = replace(bookmark, git_common_dir=Path('relative'))
 
@@ -817,7 +806,7 @@ def test_bookmark_release_check_matches_release_safety(
 
 def test_source_bookmark_preserves_rewritten_commit(make_repo: Callable[..., Path]) -> None:
     repo = make_repo(files={'original.txt': 'private revision\n'})
-    original = _git(repo, 'rev-parse', 'HEAD').strip().decode()
+    original = git_bytes(repo, 'rev-parse', 'HEAD').strip().decode()
     publication = 'a' * 40
     bookmark = _source.describe_bookmark(repo, 'project', publication)
     assert bookmark.source_path == repo.resolve()
@@ -826,8 +815,8 @@ def test_source_bookmark_preserves_rewritten_commit(make_repo: Callable[..., Pat
 
     _source.ensure_bookmark(bookmark, original)
     _source.ensure_bookmark(bookmark, original)
-    assert _git(repo, 'rev-parse', bookmark.refname).strip().decode() == original
-    _git(
+    assert git_bytes(repo, 'rev-parse', bookmark.refname).strip().decode() == original
+    git_bytes(
         repo,
         '-c',
         'user.name=Test User',
@@ -838,18 +827,18 @@ def test_source_bookmark_preserves_rewritten_commit(make_repo: Callable[..., Pat
         '-qm',
         'rewritten',
     )
-    _git(repo, 'reflog', 'expire', '--expire=now', '--all')
-    _git(repo, 'gc', '--prune=now')
-    assert _git(repo, 'cat-file', '-t', original) == b'commit\n'
+    git_bytes(repo, 'reflog', 'expire', '--expire=now', '--all')
+    git_bytes(repo, 'gc', '--prune=now')
+    assert git_bytes(repo, 'cat-file', '-t', original) == b'commit\n'
     assert _source.source_recovery(bookmark, original).status == 'protected'
 
-    _git(repo, 'update-ref', 'refs/keep/other', original)
+    git_bytes(repo, 'update-ref', 'refs/keep/other', original)
     _source.remove_bookmark(bookmark, original)
     _source.remove_bookmark(bookmark, original)
-    _git(repo, 'gc', '--prune=now')
-    assert _git(repo, 'cat-file', '-t', original) == b'commit\n'
-    _git(repo, 'update-ref', '-d', 'refs/keep/other', original)
-    _git(repo, 'gc', '--prune=now')
+    git_bytes(repo, 'gc', '--prune=now')
+    assert git_bytes(repo, 'cat-file', '-t', original) == b'commit\n'
+    git_bytes(repo, 'update-ref', '-d', 'refs/keep/other', original)
+    git_bytes(repo, 'gc', '--prune=now')
     missing = subprocess.run(
         ['git', '-C', repo, 'cat-file', '-e', original],
         capture_output=True,
@@ -864,7 +853,7 @@ def test_source_bookmark_recovers_moved_repository_only_with_owned_ref(
     tmp_path: Path, make_repo: Callable[..., Path]
 ) -> None:
     original_repo = make_repo(files={'same.txt': 'content\n'})
-    original = _git(original_repo, 'rev-parse', 'HEAD').strip().decode()
+    original = git_bytes(original_repo, 'rev-parse', 'HEAD').strip().decode()
     bookmark = _source.describe_bookmark(original_repo, 'project', 'e' * 40)
     _source.ensure_bookmark(bookmark, original)
     moved = tmp_path / 'moved'
@@ -878,7 +867,7 @@ def test_source_bookmark_recovers_moved_repository_only_with_owned_ref(
     unrelated = make_repo('unrelated', files={'same.txt': 'content\n'})
     refused = _source.source_recovery(bookmark, original, relocated_source=unrelated)
     assert refused.status == 'unavailable'
-    _git(moved, 'update-ref', '-d', bookmark.refname, original)
+    git_bytes(moved, 'update-ref', '-d', bookmark.refname, original)
     assert (
         _source.source_recovery(bookmark, original, relocated_source=moved).status == 'unavailable'
     )
@@ -888,12 +877,12 @@ def test_source_bookmark_refuses_conflicting_owner(
     make_repo: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo = make_repo()
-    original = _git(repo, 'rev-parse', 'HEAD').strip().decode()
+    original = git_bytes(repo, 'rev-parse', 'HEAD').strip().decode()
     other = (
-        _git(
+        git_bytes(
             repo,
             'commit-tree',
-            _git(repo, 'rev-parse', 'HEAD^{tree}').strip().decode(),
+            git_bytes(repo, 'rev-parse', 'HEAD^{tree}').strip().decode(),
             '-m',
             'other',
         )
@@ -901,17 +890,17 @@ def test_source_bookmark_refuses_conflicting_owner(
         .decode()
     )
     bookmark = _source.describe_bookmark(repo, 'project', 'b' * 40)
-    _git(repo, 'update-ref', bookmark.refname, other)
+    git_bytes(repo, 'update-ref', bookmark.refname, other)
     with pytest.raises(PubanonError, match='bookmark'):
         _source.ensure_bookmark(bookmark, original)
     with pytest.raises(PubanonError, match='bookmark'):
         _source.remove_bookmark(bookmark, original)
     assert _source.source_recovery(bookmark, original).status == 'available'
     assert 'changed' in (_source.source_recovery(bookmark, original).reason or '')
-    assert _git(repo, 'rev-parse', bookmark.refname).strip().decode() == other
+    assert git_bytes(repo, 'rev-parse', bookmark.refname).strip().decode() == other
 
-    _git(repo, 'update-ref', '-d', bookmark.refname, other)
-    _git(repo, 'symbolic-ref', bookmark.refname, 'refs/heads/master')
+    git_bytes(repo, 'update-ref', '-d', bookmark.refname, other)
+    git_bytes(repo, 'symbolic-ref', bookmark.refname, 'refs/heads/master')
     with pytest.raises(PubanonError, match='symbolic'):
         _source.ensure_bookmark(bookmark, original)
     with pytest.raises(PubanonError, match='symbolic'):
@@ -920,10 +909,10 @@ def test_source_bookmark_refuses_conflicting_owner(
     assert symbolic_recovery.status == 'available'
     assert 'symbolic' in (symbolic_recovery.reason or '')
 
-    _git(repo, 'symbolic-ref', '--delete', bookmark.refname)
+    git_bytes(repo, 'symbolic-ref', '--delete', bookmark.refname)
     original_run = _source.run_git
 
-    def _fail_write(args: Sequence[str], **kwargs: Unpack[_RunGitOptions]) -> GitResult:
+    def _fail_write(args: Sequence[str], **kwargs: Unpack[RunGitOptions]) -> GitResult:
         if 'update-ref' in args:
             return GitResult(1, b'', b'read-only fixture')
         return original_run(args, **kwargs)
@@ -946,9 +935,9 @@ def test_source_bookmark_relocation_requires_recorded_evidence(
     tmp_path: Path, make_repo: Callable[..., Path]
 ) -> None:
     original_repo = make_repo(files={'same.txt': 'content\n'})
-    original = _git(original_repo, 'rev-parse', 'HEAD').strip().decode()
+    original = git_bytes(original_repo, 'rev-parse', 'HEAD').strip().decode()
     linked = tmp_path / 'linked'
-    _git(original_repo, 'worktree', 'add', '--detach', str(linked), original)
+    git_bytes(original_repo, 'worktree', 'add', '--detach', str(linked), original)
     bookmark = _source.describe_bookmark(linked, 'project', 'c' * 40)
     other_repo = make_repo('other', files={'same.txt': 'content\n'})
     assert (
@@ -960,7 +949,7 @@ def test_source_bookmark_relocation_requires_recorded_evidence(
     assert recovery.status == 'protected'
     assert recovery.source_path != other_repo
 
-    _git(original_repo, 'worktree', 'remove', str(linked))
+    git_bytes(original_repo, 'worktree', 'remove', str(linked))
     relocated = _source.source_recovery(bookmark, original, relocated_source=original_repo)
     assert relocated.status == 'protected'
     assert relocated.source_path == original_repo.resolve()
@@ -975,7 +964,7 @@ def test_source_bookmark_skips_repository_reference_hook(
     make_repo: Callable[..., Path],
 ) -> None:
     repo = make_repo()
-    commit = _git(repo, 'rev-parse', 'HEAD').strip().decode()
+    commit = git_bytes(repo, 'rev-parse', 'HEAD').strip().decode()
     bookmark = _source.describe_bookmark(repo, 'project', 'a' * 40)
     marker = repo / 'hook-invoked'
     hook = repo / '.git' / 'hooks' / 'reference-transaction'
@@ -985,7 +974,7 @@ def test_source_bookmark_skips_repository_reference_hook(
 
     _source.ensure_bookmark(bookmark, commit)
 
-    assert _git(repo, 'rev-parse', bookmark.refname).strip().decode() == commit
+    assert git_bytes(repo, 'rev-parse', bookmark.refname).strip().decode() == commit
     assert not marker.exists()
 
 
@@ -994,11 +983,11 @@ def test_source_matches_distinguish_no_match_from_missing_source(
 ) -> None:
     source = make_repo(files={'README.md': 'published\n'})
     original = _git_out(source, 'rev-parse', 'HEAD').strip()
-    _git(source, 'update-ref', 'refs/pubanon/test-original', original)
+    git_bytes(source, 'update-ref', 'refs/pubanon/test-original', original)
     (source / 'README.md').write_text('changed contents\n')
-    _git(source, 'add', 'README.md')
-    _git(source, 'commit', '--amend', '-qm', 'changed contents')
-    _git(source, 'checkout', '--detach', '-q')
+    git_bytes(source, 'add', 'README.md')
+    git_bytes(source, 'commit', '--amend', '-qm', 'changed contents')
+    git_bytes(source, 'checkout', '--detach', '-q')
 
     matches = _source.matching_commits(source, (original, 'a' * 40))
 
@@ -1012,11 +1001,11 @@ def test_source_matches_find_rewritten_contents_and_count_latest(
     make_repo: Callable[..., Path],
 ) -> None:
     source = make_repo(files={'README.md': 'published\n'})
-    _git(source, 'branch', '-m', 'main')
+    git_bytes(source, 'branch', '-m', 'main')
     original = _git_out(source, 'rev-parse', 'HEAD').strip()
-    _git(source, 'update-ref', 'refs/pubanon/test-original', original)
-    _git(source, 'commit', '--amend', '-qm', 'rewritten message')
-    _git(source, 'commit', '--allow-empty', '-qm', 'same contents again')
+    git_bytes(source, 'update-ref', 'refs/pubanon/test-original', original)
+    git_bytes(source, 'commit', '--amend', '-qm', 'rewritten message')
+    git_bytes(source, 'commit', '--allow-empty', '-qm', 'same contents again')
     latest = _git_out(source, 'rev-parse', 'HEAD').strip()
     _commit_file(source, 'README.md', 'later work\n')
     before = _refs(source)
@@ -1080,8 +1069,8 @@ def test_source_safety_refuses_grafts_file(make_repo: Callable[..., Path]) -> No
 
 def test_source_safety_refuses_replacement_ref(make_repo: Callable[..., Path]) -> None:
     repo = make_repo()
-    oid = _git(repo, 'rev-parse', 'HEAD').strip().decode()
-    _git(repo, 'update-ref', f'refs/replace/{oid}', oid)
+    oid = git_bytes(repo, 'rev-parse', 'HEAD').strip().decode()
+    git_bytes(repo, 'update-ref', f'refs/replace/{oid}', oid)
 
     with pytest.raises(PubanonError) as exc_info:
         check_source_safety(repo)
@@ -1093,7 +1082,7 @@ def test_source_safety_refuses_shallow_repository(
     make_repo: Callable[..., Path],
 ) -> None:
     repo = make_repo()
-    (repo / '.git' / 'shallow').write_bytes(_git(repo, 'rev-parse', 'HEAD'))
+    (repo / '.git' / 'shallow').write_bytes(git_bytes(repo, 'rev-parse', 'HEAD'))
 
     with pytest.raises(PubanonError) as exc_info:
         check_source_safety(repo)
@@ -1107,8 +1096,8 @@ def test_source_tag_can_follow_rewrite_and_replacement(
     source = make_repo(files={'README.md': 'published\n'})
     original = _git_out(source, 'rev-parse', 'HEAD').strip()
     _source.update_source_tag(source, 'v1.0.0', original, (original,))
-    _git(source, 'update-ref', 'refs/pubanon/test-original', original)
-    _git(source, 'commit', '--amend', '-qm', 'rewritten message')
+    git_bytes(source, 'update-ref', 'refs/pubanon/test-original', original)
+    git_bytes(source, 'commit', '--amend', '-qm', 'rewritten message')
     rewritten = _git_out(source, 'rev-parse', 'HEAD').strip()
     _source.update_source_tag(source, 'v1.0.0', rewritten, (original,))
     assert _git_out(source, 'rev-parse', 'refs/tags/pubanon/v1.0.0').strip() == rewritten
@@ -1124,7 +1113,7 @@ def test_source_tag_preserves_annotated_tag_with_identical_contents(
 ) -> None:
     source = make_repo(files={'README.md': 'published\n'})
     original = _git_out(source, 'rev-parse', 'HEAD').strip()
-    _git(source, 'tag', '-a', 'pubanon/v1.0.0', '-m', 'my source label')
+    git_bytes(source, 'tag', '-a', 'pubanon/v1.0.0', '-m', 'my source label')
     tag = _git_out(source, 'rev-parse', 'refs/tags/pubanon/v1.0.0').strip()
 
     with pytest.raises(PubanonError, match='annotated and was left unchanged'):
@@ -1137,7 +1126,7 @@ def test_source_tag_preserves_unrelated_existing_tag(
     make_repo: Callable[..., Path],
 ) -> None:
     source = make_repo(files={'README.md': 'unrelated\n'})
-    _git(source, 'tag', 'pubanon/v1.0.0')
+    git_bytes(source, 'tag', 'pubanon/v1.0.0')
     original_tag = _git_out(source, 'rev-parse', 'refs/tags/pubanon/v1.0.0').strip()
     _commit_file(source, 'README.md', 'published\n')
     published = _git_out(source, 'rev-parse', 'HEAD').strip()
@@ -1202,9 +1191,9 @@ def test_working_changes_counts_both_columns_and_consumes_rename_paths(
 ) -> None:
     separator = ' ' if os.name == 'nt' else '\n'
     source = make_repo(files={f'old{separator}name.txt': 'original\n', 'both.txt': 'original\n'})
-    _git(source, 'mv', f'old{separator}name.txt', f'new{separator}name.txt')
+    git_bytes(source, 'mv', f'old{separator}name.txt', f'new{separator}name.txt')
     (source / 'both.txt').write_text('staged\n')
-    _git(source, 'add', 'both.txt')
+    git_bytes(source, 'add', 'both.txt')
     (source / 'both.txt').write_text('unstaged\n')
     untracked = (
         f'untracked private{separator}path.txt'
@@ -1215,7 +1204,7 @@ def test_working_changes_counts_both_columns_and_consumes_rename_paths(
     original = _source.run_git
     status_environments: list[Mapping[str, str] | None] = []
 
-    def _observed(args: Sequence[str], **kwargs: Unpack[_RunGitOptions]) -> GitResult:
+    def _observed(args: Sequence[str], **kwargs: Unpack[RunGitOptions]) -> GitResult:
         if 'status' in args:
             assert '-z' in args
             status_environments.append(kwargs.get('env_extra'))

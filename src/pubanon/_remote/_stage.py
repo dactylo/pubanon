@@ -1,7 +1,5 @@
 """Push retained candidates to a persistent private staging repository."""
 
-# pyright: reportPrivateUsage=false
-
 import os
 import re
 import tempfile
@@ -26,14 +24,13 @@ from pubanon._errors import ObservationTimeoutError, OperationCanceled, PubanonE
 from pubanon._remote import _host
 from pubanon._remote._ci import (
     RUN_ON_PUSH_VARIABLE,
-    RunQuery,
     StageCiPlan,
+    ci_acceptance,
     ensure_run_on_push_variable,
     evidence_facts,
     evidence_recovery,
     plan_stage_ci,
     require_ci_contract,
-    run_evidence,
     start_stage_ci,
 )
 from pubanon._remote._host import (
@@ -52,7 +49,7 @@ from pubanon._snapshots._records import (
     load_publication,
 )
 from pubanon._snapshots._reports import inspect_next_action
-from pubanon._snapshots._source import Snapshot, read_snapshot
+from pubanon._snapshots._source import Snapshot
 from pubanon._snapshots._store import candidate_store_path, store_path
 from pubanon._snapshots._verification import verify_retained_candidate
 from pubanon._terminal import (
@@ -91,16 +88,12 @@ class StageCiOptions:
 
 
 @dataclass(frozen=True)
-class StageRecord:
-    """Retain the exact coordinates and commit used for staging.
-
-    Attributes:
-        commit: Candidate commit pushed to the staging repository.
-    """
+class _StageRecord:
+    """Retain the exact coordinates and commit used for staging."""
 
     commit: str
-    _owner: str
-    _repo: str
+    owner: str
+    repo: str
 
 
 @dataclass(frozen=True)
@@ -113,6 +106,12 @@ class _StageObservation:
 
 class _InvalidStageRecordError(PubanonError):
     """Identify malformed persisted staging state for cleanup routing."""
+
+    def __init__(self) -> None:
+        """Report malformed staging state with its cleanup commands."""
+        super().__init__(
+            'invalid stage record', recovery='pubanon stage repair or pubanon stage forget'
+        )
 
 
 def _backup_stage(path: Path, content: bytes) -> None:
@@ -187,7 +186,7 @@ def _preview_stage_ci(plan: StageCiPlan) -> None:
 def _preview_stage_push(
     dest: Destination,
     record: CandidateRecord,
-    stage: StageRecord | None,
+    stage: _StageRecord | None,
     refs: RemoteRefs,
     settings: SettingsFacts,
 ) -> None:
@@ -205,7 +204,7 @@ def _preview_stage_push(
     )
     detail_fields(
         [
-            ('Recorded destination', escape(f'{stage._owner}/{stage._repo}' if stage else 'none')),
+            ('Recorded destination', escape(f'{stage.owner}/{stage.repo}' if stage else 'none')),
             ('Recorded staged commit', escape(stage.commit if stage else 'none')),
             ('Observed remote commit', escape(expected_old or 'absent')),
             ('Candidate tip', escape(tip)),
@@ -226,9 +225,9 @@ def _preview_stage_push(
 
 def _preview_stage_repair(
     dest: Destination,
-    stage: StageRecord | None,
+    stage: _StageRecord | None,
     observed: _StageObservation,
-    record: StageRecord,
+    record: _StageRecord,
 ) -> None:
     """Preview every intended default-branch and local-record change."""
     heading('Staging repair preview')
@@ -236,7 +235,7 @@ def _preview_stage_repair(
     output(field('Repository URL', escape(dest.url)))
     output(field('Visibility', 'private'))
     output(
-        field('Recorded destination', escape(f'{stage._owner}/{stage._repo}' if stage else 'none'))
+        field('Recorded destination', escape(f'{stage.owner}/{stage.repo}' if stage else 'none'))
     )
     output(field('Recorded staged commit', escape(stage.commit if stage else 'none')))
     output(field('Observed remote commit', escape(record.commit)))
@@ -246,7 +245,7 @@ def _preview_stage_repair(
         output('Save local tracking for this recognized snapshot.')
     else:
         output('Local tracking is current and will remain unchanged.')
-    if stage is not None and (stage._owner, stage._repo) != (dest.owner, dest.repo):
+    if stage is not None and (stage.owner, stage.repo) != (dest.owner, dest.repo):
         output('The previously recorded repository will remain unchanged.')
 
 
@@ -280,10 +279,7 @@ def _record_string(data: dict[str, object], key: str) -> str:
     """Return one required stage-record string."""
     value = data.get(key)
     if not isinstance(value, str):
-        raise _InvalidStageRecordError(
-            'invalid stage record',
-            recovery='pubanon stage repair or pubanon stage forget',
-        )
+        raise _InvalidStageRecordError
     return value
 
 
@@ -405,7 +401,7 @@ def _stage_destination(
 def _stage_path(paths: Paths, project: str) -> Path:
     """Return one validated project's stage-record path."""
     require_project_name(project)
-    return paths.data_dir / 'projects' / project / 'stage.toml'
+    return paths.project_data(project) / 'stage.toml'
 
 
 def _clear_stage(paths: Paths, project: str) -> None:
@@ -416,14 +412,16 @@ def _clear_stage(paths: Paths, project: str) -> None:
         raise PubanonError('cannot clear stage record') from exc
 
 
-def _status_checks(dest: Destination, stage: StageRecord, p: ProjectConfig) -> None:
+def _status_checks(dest: Destination, stage: _StageRecord, p: ProjectConfig) -> None:
     """Report ordered CI verdicts for one identified exact staging commit."""
-    if p.ci_workflow:
-        evidence = run_evidence(
-            (dest.owner, dest.repo),
-            RunQuery(p.ci_workflow, stage.commit, 'workflow_dispatch'),
-            required=p.required_checks,
-        )
+    ci = ci_acceptance(
+        (dest.owner, dest.repo),
+        stage.commit,
+        workflow=p.ci_workflow,
+        required=p.required_checks,
+        event='workflow_dispatch',
+    )
+    if (evidence := ci.evidence) is not None:
         if evidence.run is None:
             output(field('CI run', 'No requested CI run for the staged snapshot'))
         else:
@@ -441,7 +439,7 @@ def _status_checks(dest: Destination, stage: StageRecord, p: ProjectConfig) -> N
         )
         for check in checks:
             output(field(escape(check.name), display_check_result(check)))
-        if evidence.state != 'success':
+        if not ci.accepted:
             raise PubanonError(
                 'the latest CI run is not acceptable for the staged commit',
                 fact=evidence_facts(evidence),
@@ -454,22 +452,18 @@ def _status_checks(dest: Destination, stage: StageRecord, p: ProjectConfig) -> N
         output('No required checks are configured for the staged snapshot.', kind='warning')
         return
 
-    verdicts: list[CheckVerdict] = []
-    for name in p.required_checks:
-        verdict = _host.check_result((dest.owner, dest.repo), stage.commit, name)
-        verdicts.append(verdict)
-    if all(verdict.state == 'success' for verdict in verdicts):
+    if ci.accepted:
         output(
             field(
                 'Checks',
                 ', '.join(
                     f'{escape(verdict.name)} {display_check_result(verdict)}'
-                    for verdict in verdicts
+                    for verdict in ci.checks
                 ),
             )
         )
         return
-    for verdict in verdicts:
+    for verdict in ci.checks:
         output(
             '  '
             + field(
@@ -480,8 +474,7 @@ def _status_checks(dest: Destination, stage: StageRecord, p: ProjectConfig) -> N
         )
     raise PubanonError(
         'required checks are not acceptable for the staged commit',
-        fact=','.join(f'{escape(verdict.name)}:{escape(verdict.state)}' for verdict in verdicts),
-        recovery=_host.check_recovery(verdicts, retry='rerun `pubanon stage status`'),
+        recovery=_host.check_recovery(ci.checks, retry='rerun `pubanon stage status`'),
     )
 
 
@@ -539,58 +532,45 @@ def _unrecognized_stage_tip(dest: Destination, tip: str | None) -> PubanonError:
     )
 
 
-def _validate_stage(record: StageRecord) -> None:
+def _validate_stage(record: _StageRecord) -> None:
     """Validate one in-memory stage record against the frozen schema."""
     try:
-        validate_host_segment('owner', record._owner)
-        validate_host_segment('repo', record._repo)
+        validate_host_segment('owner', record.owner)
+        validate_host_segment('repo', record.repo)
     except PubanonError as exc:
-        raise _InvalidStageRecordError(
-            'invalid stage record',
-            recovery='pubanon stage repair or pubanon stage forget',
-        ) from exc
+        raise _InvalidStageRecordError from exc
     if _OID_PATTERN.fullmatch(record.commit) is None:
-        raise _InvalidStageRecordError(
-            'invalid stage record',
-            recovery='pubanon stage repair or pubanon stage forget',
-        )
+        raise _InvalidStageRecordError
 
 
-def _parse_stage(content: bytes) -> StageRecord:
+def _parse_stage(content: bytes) -> _StageRecord:
     """Decode and validate exact persisted staging bytes."""
     try:
         data = tomllib.loads(content.decode('utf-8'))
     except (UnicodeError, ValueError) as exc:
-        raise _InvalidStageRecordError(
-            'invalid stage record', recovery='pubanon stage repair or pubanon stage forget'
-        ) from exc
+        raise _InvalidStageRecordError from exc
     if data.keys() != _STAGE_RECORD_KEYS:
-        raise _InvalidStageRecordError(
-            'invalid stage record', recovery='pubanon stage repair or pubanon stage forget'
-        )
-    record = StageRecord(
+        raise _InvalidStageRecordError
+    record = _StageRecord(
         commit=_record_string(data, 'commit'),
-        _owner=_record_string(data, 'owner'),
-        _repo=_record_string(data, 'repo'),
+        owner=_record_string(data, 'owner'),
+        repo=_record_string(data, 'repo'),
     )
     _validate_stage(record)
     return record
 
 
-def _save_stage(paths: Paths, project: str, record: StageRecord) -> None:
+def _save_stage(paths: Paths, project: str, record: _StageRecord) -> None:
     """Atomically save a strict private record, backing up malformed old bytes."""
     _validate_stage(record)
     try:
         content = (
             f'commit = {toml_string(record.commit)}\n'
-            f'owner = {toml_string(record._owner)}\n'
-            f'repo = {toml_string(record._repo)}\n'
+            f'owner = {toml_string(record.owner)}\n'
+            f'repo = {toml_string(record.repo)}\n'
         )
     except ValueError as exc:
-        raise _InvalidStageRecordError(
-            'invalid stage record',
-            recovery='pubanon stage repair or pubanon stage forget',
-        ) from exc
+        raise _InvalidStageRecordError from exc
     path = _stage_path(paths, project)
     create_data_dirs(paths, project)
     try:
@@ -609,17 +589,17 @@ def _save_stage(paths: Paths, project: str, record: StageRecord) -> None:
     except UnicodeError as exc:
         raise PubanonError('cannot save stage record') from exc
     except _filesystem.DurableWriteError as exc:
-        if exc.interrupted and not exc.replacement_attempted:
+        if exc.interrupted_before_replacement:
             raise KeyboardInterrupt from exc.__cause__
         message = (
             'cannot confirm durable stage record save'
-            if exc.replaced or (exc.interrupted and exc.replacement_attempted)
+            if exc.may_have_saved
             else 'cannot save stage record'
         )
         raise PubanonError(message) from exc.__cause__
 
 
-def _record_stage_push(paths: Paths, project: str, record: StageRecord) -> None:
+def _record_stage_push(paths: Paths, project: str, record: _StageRecord) -> None:
     """Record a verified remote update without claiming a failed save rolled back."""
     try:
         _save_stage(paths, project, record)
@@ -633,7 +613,7 @@ def _record_stage_push(paths: Paths, project: str, record: StageRecord) -> None:
         ) from exc
 
 
-def _save_repaired_stage(paths: Paths, project: str, record: StageRecord) -> None:
+def _save_repaired_stage(paths: Paths, project: str, record: _StageRecord) -> None:
     """Keep local-save failure distinct from the observed remote state."""
     try:
         _save_stage(paths, project, record)
@@ -649,19 +629,19 @@ def _save_repaired_stage(paths: Paths, project: str, record: StageRecord) -> Non
 
 def _verified_stage_tip(
     paths: Paths, g: GlobalConfig, p: ProjectConfig, record: CandidateRecord
-) -> str:
-    """Verify retained candidate gates and select the resulting commit."""
-    verify_retained_candidate(paths, g, p, record, env=os.environ)
-    return candidate_tip(record)
+) -> tuple[str, Snapshot]:
+    """Verify retained candidate gates and return the resulting commit and its tree."""
+    snapshot = verify_retained_candidate(paths, g, p, record, env=os.environ)
+    return candidate_tip(record), snapshot
 
 
 def _recognized_stage_record(
     paths: Paths,
     g: GlobalConfig,
     p: ProjectConfig,
-    observed: StageRecord,
-    stage: StageRecord | None,
-) -> StageRecord | None:
+    observed: _StageRecord,
+    stage: _StageRecord | None,
+) -> _StageRecord | None:
     """Identify the observed tip using independent existing local evidence."""
     tip = observed.commit
     if stage == observed:
@@ -684,16 +664,19 @@ def _stage_push_candidate(
     if (ci.full_tests or ci.hosted) and p.ci_workflow is None:
         raise PubanonError(
             '--full-tests and --hosted require ci_workflow',
-            recovery='set ci_workflow in the project configuration, then prepare a new snapshot',
+            recovery=(
+                'connect a CI workflow in the checks section of `pubanon init --edit`, then '
+                'discard and prepare again; see "Request CI from stage push" in the operator guide'
+            ),
         )
     record = load_candidate(paths, p.name)
     if record is None:
         raise PubanonError('no prepared snapshot is retained', recovery='pubanon prepare')
-    tip = _verified_stage_tip(paths, g, p, record)
+    tip, verified = _verified_stage_tip(paths, g, p, record)
     store = store_path(paths, p.name)
     if p.ci_workflow is not None:
         require_ci_contract(store, tip, p.ci_workflow)
-    snapshot = read_snapshot(store, tip, git_dir=store) if p.required_checks else ()
+    snapshot = verified if p.required_checks else ()
     _require_workflow_jobs(p, snapshot)
     return record, tip, snapshot
 
@@ -812,7 +795,7 @@ def _finish_stage_push(
         ) from exc
 
 
-def load_stage(paths: Paths, project: str) -> StageRecord | None:
+def load_stage(paths: Paths, project: str) -> _StageRecord | None:
     """Load one strict stage record if present.
 
     Args:
@@ -823,7 +806,7 @@ def load_stage(paths: Paths, project: str) -> StageRecord | None:
         The validated stage record, or `None` when absent.
 
     Raises:
-        PubanonError: Persisted staging state is malformed.
+        PubanonError: Persisted staging state is unreadable or malformed.
     """
     path = _stage_path(paths, project)
     try:
@@ -848,7 +831,7 @@ def _repair_stage(paths: Paths, g: GlobalConfig, p: ProjectConfig, *, yes: bool)
     tip = observed.refs.main
     if tip is None:
         raise _unrecognized_stage_tip(dest, None)
-    record = _recognized_stage_record(paths, g, p, StageRecord(tip, dest.owner, dest.repo), stage)
+    record = _recognized_stage_record(paths, g, p, _StageRecord(tip, dest.owner, dest.repo), stage)
     if record is None:
         raise _unrecognized_stage_tip(dest, tip)
     if record == stage and observed.default == 'main':
@@ -867,7 +850,7 @@ def _repair_stage(paths: Paths, g: GlobalConfig, p: ProjectConfig, *, yes: bool)
 
 def _status_tracking(
     paths: Paths, p: ProjectConfig, shown_commits: dict[str, str]
-) -> tuple[StageRecord | None, PubanonError | None]:
+) -> tuple[_StageRecord | None, PubanonError | None]:
     """Print available tracking without concealing malformed or unreadable state."""
     try:
         stage = load_stage(paths, p.name)
@@ -881,7 +864,7 @@ def _status_tracking(
         shown_commits[stage.commit] = 'recorded staged commit'
     detail_fields(
         [
-            ('Recorded destination', escape(f'{stage._owner}/{stage._repo}' if stage else 'none')),
+            ('Recorded destination', escape(f'{stage.owner}/{stage.repo}' if stage else 'none')),
             ('Recorded staged commit', escape(stage.commit if stage else 'none')),
         ]
     )
@@ -890,7 +873,7 @@ def _status_tracking(
 
 def _status_target(
     paths: Paths, g: GlobalConfig, p: ProjectConfig, shown_commits: dict[str, str]
-) -> tuple[Destination, StageRecord, PubanonError | None]:
+) -> tuple[Destination, _StageRecord, PubanonError | None]:
     """Report observed staging facts and identify a snapshot without changing state."""
     dest = _stage_destination(paths, g, p)
     stage, tracking_error = _status_tracking(paths, p, shown_commits)
@@ -926,7 +909,7 @@ def _status_target(
     _verify_stage_default(settings.default_branch)
     if refs.main is None:
         raise _unrecognized_stage_tip(dest, None)
-    observed = StageRecord(refs.main, dest.owner, dest.repo)
+    observed = _StageRecord(refs.main, dest.owner, dest.repo)
     record = _recognized_stage_record(paths, g, p, observed, stage)
     if record is None:
         if tracking_error is not None:
@@ -960,6 +943,10 @@ def candidate_next_action(
 
     Returns:
         The next command based on the saved route and local staging evidence.
+
+    Raises:
+        PubanonError: Staging tracking cannot be read. Malformed tracking
+            instead selects staging repair.
     """
     if record is None:
         return 'pubanon prepare'
@@ -974,7 +961,7 @@ def candidate_next_action(
         return 'pubanon stage repair'
     if stage is None:
         action = 'pubanon stage push'
-    elif (stage._owner, stage._repo) != (p.owner, stage_repository(p)):
+    elif (stage.owner, stage.repo) != (p.owner, stage_repository(p)):
         action = 'pubanon stage repair'
     elif stage.commit != candidate_tip(record):
         action = 'pubanon stage push'
@@ -1017,11 +1004,11 @@ def stage_delete(
     except _InvalidStageRecordError:
         stage = None
     configured = (dest.owner, dest.repo)
-    if stage is not None and (stage._owner, stage._repo) != configured:
+    if stage is not None and (stage.owner, stage.repo) != configured:
         raise PubanonError(
             'recorded staging coordinates differ from configured destination',
             expected=f'{escape(dest.owner)}/{escape(dest.repo)}',
-            actual=f'{escape(stage._owner)}/{escape(stage._repo)}',
+            actual=f'{escape(stage.owner)}/{escape(stage.repo)}',
             recovery='inspect the recorded target; use pubanon stage forget to remove tracking',
         )
 
@@ -1074,6 +1061,11 @@ def stage_forget(paths: Paths, p: ProjectConfig, *, yes: bool) -> None:
     """Forget local staged-candidate comparison without contacting the host.
 
     The caller must hold the project lock for the complete operation.
+
+    Raises:
+        PubanonError: Local staging tracking cannot be removed, or confirmation
+            input is unavailable.
+        OperationCanceled: Confirmation is declined or interrupted.
     """
     if not _stage_path(paths, p.name).exists():
         output('No local staging record exists.')
@@ -1171,7 +1163,7 @@ def stage_push(
     _push_stage_main(dest, store_path(paths, p.name), tip, expected_old)
 
     _finish_stage_push(dest, tip, refs, settings)
-    _record_stage_push(paths, p.name, StageRecord(tip, dest.owner, dest.repo))
+    _record_stage_push(paths, p.name, _StageRecord(tip, dest.owner, dest.repo))
     label = escape(record.tag_intent) if record.tag_intent else 'snapshot'
     output(
         f'Staged {label} ({escape(tip[:12])}) in private repository '
@@ -1309,7 +1301,7 @@ def verify_staged_target(
     p: ProjectConfig,
     *,
     timeout: float | None = None,
-) -> tuple[Destination, StageRecord]:
+) -> tuple[Destination, _StageRecord]:
     """Verify and return one exact staged destination and commit record.
 
     Args:
@@ -1327,19 +1319,17 @@ def verify_staged_target(
         ObservationTimeoutError: A supplied observation timeout expires, with
             the pending host-read stage retained for the watcher.
     """
-    started = 0.0
-    if timeout is not None:
-        started = _monotonic()
+    deadline = None if timeout is None else _monotonic() + timeout
     record = load_stage(paths, p.name)
     if record is None:
         raise PubanonError(
             'no staged commit is recorded', recovery='pubanon stage repair or pubanon stage push'
         )
     configured = (p.owner, stage_repository(p))
-    if (record._owner, record._repo) != configured:
+    if (record.owner, record.repo) != configured:
         raise PubanonError(
             'configured staging coordinates differ from the recorded staging coordinates',
-            expected=(f'{escape(record._owner)}/{escape(record._repo)}'),
+            expected=(f'{escape(record.owner)}/{escape(record.repo)}'),
             actual=(f'{escape(configured[0])}/{escape(configured[1])}'),
             recovery='pubanon stage repair',
         )
@@ -1350,33 +1340,20 @@ def verify_staged_target(
             recovery='pubanon repo restore --to local',
         )
     try:
-        if timeout is None:
-            _host.require_authenticated_account(
-                destination.account, authority='staging configuration'
-            )
-            _verify_stage_facts(destination, recovery='pubanon stage repair')
-        else:
-            _host.require_authenticated_account(
-                destination.account,
-                authority='staging configuration',
-                timeout=_host.remaining_timeout(timeout, started, _monotonic()),
-            )
-            _verify_stage_facts(
-                destination,
-                recovery='pubanon stage repair',
-                timeout=_host.remaining_timeout(timeout, started, _monotonic()),
-            )
+        _host.require_authenticated_account(
+            destination.account,
+            authority='staging configuration',
+            timeout=_host.time_left(deadline, _monotonic),
+        )
+        _verify_stage_facts(
+            destination,
+            recovery='pubanon stage repair',
+            timeout=_host.time_left(deadline, _monotonic),
+        )
     except ObservationTimeoutError as exc:
         raise ObservationTimeoutError(stage='account/repository verification') from exc
     try:
-        refs = _host.read_remote_refs(
-            destination,
-            timeout=(
-                None
-                if timeout is None
-                else _host.remaining_timeout(timeout, started, _monotonic())
-            ),
-        )
+        refs = _host.read_remote_refs(destination, timeout=_host.time_left(deadline, _monotonic))
     except ObservationTimeoutError as exc:
         raise ObservationTimeoutError(stage='refs') from exc
     _verify_stage_refs(refs)
@@ -1391,11 +1368,7 @@ def verify_staged_target(
         settings = _host.repository_settings(
             destination.owner,
             destination.repo,
-            timeout=(
-                None
-                if timeout is None
-                else _host.remaining_timeout(timeout, started, _monotonic())
-            ),
+            timeout=_host.time_left(deadline, _monotonic),
         )
     except ObservationTimeoutError as exc:
         raise ObservationTimeoutError(stage='repository settings verification') from exc

@@ -27,11 +27,10 @@ from tests._cli import (
     save_workflows,
     stub_remote,
 )
-from tests._git import git_env
+from tests._git import git_bytes, git_env
 from tests._permissions import assert_private_mode
 from tests._setup import configure
-from tests.remote.test_releases import _Host as _ReleaseHost
-from tests.remote.test_stage import _git
+from tests.remote.test_releases import Host as _ReleaseHost
 
 
 def _assert_staged_check_blocks_publish(
@@ -74,7 +73,7 @@ def _assert_staged_check_blocks_publish(
         capsys.readouterr()
         assert _cli.main(['publish', '--project', project.name, '--yes']) == 1
         assert diagnostic in capsys.readouterr().err
-        assert _git(final_host, 'for-each-ref') == b''
+        assert git_bytes(final_host, 'for-each-ref') == b''
         assert _records.load_candidate(paths, project.name) == candidate
         responses.pop()
     return check_args
@@ -100,7 +99,7 @@ def test_run_candidate_bound_stage_refuses_mismatched_tag_before_staging_preflig
     paths, project, _record = prepare(tmp_path, source, monkeypatch, version='1.0.0')
     save_workflows(paths, project, ship=('stage push', 'publish'))
 
-    def _unexpected_host() -> object:
+    def _unexpected_host(*_args: object, **_kwargs: object) -> Never:
         pytest.fail('mismatched snapshot reached staging or publication host reads')
 
     monkeypatch.setattr(_host, 'verify_destination', _unexpected_host)
@@ -209,7 +208,6 @@ def test_run_fresh_publish_watches_the_exact_published_version_commit(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     project = save_workflows(
         paths,
         project,
@@ -229,20 +227,18 @@ def test_run_fresh_publish_watches_the_exact_published_version_commit(
     watched: list[str] = []
 
     def _publish(ctx: _publish_module.PublishContext) -> None:
-        inspection = (
-            paths.data_dir / 'projects' / project.name / 'inspections' / ctx._record.commit
-        )
+        inspection = paths.data_dir / 'projects' / project.name / 'inspections' / ctx.record.commit
         assert (inspection / 'README.md').read_text(encoding='utf-8') == 'public\n'
-        assert ctx._yes is False
-        published.append(ctx._record.commit)
+        assert ctx.yes is False
+        published.append(ctx.record.commit)
         store = _store.store_path(paths, project.name)
         subprocess.run(
-            ['git', '-C', store, 'update-ref', 'refs/heads/main', ctx._record.commit],
+            ['git', '-C', store, 'update-ref', 'refs/heads/main', ctx.record.commit],
             check=True,
             env=git_env(),
         )
         subprocess.run(
-            ['git', '-C', store, 'update-ref', 'refs/tags/v1.0.0', ctx._record.commit],
+            ['git', '-C', store, 'update-ref', 'refs/tags/v1.0.0', ctx.record.commit],
             check=True,
             env=git_env(),
         )
@@ -303,7 +299,6 @@ def test_run_holds_project_lock_for_the_complete_workflow(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     paths, _global_config, project = configured_project
-    assert project is not None
     save_workflows(paths, project, checks=('repo watch',))
 
     def _watch_ci(*_args: object, **_kwargs: object) -> None:
@@ -357,7 +352,6 @@ def test_run_observation_requires_no_mutation_confirmation(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     paths, _global_config, project = configured_project
-    assert project is not None
     save_workflows(paths, project, checks=('repo watch',))
 
     watched: list[None] = []
@@ -383,7 +377,6 @@ def test_run_post_publish_cancellation_preserves_private_details_and_completed_f
     raw: bool,
 ) -> None:
     paths, _global_config, project = configured_project
-    assert project is not None
     ctx = load_context(paths, project.name)
     plan = _workflow._RunPlan(
         ctx,
@@ -391,8 +384,8 @@ def test_run_post_publish_cancellation_preserves_private_details_and_completed_f
         ('repo watch',),
         None,
         'v1.0.0',
-        _published_ctx=ctx,
-        _stage_creation_needed=False,
+        published_ctx=ctx,
+        stage_creation_needed=False,
     )
     error = OperationCanceled('operation cancelled', fact='watch stopped', actual='private-canary')
 
@@ -427,7 +420,6 @@ def test_run_post_publish_failure_names_every_remaining_stepwise_command(
     version, prepared = case
     source = make_repo(files={'README.md': 'public\n'})
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     project = save_workflows(
         paths,
         project,
@@ -453,7 +445,7 @@ def test_run_post_publish_failure_names_every_remaining_stepwise_command(
             refs.append(f'refs/tags/v{version}')
         for ref in refs:
             subprocess.run(
-                ['git', '-C', store, 'update-ref', ref, ctx._record.commit],
+                ['git', '-C', store, 'update-ref', ref, ctx.record.commit],
                 check=True,
                 env=git_env(),
             )
@@ -573,7 +565,6 @@ def test_run_prepare_and_inspect_materializes_exact_read_only_candidate_copy(
         env=git_env(),
     )
     paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     save_workflows(paths, project, review=('prepare', 'inspect'))
 
     assert (
@@ -623,7 +614,6 @@ def test_run_prepare_records_configured_global_tagged_message(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, g, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     _config.save_global(
         paths,
         replace(
@@ -794,10 +784,9 @@ def test_run_publish_requires_valid_version_before_host_reads(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     paths, _global_config, project = configured_project
-    assert project is not None
     save_workflows(paths, project, ship=('publish',))
 
-    def _unexpected_host() -> object:
+    def _unexpected_host(*_args: object, **_kwargs: object) -> Never:
         pytest.fail('invalid run version reached host reads')
 
     monkeypatch.setattr(_host, 'verify_destination', _unexpected_host)
@@ -888,12 +877,12 @@ def test_run_published_resume_allows_public_host_partial_to_reach_reveal(
         return 'y'
 
     monkeypatch.setattr(_host, 'verify_destination', _verify_destination)
-    monkeypatch.setattr(_host, 'ls_remote', host._refs)
-    monkeypatch.setattr(_host, 'read_release', host._read)
-    monkeypatch.setattr(_host, 'all_releases', host._all)
-    monkeypatch.setattr(_host, 'create_release', host._create)
-    monkeypatch.setattr(_releases, '_monotonic', host.clock._monotonic)
-    monkeypatch.setattr(_releases, '_sleep', host.clock._sleep)
+    monkeypatch.setattr(_host, 'ls_remote', host.refs)
+    monkeypatch.setattr(_host, 'read_release', host.read)
+    monkeypatch.setattr(_host, 'all_releases', host.all)
+    monkeypatch.setattr(_host, 'create_release', host.create)
+    monkeypatch.setattr(_releases, '_monotonic', host.clock.monotonic)
+    monkeypatch.setattr(_releases, '_sleep', host.clock.sleep)
     monkeypatch.setattr(_lifecycle, 'reveal', _reveal)
     monkeypatch.setattr('builtins.input', _approve)
 
@@ -988,12 +977,12 @@ def test_run_reclassifies_landed_publish_exception_before_stepwise_recovery(
 
     def _publish(ctx: _publish_module.PublishContext) -> None:
         if page_failure:
-            assert ctx._release_page.notes == b'Exact\r\nnotes\n'
-            assert ctx._release_page.notes_file == notes.absolute()
+            assert ctx.release_page.notes == b'Exact\r\nnotes\n'
+            assert ctx.release_page.notes_file == notes.absolute()
         store = _store.store_path(paths, project.name)
         for ref in ('refs/heads/main', 'refs/tags/v1.0.0'):
             subprocess.run(
-                ['git', '-C', store, 'update-ref', ref, ctx._record.commit],
+                ['git', '-C', store, 'update-ref', ref, ctx.record.commit],
                 check=True,
                 env=git_env(),
             )
@@ -1054,7 +1043,6 @@ def test_run_refuses_remote_and_local_version_mismatch_showing_both_sides(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     save_workflows(paths, project, ship=('publish',))
     destination = _host.Destination(
         adapter='github',
@@ -1121,7 +1109,6 @@ def test_run_reloads_public_configuration_after_reveal_before_watch_package(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     paths, _global_config, project = configured_project
-    assert project is not None
     save_workflows(paths, project, observe=('repo reveal', 'package watch'))
     watched_visibilities: list[str] = []
 
@@ -1222,7 +1209,6 @@ def test_run_reveal_leaves_both_decisions_to_the_primitive(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     paths, _global_config, project = configured_project
-    assert project is not None
     save_workflows(paths, project, reveal=('repo reveal',))
     prompts: list[str] = []
     received: list[tuple[str, str]] = []
@@ -1263,8 +1249,8 @@ def test_run_reveal_package_timeout_keeps_already_public_recovery_read_only(
     )
     private = 'private composed timeout detail'
 
-    def _timeout(*_args: object) -> _package.PackageRelease | None:
-        raise ObservationTimeoutError
+    def _timeout(*_args: object, **_options: object) -> _package.PackageRelease | None:
+        raise ObservationTimeoutError from TimeoutError(private)
 
     def _unexpected_mutation(*_args: object) -> None:
         pytest.fail('already-public package recovery mutated host visibility')
@@ -1442,7 +1428,6 @@ def test_run_staging_preview_checks_account_before_repository_request(
     source = make_repo(files={'README.md': 'public\n'})
     if stages[0] == 'prepare':
         paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-        assert project is not None
     else:
         paths, project, _record = prepare(tmp_path, source, monkeypatch)
     save_workflows(paths, project, staging=stages)
@@ -1504,12 +1489,11 @@ def test_run_staging_preview_gates_coordinates_before_host_access(
     source = make_repo(files={'README.md': 'public\n'})
     if stages[0] == 'prepare':
         paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-        assert project is not None
     else:
         paths, project, _record = prepare(tmp_path, source, monkeypatch)
     project = replace(
         project,
-        _stage_repo=f'public-{term}',
+        stage_repo=f'public-{term}',
         extra_terms=(term,),
     )
     save_workflows(paths, project, staging=stages)
@@ -1613,9 +1597,8 @@ def test_run_staging_watch_and_publish_share_the_exact_candidate_commit(
     source = make_repo(
         files={'README.md': 'candidate A\n', 'pyproject.toml': '[project]\nversion = "1.0.0"\n'}
     )
-    _git(source, 'tag', 'source-only')
+    git_bytes(source, 'tag', 'source-only')
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     project = save_workflows(
         paths,
         replace(project, publication_route='staged', required_checks=('build',)),
@@ -1680,27 +1663,27 @@ def test_run_staging_watch_and_publish_share_the_exact_candidate_commit(
     )
     first = _records.load_candidate(paths, project.name)
     assert first is not None
-    assert _git(stage_host, 'show-ref').decode().splitlines() == [
+    assert git_bytes(stage_host, 'show-ref').decode().splitlines() == [
         f'{first.commit} refs/heads/main'
     ]
     _discard.discard(paths, project.name, force=True)
     (source / 'README.md').write_text('candidate B\n')
-    _git(source, 'add', 'README.md')
-    _git(source, 'commit', '-qm', 'candidate B')
+    git_bytes(source, 'add', 'README.md')
+    git_bytes(source, 'commit', '-qm', 'candidate B')
     assert (
         _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths', '--yes']) == 0
     )
     second = _records.load_candidate(paths, project.name)
     assert second is not None
     assert second.commit != first.commit
-    source_refs = _git(source, 'show-ref', '--heads', '--tags')
+    source_refs = git_bytes(source, 'show-ref', '--heads', '--tags')
     assert _cli.main(['inspect', '--project', project.name]) == 0
     assert 'pubanon stage push' in capsys.readouterr().out
     assert _cli.main(['stage', 'push', '--project', project.name, '--yes']) == 0
-    assert _git(stage_host, 'show-ref').decode().splitlines() == [
+    assert git_bytes(stage_host, 'show-ref').decode().splitlines() == [
         f'{second.commit} refs/heads/main'
     ]
-    staged_dates = _git(stage_host, 'show', '-s', '--format=%aI%n%cI', second.commit)
+    staged_dates = git_bytes(stage_host, 'show', '-s', '--format=%aI%n%cI', second.commit)
     check_args = _assert_staged_check_blocks_publish(project, second, paths, final_host, capsys)
     responses.extend(
         {
@@ -1729,16 +1712,16 @@ def test_run_staging_watch_and_publish_share_the_exact_candidate_commit(
     assert _cli.main(['run', 'ship', '--project', project.name, '--yes']) == 0
     output = capsys.readouterr().out
     assert 'Workflow ship (staged route): stage push, stage watch, publish, repo watch' in output
-    assert _git(stage_host, 'show-ref').decode().splitlines() == [
+    assert git_bytes(stage_host, 'show-ref').decode().splitlines() == [
         f'{second.commit} refs/heads/main'
     ]
-    assert _git(final_host, 'show-ref').decode().splitlines() == [
+    assert git_bytes(final_host, 'show-ref').decode().splitlines() == [
         f'{second.commit} refs/heads/main',
         f'{second.commit} refs/tags/v1.0.0',
     ]
-    assert _git(final_host, 'rev-list', '--all').decode().splitlines() == [second.commit]
-    assert _git(final_host, 'show', '-s', '--format=%aI%n%cI', second.commit) == staged_dates
-    assert _git(source, 'show-ref', '--heads', '--tags') == source_refs
+    assert git_bytes(final_host, 'rev-list', '--all').decode().splitlines() == [second.commit]
+    assert git_bytes(final_host, 'show', '-s', '--format=%aI%n%cI', second.commit) == staged_dates
+    assert git_bytes(source, 'show-ref', '--heads', '--tags') == source_refs
     calls = gh_calls(tmp_path)
     check_calls = [args[1] for args in calls if '/check-runs?' in args[1]]
     assert check_calls == [
@@ -1756,7 +1739,6 @@ def test_run_unknown_name_lists_declared_workflows(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     paths, _global_config, project = configured_project
-    assert project is not None
     save_workflows(paths, project, checks=('repo watch',), ship=('publish',))
 
     assert _cli.main(['run', 'missing', '--project', project.name]) == 1
@@ -1846,7 +1828,7 @@ def test_run_unknown_outcome_refuses_before_any_declared_stage(
     )
     save_workflows(paths, project, checks=('repo watch',))
 
-    def _unexpected_watch() -> object:
+    def _unexpected_watch(*_args: object, **_kwargs: object) -> Never:
         pytest.fail('unknown-outcome snapshot reached a declared stage')
 
     monkeypatch.setattr(_watch, 'watch_ci', _unexpected_watch)
@@ -1900,7 +1882,6 @@ def test_run_unknown_workflow_reports_requested_and_declared_names(
 ) -> None:
     term = 'style-canary'
     paths, _global_config, project = configured_project
-    assert project is not None
     _config.save_project(
         paths,
         replace(
@@ -1922,7 +1903,6 @@ def test_run_watch_package_is_bound_to_invocation_version(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     paths, _global_config, project = configured_project
-    assert project is not None
     save_workflows(paths, project, observe=('package watch',))
     received: list[str | None] = []
 
@@ -1977,7 +1957,6 @@ def test_run_yes_still_prints_preview_and_only_declared_stage_runs(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     project = save_workflows(paths, project, checks=('repo watch',))
     received: list[tuple[object, ...]] = []
 
@@ -2014,7 +1993,6 @@ def test_run_yes_stops_before_reveal_and_names_interactive_command(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     paths, _global_config, project = configured_project
-    assert project is not None
     save_workflows(paths, project, reveal=('repo reveal',))
 
     def _reveal(*_args: object, **_kwargs: object) -> None:

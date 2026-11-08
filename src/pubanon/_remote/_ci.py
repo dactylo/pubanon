@@ -1,7 +1,7 @@
 """Request staging CI and judge the latest requested run."""
 
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import NamedTuple
 
@@ -46,6 +46,29 @@ class RunEvidence(NamedTuple):
     run: WorkflowRun | None
     checks: tuple[CheckVerdict, ...]
     detail: str
+
+
+class _CiAcceptance(NamedTuple):
+    """Judge one exact commit against a project's configured CI."""
+
+    evidence: RunEvidence | None
+    checks: tuple[CheckVerdict, ...]
+
+    @property
+    def failing(self) -> tuple[CheckVerdict, ...]:
+        """Return the required-check verdicts that are not successful."""
+        return tuple(check for check in self.checks if check.state != 'success')
+
+    @property
+    def accepted(self) -> bool:
+        """Return whether this CI permits publication.
+
+        A connected workflow's run decides by itself. Without one, every
+        required check must succeed, so no required checks is accepted.
+        """
+        if self.evidence is not None:
+            return self.evidence.state == 'success'
+        return not self.failing
 
 
 class RunQuery(NamedTuple):
@@ -152,6 +175,25 @@ def _wait_for_registration(coordinates: tuple[str, str], workflow: str) -> None:
             fact='The snapshot is staged. CI did not start.',
             recovery='wait a minute, then rerun pubanon stage push',
         )
+
+
+def ci_verdicts(
+    coordinates: tuple[str, str], commit: str, checks: Iterable[str]
+) -> list[CheckVerdict]:
+    """Read each named CI check once for an exact commit.
+
+    Args:
+        coordinates: Verified repository owner and name.
+        commit: Exact commit object ID to observe.
+        checks: Check names in display order.
+
+    Returns:
+        One current verdict per named check.
+
+    Raises:
+        PubanonError: A host response is invalid or cannot be read.
+    """
+    return [_host.check_result(coordinates, commit, name) for name in checks]
 
 
 def ensure_run_on_push_variable(coordinates: tuple[str, str], plan: StageCiPlan) -> None:
@@ -393,6 +435,38 @@ def run_evidence(
     if not _same_attempt(latest, confirmed):
         return RunEvidence('pending', latest, (), 'a newer run or attempt appeared')
     return _completed_evidence(latest, jobs, required)
+
+
+def ci_acceptance(
+    coordinates: tuple[str, str],
+    commit: str,
+    *,
+    workflow: str | None,
+    required: Sequence[str],
+    event: str,
+) -> _CiAcceptance:
+    """Read the configured CI for one exact commit once.
+
+    Args:
+        coordinates: Verified repository owner and name.
+        commit: Exact commit object ID to judge.
+        workflow: Connected workflow filename. When set, its latest run
+            decides; otherwise each required check is read by name.
+        required: Required job or check names in configured order.
+        event: Trigger the connected workflow's run must have.
+
+    Returns:
+        Fresh acceptance without caching.
+
+    Raises:
+        PubanonError: A host request fails or its response is invalid.
+    """
+    if workflow:
+        evidence = run_evidence(coordinates, RunQuery(workflow, commit, event), required=required)
+        return _CiAcceptance(evidence, evidence.checks)
+    return _CiAcceptance(
+        None, tuple(_host.check_result(coordinates, commit, name) for name in required)
+    )
 
 
 def start_stage_ci(

@@ -49,7 +49,8 @@ def test_doctor_missing_configuration_reports_setup_recovery(
     paths.global_config.unlink()
     assert _cli.main(['doctor']) == 1
     output = capsys.readouterr()
-    assert 'missing' in output.err
+    assert 'global configuration was not found' in output.err
+    assert 'pubanon setup' in output.err
     assert escape((paths.global_config).as_posix()) in output.err
 
 
@@ -108,6 +109,25 @@ def test_doctor_refuses_identity_matching_sensitive_term(
     assert 'Private Person' not in err
 
 
+def test_doctor_reports_github_cli_older_than_the_floor(
+    tmp_path: Path,
+    fake_gh: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    configure(tmp_path, monkeypatch)
+    fake_gh.write_text(
+        json.dumps([{'args': ['api', 'user', '--jq', '.login'], 'stdout': 'anonymous-account\n'}])
+    )
+    monkeypatch.setenv('PUBANON_FAKE_GH_VERSION', '2.96.0')
+
+    assert _cli.main(['doctor']) == 1
+
+    error = capsys.readouterr().err
+    assert 'GitHub CLI 2.97.0 or newer is required' in error
+    assert 'upgrade GitHub CLI' in error
+
+
 def test_doctor_reports_known_machine_paths_in_host_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -154,3 +174,4 @@ def test_doctor_reports_unexpected_authenticated_account(
     error = capsys.readouterr().err
     assert 'anonymous-account' in error
     assert 'real-login-canary' in error
+    assert 'gh auth switch --user anonymous-account' in error

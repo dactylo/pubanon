@@ -127,6 +127,10 @@ def closable_stdout() -> Generator[_ClosableTextOutput]:
 
     Yields:
         The installed wrapper.
+
+    Raises:
+        OSError: A non-closure output error or null-device redirection failure
+            occurs.
     """
     original = sys.stdout
     output = _ClosableTextOutput(original)

@@ -1,4 +1,3 @@
-from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -18,12 +17,11 @@ def test_stage_operation_uses_concrete_operation_and_holds_project_lock(
     operation: str,
     yes: bool,
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = make_repo(files={'README.md': 'public\n'})
+    source = tmp_path / 'source'
+    source.mkdir()
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     received: list[tuple[object, ...]] = []
 
     def _stage_operation(*args: object, yes: bool) -> None:
@@ -60,12 +58,11 @@ def test_stage_push_forwards_ci_options(
     full_tests: bool,
     hosted: bool,
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = make_repo(files={'README.md': 'public\n'})
+    source = tmp_path / 'source'
+    source.mkdir()
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     received: list[tuple[object, ...]] = []
 
     def _stage_push(
@@ -104,12 +101,11 @@ def test_stage_push_forwards_ci_options(
 
 def test_stage_status_uses_concrete_operation_and_holds_project_lock(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = make_repo(files={'README.md': 'public\n'})
+    source = tmp_path / 'source'
+    source.mkdir()
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     received: list[tuple[object, ...]] = []
 
     def _stage_status(

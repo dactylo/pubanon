@@ -24,6 +24,7 @@ from pubanon._snapshots import (
 )
 from pubanon._terminal import (
     confirm,
+    display_commit,
     display_path,
     display_time,
     escape,
@@ -31,6 +32,7 @@ from pubanon._terminal import (
     heading,
     next_step,
     output,
+    project_command,
     style,
     verbose_enabled,
 )
@@ -104,7 +106,7 @@ def _matching_source_details(match: _source.SourceMatches | None) -> list[tuple[
 def _history_entry(
     ctx: _context.ProjectContext,
     entry: _history.PublicationEntry,
-    candidate: _candidate.CandidateRecord | None,
+    candidate: _records.CandidateRecord | None,
     *,
     match: _source.SourceMatches | None = None,
 ) -> tuple[tuple[str, str, str, str], list[str | tuple[str, str]]]:
@@ -112,9 +114,9 @@ def _history_entry(
     pending = (
         candidate is not None
         and entry.commit in {candidate.commit, *(item.new for item in candidate.replayed)}
-        and candidate.state == _candidate.STATE_UNKNOWN_OUTCOME
+        and candidate.state == _records.STATE_UNKNOWN_OUTCOME
     )
-    snapshot = entry.commit if verbose_enabled() else entry.commit[:12]
+    snapshot = display_commit(entry.commit)
     state = 'published' if pending else 'superseded' if entry.replaced else 'published'
     published = display_time(entry.record.confirmed_at) if entry.record is not None else '-'
     details: list[str | tuple[str, str]] = []
@@ -141,13 +143,13 @@ def _history_entry(
 
 def _pending_history(
     ctx: _context.ProjectContext,
-    record: _candidate.CandidateRecord,
+    record: _records.CandidateRecord,
     entries: tuple[_history.PublicationEntry, ...],
 ) -> tuple[list[tuple[str, str, str, str]], list[str | tuple[str, str]], str]:
     """List each retained snapshot under its own identity and return its recovery action."""
     progress = _records.load_rewrite(ctx.paths, ctx.project.name)
-    incomplete = record.replaces is not None and (record.tip is None or progress is not None)
-    unknown = record.state == _candidate.STATE_UNKNOWN_OUTCOME
+    incomplete = _records.rewrite_incomplete(ctx.paths, ctx.project.name, record)
+    unknown = record.state == _records.STATE_UNKNOWN_OUTCOME
     confirmed = unknown and _verification.confirmed_publication(
         ctx.paths, ctx.project.name, record
     )
@@ -183,7 +185,7 @@ def _pending_history(
         version = (
             ', '.join(tag for tag, oid in tags.items() if oid == commit) or intended or 'untagged'
         )
-        snapshot = commit if verbose_enabled() else commit[:12]
+        snapshot = display_commit(commit)
         rows.append((snapshot, escape(version), state, '-'))
         if confirmed:
             details.append(('Local recording', style('incomplete', 'warning')))
@@ -229,7 +231,7 @@ def _refresh_source_matches(
 
 def _selected_prepared(
     paths: _config.Paths, name: str, selector: str
-) -> _candidate.CandidateRecord | None:
+) -> _records.CandidateRecord | None:
     """Select a prepared candidate by its explicit name or unambiguous commit prefix."""
     candidate = _records.load_candidate(paths, name)
     if candidate is None:
@@ -316,7 +318,7 @@ def _show_publication(
     """Show recorded provenance, bounded Git changes, and source recovery advice."""
     heading('Superseded snapshot' if entry.replaced else 'Published snapshot')
     rows = [
-        ('Snapshot commit', entry.commit if verbose_enabled() else entry.commit[:12]),
+        ('Snapshot commit', display_commit(entry.commit)),
         ('Version', escape(', '.join(entry.tags) or 'untagged')),
     ]
     record = entry.record
@@ -374,15 +376,7 @@ def _show_publication(
         else [f'Source: {_history_source_status(ctx.project, entry)}']
     )
     if verbose_enabled():
-        fields(
-            [
-                (f'Latest match on {escape(match.branch)}', match.latest or 'none')
-                if match is not None
-                else ('Latest match', 'unavailable'),
-                ('Number of matches', str(match.count) if match is not None else 'unavailable'),
-                ('Local store', display_path(store)),
-            ]
-        )
+        fields([*_matching_source_details(match), ('Local store', display_path(store))])
         print()
     source_rows: list[tuple[str, str]] = []
     if record and record.source_bookmark and source_lines[0].startswith('Source unavailable:'):
@@ -392,14 +386,21 @@ def _show_publication(
     _show_source_lines(source_lines, source_rows)
     print()
     next_step(
-        f'pubanon inspect --published {entry.commit if verbose_enabled() else entry.commit[:12]}'
+        f'pubanon inspect --published {display_commit(entry.commit)}'
         if available
         else 'pubanon repo restore --to local'
     )
 
 
 def command_clean(args: argparse.Namespace) -> None:
-    """Preview and remove superseded snapshots and review copies."""
+    """Preview and remove superseded snapshots and review copies.
+
+    Raises:
+        PubanonError: Configuration or retained history is invalid, or selected
+            local cleanup fails.
+        OperationCanceled: An interactive decision is declined or the operation
+            is canceled.
+    """
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
@@ -447,7 +448,14 @@ def command_clean(args: argparse.Namespace) -> None:
 
 
 def command_delete(args: argparse.Namespace) -> None:
-    """Confirm and delete one selected local snapshot."""
+    """Confirm and delete one selected local snapshot.
+
+    Raises:
+        PubanonError: The selection or recovery evidence is invalid, or local
+            deletion fails.
+        OperationCanceled: An interactive decision is declined or the operation
+            is canceled.
+    """
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
@@ -461,7 +469,12 @@ def command_delete(args: argparse.Namespace) -> None:
 
 
 def command_discard(args: argparse.Namespace) -> None:
-    """Discard one retained snapshot and its review copies."""
+    """Discard one retained snapshot and its review copies.
+
+    Raises:
+        PubanonError: Recovery evidence forbids discard, or local discard
+            cannot finish.
+    """
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
@@ -475,11 +488,18 @@ def command_discard(args: argparse.Namespace) -> None:
         heading('Remaining review copies', separate=True)
         for copy in copies:
             print(f'  {display_path(copy)}')
-        next_step(_context.project_command(name, 'clean', f'--project={name}'))
+        next_step(project_command(name, 'clean', f'--project={name}'))
 
 
 def command_list(args: argparse.Namespace) -> None:
-    """List locally known snapshots."""
+    """List locally known snapshots.
+
+    Refresh opted-in local source tags while reading source matches.
+
+    Raises:
+        PubanonError: Configuration or local publication history cannot be
+            read.
+    """
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
@@ -517,13 +537,21 @@ def command_list(args: argparse.Namespace) -> None:
                 if any(entry.commit == main for entry in entries)
                 else entries[0].commit[:12]
             )
-            action = _context.project_command(name, 'show', f'--project={name}', selector)
+            action = project_command(name, 'show', f'--project={name}', selector)
         print()
         next_step(action)
 
 
 def command_show(args: argparse.Namespace) -> None:
-    """Show one selected prepared or published snapshot."""
+    """Show one selected prepared or published snapshot.
+
+    Refresh opted-in local source tags while reading source matches. A prepared
+    snapshot report also writes its complete private file report.
+
+    Raises:
+        PubanonError: The selection or retained snapshot evidence is invalid or
+            unavailable.
+    """
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):

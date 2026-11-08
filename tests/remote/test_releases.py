@@ -1,10 +1,9 @@
 import re
 import shlex
-import subprocess
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Literal, cast
+from typing import Literal, Never
 
 import pytest
 
@@ -13,7 +12,9 @@ from pubanon._errors import ObservationTimeoutError, OperationCanceled, PubanonE
 from pubanon._remote import _host, _releases
 from pubanon._snapshots import _candidate, _records, _store
 from pubanon._snapshots._source import PinnedSource
-from tests._git import git_env
+from pubanon._terminal import escape
+from tests._git import git_text
+from tests._setup import make_global_config, make_paths, make_project_config
 
 _LINK = 'https://github.com/public-owner/public-repo/blob/v1.2.3/CHANGELOG.md'
 _NO_HEADING = 'warning: CHANGELOG.md has no heading for 1.2.3, so the notes only link to it.'
@@ -23,7 +24,7 @@ _SECTIONED = (
 )
 
 _TAG = 'v1.2.3'
-type _Context = tuple[_config.Paths, _config.GlobalConfig, _config.ProjectConfig, _Host]
+type _Context = tuple[_config.Paths, _config.GlobalConfig, _config.ProjectConfig, Host]
 type _Outcome = Literal['normal', 'missing', 'notes', 'status', 'tag', 'read-error']
 
 
@@ -32,16 +33,16 @@ class _Clock:
     now: float = 100.0
     waits: list[float] = field(default_factory=list[float])
 
-    def _monotonic(self) -> float:
+    def monotonic(self) -> float:
         return self.now
 
-    def _sleep(self, seconds: float) -> None:
+    def sleep(self, seconds: float) -> None:
         self.waits.append(seconds)
         self.now += seconds
 
 
 @dataclass
-class _Host:
+class Host:
     destination: _host.Destination
     commit: str
     page: _host.GitHubRelease | None = None
@@ -62,44 +63,6 @@ class _Host:
     tag_seconds: float = 0
     read_error: BaseException | None = None
     tag: str = _TAG
-
-    def _all(self, dest: _host.Destination) -> tuple[_host.GitHubRelease, ...]:
-        assert dest == self.destination
-        self.scans += 1
-        return (*self.pages, *((self.page,) if self.page is not None else ()))
-
-    def _destination(self, *_args: object) -> _host.Destination:
-        return self.destination
-
-    def _read(
-        self, dest: _host.Destination, tag: str, *, deadline: float | None = None
-    ) -> _host.GitHubRelease | None:
-        assert dest == self.destination
-        assert tag == self.tag
-        if deadline is not None:
-            assert self.clock.now < deadline
-            self.deadlines.append(deadline)
-            self.clock.now += min(self.read_seconds, deadline - self.clock.now)
-            if self.read_error is not None:
-                raise self.read_error
-            if self.clock.now >= deadline:
-                raise ObservationTimeoutError
-            if self.stale:
-                return self.stale.pop(0)
-        if self.writes and self.after_write == 'read-error':
-            raise PubanonError('read failed\x1b[31m')
-        return self.page
-
-    def _refs(
-        self, dest: _host.Destination, *_args: object, timeout: float | None = None
-    ) -> _host.RemoteRefs:
-        assert dest == self.destination
-        if timeout is not None:
-            self.timeouts.append(timeout)
-            self.clock.now += min(self.tag_seconds, timeout)
-            if self.tag_seconds >= timeout:
-                raise ObservationTimeoutError
-        return _host.RemoteRefs(self.commit, {self.tag: self.commit})
 
     def _write(self, dest: _host.Destination, tag: str, *, title: str, notes: bytes) -> None:
         assert dest == self.destination
@@ -125,52 +88,76 @@ class _Host:
         elif self.after_write == 'tag':
             self.commit = 'b' * 40
 
-    def _create(
+    def all(self, dest: _host.Destination) -> tuple[_host.GitHubRelease, ...]:
+        assert dest == self.destination
+        self.scans += 1
+        return (*self.pages, *((self.page,) if self.page is not None else ()))
+
+    def edit(self, dest: _host.Destination, tag: str, *, title: str, notes: bytes) -> None:
+        assert self.page is not None, 'edit requires an existing release'
+        self._write(dest, tag, title=title, notes=notes)
+
+    def read(
+        self, dest: _host.Destination, tag: str, *, deadline: float | None = None
+    ) -> _host.GitHubRelease | None:
+        assert dest == self.destination
+        assert tag == self.tag
+        if deadline is not None:
+            assert self.clock.now < deadline
+            self.deadlines.append(deadline)
+            self.clock.now += min(self.read_seconds, deadline - self.clock.now)
+            if self.read_error is not None:
+                raise self.read_error
+            if self.clock.now >= deadline:
+                raise ObservationTimeoutError
+            if self.stale:
+                return self.stale.pop(0)
+        if self.writes and self.after_write == 'read-error':
+            raise PubanonError('read failed\x1b[31m')
+        return self.page
+
+    def refs(
+        self, dest: _host.Destination, *_args: object, timeout: float | None = None
+    ) -> _host.RemoteRefs:
+        assert dest == self.destination
+        if timeout is not None:
+            self.timeouts.append(timeout)
+            self.clock.now += min(self.tag_seconds, timeout)
+            if self.tag_seconds >= timeout:
+                raise ObservationTimeoutError
+        return _host.RemoteRefs(self.commit, {self.tag: self.commit})
+
+    def create(
         self,
         dest: _host.Destination,
         tag: str,
         *,
         title: str,
         notes: bytes,
-        mode: _host.ReleaseCreationMode = 'latest',
+        mode: _host._ReleaseCreationMode = 'latest',
     ) -> None:
         assert self.page is None, 'create requires an absent release'
         self.latest.append(mode == 'latest')
         self.drafts.append(mode == 'draft')
         self._write(dest, tag, title=title, notes=notes)
 
-    def _edit(self, dest: _host.Destination, tag: str, *, title: str, notes: bytes) -> None:
-        assert self.page is not None, 'edit requires an existing release'
-        self._write(dest, tag, title=title, notes=notes)
+    def verify_destination(self, *_args: object) -> _host.Destination:
+        return self.destination
 
 
 @dataclass(frozen=True)
 class _PageContext:
-    _paths: _config.Paths
-    _global_config: _config.GlobalConfig
-    _project: _config.ProjectConfig
-    _record: _records.CandidateRecord
-    _release_page: _releases.PageRequest = field(default_factory=_releases.PageRequest)
+    paths: _config.Paths
+    global_config: _config.GlobalConfig
+    project: _config.ProjectConfig
+    record: _records.CandidateRecord
+    release_page: _releases.PageRequest = field(default_factory=_releases.PageRequest)
 
 
 def _drafting(context: _Context) -> _Context:
     paths, g, p, host = context
     page = _config.ReleasePageSettings(enabled=True, draft=True)
     return paths, g, replace(p, release_page=page), host
-
-
-def _git(store: Path, *args: str, data: bytes | None = None) -> str:
-    return (
-        subprocess.run(
-            ['git', '-C', str(store), *args],
-            input=data,
-            capture_output=True,
-            check=True,
-            env=git_env(),
-        )
-        .stdout.decode()
-        .strip()
-    )
 
 
 def _listed(tag: str, *, draft: bool) -> _host.GitHubRelease:
@@ -190,75 +177,8 @@ def _matching(change: _releases.ReleaseChange) -> _host.GitHubRelease:
     )
 
 
-def _page_plan(ctx: _PageContext) -> _releases.PagePlan:
-    return _releases.plan_publication_page(
-        ctx._paths, ctx._global_config, ctx._project, ctx._record, ctx._release_page
-    )
-
-
-def _release_context(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, published: bool
-) -> _Context:
-    paths = _config.Paths(
-        tmp_path / 'config', tmp_path / 'data', tmp_path / 'global', tmp_path / 'registry'
-    )
-    g = _config.GlobalConfig(
-        'Publisher', 'publisher@example.invalid', {'github': 'publisher'}, ('Private Person',)
-    )
-    p = _config.ProjectConfig(
-        'example',
-        tmp_path / 'source',
-        'github',
-        'public-owner',
-        'public-repo',
-        'public',
-        ('**',),
-        (),
-        (),
-        (),
-        ('internal-only',),
-        self_publication=False,
-        required_checks=(),
-    )
-    commit = 'a' * 40
-    if published:
-        store = _store.candidate_store_path(paths, p.name)
-        store.mkdir(parents=True)
-        _git(store, 'init', '--bare', '-q')
-        tree = _git(store, 'mktree', data=b'')
-        commit = _git(store, 'commit-tree', tree, data=b'Published snapshot\n')
-        _git(store, 'update-ref', 'refs/heads/main', commit)
-        _git(store, 'update-ref', f'refs/tags/{_TAG}', commit)
-    host = _Host(
-        _host.Destination(
-            'github', p.owner, p.repo, 'https://example.invalid/repo.git', 'publisher', 'public'
-        ),
-        commit,
-    )
-    monkeypatch.setattr(_host, 'verify_destination', host._destination)
-    monkeypatch.setattr(_host, 'ls_remote', host._refs)
-    monkeypatch.setattr(_host, 'read_release', host._read)
-    monkeypatch.setattr(_host, 'all_releases', host._all)
-    monkeypatch.setattr(_releases, '_monotonic', host.clock._monotonic)
-    monkeypatch.setattr(_releases, '_sleep', host.clock._sleep)
-    monkeypatch.setattr(_host, 'create_release', host._create)
-    monkeypatch.setattr(_host, 'edit_release', host._edit)
-    return paths, g, p, host
-
-
-@pytest.fixture
-def literal_release_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Context:
-    return _release_context(tmp_path, monkeypatch, published=False)
-
-
-@pytest.fixture
-def release_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Context:
-    return _release_context(tmp_path, monkeypatch, published=True)
-
-
-@pytest.fixture
-def page_context(release_context: _Context) -> tuple[_PageContext, _Host]:
-    paths, g, project, host = release_context
+def _page_context(context: _Context) -> tuple[_PageContext, Host]:
+    paths, g, project, host = context
     project = replace(project, release_page=_config.ReleasePageSettings(enabled=True))
     host.destination = replace(
         host.destination, url=_host.repository_url(project.owner, project.repo)
@@ -281,6 +201,76 @@ def page_context(release_context: _Context) -> tuple[_PageContext, _Host]:
     return _PageContext(paths, g, project, record), host
 
 
+def _page_plan(ctx: _PageContext) -> _releases.PagePlan:
+    return _releases.plan_publication_page(
+        ctx.paths, ctx.global_config, ctx.project, ctx.record, ctx.release_page
+    )
+
+
+def _release_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, published: bool
+) -> _Context:
+    paths = make_paths(tmp_path)
+    g = replace(
+        make_global_config(),
+        anon_name='Publisher',
+        anon_email='publisher@example.invalid',
+        accounts={'github': 'publisher'},
+    )
+    p = replace(
+        make_project_config(tmp_path / 'source'),
+        name='example',
+        owner='public-owner',
+        visibility='public',
+        hygiene_terms=('internal-only',),
+        self_publication=False,
+    )
+    commit = 'a' * 40
+    if published:
+        store = _store.candidate_store_path(paths, p.name)
+        store.mkdir(parents=True)
+        git_text(store, 'init', '--bare', '-q')
+        tree = git_text(store, 'mktree', input_bytes=b'')
+        commit = git_text(store, 'commit-tree', tree, input_bytes=b'Published snapshot\n')
+        git_text(store, 'update-ref', 'refs/heads/main', commit)
+        git_text(store, 'update-ref', f'refs/tags/{_TAG}', commit)
+    host = Host(
+        _host.Destination(
+            'github', p.owner, p.repo, 'https://example.invalid/repo.git', 'publisher', 'public'
+        ),
+        commit,
+    )
+    monkeypatch.setattr(_host, 'verify_destination', host.verify_destination)
+    monkeypatch.setattr(_host, 'ls_remote', host.refs)
+    monkeypatch.setattr(_host, 'read_release', host.read)
+    monkeypatch.setattr(_host, 'all_releases', host.all)
+    monkeypatch.setattr(_releases, '_monotonic', host.clock.monotonic)
+    monkeypatch.setattr(_releases, '_sleep', host.clock.sleep)
+    monkeypatch.setattr(_host, 'create_release', host.create)
+    monkeypatch.setattr(_host, 'edit_release', host.edit)
+    return paths, g, p, host
+
+
+@pytest.fixture
+def literal_release_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Context:
+    return _release_context(tmp_path, monkeypatch, published=False)
+
+
+@pytest.fixture
+def release_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Context:
+    return _release_context(tmp_path, monkeypatch, published=True)
+
+
+@pytest.fixture
+def page_context(release_context: _Context) -> tuple[_PageContext, Host]:
+    return _page_context(release_context)
+
+
+@pytest.fixture
+def literal_page_context(literal_release_context: _Context) -> tuple[_PageContext, Host]:
+    return _page_context(literal_release_context)
+
+
 def _prepare(
     context: _Context,
     *,
@@ -300,11 +290,11 @@ def _publish_changelog(
 ) -> None:
     paths, _g, p, host = context
     store = _store.candidate_store_path(paths, p.name)
-    blob = _git(store, 'hash-object', '-w', '--stdin', data=data)
-    tree = _git(store, 'mktree', data=f'100644 blob {blob}\t{path}\n'.encode())
-    host.commit = _git(store, 'commit-tree', tree, data=b'Published snapshot\n')
-    _git(store, 'update-ref', 'refs/heads/main', host.commit)
-    _git(store, 'update-ref', f'refs/tags/{_TAG}', host.commit)
+    blob = git_text(store, 'hash-object', '-w', '--stdin', input_bytes=data)
+    tree = git_text(store, 'mktree', input_bytes=f'100644 blob {blob}\t{path}\n'.encode())
+    host.commit = git_text(store, 'commit-tree', tree, input_bytes=b'Published snapshot\n')
+    git_text(store, 'update-ref', 'refs/heads/main', host.commit)
+    git_text(store, 'update-ref', f'refs/tags/{_TAG}', host.commit)
 
 
 def test_absence_exhausts_budget_and_preserves_recovery(release_context: _Context) -> None:
@@ -314,7 +304,7 @@ def test_absence_exhausts_budget_and_preserves_recovery(release_context: _Contex
     )
     change = _releases.prepare_change(paths, g, p, request)
     host.after_write = 'missing'
-    with pytest.raises(_releases.ReleaseOutcomeUnknownError, match='could not verify') as caught:
+    with pytest.raises(_releases._ReleaseOutcomeUnknownError, match='could not verify') as caught:
         _releases.apply_change(paths, g, p, change)
     assert host.clock.now == 110.0
     assert host.clock.waits == [0.5, 1.0, 2.0, 4.0, 2.5]
@@ -366,7 +356,7 @@ def test_complete_draft_creation_reports_the_observed_status(
     )
 
     assert host.drafts == [True]
-    assert outcome == _releases.PageOutcome(
+    assert outcome == _releases._PageOutcome(
         'created', 'https://example.invalid/release', draft=not published_first
     )
 
@@ -382,7 +372,7 @@ def test_complete_inactive_page_does_not_access_host(
     monkeypatch.setattr(_host, 'verify_destination', _unexpected)
     assert _releases.complete_publication_page(
         paths, g, p, _releases.PagePlan('none', 'disabled')
-    ) == _releases.PageOutcome('none', None)
+    ) == _releases._PageOutcome('none', None)
     assert host.writes == []
 
 
@@ -390,7 +380,7 @@ def test_complete_kept_page_retains_custom_draft(release_context: _Context) -> N
     paths, g, p, host = release_context
     host.page = replace(_matching(_prepare(release_context)), title='Custom', draft=True)
     plan = _releases.PagePlan('keep', 'exists', tag=_TAG, existing=host.page)
-    assert _releases.complete_publication_page(paths, g, p, plan) == _releases.PageOutcome(
+    assert _releases.complete_publication_page(paths, g, p, plan) == _releases._PageOutcome(
         'kept', host.page.url, draft=True
     )
     assert host.writes == []
@@ -401,7 +391,7 @@ def test_complete_preexisting_matching_page_reports_existing(release_context: _C
     change = _prepare(release_context)
     host.page = _matching(change)
     plan = _releases.PagePlan('keep', 'matches', tag=_TAG, existing=host.page, change=change)
-    assert _releases.complete_publication_page(paths, g, p, plan) == _releases.PageOutcome(
+    assert _releases.complete_publication_page(paths, g, p, plan) == _releases._PageOutcome(
         'existing', host.page.url
     )
     assert host.writes == []
@@ -429,7 +419,7 @@ def test_create_preserves_checked_bytes_and_verifies_result(release_context: _Co
     result = _releases.apply_change(paths, g, p, change)
     assert host.writes == [(_TAG, _TAG, b'Public notes\r\n')]
     assert host.page is not None
-    assert result == _releases.ReleaseResult(host.page, written=True)
+    assert result == _releases._ReleaseResult(host.page, written=True)
 
 
 def test_create_rechecks_absence_without_rewriting(release_context: _Context) -> None:
@@ -438,7 +428,7 @@ def test_create_rechecks_absence_without_rewriting(release_context: _Context) ->
     host.stale = [None, None, None]
     result = _releases.apply_change(paths, g, p, change)
     assert host.page is not None
-    assert result == _releases.ReleaseResult(host.page, written=True)
+    assert result == _releases._ReleaseResult(host.page, written=True)
     assert host.writes == [(change.tag, change.title, change.notes)]
     assert host.clock.waits == [0.5, 1.0, 2.0]
     assert host.deadlines == [110.0] * 4
@@ -502,7 +492,9 @@ def test_draft_ignores_higher_published_page_when_choosing_create_mode(
     context = _drafting(release_context)
     paths, g, p, host = context
     host.tag = 'v0.9.0'
-    _git(_store.candidate_store_path(paths, p.name), 'update-ref', 'refs/tags/v0.9.0', host.commit)
+    git_text(
+        _store.candidate_store_path(paths, p.name), 'update-ref', 'refs/tags/v0.9.0', host.commit
+    )
     host.pages = (_host.GitHubRelease('v0.10.0', 'Title', '', '', draft=False, prerelease=False),)
     change = _prepare(context, tag=host.tag)
 
@@ -545,7 +537,7 @@ def test_matching_page_appearing_before_write_succeeds(release_context: _Context
     change = _prepare(release_context)
     host.page = _matching(change)
     result = _releases.apply_change(paths, g, p, change)
-    assert result == _releases.ReleaseResult(host.page, written=False)
+    assert result == _releases._ReleaseResult(host.page, written=False)
     assert host.scans == 1
     assert host.writes == []
 
@@ -565,35 +557,35 @@ def test_metadata_findings_refuse_unknown_match_location(monkeypatch: pytest.Mon
 
 
 def test_page_existing_ignores_unused_defaults_and_matches_supplied_notes(
-    page_context: tuple[_PageContext, _Host],
+    literal_page_context: tuple[_PageContext, Host],
 ) -> None:
-    ctx, host = page_context
+    ctx, host = literal_page_context
     host.page = _host.GitHubRelease(
         'v1.2.3', 'v1.2.3', 'notes', 'https://example.invalid/page', draft=False, prerelease=False
     )
     ctx = replace(
         ctx,
-        _project=replace(
-            ctx._project,
+        project=replace(
+            ctx.project,
             release_page=_config.ReleasePageSettings(enabled=True, changelog='missing'),
         ),
     )
     assert _page_plan(ctx).reason == 'exists'
     assert (
-        _page_plan(replace(ctx, _release_page=_releases.PageRequest(notes=b'notes'))).reason
+        _page_plan(replace(ctx, release_page=_releases.PageRequest(notes=b'notes'))).reason
         == 'matches'
     )
     with pytest.raises(PubanonError) as caught:
-        _page_plan(replace(ctx, _release_page=_releases.PageRequest(notes=b'different')))
+        _page_plan(replace(ctx, release_page=_releases.PageRequest(notes=b'different')))
     assert 'release show v1.2.3 --project=example' in caught.value.render()
     assert 'release edit v1.2.3 --project=example' in caught.value.render()
     assert host.writes == []
 
 
 def test_page_lookup_failure_has_skip_recovery(
-    page_context: tuple[_PageContext, _Host], monkeypatch: pytest.MonkeyPatch
+    literal_page_context: tuple[_PageContext, Host], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    ctx, _host_facts = page_context
+    ctx, _host_facts = literal_page_context
 
     def _fail(_dest: _host.Destination) -> tuple[_host.GitHubRelease, ...]:
         raise PubanonError('lookup failed')
@@ -633,7 +625,7 @@ def test_page_outcome_marks_drafts_and_guides_only_draft_projects(
     p = replace(p, release_page=_config.ReleasePageSettings(enabled=True, draft=drafts))
 
     _releases.show_page_outcome(
-        p, _releases.PageOutcome(kind, 'https://example.invalid/page', draft=draft)
+        p, _releases._PageOutcome(kind, 'https://example.invalid/page', draft=draft)
     )
 
     out = capsys.readouterr().out
@@ -658,7 +650,7 @@ def test_create_defaults_render_published_page_without_notes_file(
     )
     assert missing.title == _TAG
     assert missing.notes == b''
-    assert missing.origin == _releases.NotesOrigin('empty')
+    assert missing.origin == _releases._NotesOrigin('empty')
     _publish_changelog(release_context)
     present = _releases.prepare_change(
         paths, g, p, _releases.ReleaseRequest('create', _TAG, None, None)
@@ -667,7 +659,7 @@ def test_create_defaults_render_published_page_without_notes_file(
         b'See the [changelog](https://github.com/public-owner/public-repo/blob/'
         b'v1.2.3/CHANGELOG.md).\n'
     )
-    assert present.origin == _releases.NotesOrigin(
+    assert present.origin == _releases._NotesOrigin(
         'link', 'CHANGELOG.md', '1.2.3', warning=_NO_HEADING
     )
     host.page = _host.GitHubRelease(
@@ -737,7 +729,7 @@ def test_command_fallback_preserves_required_arguments(args: tuple[str, ...]) ->
     [(True, True, True), (True, False, True), (False, True, False), (False, False, True)],
 )
 def test_existing_page_matches_by_content_and_the_draft_setting(
-    page_context: tuple[_PageContext, _Host],
+    page_context: tuple[_PageContext, Host],
     *,
     drafts: bool,
     existing_draft: bool,
@@ -745,10 +737,10 @@ def test_existing_page_matches_by_content_and_the_draft_setting(
 ) -> None:
     ctx, host = page_context
     project = replace(
-        ctx._project, release_page=_config.ReleasePageSettings(enabled=True, draft=drafts)
+        ctx.project, release_page=_config.ReleasePageSettings(enabled=True, draft=drafts)
     )
-    ctx = replace(ctx, _project=project, _release_page=_releases.PageRequest(notes=b'Notes\n'))
-    paths, g = ctx._paths, ctx._global_config
+    ctx = replace(ctx, project=project, release_page=_releases.PageRequest(notes=b'Notes\n'))
+    paths, g = ctx.paths, ctx.global_config
     request = _releases.ReleaseRequest('create', _TAG, None, b'Notes\n')
     change = _releases.prepare_change(paths, g, project, request)
     host.page = replace(_matching(change), draft=existing_draft)
@@ -768,9 +760,9 @@ def test_existing_page_matches_by_content_and_the_draft_setting(
 
 
 def test_page_plan_keeping_a_page_lists_no_waiting_drafts(
-    page_context: tuple[_PageContext, _Host],
+    literal_page_context: tuple[_PageContext, Host],
 ) -> None:
-    ctx, host = page_context
+    ctx, host = literal_page_context
     host.pages = (_listed('v1.0.0', draft=True),)
     host.page = _listed(_TAG, draft=False)
 
@@ -780,7 +772,7 @@ def test_page_plan_keeping_a_page_lists_no_waiting_drafts(
 
 
 def test_page_plan_lists_lower_version_drafts_oldest_first(
-    page_context: tuple[_PageContext, _Host],
+    page_context: tuple[_PageContext, Host],
 ) -> None:
     ctx, host = page_context
     host.pages = (
@@ -798,19 +790,13 @@ def test_page_plan_lists_lower_version_drafts_oldest_first(
     assert host.scans == 1
 
 
-def test_page_preview_empty_defaults_and_supplied_file(
-    page_context: tuple[_PageContext, _Host], capsys: pytest.CaptureFixture[str]
+def test_page_preview_supplied_file(
+    literal_page_context: tuple[_PageContext, Host], capsys: pytest.CaptureFixture[str]
 ) -> None:
-    ctx, _host_facts = page_context
-    plan = _page_plan(ctx)
-    _releases.show_page_plan(plan)
-    rendered = capsys.readouterr().out
-    assert 'create "v1.2.3" with empty notes' in rendered
-    assert 'no CHANGELOG.md' in rendered
-    assert 'release_page.changelog' in rendered
-    path = ctx._paths.data_dir / 'notes.md'
+    ctx, _host_facts = literal_page_context
+    path = ctx.paths.data_dir / 'notes.md'
     ctx = replace(
-        ctx, _release_page=_releases.PageRequest(notes=b'full\r\nlast\n', notes_file=path)
+        ctx, release_page=_releases.PageRequest(notes=b'full\r\nlast\n', notes_file=path)
     )
     _releases.show_page_plan(_page_plan(ctx))
     out = capsys.readouterr().out
@@ -820,19 +806,19 @@ def test_page_preview_empty_defaults_and_supplied_file(
 
 
 def test_page_replacement_uses_correction_tag_not_replayed_tags(
-    page_context: tuple[_PageContext, _Host],
+    page_context: tuple[_PageContext, Host],
 ) -> None:
     ctx, host = page_context
     record = replace(
-        ctx._record,
+        ctx.record,
         tag_intent=None,
         replaces='a' * 40,
         replace_scope='one',
         prestate_main='b' * 40,
         tip='c' * 40,
-        poststate_tags={'v1.0.0': ctx._record.commit, 'v2.0.0': 'c' * 40},
+        poststate_tags={'v1.0.0': ctx.record.commit, 'v2.0.0': 'c' * 40},
     )
-    ctx = replace(ctx, _record=record)
+    ctx = replace(ctx, record=record)
     assert _releases.page_tags(record) == ('v1.0.0',)
     plan = _page_plan(ctx)
     assert plan.tag == 'v1.0.0'
@@ -842,8 +828,73 @@ def test_page_replacement_uses_correction_tag_not_replayed_tags(
     assert _releases.page_tags(replace(record, tag_intent='v3.0.0')) == ('v3.0.0',)
 
 
-def test_refresh_notes_cannot_take_notes(release_context: _Context) -> None:
-    paths, g, p, _host_facts = release_context
+def test_planned_page_ambiguous_tags_offer_one_manual_command_per_tag(
+    literal_page_context: tuple[_PageContext, Host],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ctx, _host_facts = literal_page_context
+    record = replace(
+        ctx.record,
+        tag_intent=None,
+        replaces='d' * 40,
+        replace_scope='one',
+        tip=ctx.record.commit,
+        poststate_tags={'v1.2.1': ctx.record.commit, 'v1.2.2': ctx.record.commit},
+    )
+
+    def _unexpected_host(*_args: object, **_kwargs: object) -> None:
+        pytest.fail('local preview read the host')
+
+    monkeypatch.setattr(_host, 'read_release', _unexpected_host)
+    monkeypatch.setattr(_host, 'all_releases', _unexpected_host)
+    _releases.show_planned_page(ctx.paths, ctx.project, record)
+    rendered = capsys.readouterr().out
+    assert 'Release page (planned): not created' in rendered
+    assert 'v1.2.1 and v1.2.2' in rendered
+    assert 'pubanon release create v1.2.1 --project=example' in rendered
+    assert 'pubanon release create v1.2.2 --project=example' in rendered
+    assert 'create "v1.2.1"' not in rendered
+
+
+def test_planned_page_reports_rendering_failure(
+    literal_page_context: tuple[_PageContext, Host],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ctx, _host_facts = literal_page_context
+
+    def _fail_render(*_args: object, **_kwargs: object) -> Never:
+        raise PubanonError('bad\nnotes')
+
+    monkeypatch.setattr(_releases, '_render_page', _fail_render)
+    _releases.show_planned_page(ctx.paths, ctx.project, ctx.record)
+    rendered = capsys.readouterr()
+    assert f'Release page (planned): cannot be planned: {escape("bad\nnotes")}' in rendered.out
+    assert rendered.err == ''
+
+
+def test_planned_page_shows_hints_for_refused_notes_template(
+    release_context: _Context,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _publish_changelog(release_context, data=b'# Changelog\n\n## Version 1.2.3\n- a\n')
+    ctx, _host_facts = _page_context(release_context)
+    settings = _config.ReleasePageSettings(enabled=True, notes='{changelog_section}')
+    _releases.show_planned_page(ctx.paths, replace(ctx.project, release_page=settings), ctx.record)
+    assert (
+        'Release page (planned): cannot be planned: release_page.notes uses '
+        '{changelog_section}, but CHANGELOG.md has no heading for 1.2.3\n'
+        '  line 3 mentions 1.2.3: ## Version 1.2.3\n'
+        '  to use headings like this, add changelog_heading = "## Version {version}" '
+        'to [release_page]\n'
+        '  add or correct the 1.2.3 section, use a notes file, '
+        'or remove {changelog_section} from release_page.notes\n'
+    ) in capsys.readouterr().out
+
+
+def test_refresh_notes_cannot_take_notes(literal_release_context: _Context) -> None:
+    paths, g, p, _host_facts = literal_release_context
     with pytest.raises(PubanonError, match='--refresh-notes'):
         _releases.prepare_change(
             paths, g, p, _releases.ReleaseRequest('edit', _TAG, None, b'x', refresh_notes=True)
@@ -878,6 +929,22 @@ def test_refresh_notes_ignores_the_configured_creation_title(
     assert host.writes == []
 
 
+def test_refresh_notes_keeps_an_untitled_page_untitled(release_context: _Context) -> None:
+    paths, g, p, host = release_context
+    _publish_changelog(release_context, data=_SECTIONED)
+    host.page = _host.GitHubRelease(
+        _TAG, '', 'Old notes', 'https://example.invalid/page', draft=True, prerelease=False
+    )
+
+    change = _releases.prepare_change(
+        paths, g, p, _releases.ReleaseRequest('edit', _TAG, None, None, refresh_notes=True)
+    )
+
+    assert change.title == ''
+    assert change.notes.startswith(b'### Added\n')
+    assert host.writes == []
+
+
 def test_refresh_notes_renders_the_changelog_at_the_tag(release_context: _Context) -> None:
     paths, g, p, host = release_context
     _publish_changelog(release_context, data=_SECTIONED)
@@ -898,7 +965,7 @@ def test_refresh_notes_renders_the_changelog_at_the_tag(release_context: _Contex
     assert change.notes == (
         f'### Added\n\n- A thing.\n\nSee the [changelog]({_LINK}) for all versions.\n'.encode()
     )
-    assert change.origin == _releases.NotesOrigin('section', 'CHANGELOG.md', '1.2.3')
+    assert change.origin == _releases._NotesOrigin('section', 'CHANGELOG.md', '1.2.3')
     titled = _releases.prepare_change(
         paths,
         g,
@@ -926,7 +993,7 @@ def test_render_page_default_notes_include_the_section(release_context: _Context
     assert page.notes == (
         f'### Added\n\n- A thing.\n\nSee the [changelog]({_LINK}) for all versions.\n'.encode()
     )
-    assert page.origin == _releases.NotesOrigin('section', 'CHANGELOG.md', '1.2.3')
+    assert page.origin == _releases._NotesOrigin('section', 'CHANGELOG.md', '1.2.3')
 
 
 def test_render_page_default_notes_link_only_when_sections_are_off(
@@ -939,7 +1006,7 @@ def test_render_page_default_notes_link_only_when_sections_are_off(
     page = _releases._render_page(paths, p, _TAG, host.commit)
 
     assert page.notes == f'See the [changelog]({_LINK}).\n'.encode()
-    assert page.origin == _releases.NotesOrigin('link', 'CHANGELOG.md', '1.2.3')
+    assert page.origin == _releases._NotesOrigin('link', 'CHANGELOG.md', '1.2.3')
 
 
 def test_render_page_defaults_use_only_published_tree(release_context: _Context) -> None:
@@ -947,7 +1014,7 @@ def test_render_page_defaults_use_only_published_tree(release_context: _Context)
     p.source_path.mkdir()
     (p.source_path / 'CHANGELOG.md').write_text('Unpublished\n')
     missing = _releases._render_page(paths, p, _TAG, host.commit)
-    assert missing == _releases._PlannedPage(_TAG, b'', None, _releases.NotesOrigin('empty'))
+    assert missing == _releases._PlannedPage(_TAG, b'', None, _releases._NotesOrigin('empty'))
 
     _publish_changelog(release_context)
     (p.source_path / 'CHANGELOG.md').write_text('Changed again\n')
@@ -956,7 +1023,7 @@ def test_render_page_defaults_use_only_published_tree(release_context: _Context)
         _TAG,
         b'See the [changelog](https://github.com/public-owner/public-repo/blob/v1.2.3/CHANGELOG.md).\n',
         None,
-        _releases.NotesOrigin('link', 'CHANGELOG.md', '1.2.3', warning=_NO_HEADING),
+        _releases._NotesOrigin('link', 'CHANGELOG.md', '1.2.3', warning=_NO_HEADING),
     )
 
 
@@ -1028,7 +1095,7 @@ def test_render_page_template_inserts_the_section(release_context: _Context) -> 
     page = _releases._render_page(paths, p, _TAG, host.commit)
 
     assert page.notes == b'## What changed\n\n### Added\n\n- A thing.\n'
-    assert page.origin == _releases.NotesOrigin('template')
+    assert page.origin == _releases._NotesOrigin('template')
 
 
 def test_render_page_template_refuses_a_missing_section(release_context: _Context) -> None:
@@ -1074,7 +1141,7 @@ def test_render_page_templates_and_overrides(literal_release_context: _Context) 
         'Version 1.2.3 {stable}',
         b'Release v1.2.3: 1.2.3.\n',
         None,
-        _releases.NotesOrigin('template'),
+        _releases._NotesOrigin('template'),
     )
     assert _releases._render_page(paths, one_line, _TAG, host.commit) == expected
     assert _releases._render_page(paths, block, _TAG, host.commit) == expected
@@ -1088,7 +1155,7 @@ def test_render_page_templates_and_overrides(literal_release_context: _Context) 
         host.commit,
         request=_releases.ReleaseRequest('create', _TAG, 'Supplied', b'CRLF\r\nNo LF', notes_file),
     ) == _releases._PlannedPage(
-        'Supplied', b'CRLF\r\nNo LF', notes_file, _releases.NotesOrigin('file')
+        'Supplied', b'CRLF\r\nNo LF', notes_file, _releases._NotesOrigin('file')
     )
 
 
@@ -1142,10 +1209,10 @@ def test_requires_recorded_matching_publication(
         p = replace(p, name='absent')
     elif boundary.startswith('local-'):
         ref = f'refs/tags/{_TAG}' if boundary == 'local-tag' else 'refs/heads/main'
-        _git(store, 'update-ref', '-d', ref)
+        git_text(store, 'update-ref', '-d', ref)
         if boundary == 'local-tag':
-            _git(store, 'clone', '-q', str(store), str(p.source_path))
-            _git(p.source_path, 'tag', _TAG, host.commit)
+            git_text(store, 'clone', '-q', str(store), str(p.source_path))
+            git_text(p.source_path, 'tag', _TAG, host.commit)
 
             def _prepared(*_args: object) -> SimpleNamespace:
                 return SimpleNamespace(
@@ -1179,21 +1246,6 @@ def test_requires_recorded_matching_publication(
 def test_requires_strict_tag(literal_release_context: _Context, tag: str) -> None:
     with pytest.raises(PubanonError, match=r'vX\.Y\.Z'):
         _prepare(literal_release_context, tag=tag)
-
-
-@pytest.mark.parametrize(
-    ('operation', 'title', 'notes'),
-    [('edit', None, None), ('create', '', b'')],
-)
-def test_rejects_invalid_metadata_before_publication_verification(
-    literal_release_context: _Context,
-    operation: Literal['create', 'edit'],
-    title: str | None,
-    notes: bytes | None,
-) -> None:
-    with pytest.raises(PubanonError):
-        _prepare(literal_release_context, operation=operation, title=title, notes=notes)
-    assert literal_release_context[3].writes == []
 
 
 @pytest.mark.parametrize(
@@ -1344,7 +1396,7 @@ def test_verification_budget_includes_requests_and_tag(
     change = _prepare(release_context)
     host.after_write = 'missing'
     host.tag_seconds, host.read_seconds = tag_seconds, read_seconds
-    with pytest.raises(_releases.ReleaseOutcomeUnknownError):
+    with pytest.raises(_releases._ReleaseOutcomeUnknownError):
         _releases.apply_change(paths, g, p, change)
     assert host.clock.now == 110.0
     assert host.timeouts == [10.0]
@@ -1359,7 +1411,7 @@ def test_read_failure_is_not_absence(release_context: _Context, failure: Excepti
     paths, g, p, host = release_context
     change = _prepare(release_context)
     host.read_error = failure
-    with pytest.raises(_releases.ReleaseOutcomeUnknownError, match='could not verify'):
+    with pytest.raises(_releases._ReleaseOutcomeUnknownError, match='could not verify'):
         _releases.apply_change(paths, g, p, change)
     assert host.clock.waits == []
     assert len(host.writes) == 1
@@ -1372,7 +1424,7 @@ def test_unverified_edit_uses_show_recovery(release_context: _Context, stale: bo
     host.page = _matching(_prepare(release_context))
     change = _prepare(release_context, operation='edit', title='New title')
     host.stale = [host.page] * 20 if stale else [None]
-    with pytest.raises(_releases.ReleaseOutcomeUnknownError) as caught:
+    with pytest.raises(_releases._ReleaseOutcomeUnknownError) as caught:
         _releases.apply_change(paths, g, p, change)
     assert f'release show {_TAG}' in (caught.value.recovery or '')
     assert 'release create' not in (caught.value.recovery or '')
@@ -1402,7 +1454,7 @@ def test_mismatch_names_fields_with_bounded_escaped_excerpts(
             tag='v9.9.9',
         )
     ]
-    with pytest.raises(_releases.ReleaseOutcomeUnknownError) as caught:
+    with pytest.raises(_releases._ReleaseOutcomeUnknownError) as caught:
         _releases.apply_change(paths, g, p, change)
     fact = caught.value.fact or ''
     for field_name in ('tag', 'title', 'notes line 2', 'draft', 'prerelease'):
@@ -1439,7 +1491,7 @@ def test_latest_uses_published_numeric_versions(
 ) -> None:
     paths, g, p, host = release_context
     host.tag = 'v0.9.0'
-    _git(
+    git_text(
         _store.candidate_store_path(paths, p.name),
         'update-ref',
         'refs/tags/v0.9.0',
@@ -1456,36 +1508,36 @@ def test_latest_uses_published_numeric_versions(
 
 @pytest.mark.parametrize('mode', ['untagged', 'ambiguous', 'skipped', 'disabled'])
 def test_page_inactive_actions_do_not_lookup_or_render(
-    page_context: tuple[_PageContext, _Host], mode: str
+    literal_page_context: tuple[_PageContext, Host], mode: str
 ) -> None:
-    ctx, host = page_context
+    ctx, host = literal_page_context
     settings = _config.ReleasePageSettings(enabled=mode != 'disabled', changelog='missing.md')
-    ctx = replace(ctx, _project=replace(ctx._project, release_page=settings))
+    ctx = replace(ctx, project=replace(ctx.project, release_page=settings))
     if mode == 'untagged':
-        ctx = replace(ctx, _record=replace(ctx._record, tag_intent=None))
+        ctx = replace(ctx, record=replace(ctx.record, tag_intent=None))
     elif mode == 'ambiguous':
         ctx = replace(
             ctx,
-            _record=replace(
-                ctx._record,
+            record=replace(
+                ctx.record,
                 tag_intent=None,
                 prestate_tags={
-                    'v2.0.0': ctx._record.commit,
-                    'v1.0.0': ctx._record.commit,
-                    'other': ctx._record.commit,
+                    'v2.0.0': ctx.record.commit,
+                    'v1.0.0': ctx.record.commit,
+                    'other': ctx.record.commit,
                 },
             ),
         )
     elif mode == 'skipped':
-        ctx = replace(ctx, _release_page=_releases.PageRequest(skip=True))
+        ctx = replace(ctx, release_page=_releases.PageRequest(skip=True))
     plan = _page_plan(ctx)
     assert (plan.action, plan.reason) == ('none', mode)
     assert host.scans == 0
     assert plan.candidates == (('v1.0.0', 'v2.0.0') if mode == 'ambiguous' else ())
     if mode == 'untagged':
-        assert _page_plan(replace(ctx, _release_page=_releases.PageRequest(skip=True))) == plan
+        assert _page_plan(replace(ctx, release_page=_releases.PageRequest(skip=True))) == plan
     if mode in {'untagged', 'ambiguous'}:
-        ctx = replace(ctx, _release_page=_releases.PageRequest(notes=b'notes'))
+        ctx = replace(ctx, release_page=_releases.PageRequest(notes=b'notes'))
         with pytest.raises(PubanonError) as caught:
             _page_plan(ctx)
         text = caught.value.render()
@@ -1496,7 +1548,7 @@ def test_page_inactive_actions_do_not_lookup_or_render(
             assert 'release create v2.0.0' in text
         assert host.scans == 0
 
-        ctx = replace(ctx, _release_page=_releases.PageRequest(requested=True))
+        ctx = replace(ctx, release_page=_releases.PageRequest(requested=True))
         with pytest.raises(PubanonError) as caught:
             _page_plan(ctx)
         text = caught.value.render()
@@ -1509,10 +1561,10 @@ def test_page_inactive_actions_do_not_lookup_or_render(
 
 @pytest.mark.parametrize('settings', [None, _config.ReleasePageSettings(changelog='missing.md')])
 def test_page_plan_is_disabled_unless_pages_are_enabled(
-    page_context: tuple[_PageContext, _Host], settings: _config.ReleasePageSettings | None
+    literal_page_context: tuple[_PageContext, Host], settings: _config.ReleasePageSettings | None
 ) -> None:
-    ctx, host = page_context
-    ctx = replace(ctx, _project=replace(ctx._project, release_page=settings))
+    ctx, host = literal_page_context
+    ctx = replace(ctx, project=replace(ctx.project, release_page=settings))
     plan = _page_plan(ctx)
     assert (plan.action, plan.reason, plan.tag) == ('none', 'disabled', 'v1.2.3')
     assert host.scans == 0
@@ -1520,13 +1572,13 @@ def test_page_plan_is_disabled_unless_pages_are_enabled(
 
 @pytest.mark.parametrize('settings', [None, _config.ReleasePageSettings(enabled=False)])
 def test_requested_page_is_planned_when_pages_are_off(
-    page_context: tuple[_PageContext, _Host], settings: _config.ReleasePageSettings | None
+    page_context: tuple[_PageContext, Host], settings: _config.ReleasePageSettings | None
 ) -> None:
     ctx, host = page_context
     ctx = replace(
         ctx,
-        _project=replace(ctx._project, release_page=settings),
-        _release_page=_releases.PageRequest(requested=True),
+        project=replace(ctx.project, release_page=settings),
+        release_page=_releases.PageRequest(requested=True),
     )
     plan = _page_plan(ctx)
     assert (plan.action, plan.reason, plan.tag) == ('create', 'new', 'v1.2.3')
@@ -1536,11 +1588,11 @@ def test_requested_page_is_planned_when_pages_are_off(
 
 @pytest.mark.parametrize('reason', ['disabled', 'skipped'])
 def test_finished_publication_without_page_shows_create_command(
-    reason: str, capsys: pytest.CaptureFixture[str]
+    reason: Literal['disabled', 'skipped'], capsys: pytest.CaptureFixture[str]
 ) -> None:
     plan = _releases.PagePlan(
         'none',
-        cast("Literal['disabled', 'skipped']", reason),
+        reason,
         tag='v1.0.0',
         project='example',
     )
@@ -1630,11 +1682,13 @@ def test_page_preview_existing_status(draft: bool, capsys: pytest.CaptureFixture
     ],
 )
 def test_page_preview_inactive_rows(
-    reason: str, expected: str, capsys: pytest.CaptureFixture[str]
+    reason: Literal['untagged', 'disabled', 'skipped', 'ambiguous'],
+    expected: str,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     plan = _releases.PagePlan(
         'none',
-        cast("Literal['untagged', 'disabled', 'skipped', 'ambiguous']", reason),
+        reason,
         candidates=('v1.0.0', 'v2.0.0') if reason == 'ambiguous' else (),
         project='example',
     )
@@ -1652,23 +1706,23 @@ def test_page_preview_inactive_rows(
 
 @pytest.mark.parametrize('enabled', [True, False])
 def test_page_supplied_notes_plan_exact_gated_candidate(
-    page_context: tuple[_PageContext, _Host], enabled: bool
+    literal_page_context: tuple[_PageContext, Host], enabled: bool
 ) -> None:
-    ctx, host = page_context
+    ctx, host = literal_page_context
     ctx = replace(
         ctx,
-        _project=replace(ctx._project, release_page=_config.ReleasePageSettings(enabled=enabled)),
-        _release_page=_releases.PageRequest(notes=b'Public\r\nnotes\n'),
+        project=replace(ctx.project, release_page=_config.ReleasePageSettings(enabled=enabled)),
+        release_page=_releases.PageRequest(notes=b'Public\r\nnotes\n'),
     )
     plan = _page_plan(ctx)
     assert (plan.action, plan.reason, plan.tag) == ('create', 'new', 'v1.2.3')
     assert plan.change is not None
-    assert plan.change.commit == ctx._record.commit
+    assert plan.change.commit == ctx.record.commit
     assert plan.change.notes == b'Public\r\nnotes\n'
     assert host.scans == 1
     assert host.writes == []
     with pytest.raises(PubanonError, match='release content is blocked'):
-        _page_plan(replace(ctx, _release_page=_releases.PageRequest(notes=b'Private Person')))
+        _page_plan(replace(ctx, release_page=_releases.PageRequest(notes=b'Private Person')))
 
 
 @pytest.mark.parametrize('present', [False, True])
@@ -1718,11 +1772,7 @@ def test_metadata_findings_bound_context_and_escape_controls_once(field_name: st
     )
     location = 'notes line 2' if field_name == 'notes' else field_name
     assert findings == [
-        f'{location}: identity_critical match private: ...'
-        + 'x' * 59
-        + r'\x1bprivate'
-        + 'y' * 60
-        + '...'
+        f'{location}: sensitive term private: ...' + 'x' * 59 + r'\x1bprivate' + 'y' * 60 + '...'
     ]
 
 
@@ -1746,9 +1796,43 @@ def test_render_page_explains_why_default_notes_only_link(
     page = _releases._render_page(paths, p, _TAG, host.commit)
 
     assert page.notes == f'See the [changelog]({_LINK}).\n'.encode()
-    assert page.origin == _releases.NotesOrigin(
+    assert page.origin == _releases._NotesOrigin(
         'link',
         'CHANGELOG.md',
         '1.2.3',
         warning=f'warning: {reason}, so the notes only link to it.',
+    )
+
+
+@pytest.mark.parametrize('draft', [False, True])
+def test_planned_page_explains_missing_changelog(
+    page_context: tuple[_PageContext, Host],
+    capsys: pytest.CaptureFixture[str],
+    draft: bool,
+) -> None:
+    ctx, _host_facts = page_context
+    project = replace(
+        ctx.project, release_page=_config.ReleasePageSettings(enabled=True, draft=draft)
+    )
+    _releases.show_planned_page(ctx.paths, project, ctx.record)
+    action = 'create draft' if draft else 'create'
+    assert (
+        f'Release page (planned): {action} "v1.2.3" with empty notes '
+        '(no CHANGELOG.md; set release_page.changelog)' in capsys.readouterr().out
+    )
+
+
+@pytest.mark.parametrize(
+    'settings', [None, _config.ReleasePageSettings(), _config.ReleasePageSettings(enabled=False)]
+)
+def test_planned_page_explains_disabled_pages(
+    literal_page_context: tuple[_PageContext, Host],
+    capsys: pytest.CaptureFixture[str],
+    settings: _config.ReleasePageSettings | None,
+) -> None:
+    ctx, _host_facts = literal_page_context
+    _releases.show_planned_page(ctx.paths, replace(ctx.project, release_page=settings), ctx.record)
+    assert (
+        'Release page (planned): not created; release pages are off for this project'
+        in capsys.readouterr().out
     )

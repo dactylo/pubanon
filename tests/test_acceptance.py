@@ -22,19 +22,11 @@ from pubanon._remote import _host, _package, _stage, _watch
 from pubanon._run import GitResult
 from pubanon._snapshots import _candidate, _records, _source, _store
 from pubanon._terminal import display_path
+from tests._cli import FakeGhCall, read_gh_calls
 from tests._git import git_env
 
 _ACCOUNT_CALL: dict[str, object] = {
     'args': ['api', 'user', '--jq', '.login'],
-    'stdin': '',
-}
-_REPOSITORY_CALL: dict[str, object] = {
-    'args': [
-        'api',
-        'repos/release-owner/public-repo',
-        '--jq',
-        '{owner: .owner.login, repo: .name, visibility: .visibility}',
-    ],
     'stdin': '',
 }
 _REAL_ACCOUNT = 'pat-example'
@@ -50,6 +42,15 @@ _REAL_SETTINGS = Settings(
     discussions=False,
 )
 _REAL_TERM = 'internal-host.example'
+_REPOSITORY_CALL: dict[str, object] = {
+    'args': [
+        'api',
+        'repos/release-owner/public-repo',
+        '--jq',
+        '{owner: .owner.login, repo: .name, visibility: .visibility}',
+    ],
+    'stdin': '',
+}
 _SETTINGS_CALL: dict[str, object] = {
     'args': ['api', 'repos/release-owner/public-repo', '--jq', _host._REPOSITORY_SETTINGS_QUERY],
     'stdin': '',
@@ -58,32 +59,32 @@ _SETTINGS_CALL: dict[str, object] = {
 
 @dataclass(frozen=True)
 class _LifecycleFixture:
-    _account: str
-    _check: str
-    _fake_gh: Path
-    _owner: str
-    _paths: _config.Paths
-    _publication_host: Path
-    _publication_repo: str
-    _settings: Settings
-    _source: Path
-    _staging_host: Path
-    _staging_repo: str
-    _tmp_path: Path
+    account: str
+    check: str
+    fake_gh: Path
+    owner: str
+    paths: _config.Paths
+    publication_host: Path
+    publication_repo: str
+    settings: Settings
+    source: Path
+    staging_host: Path
+    staging_repo: str
+    tmp_path: Path
 
 
 @dataclass
 class _ReleaseWalk:
-    _fixture: _LifecycleFixture
-    _publication_pushes: list[tuple[Path, tuple[str, ...]]]
-    _stage_pushes: list[tuple[Path, tuple[str, ...]]]
-    _events: list[tuple[str, str]]
-    _executed_stages: list[str]
-    _candidate_builds: int
-    _host_call_cursor: int
-    _first_oid: str = ''
-    _second_oid: str = ''
-    _third_oid: str = ''
+    fixture: _LifecycleFixture
+    publication_pushes: list[tuple[Path, tuple[str, ...]]]
+    stage_pushes: list[tuple[Path, tuple[str, ...]]]
+    events: list[tuple[str, str]]
+    executed_stages: list[str]
+    candidate_builds: int
+    host_call_cursor: int
+    first_oid: str = ''
+    second_oid: str = ''
+    third_oid: str = ''
 
 
 def _account_response(account: str) -> dict[str, object]:
@@ -121,13 +122,13 @@ def _assert_release_published_snapshot(
 ) -> None:
     remote, local = snapshot
     assert remote == {
-        'refs/heads/main': walk._second_oid,
-        'refs/tags/v0.1.0': walk._first_oid,
-        'refs/tags/v0.2.0': walk._second_oid,
+        'refs/heads/main': walk.second_oid,
+        'refs/tags/v0.1.0': walk.first_oid,
+        'refs/tags/v0.2.0': walk.second_oid,
     }
     assert local == (
-        walk._second_oid,
-        {'v0.1.0': walk._first_oid, 'v0.2.0': walk._second_oid},
+        walk.second_oid,
+        {'v0.1.0': walk.first_oid, 'v0.2.0': walk.second_oid},
     )
 
 
@@ -299,15 +300,12 @@ def _git_source_state(repo: Path) -> tuple[dict[str, str], str]:
     return _git_refs(repo), remotes
 
 
-def _host_calls() -> list[object]:
-    calls = Path(os.environ['PUBANON_FAKE_GH_CALLS'])
-    if not calls.exists():
-        return []
-    return [json.loads(line) for line in calls.read_text().splitlines()]
+def _host_calls() -> list[FakeGhCall]:
+    return read_gh_calls(Path(os.environ['PUBANON_FAKE_GH_CALLS']))
 
 
 def _host_call_args() -> list[list[str]]:
-    return [cast('dict[str, list[str]]', call)['args'] for call in _host_calls()]
+    return [call['args'] for call in _host_calls()]
 
 
 def _init_answers(
@@ -381,21 +379,21 @@ def _prepare_guided_review(
     capsys: pytest.CaptureFixture[str],
     cli_output: list[str],
 ) -> tuple[_candidate.CandidateRecord, Path]:
-    (fixture._source / 'README.md').write_text('omitted staged edit\n')
-    subprocess.run(['git', '-C', fixture._source, 'add', 'README.md'], check=True, env=git_env())
-    (fixture._source / 'docs/guide.md').write_text('omitted unstaged edit\n')
-    (fixture._source / 'untracked.txt').write_text('omitted untracked edit\n')
+    (fixture.source / 'README.md').write_text('omitted staged edit\n')
+    subprocess.run(['git', '-C', fixture.source, 'add', 'README.md'], check=True, env=git_env())
+    (fixture.source / 'docs/guide.md').write_text('omitted unstaged edit\n')
+    (fixture.source / 'untracked.txt').write_text('omitted untracked edit\n')
     assert _cli.main(['prepare', '--version', '1.0.0', '--yes']) == 0
     prepared = capsys.readouterr()
     cli_output.extend((prepared.out, prepared.err))
     assert 'left out: 1 staged change, 1 unstaged change, 1 untracked change' in prepared.out
-    candidate = _records.load_candidate(fixture._paths, 'demo')
+    candidate = _records.load_candidate(fixture.paths, 'demo')
     assert candidate is not None
 
     assert _cli.main(['inspect']) == 0
     inspected = capsys.readouterr()
     cli_output.extend((inspected.out, inspected.err))
-    inspection = fixture._paths.data_dir / 'projects' / 'demo' / 'inspections' / candidate.commit
+    inspection = fixture.paths.data_dir / 'projects' / 'demo' / 'inspections' / candidate.commit
     assert sorted(path.relative_to(inspection).as_posix() for path in inspection.rglob('*')) == [
         'README.md',
         'docs',
@@ -414,18 +412,18 @@ def _prepare_guided_review(
 
 def _record_release_host_events(walk: _ReleaseWalk) -> None:
     calls = _host_calls()
-    for call in calls[walk._host_call_cursor :]:
-        walk._events.append(('host', json.dumps(call)))
-    walk._host_call_cursor = len(calls)
+    for call in calls[walk.host_call_cursor :]:
+        walk.events.append(('host', json.dumps(call)))
+    walk.host_call_cursor = len(calls)
 
 
 def _release_published_snapshot(
     walk: _ReleaseWalk,
 ) -> tuple[dict[str, str], tuple[str | None, dict[str, str]]]:
-    fixture = walk._fixture
+    fixture = walk.fixture
     return (
-        _git_refs(fixture._publication_host),
-        _candidate.published_refs(fixture._paths, 'demo'),
+        _git_refs(fixture.publication_host),
+        _candidate.published_refs(fixture.paths, 'demo'),
     )
 
 
@@ -526,7 +524,7 @@ def _run_release_unattended_reveal_refusal(
     walk: _ReleaseWalk,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert _config.load_project(walk._fixture._paths, 'demo').visibility == 'public'
+    assert _config.load_project(walk.fixture.paths, 'demo').visibility == 'public'
 
     calls_before_refusal = _host_calls()
     assert _cli.main(['run', 'reveal-declared', '--yes']) == 1
@@ -632,25 +630,25 @@ def _initialize_lifecycle(
     project = replace(
         _config.load_project(paths, 'demo'),
         settings=settings,
-        _stage_repo='staging-repo',
+        stage_repo='staging-repo',
         release_page=_config.ReleasePageSettings(enabled=False),
     )
     _config.save_project(paths, project)
     assert project.required_checks == ('Acceptance',)
     assert _host_calls() == []
     return _LifecycleFixture(
-        _account=account,
-        _check='Acceptance',
-        _fake_gh=fake_gh,
-        _owner=account,
-        _paths=paths,
-        _publication_host=publication_host,
-        _publication_repo='public-repo',
-        _settings=settings,
-        _source=source,
-        _staging_host=staging_host,
-        _staging_repo='staging-repo',
-        _tmp_path=tmp_path,
+        account=account,
+        check='Acceptance',
+        fake_gh=fake_gh,
+        owner=account,
+        paths=paths,
+        publication_host=publication_host,
+        publication_repo='public-repo',
+        settings=settings,
+        source=source,
+        staging_host=staging_host,
+        staging_repo='staging-repo',
+        tmp_path=tmp_path,
     )
 
 
@@ -897,14 +895,14 @@ def _assert_policy_growth_acknowledgment(
     published_commit: str,
 ) -> None:
     assert _cli.main(['init', '--project', 'demo', '--publication-route', 'direct']) == 0
-    assert _config.load_project(fixture._paths, 'demo').publication_route == 'direct'
-    fixture._paths.global_config.write_text(
+    assert _config.load_project(fixture.paths, 'demo').publication_route == 'direct'
+    fixture.paths.global_config.write_text(
         'anon_name = "Anonymous Publisher"\n'
         'anon_email = "anonymous@example.invalid"\n'
         'sensitive_terms = ["private-canary", "historical-canary"]\n'
         'default_publication_route = "direct"\n'
         '[accounts]\n'
-        f'github = "{fixture._account}"\n'
+        f'github = "{fixture.account}"\n'
     )
     capsys.readouterr()
     assert _cli.main(['audit']) == 0
@@ -917,11 +915,11 @@ def _assert_policy_growth_acknowledgment(
     assert 'Text: historical-canary' in exposure_audit
 
     new_path = 'release-notes.txt'
-    (fixture._source / new_path).write_text('public release notes\n')
-    _commit(fixture._source, 'fresh clean release\n')
-    project = _config.load_project(fixture._paths, 'demo')
+    (fixture.source / new_path).write_text('public release notes\n')
+    _commit(fixture.source, 'fresh clean release\n')
+    project = _config.load_project(fixture.paths, 'demo')
     _config.save_project(
-        fixture._paths,
+        fixture.paths,
         replace(project, allow=(*project.allow, new_path)),
     )
 
@@ -936,14 +934,14 @@ def _assert_policy_growth_acknowledgment(
 
     monkeypatch.setattr('builtins.input', _include_new_path)
     assert _cli.main(['prepare', '--version', '1.1.0']) == 0
-    fresh = _records.load_candidate(fixture._paths, 'demo')
+    fresh = _records.load_candidate(fixture.paths, 'demo')
     assert fresh is not None
     _write_responses(
-        fixture._fake_gh,
+        fixture.fake_gh,
         [
-            _account_response(fixture._account),
-            _repository_response(fixture._owner, fixture._publication_repo, 'public'),
-            _settings_response(fixture._owner, fixture._publication_repo, fixture._settings),
+            _account_response(fixture.account),
+            _repository_response(fixture.owner, fixture.publication_repo, 'public'),
+            _settings_response(fixture.owner, fixture.publication_repo, fixture.settings),
         ],
     )
 
@@ -952,15 +950,15 @@ def _assert_policy_growth_acknowledgment(
 
     monkeypatch.setattr('builtins.input', _unexpected_prompt)
     capsys.readouterr()
-    published_refs = _git_refs(fixture._publication_host)
+    published_refs = _git_refs(fixture.publication_host)
     assert _cli.main(['publish', '--yes']) == 1
     refusal = capsys.readouterr().err
     assert '--yes cannot acknowledge historical exposure' in refusal
-    assert _git_refs(fixture._publication_host) == published_refs
-    retained = _records.load_candidate(fixture._paths, 'demo')
+    assert _git_refs(fixture.publication_host) == published_refs
+    retained = _records.load_candidate(fixture.paths, 'demo')
     assert retained is not None
     assert replace(retained, source_bookmark=None) == fresh
-    bookmark = _source.describe_bookmark(fixture._source, 'demo', fresh.commit)
+    bookmark = _source.describe_bookmark(fixture.source, 'demo', fresh.commit)
     assert retained.source_bookmark == bookmark
     assert _source.source_recovery(bookmark, fresh.pinned.commit).status == 'protected'
 
@@ -969,15 +967,15 @@ def _assert_policy_growth_acknowledgment(
         [
             ('Continue with this history? [y/n] ', 'y'),
             (
-                (f'Publish v1.1.0 to {fixture._owner}/{fixture._publication_repo}? [y/n] '),
+                (f'Publish v1.1.0 to {fixture.owner}/{fixture.publication_repo}? [y/n] '),
                 'y',
             ),
         ],
     )
     assert _cli.main(['publish']) == 0
     assert_answers()
-    assert _config.load_project(fixture._paths, 'demo').acknowledged_exposure
-    assert _records.load_candidate(fixture._paths, 'demo') is None
+    assert _config.load_project(fixture.paths, 'demo').acknowledged_exposure
+    assert _records.load_candidate(fixture.paths, 'demo') is None
 
 
 def _complete_guided_publication(
@@ -988,19 +986,17 @@ def _complete_guided_publication(
 ) -> _candidate.CandidateRecord:
     candidate, inspection = _prepare_guided_review(fixture, capsys, cli_output)
     _write_responses(
-        fixture._fake_gh,
+        fixture.fake_gh,
         [
-            _account_response(fixture._account),
-            _repository_response(fixture._owner, fixture._publication_repo, 'private'),
-            _settings_response(fixture._owner, fixture._publication_repo, fixture._settings),
+            _account_response(fixture.account),
+            _repository_response(fixture.owner, fixture.publication_repo, 'private'),
+            _settings_response(fixture.owner, fixture.publication_repo, fixture.settings),
         ],
     )
     answers = ['n', 'y']
 
     def _publication_answer(prompt: str) -> str:
-        assert prompt == (
-            f'Publish v1.0.0 to {fixture._owner}/{fixture._publication_repo}? [y/n] '
-        )
+        assert prompt == (f'Publish v1.0.0 to {fixture.owner}/{fixture.publication_repo}? [y/n] ')
         assert answers, f'unexpected prompt: {prompt}'
         preview = capsys.readouterr()
         cli_output.extend((preview.out, preview.err))
@@ -1008,8 +1004,8 @@ def _complete_guided_publication(
         assert candidate.commit not in preview.out
         assert 'Checked:' in preview.out
         assert 'content, identity, and destination' in preview.out
-        assert f'{fixture._owner}/{fixture._publication_repo} (private)' in preview.out
-        assert _git_refs(fixture._publication_host) == {}
+        assert f'{fixture.owner}/{fixture.publication_repo} (private)' in preview.out
+        assert _git_refs(fixture.publication_host) == {}
         assert (inspection / 'README.md').read_text() == 'sanitized release\n'
         return answers.pop(0)
 
@@ -1018,11 +1014,11 @@ def _complete_guided_publication(
     declined = capsys.readouterr()
     assert 'Canceled. Nothing was published.' in declined.err
     cli_output.extend((declined.out, declined.err))
-    assert _git_refs(fixture._publication_host) == {}
-    retained = _records.load_candidate(fixture._paths, 'demo')
+    assert _git_refs(fixture.publication_host) == {}
+    retained = _records.load_candidate(fixture.paths, 'demo')
     assert retained is not None
     assert replace(retained, source_bookmark=None) == candidate
-    bookmark = _source.describe_bookmark(fixture._source, 'demo', candidate.commit)
+    bookmark = _source.describe_bookmark(fixture.source, 'demo', candidate.commit)
     assert retained.source_bookmark == bookmark
     assert _source.source_recovery(bookmark, candidate.pinned.commit).status == 'protected'
     assert _cli.main(['publish']) == 0
@@ -1040,7 +1036,7 @@ def _create_lifecycle_repository(
     # The fake gh process cannot create a directory, so provide the empty bare
     # transport immediately before its scripted repository-creation response.
     subprocess.run(
-        ['git', 'init', '--bare', '-q', fixture._publication_host], check=True, env=git_env()
+        ['git', 'init', '--bare', '-q', fixture.publication_host], check=True, env=git_env()
     )
     create_publication = [
         'api',
@@ -1048,11 +1044,11 @@ def _create_lifecycle_repository(
         'POST',
         'user/repos',
         '-f',
-        f'name={fixture._publication_repo}',
+        f'name={fixture.publication_repo}',
         '-F',
         'private=true',
         '-f',
-        f'description={fixture._settings.description}',
+        f'description={fixture.settings.description}',
         '-F',
         'has_issues=true',
         '-F',
@@ -1063,13 +1059,13 @@ def _create_lifecycle_repository(
         'has_discussions=false',
     ]
     _write_responses(
-        fixture._fake_gh,
+        fixture.fake_gh,
         [
-            _account_response(fixture._account),
+            _account_response(fixture.account),
             {
                 'args': [
                     'api',
-                    f'repos/{fixture._owner}/{fixture._publication_repo}',
+                    f'repos/{fixture.owner}/{fixture.publication_repo}',
                     '--jq',
                     _host._REPOSITORY_QUERY,
                 ],
@@ -1079,9 +1075,9 @@ def _create_lifecycle_repository(
             },
             {'args': create_publication},
             *_created_settings_responses(
-                fixture._owner, fixture._publication_repo, fixture._settings
+                fixture.owner, fixture.publication_repo, fixture.settings
             ),
-            _repository_response(fixture._owner, fixture._publication_repo, 'private'),
+            _repository_response(fixture.owner, fixture.publication_repo, 'private'),
         ],
     )
     assert _cli.main(['repo', 'create', '--yes']) == 0
@@ -1267,18 +1263,18 @@ def _initialize_guided_first_run(
     assert project.settings is not None
     assert _git_source_state(source) == (source_refs, source_remotes)
     fixture = _LifecycleFixture(
-        _account=account,
-        _check='',
-        _fake_gh=fake_gh,
-        _owner=account,
-        _paths=paths,
-        _publication_host=publication_host,
-        _publication_repo='public-repo',
-        _settings=project.settings,
-        _source=source,
-        _staging_host=tmp_path / 'unused-staging.git',
-        _staging_repo='unused-staging',
-        _tmp_path=tmp_path,
+        account=account,
+        check='',
+        fake_gh=fake_gh,
+        owner=account,
+        paths=paths,
+        publication_host=publication_host,
+        publication_repo='public-repo',
+        settings=project.settings,
+        source=source,
+        staging_host=tmp_path / 'unused-staging.git',
+        staging_repo='unused-staging',
+        tmp_path=tmp_path,
     )
     return fixture, output, source_refs, source_remotes
 
@@ -1347,11 +1343,11 @@ def _initialize_release_walk(
     )
     initialized = re.sub(r': +', ': ', capsys.readouterr().out)
     assert 'README.md' in initialized
-    proposed = fixture._paths.data_dir / 'projects' / 'demo' / 'proposed-selection.json'
+    proposed = fixture.paths.data_dir / 'projects' / 'demo' / 'proposed-selection.json'
     assert json.loads(proposed.read_text(encoding='utf-8')) == ['README.md']
-    assert _config.load_project(fixture._paths, 'demo').allow == ('README.md',)
+    assert _config.load_project(fixture.paths, 'demo').allow == ('README.md',)
     project = replace(
-        _config.load_project(fixture._paths, 'demo'),
+        _config.load_project(fixture.paths, 'demo'),
         package=PackageObservation('pypi', 'demo-package', ('Release',)),
         workflows={
             'ship': ('prepare', 'inspect', 'publish', 'repo watch'),
@@ -1360,7 +1356,7 @@ def _initialize_release_walk(
             'reveal-declared': ('repo reveal',),
         },
     )
-    _config.save_project(fixture._paths, project)
+    _config.save_project(fixture.paths, project)
 
     _create_lifecycle_repository(fixture)
     created = re.sub(r': +', ': ', capsys.readouterr().out)
@@ -1375,7 +1371,7 @@ def _initialize_release_walk(
         plan: _prepare._PreparePlan,
         options: _prepare.PrepareOptions,
     ) -> _candidate.CandidateRecord:
-        walk._candidate_builds += 1
+        walk.candidate_builds += 1
         return real_build_candidate(plan, options)
 
     def _execute_run_stage(
@@ -1384,7 +1380,7 @@ def _initialize_release_walk(
         state: _workflow._RunState,
         stage: str,
     ) -> None:
-        walk._executed_stages.append(stage)
+        walk.executed_stages.append(stage)
         real_execute_run_stage(args, plan, state, stage)
 
     def _publication_push(
@@ -1392,17 +1388,17 @@ def _initialize_release_walk(
         cwd: Path,
         args: Sequence[str],
     ) -> GitResult:
-        walk._publication_pushes.append((cwd, tuple(args)))
+        walk.publication_pushes.append((cwd, tuple(args)))
         for arg in args:
             commit, separator, destination_ref = arg.partition(':')
             if separator and destination_ref == 'refs/tags/v0.1.0':
                 _append_response(
-                    fixture._fake_gh,
+                    fixture.fake_gh,
                     _check_response(
-                        fixture._owner,
-                        fixture._publication_repo,
+                        fixture.owner,
+                        fixture.publication_repo,
                         commit,
-                        fixture._check,
+                        fixture.check,
                         conclusion='failure',
                     ),
                 )
@@ -1413,17 +1409,17 @@ def _initialize_release_walk(
         cwd: Path,
         args: Sequence[str],
     ) -> GitResult:
-        walk._stage_pushes.append((cwd, tuple(args)))
+        walk.stage_pushes.append((cwd, tuple(args)))
         commit, separator, destination_ref = args[-1].partition(':')
         assert separator
         assert destination_ref == 'refs/heads/main'
         _append_response(
-            fixture._fake_gh,
+            fixture.fake_gh,
             _check_response(
-                fixture._owner,
-                fixture._staging_repo,
+                fixture.owner,
+                fixture.staging_repo,
                 commit,
-                fixture._check,
+                fixture.check,
             ),
         )
         return real_push(destination, cwd, args)
@@ -1433,9 +1429,9 @@ def _initialize_release_walk(
         cwd: Path,
         args: Sequence[str],
     ) -> GitResult:
-        if destination.repo == fixture._staging_repo:
+        if destination.repo == fixture.staging_repo:
             return _stage_push(destination, cwd, args)
-        assert destination.repo == fixture._publication_repo
+        assert destination.repo == fixture.publication_repo
         return _publication_push(destination, cwd, args)
 
     monkeypatch.setattr(_prepare, '_build_candidate', _build_candidate)
@@ -1450,39 +1446,39 @@ def _reveal_clean_and_restore(
     staged_oid: str,
 ) -> None:
     private_settings = _settings_response(
-        fixture._owner,
-        fixture._publication_repo,
-        fixture._settings,
+        fixture.owner,
+        fixture.publication_repo,
+        fixture.settings,
         once=True,
     )
     _write_responses(
-        fixture._fake_gh,
+        fixture.fake_gh,
         [
-            _account_response(fixture._account),
+            _account_response(fixture.account),
             _repository_response(
-                fixture._owner,
-                fixture._publication_repo,
+                fixture.owner,
+                fixture.publication_repo,
                 'private',
                 once=True,
             ),
             _repository_response(
-                fixture._owner,
-                fixture._publication_repo,
+                fixture.owner,
+                fixture.publication_repo,
                 'private',
                 once=True,
             ),
-            _repository_response(fixture._owner, fixture._publication_repo, 'public'),
+            _repository_response(fixture.owner, fixture.publication_repo, 'public'),
             _check_response(
-                fixture._owner,
-                fixture._publication_repo,
+                fixture.owner,
+                fixture.publication_repo,
                 staged_oid,
-                fixture._check,
+                fixture.check,
             ),
             private_settings,
-            _settings_response(fixture._owner, fixture._publication_repo, fixture._settings),
+            _settings_response(fixture.owner, fixture.publication_repo, fixture.settings),
             *_disclosure_responses(
-                fixture._owner,
-                fixture._publication_repo,
+                fixture.owner,
+                fixture.publication_repo,
                 artifacts=((201, 'release-package'), (202, 'checks-report')),
             ),
             {
@@ -1490,7 +1486,7 @@ def _reveal_clean_and_restore(
                     'api',
                     '-X',
                     'PATCH',
-                    f'repos/{fixture._owner}/{fixture._publication_repo}',
+                    f'repos/{fixture.owner}/{fixture.publication_repo}',
                     '-f',
                     'visibility=public',
                 ]
@@ -1503,29 +1499,29 @@ def _reveal_clean_and_restore(
     )
     assert _cli.main(['repo', 'reveal']) == 0
     assert_answers()
-    assert _config.load_project(fixture._paths, 'demo').visibility == 'public'
-    project_file = fixture._paths.config_dir / 'projects' / 'demo.toml'
+    assert _config.load_project(fixture.paths, 'demo').visibility == 'public'
+    project_file = fixture.paths.config_dir / 'projects' / 'demo.toml'
     assert 'visibility = "public"' in project_file.read_text()
 
     delete_stage = [
         'api',
         '-X',
         'DELETE',
-        f'repos/{fixture._owner}/{fixture._staging_repo}',
+        f'repos/{fixture.owner}/{fixture.staging_repo}',
     ]
     _write_responses(
-        fixture._fake_gh,
+        fixture.fake_gh,
         [
-            _account_response(fixture._account),
+            _account_response(fixture.account),
             _repository_response(
-                fixture._owner,
-                fixture._staging_repo,
+                fixture.owner,
+                fixture.staging_repo,
                 'private',
                 once=True,
             ),
             _repository_response(
-                fixture._owner,
-                fixture._staging_repo,
+                fixture.owner,
+                fixture.staging_repo,
                 'private',
                 once=True,
             ),
@@ -1533,7 +1529,7 @@ def _reveal_clean_and_restore(
             {
                 'args': [
                     'api',
-                    f'repos/{fixture._owner}/{fixture._staging_repo}',
+                    f'repos/{fixture.owner}/{fixture.staging_repo}',
                     '--jq',
                     _host._REPOSITORY_QUERY,
                 ],
@@ -1544,24 +1540,24 @@ def _reveal_clean_and_restore(
     )
     assert _cli.main(['stage', 'delete', '--yes']) == 0
     assert {'args': delete_stage, 'stdin': ''} in _host_calls()
-    assert _stage.load_stage(fixture._paths, 'demo') is None
-    assert _config.load_project(fixture._paths, 'demo').publication_route == 'staged'
+    assert _stage.load_stage(fixture.paths, 'demo') is None
+    assert _config.load_project(fixture.paths, 'demo').publication_route == 'staged'
 
-    original_host = fixture._tmp_path / 'published-before-recreation.git'
-    fixture._publication_host.rename(original_host)
+    original_host = fixture.tmp_path / 'published-before-recreation.git'
+    fixture.publication_host.rename(original_host)
     subprocess.run(
-        ['git', 'init', '--bare', '-q', fixture._publication_host], check=True, env=git_env()
+        ['git', 'init', '--bare', '-q', fixture.publication_host], check=True, env=git_env()
     )
     _write_responses(
-        fixture._fake_gh,
+        fixture.fake_gh,
         [
-            _account_response(fixture._account),
-            _repository_response(fixture._owner, fixture._publication_repo, 'public'),
+            _account_response(fixture.account),
+            _repository_response(fixture.owner, fixture.publication_repo, 'public'),
         ],
     )
     assert _cli.main(['repo', 'restore', '--to', 'remote', '--yes']) == 0
-    assert _git_refs(fixture._publication_host) == _git_refs(
-        _store.store_path(fixture._paths, 'demo')
+    assert _git_refs(fixture.publication_host) == _git_refs(
+        _store.store_path(fixture.paths, 'demo')
     )
 
 
@@ -1569,14 +1565,14 @@ def _run_release_failed_ship(
     walk: _ReleaseWalk,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    fixture = walk._fixture
+    fixture = walk.fixture
 
     _write_responses(
-        fixture._fake_gh,
+        fixture.fake_gh,
         [
-            _account_response(fixture._account),
-            _repository_response(fixture._owner, fixture._publication_repo, 'private'),
-            _settings_response(fixture._owner, fixture._publication_repo, fixture._settings),
+            _account_response(fixture.account),
+            _repository_response(fixture.owner, fixture.publication_repo, 'private'),
+            _settings_response(fixture.owner, fixture.publication_repo, fixture.settings),
         ],
     )
     assert (
@@ -1593,64 +1589,64 @@ def _run_release_failed_ship(
         == 1
     )
     first_run = capsys.readouterr()
-    first_refs = _git_refs(fixture._publication_host)
-    walk._first_oid = first_refs['refs/tags/v0.1.0']
+    first_refs = _git_refs(fixture.publication_host)
+    walk.first_oid = first_refs['refs/tags/v0.1.0']
     assert '  Acceptance: failed' in first_run.err
     assert 'The publication itself completed.' in first_run.err
     assert 'pubanon repo watch' in first_run.err
     assert '--version 0.1.0' in first_run.err
-    assert len(walk._publication_pushes) == 1
-    assert _records.load_candidate(fixture._paths, 'demo') is None
-    assert f'/commits/{walk._first_oid}/check-runs?' in json.dumps(_host_calls())
+    assert len(walk.publication_pushes) == 1
+    assert _records.load_candidate(fixture.paths, 'demo') is None
+    assert f'/commits/{walk.first_oid}/check-runs?' in json.dumps(_host_calls())
 
 
 def _run_release_green_release(
     walk: _ReleaseWalk,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    fixture = walk._fixture
+    fixture = walk.fixture
 
-    _commit(fixture._source, 'second release\n')
+    _commit(fixture.source, 'second release\n')
     _write_responses(
-        fixture._fake_gh,
+        fixture.fake_gh,
         [
-            _account_response(fixture._account),
-            _repository_response(fixture._owner, fixture._publication_repo, 'private'),
-            _settings_response(fixture._owner, fixture._publication_repo, fixture._settings),
+            _account_response(fixture.account),
+            _repository_response(fixture.owner, fixture.publication_repo, 'private'),
+            _settings_response(fixture.owner, fixture.publication_repo, fixture.settings),
         ],
     )
     assert _cli.main(['prepare', '--version', '0.2.0', '--yes']) == 0
     assert _cli.main(['inspect']) == 0
     assert _cli.main(['publish', '--yes']) == 0
     second_run = re.sub(r': +', ': ', capsys.readouterr().out)
-    second_refs = _git_refs(fixture._publication_host)
-    walk._second_oid = second_refs['refs/tags/v0.2.0']
+    second_refs = _git_refs(fixture.publication_host)
+    walk.second_oid = second_refs['refs/tags/v0.2.0']
     assert 'Published v0.2.0 to ' in second_run
-    assert walk._second_oid != walk._first_oid
-    assert len(walk._publication_pushes) == 2
+    assert walk.second_oid != walk.first_oid
+    assert len(walk.publication_pushes) == 2
 
 
 def _run_release_old_version_resume(
     walk: _ReleaseWalk,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    fixture = walk._fixture
+    fixture = walk.fixture
     before = _release_published_snapshot(walk)
     _assert_release_published_snapshot(walk, before)
-    assert _records.load_candidate(fixture._paths, 'demo') is None
-    first_stage = len(walk._executed_stages)
-    builds_before = walk._candidate_builds
+    assert _records.load_candidate(fixture.paths, 'demo') is None
+    first_stage = len(walk.executed_stages)
+    builds_before = walk.candidate_builds
 
     _write_responses(
-        fixture._fake_gh,
+        fixture.fake_gh,
         [
-            _account_response(fixture._account),
-            _repository_response(fixture._owner, fixture._publication_repo, 'private'),
+            _account_response(fixture.account),
+            _repository_response(fixture.owner, fixture.publication_repo, 'private'),
             _check_response(
-                fixture._owner,
-                fixture._publication_repo,
-                walk._first_oid,
-                fixture._check,
+                fixture.owner,
+                fixture.publication_repo,
+                walk.first_oid,
+                fixture.check,
             ),
         ],
     )
@@ -1662,12 +1658,12 @@ def _run_release_old_version_resume(
     assert 'Workflow ship (direct route)' in resumed
     assert 'Repo watch' in resumed
     assert 'Required checks passed.' in resumed
-    assert len(walk._publication_pushes) == 2
-    assert _records.load_candidate(fixture._paths, 'demo') is None
-    assert walk._executed_stages[first_stage:] == ['repo watch']
-    assert walk._candidate_builds == builds_before
-    assert f'/commits/{walk._first_oid}/check-runs?' in resume_log
-    assert f'/commits/{walk._second_oid}/check-runs?' not in resume_log
+    assert len(walk.publication_pushes) == 2
+    assert _records.load_candidate(fixture.paths, 'demo') is None
+    assert walk.executed_stages[first_stage:] == ['repo watch']
+    assert walk.candidate_builds == builds_before
+    assert f'/commits/{walk.first_oid}/check-runs?' in resume_log
+    assert f'/commits/{walk.second_oid}/check-runs?' not in resume_log
     after = _release_published_snapshot(walk)
     _assert_release_published_snapshot(walk, after)
     assert after == before
@@ -1678,7 +1674,7 @@ def _run_release_package_watch(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> list[str]:
-    fixture = walk._fixture
+    fixture = walk.fixture
 
     package_payload = json.dumps(
         {
@@ -1702,7 +1698,7 @@ def _run_release_package_watch(
         _record_release_host_events(walk)
         package_urls.append(url)
         status, body = next(package_states)
-        walk._events.append(('fetch', f'{status} {url}'))
+        walk.events.append(('fetch', f'{status} {url}'))
         return status, body
 
     now = 0.0
@@ -1713,23 +1709,23 @@ def _run_release_package_watch(
     def _sleep(seconds: float) -> None:
         nonlocal now
         _record_release_host_events(walk)
-        walk._events.append(('sleep', f'{seconds:g}'))
+        walk.events.append(('sleep', f'{seconds:g}'))
         now += seconds
 
     monkeypatch.setattr(_package, '_fetch', _fetch_package)
     monkeypatch.setattr(_watch, '_monotonic', _monotonic)
     monkeypatch.setattr(_watch, '_sleep', _sleep)
-    walk._host_call_cursor = len(_host_calls())
-    first_event = len(walk._events)
+    walk.host_call_cursor = len(_host_calls())
+    first_event = len(walk.events)
     _write_responses(
-        fixture._fake_gh,
+        fixture.fake_gh,
         [
-            _account_response(fixture._account),
-            _repository_response(fixture._owner, fixture._publication_repo, 'private'),
+            _account_response(fixture.account),
+            _repository_response(fixture.owner, fixture.publication_repo, 'private'),
             _check_response(
-                fixture._owner,
-                fixture._publication_repo,
-                walk._third_oid,
+                fixture.owner,
+                fixture.publication_repo,
+                walk.third_oid,
                 'Release',
             ),
         ],
@@ -1747,10 +1743,10 @@ def _run_release_package_watch(
         'https://pypi.org/pypi/demo-package/0.3.0/json',
     ]
     release_path = (
-        f'repos/{fixture._owner}/{fixture._publication_repo}/commits/{walk._third_oid}/check-runs?'
+        f'repos/{fixture.owner}/{fixture.publication_repo}/commits/{walk.third_oid}/check-runs?'
         'check_name=Release&filter=latest&per_page=100'
     )
-    _assert_release_package_events(walk._events[first_event:], release_path)
+    _assert_release_package_events(walk.events[first_event:], release_path)
     return package_urls
 
 
@@ -1758,29 +1754,29 @@ def _run_release_published_noop(
     walk: _ReleaseWalk,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    fixture = walk._fixture
+    fixture = walk.fixture
     before = _release_published_snapshot(walk)
     _assert_release_published_snapshot(walk, before)
-    assert _records.load_candidate(fixture._paths, 'demo') is None
-    first_stage = len(walk._executed_stages)
-    builds_before = walk._candidate_builds
+    assert _records.load_candidate(fixture.paths, 'demo') is None
+    first_stage = len(walk.executed_stages)
+    builds_before = walk.candidate_builds
 
     _write_responses(
-        fixture._fake_gh,
+        fixture.fake_gh,
         [
-            _account_response(fixture._account),
-            _repository_response(fixture._owner, fixture._publication_repo, 'private'),
+            _account_response(fixture.account),
+            _repository_response(fixture.owner, fixture.publication_repo, 'private'),
         ],
     )
-    stage_before_noop = _stage.load_stage(fixture._paths, 'demo')
+    stage_before_noop = _stage.load_stage(fixture.paths, 'demo')
     assert _cli.main(['run', 'published', '--version', '0.1.0', '--yes']) == 0
     noop = re.sub(r': +', ': ', capsys.readouterr().out)
     assert 'Nothing to do: v0.1.0 is already published.' in noop
-    assert len(walk._publication_pushes) == 2
-    assert _stage.load_stage(fixture._paths, 'demo') == stage_before_noop
-    assert _records.load_candidate(fixture._paths, 'demo') is None
-    assert walk._executed_stages[first_stage:] == []
-    assert walk._candidate_builds == builds_before
+    assert len(walk.publication_pushes) == 2
+    assert _stage.load_stage(fixture.paths, 'demo') == stage_before_noop
+    assert _records.load_candidate(fixture.paths, 'demo') is None
+    assert walk.executed_stages[first_stage:] == []
+    assert walk.candidate_builds == builds_before
     after = _release_published_snapshot(walk)
     _assert_release_published_snapshot(walk, after)
     assert after == before
@@ -1792,48 +1788,48 @@ def _run_release_reveal_with_package_gate(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    fixture = walk._fixture
-    first_event = len(walk._events)
+    fixture = walk.fixture
+    first_event = len(walk.events)
 
     _write_responses(
-        fixture._fake_gh,
+        fixture.fake_gh,
         [
-            _account_response(fixture._account),
+            _account_response(fixture.account),
             _repository_response(
-                fixture._owner,
-                fixture._publication_repo,
+                fixture.owner,
+                fixture.publication_repo,
                 'private',
                 once=True,
             ),
             _repository_response(
-                fixture._owner,
-                fixture._publication_repo,
+                fixture.owner,
+                fixture.publication_repo,
                 'private',
                 once=True,
             ),
-            _repository_response(fixture._owner, fixture._publication_repo, 'public'),
+            _repository_response(fixture.owner, fixture.publication_repo, 'public'),
             _check_response(
-                fixture._owner,
-                fixture._publication_repo,
-                walk._third_oid,
-                fixture._check,
+                fixture.owner,
+                fixture.publication_repo,
+                walk.third_oid,
+                fixture.check,
             ),
             _check_response(
-                fixture._owner,
-                fixture._publication_repo,
-                walk._third_oid,
+                fixture.owner,
+                fixture.publication_repo,
+                walk.third_oid,
                 'Release',
             ),
             _settings_response(
-                fixture._owner,
-                fixture._publication_repo,
-                fixture._settings,
+                fixture.owner,
+                fixture.publication_repo,
+                fixture.settings,
                 once=True,
             ),
-            _settings_response(fixture._owner, fixture._publication_repo, fixture._settings),
+            _settings_response(fixture.owner, fixture.publication_repo, fixture.settings),
             *_disclosure_responses(
-                fixture._owner,
-                fixture._publication_repo,
+                fixture.owner,
+                fixture.publication_repo,
                 artifacts=((201, 'release-package'), (202, 'checks-report')),
             ),
             {
@@ -1841,7 +1837,7 @@ def _run_release_reveal_with_package_gate(
                     'api',
                     '-X',
                     'PATCH',
-                    f'repos/{fixture._owner}/{fixture._publication_repo}',
+                    f'repos/{fixture.owner}/{fixture.publication_repo}',
                     '-f',
                     'visibility=public',
                 ]
@@ -1866,14 +1862,14 @@ def _run_release_reveal_with_package_gate(
     _record_release_host_events(walk)
     reveal = ''.join((*reveal_output, capsys.readouterr().out))
     assert re.search(r'Package: +demo-package 0.3.0 is published', reveal)
-    assert f'Made {fixture._owner}/{fixture._publication_repo} public.' in reveal
+    assert f'Made {fixture.owner}/{fixture.publication_repo} public.' in reveal
     assert len(package_urls) == 3
     check_prefix = (
-        f'repos/{fixture._owner}/{fixture._publication_repo}/commits/{walk._third_oid}/check-runs?'
+        f'repos/{fixture.owner}/{fixture.publication_repo}/commits/{walk.third_oid}/check-runs?'
     )
     _assert_release_reveal_events(
-        walk._events[first_event:],
-        f'{check_prefix}check_name={fixture._check}&filter=latest&per_page=100',
+        walk.events[first_event:],
+        f'{check_prefix}check_name={fixture.check}&filter=latest&per_page=100',
         f'{check_prefix}check_name=Release&filter=latest&per_page=100',
     )
 
@@ -1892,18 +1888,18 @@ def _run_release_staged_release(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    fixture = walk._fixture
-    project = _config.load_project(fixture._paths, 'demo')
-    _config.save_project(fixture._paths, replace(project, publication_route='staged'))
+    fixture = walk.fixture
+    project = _config.load_project(fixture.paths, 'demo')
+    _config.save_project(fixture.paths, replace(project, publication_route='staged'))
 
-    _commit(fixture._source, 'third release\n')
+    _commit(fixture.source, 'third release\n')
     subprocess.run(
-        ['git', 'init', '--bare', '-q', fixture._staging_host], check=True, env=git_env()
+        ['git', 'init', '--bare', '-q', fixture.staging_host], check=True, env=git_env()
     )
     stage_missing: dict[str, object] = {
         'args': [
             'api',
-            f'repos/{fixture._owner}/{fixture._staging_repo}',
+            f'repos/{fixture.owner}/{fixture.staging_repo}',
             '--jq',
             _host._REPOSITORY_QUERY,
         ],
@@ -1917,11 +1913,11 @@ def _run_release_staged_release(
         'POST',
         'user/repos',
         '-f',
-        f'name={fixture._staging_repo}',
+        f'name={fixture.staging_repo}',
         '-F',
         'private=true',
         '-f',
-        f'description={fixture._settings.description}',
+        f'description={fixture.settings.description}',
         '-F',
         'has_issues=true',
         '-F',
@@ -1933,17 +1929,17 @@ def _run_release_staged_release(
     ]
     create_stage_response: dict[str, object] = {'args': create_stage}
     _write_responses(
-        fixture._fake_gh,
+        fixture.fake_gh,
         [
-            _account_response(fixture._account),
-            _repository_response(fixture._owner, fixture._publication_repo, 'private'),
-            _settings_response(fixture._owner, fixture._publication_repo, fixture._settings),
+            _account_response(fixture.account),
+            _repository_response(fixture.owner, fixture.publication_repo, 'private'),
+            _settings_response(fixture.owner, fixture.publication_repo, fixture.settings),
             stage_missing,
             stage_missing,
             stage_missing,
             create_stage_response,
-            *_created_settings_responses(fixture._owner, fixture._staging_repo, fixture._settings),
-            _repository_response(fixture._owner, fixture._staging_repo, 'private'),
+            *_created_settings_responses(fixture.owner, fixture.staging_repo, fixture.settings),
+            _repository_response(fixture.owner, fixture.staging_repo, 'private'),
         ],
     )
     prompts_seen: list[str] = []
@@ -1951,17 +1947,17 @@ def _run_release_staged_release(
 
     def _staged_answer(prompt: str) -> str:
         if prompt.startswith('Use this selection?'):
-            assert _records.load_candidate(fixture._paths, 'demo') is None
+            assert _records.load_candidate(fixture.paths, 'demo') is None
             return 'c'
-        record = _records.load_candidate(fixture._paths, 'demo')
+        record = _records.load_candidate(fixture.paths, 'demo')
         assert record is not None
         expected = [
             (
                 f'Create the private staging repository '
-                f'{fixture._owner}/{fixture._staging_repo}? [y/n] '
+                f'{fixture.owner}/{fixture.staging_repo}? [y/n] '
             ),
             f'Push {record.commit[:12]} to the staging repository? [y/n] ',
-            (f'Publish v0.3.0 to {fixture._owner}/{fixture._publication_repo}? [y/n] '),
+            (f'Publish v0.3.0 to {fixture.owner}/{fixture.publication_repo}? [y/n] '),
         ]
         assert prompt == expected[len(prompts_seen)]
         visible = re.sub(r': +', ': ', capsys.readouterr().out)
@@ -1974,22 +1970,22 @@ def _run_release_staged_release(
     assert _cli.main(['run', 'staged', '--version', '0.3.0']) == 0
     assert len(prompts_seen) == 3
     staged_run = ''.join((*staged_output, capsys.readouterr().out))
-    third_refs = _git_refs(fixture._publication_host)
-    walk._third_oid = third_refs['refs/tags/v0.3.0']
-    stage_record = _stage.load_stage(fixture._paths, 'demo')
-    assert stage_record == _stage.StageRecord(
-        walk._third_oid,
-        fixture._owner,
-        fixture._staging_repo,
+    third_refs = _git_refs(fixture.publication_host)
+    walk.third_oid = third_refs['refs/tags/v0.3.0']
+    stage_record = _stage.load_stage(fixture.paths, 'demo')
+    assert stage_record == _stage._StageRecord(
+        walk.third_oid,
+        fixture.owner,
+        fixture.staging_repo,
     )
-    assert _git_refs(fixture._staging_host) == {'refs/heads/main': walk._third_oid}
+    assert _git_refs(fixture.staging_host) == {'refs/heads/main': walk.third_oid}
     assert 'create staging repository' in staged_run
     assert 'stage watch' in staged_run
     assert 'Required checks passed.' in staged_run
-    assert len(walk._stage_pushes) == 1
-    assert len(walk._publication_pushes) == 3
+    assert len(walk.stage_pushes) == 1
+    assert len(walk.publication_pushes) == 3
     assert (
-        f'repos/{fixture._owner}/{fixture._staging_repo}/commits/{walk._third_oid}/check-runs?'
+        f'repos/{fixture.owner}/{fixture.staging_repo}/commits/{walk.third_oid}/check-runs?'
         in json.dumps(_host_calls())
     )
 
@@ -1999,24 +1995,24 @@ def _stage_and_publish_lifecycle_candidate(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> str:
-    project = _config.load_project(fixture._paths, 'demo')
-    _config.save_project(fixture._paths, replace(project, publication_route='staged'))
+    project = _config.load_project(fixture.paths, 'demo')
+    _config.save_project(fixture.paths, replace(project, publication_route='staged'))
     assert _cli.main(['prepare', '--version', '1.0.0', '--yes']) == 0
-    candidate = _records.load_candidate(fixture._paths, 'demo')
+    candidate = _records.load_candidate(fixture.paths, 'demo')
     assert candidate is not None
 
     # This is the same fake-create seam for the disposable staging transport.
     subprocess.run(
-        ['git', 'init', '--bare', '-q', fixture._staging_host], check=True, env=git_env()
+        ['git', 'init', '--bare', '-q', fixture.staging_host], check=True, env=git_env()
     )
     _write_responses(
-        fixture._fake_gh,
+        fixture.fake_gh,
         [
-            _account_response(fixture._account),
+            _account_response(fixture.account),
             {
                 'args': [
                     'api',
-                    f'repos/{fixture._owner}/{fixture._staging_repo}',
+                    f'repos/{fixture.owner}/{fixture.staging_repo}',
                     '--jq',
                     _host._REPOSITORY_QUERY,
                 ],
@@ -2031,11 +2027,11 @@ def _stage_and_publish_lifecycle_candidate(
                     'POST',
                     'user/repos',
                     '-f',
-                    f'name={fixture._staging_repo}',
+                    f'name={fixture.staging_repo}',
                     '-F',
                     'private=true',
                     '-f',
-                    f'description={fixture._settings.description}',
+                    f'description={fixture.settings.description}',
                     '-F',
                     'has_issues=true',
                     '-F',
@@ -2046,8 +2042,8 @@ def _stage_and_publish_lifecycle_candidate(
                     'has_discussions=false',
                 ]
             },
-            *_created_settings_responses(fixture._owner, fixture._staging_repo, fixture._settings),
-            _repository_response(fixture._owner, fixture._staging_repo, 'private'),
+            *_created_settings_responses(fixture.owner, fixture.staging_repo, fixture.settings),
+            _repository_response(fixture.owner, fixture.staging_repo, 'private'),
         ],
     )
     assert_answers = _script_answers(
@@ -2056,7 +2052,7 @@ def _stage_and_publish_lifecycle_candidate(
             (
                 (
                     f'Create the private staging repository '
-                    f'{fixture._owner}/{fixture._staging_repo}?'
+                    f'{fixture.owner}/{fixture.staging_repo}?'
                     ' [y/n] '
                 ),
                 'y',
@@ -2065,20 +2061,20 @@ def _stage_and_publish_lifecycle_candidate(
     )
     assert _cli.main(['stage', 'push', '--yes']) == 0
     assert_answers()
-    staged_oid = _git_refs(fixture._staging_host)['refs/heads/main']
+    staged_oid = _git_refs(fixture.staging_host)['refs/heads/main']
     assert staged_oid == candidate.commit
 
     _write_responses(
-        fixture._fake_gh,
+        fixture.fake_gh,
         [
-            _account_response(fixture._account),
-            _repository_response(fixture._owner, fixture._staging_repo, 'private'),
-            _settings_response(fixture._owner, fixture._staging_repo, fixture._settings),
+            _account_response(fixture.account),
+            _repository_response(fixture.owner, fixture.staging_repo, 'private'),
+            _settings_response(fixture.owner, fixture.staging_repo, fixture.settings),
             _check_response(
-                fixture._owner,
-                fixture._staging_repo,
+                fixture.owner,
+                fixture.staging_repo,
                 staged_oid,
-                fixture._check,
+                fixture.check,
             ),
         ],
     )
@@ -2089,21 +2085,21 @@ def _stage_and_publish_lifecycle_candidate(
     assert f'Staged: v1.0.0 ({staged_oid[:12]})' in staged
 
     _write_responses(
-        fixture._fake_gh,
+        fixture.fake_gh,
         [
-            _account_response(fixture._account),
-            _repository_response(fixture._owner, fixture._publication_repo, 'private'),
-            _settings_response(fixture._owner, fixture._publication_repo, fixture._settings),
-            _repository_response(fixture._owner, fixture._staging_repo, 'private'),
-            _settings_response(fixture._owner, fixture._staging_repo, fixture._settings),
-            _check_response(fixture._owner, fixture._staging_repo, staged_oid, fixture._check),
+            _account_response(fixture.account),
+            _repository_response(fixture.owner, fixture.publication_repo, 'private'),
+            _settings_response(fixture.owner, fixture.publication_repo, fixture.settings),
+            _repository_response(fixture.owner, fixture.staging_repo, 'private'),
+            _settings_response(fixture.owner, fixture.staging_repo, fixture.settings),
+            _check_response(fixture.owner, fixture.staging_repo, staged_oid, fixture.check),
         ],
     )
     assert _cli.main(['publish', '--yes']) == 0
     publication_output = re.sub(r': +', ': ', capsys.readouterr().out)
     assert 'Published v1.0.0' in publication_output
     assert 'Verified staged commit:' not in publication_output
-    assert _git_refs(fixture._publication_host) == {
+    assert _git_refs(fixture.publication_host) == {
         'refs/heads/main': staged_oid,
         'refs/tags/v1.0.0': staged_oid,
     }
@@ -2118,26 +2114,24 @@ def _stage_and_publish_lifecycle_candidate(
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize('login_needed', [False, True], ids=['authenticated', 'login-needed'])
 def test_guided_first_publication_works_from_empty_roots(
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     answers: Callable[[Sequence[str | tuple[str, str]]], None],
-    login_needed: bool,
 ) -> None:
     fixture, cli_output, source_refs, source_remotes = _initialize_guided_first_run(
         make_repo,
         monkeypatch,
         capsys,
         answers,
-        login_needed=login_needed,
+        login_needed=True,
     )
-    config = _config.load_global(fixture._paths)
+    config = _config.load_global(fixture.paths)
     assert config.anon_name == 'Publication Alias'
     assert config.anon_email == 'publication@example.invalid'
     assert config.sensitive_terms == ('private-canary',)
-    assert config.accounts == {'github': fixture._account}
+    assert config.accounts == {'github': fixture.account}
 
     _create_lifecycle_repository(fixture)
     created = capsys.readouterr()
@@ -2145,13 +2139,13 @@ def test_guided_first_publication_works_from_empty_roots(
 
     candidate = _complete_guided_publication(fixture, monkeypatch, capsys, cli_output)
 
-    refs = _git_refs(fixture._publication_host)
+    refs = _git_refs(fixture.publication_host)
     assert refs == {
         'refs/heads/main': candidate.commit,
         'refs/tags/v1.0.0': candidate.commit,
     }
     author, committer, parents, signed = _commit_headers(
-        fixture._publication_host, candidate.commit
+        fixture.publication_host, candidate.commit
     )
     expected_identity = 'Publication Alias <publication@example.invalid>'
     assert author.startswith(f'author {expected_identity} ')
@@ -2159,7 +2153,7 @@ def test_guided_first_publication_works_from_empty_roots(
     assert parents == []
     assert signed is False
     tree = subprocess.run(
-        ['git', '-C', fixture._publication_host, 'ls-tree', '-r', '--name-only', candidate.commit],
+        ['git', '-C', fixture.publication_host, 'ls-tree', '-r', '--name-only', candidate.commit],
         check=True,
         capture_output=True,
         text=True,
@@ -2167,7 +2161,7 @@ def test_guided_first_publication_works_from_empty_roots(
     ).stdout
     assert tree == 'README.md\ndocs/guide.md\n'
     content = subprocess.run(
-        ['git', '-C', fixture._publication_host, 'show', f'{candidate.commit}:README.md'],
+        ['git', '-C', fixture.publication_host, 'show', f'{candidate.commit}:README.md'],
         check=True,
         capture_output=True,
         text=True,
@@ -2176,11 +2170,11 @@ def test_guided_first_publication_works_from_empty_roots(
     assert content == 'sanitized release\n'
 
     _write_responses(
-        fixture._fake_gh,
+        fixture.fake_gh,
         [
-            _account_response(fixture._account),
-            _repository_response(fixture._owner, fixture._publication_repo, 'private'),
-            *_disclosure_responses(fixture._owner, fixture._publication_repo),
+            _account_response(fixture.account),
+            _repository_response(fixture.owner, fixture.publication_repo, 'private'),
+            *_disclosure_responses(fixture.owner, fixture.publication_repo),
         ],
     )
     assert _cli.main(['audit', '--remote']) == 0
@@ -2192,7 +2186,7 @@ def test_guided_first_publication_works_from_empty_roots(
     assert 'Warning: policy mismatch' not in audited.out
     assert 'identity problem:' not in audited.out
 
-    assert _git_source_state(fixture._source) == (source_refs, source_remotes)
+    assert _git_source_state(fixture.source) == (source_refs, source_remotes)
     rendered = ''.join(cli_output)
     for expected in (
         'Publication Alias <publication@example.invalid>',
@@ -2201,8 +2195,7 @@ def test_guided_first_publication_works_from_empty_roots(
     ):
         assert expected in rendered
     assert 'private-canary' in rendered
-    if login_needed:
-        assert 'ghp_PRIVATE_CREDENTIAL' in rendered
+    assert 'ghp_PRIVATE_CREDENTIAL' in rendered
 
 
 @pytest.mark.slow

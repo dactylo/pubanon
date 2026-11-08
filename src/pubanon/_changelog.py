@@ -12,11 +12,12 @@ _NEAR_MISS_LIMIT = 3
 _SPACES = re.compile(r'[ \t]+')
 _STRICT = r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)'
 _STRICT_MENTION = re.compile(r'(?<![\w.+-])v?(' + _STRICT + r')(?![\w.+-])')
+_STRICT_VERSION = re.compile(_STRICT)
 _VERSION_END = r'(?![\w.+-])'
 _VERSION_LIKE = r'[0-9]+(?:\.[0-9]+)+(?:(?:[-+.]|[^\W\d_])[\w.+-]*)?'
 _WORD = re.compile(r'[\w.+-]+')
 
-type Reason = Literal['no heading', 'several headings', 'empty section', 'not UTF-8']
+type _Reason = Literal['no heading', 'several headings', 'empty section', 'not UTF-8']
 
 
 @dataclass(frozen=True)
@@ -49,25 +50,15 @@ class Lookup:
     """
 
     section: str | None
-    reason: Reason | None = None
+    reason: _Reason | None = None
     lines: tuple[int, ...] = ()
     near_misses: tuple[NearMiss, ...] = ()
     suggestion: str | None = None
 
 
 @dataclass(frozen=True)
-class Recognition:
-    """Report the versions that a changelog's headings name, for setup.
-
-    Attributes:
-        versions: Distinct strict `X.Y.Z` versions with matching headings,
-            newest first.
-        readable: False when the changelog is not UTF-8.
-        near_misses: Up to three headings that name a strict version without
-            matching, in file order, when no heading matches.
-        suggestion: A `changelog_heading` template matching the first near miss
-            with no digit before its version, not yet validated.
-    """
+class _Recognition:
+    """Report the versions that a changelog's headings name, for setup."""
 
     versions: tuple[str, ...]
     readable: bool = True
@@ -206,7 +197,44 @@ def find_section(data: bytes, version: str, template: str | None = None) -> Look
     return Lookup('\n'.join(body))
 
 
-def recognize(data: bytes, template: str | None = None) -> Recognition:
+def is_strict_version(text: str) -> bool:
+    """Report whether text is a strict `X.Y.Z` version without leading zeros.
+
+    Args:
+        text: Candidate version without a `v` prefix.
+
+    Returns:
+        Whether the whole text is a strict version.
+    """
+    return _STRICT_VERSION.fullmatch(text) is not None
+
+
+def version_from_tag(tag: str) -> str | None:
+    """Return the version from one strict `vX.Y.Z` release tag.
+
+    Args:
+        tag: Candidate Git tag name.
+
+    Returns:
+        The `X.Y.Z` version, or `None` for a nonrelease tag.
+    """
+    version = tag.removeprefix('v')
+    return version if version != tag and is_strict_version(version) else None
+
+
+def version_key(version: str) -> tuple[int, ...]:
+    """Return a strict version's numeric components for ordering.
+
+    Args:
+        version: Strict `X.Y.Z` version.
+
+    Returns:
+        The major, minor, and patch numbers.
+    """
+    return tuple(int(part) for part in version.split('.'))
+
+
+def recognize(data: bytes, template: str | None = None) -> _Recognition:
     """List the strict versions that a changelog's headings name.
 
     Args:
@@ -218,7 +246,7 @@ def recognize(data: bytes, template: str | None = None) -> Recognition:
     """
     lines = _lines(data)
     if lines is None:
-        return Recognition((), readable=False)
+        return _Recognition((), readable=False)
     strict = _pattern(template, _STRICT)
     headings = _headings(lines)
     versions = {
@@ -227,21 +255,13 @@ def recognize(data: bytes, template: str | None = None) -> Recognition:
         if (found := strict.match(lines[index])) is not None
     }
     if versions:
-        return Recognition(
-            tuple(
-                sorted(
-                    versions,
-                    key=lambda version: tuple(int(part) for part in version.split('.')),
-                    reverse=True,
-                )
-            )
-        )
+        return _Recognition(tuple(sorted(versions, key=version_key, reverse=True)))
     mentions = [
         (index, found.start(1))
         for index, _level in headings
         if (found := _STRICT_MENTION.search(lines[index])) is not None
     ][:_NEAR_MISS_LIMIT]
-    return Recognition(
+    return _Recognition(
         (),
         near_misses=tuple(NearMiss(index + 1, lines[index]) for index, _start in mentions),
         suggestion=_suggestion([(lines[index], start) for index, start in mentions]),

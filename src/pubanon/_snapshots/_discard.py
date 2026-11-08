@@ -22,6 +22,43 @@ from pubanon._terminal import (
 )
 
 
+def _discard_preflight(
+    paths: Paths, project: str, record: CandidateRecord | None, *, force: bool
+) -> None:
+    """Refuse confirmed or protected candidates before any cleanup."""
+    if record is not None:
+        try:
+            confirmed = _verification.confirmed_publication(paths, project, record)
+        except PubanonError:
+            store = _store.candidate_store_path(paths, project)
+            if (
+                not force
+                or record.source_bookmark is not None
+                or _records.load_publication(paths, project, record.commit) is not None
+                or run_git(
+                    ['--git-dir', str(store.absolute()), 'rev-parse', '--git-dir'],
+                    cwd=store,
+                    check=False,
+                ).returncode
+                == 0
+            ):
+                raise
+            # Forced abandonment may proceed for an unbookmarked candidate
+            # with an unreadable store and no recorded publication.
+            # It never removes publication records or archive refs.
+            confirmed = False
+        if confirmed:
+            raise PubanonError(
+                'confirmed publication cannot be discarded', recovery='pubanon publish --resolve'
+            )
+        if force and record.state == STATE_UNKNOWN_OUTCOME:
+            output(
+                'Abandoning unresolved snapshot recovery information; this does not undo any '
+                'possible GitHub publication.',
+                kind='warning',
+            )
+
+
 def _discard_rewrite(
     paths: Paths, project: str, entries: tuple[_records.ReplayEntry, ...]
 ) -> bool:
@@ -30,6 +67,8 @@ def _discard_rewrite(
     present = directory.exists() or _records.rewrite_path(paths, project).exists()
     if directory.is_symlink():
         raise PubanonError('cannot discard rewrite directory through a symlink')
+    if directory.exists():
+        output('Removing the paused rewrite, including any conflict edits.', kind='warning')
     try:
         _filesystem.remove_tree(directory)
     except OSError as exc:
@@ -83,88 +122,10 @@ def _discard_source_bookmark(record: CandidateRecord | None) -> None:
         )
 
 
-def check_recovery_state(paths: Paths, project: str, *, force: bool) -> None:
-    """Refuse unreadable or unresolved publication evidence before local removal.
-
-    The caller holds the project lock. `force` abandons this evidence without
-    undoing any possible host publication; confirmed publications are accepted.
-    """
-    if force:
-        return
-    try:
-        record = load_candidate(paths, project)
-    except PubanonError as exc:
-        raise PubanonError(
-            str(exc),
-            fact=f'{escape(path_text(_records.candidate_path(paths, project)))}: {exc.render()}',
-        ) from exc
-    try:
-        _records.load_rewrite(paths, project)
-    except PubanonError as exc:
-        raise PubanonError(
-            str(exc),
-            fact=f'{escape(path_text(_records.rewrite_path(paths, project)))}: {exc.render()}',
-        ) from exc
-    _candidate.require_known_outcome(record)
-
-
-def _candidate_for_discard(paths: Paths, project: str, *, force: bool) -> CandidateRecord | None:
-    """Read trusted discard metadata or explicitly abandon malformed evidence."""
-    check_recovery_state(paths, project, force=force)
-    try:
-        return load_candidate(paths, project)
-    except PubanonError:
-        if not force:
-            raise
-        output(
-            'Source-bookmark cleanup could not be verified from the malformed snapshot record.',
-            kind='warning',
-        )
-        return None
-
-
-def _discard_preflight(paths: Paths, project: str, *, force: bool) -> CandidateRecord | None:
-    """Refuse confirmed or protected candidates before any cleanup."""
-    record = _candidate_for_discard(paths, project, force=force)
-    if record is not None:
-        try:
-            confirmed = _verification.confirmed_publication(paths, project, record)
-        except PubanonError:
-            store = _store.candidate_store_path(paths, project)
-            if (
-                not force
-                or record.source_bookmark is not None
-                or _records.load_publication(paths, project, record.commit) is not None
-                or run_git(
-                    ['--git-dir', str(store.absolute()), 'rev-parse', '--git-dir'],
-                    cwd=store,
-                    check=False,
-                ).returncode
-                == 0
-            ):
-                raise
-            # Forced abandonment may proceed for an unbookmarked candidate
-            # with an unreadable store and no recorded publication.
-            # It never removes publication records or archive refs.
-            confirmed = False
-        if confirmed:
-            raise PubanonError(
-                'confirmed publication cannot be discarded', recovery='pubanon publish --resolve'
-            )
-        if force and record.state == STATE_UNKNOWN_OUTCOME:
-            output(
-                'Abandoning unresolved snapshot recovery information; this does not undo any '
-                'possible GitHub publication.',
-                kind='warning',
-            )
-    return record
-
-
 def _replayed_for_discard(
-    paths: Paths, project: str, *, force: bool
+    paths: Paths, project: str, record: CandidateRecord | None, *, force: bool
 ) -> tuple[_records.ReplayEntry, ...]:
     """Read replay cleanup locators and refuse confirmed outputs before any mutation."""
-    record = _candidate_for_discard(paths, project, force=force)
     try:
         progress = _records.load_rewrite(paths, project)
     except PubanonError:
@@ -184,6 +145,52 @@ def _replayed_for_discard(
                 'confirmed publication cannot be discarded', recovery='pubanon publish --resolve'
             )
     return entries
+
+
+def check_recovery_state(paths: Paths, project: str, *, force: bool) -> None:
+    """Refuse unreadable or unresolved publication evidence before local removal.
+
+    The caller holds the project lock. `force` abandons this evidence without
+    undoing any possible host publication; confirmed publications are accepted.
+
+    Raises:
+        PubanonError: Without `force`, retained candidate or rewrite evidence
+            is unreadable or publication outcome is unresolved.
+    """
+    if force:
+        return
+    try:
+        record = load_candidate(paths, project)
+    except PubanonError as exc:
+        raise PubanonError(
+            str(exc),
+            fact=f'{escape(path_text(_records.candidate_path(paths, project)))}: {exc.render()}',
+            recovery=exc.recovery,
+        ) from exc
+    try:
+        _records.load_rewrite(paths, project)
+    except PubanonError as exc:
+        raise PubanonError(
+            str(exc),
+            fact=f'{escape(path_text(_records.rewrite_path(paths, project)))}: {exc.render()}',
+            recovery=exc.recovery,
+        ) from exc
+    _candidate.require_known_outcome(record)
+
+
+def _candidate_for_discard(paths: Paths, project: str, *, force: bool) -> CandidateRecord | None:
+    """Read trusted discard metadata or explicitly abandon malformed evidence."""
+    check_recovery_state(paths, project, force=force)
+    try:
+        return load_candidate(paths, project)
+    except PubanonError:
+        if not force:
+            raise
+        output(
+            'Source-bookmark cleanup could not be verified from the malformed snapshot record.',
+            kind='warning',
+        )
+        return None
 
 
 def discard(paths: Paths, project: str, *, force: bool) -> bool:
@@ -208,8 +215,9 @@ def discard(paths: Paths, project: str, *, force: bool) -> bool:
             protection. Forced cleanup can remove the record before reporting
             an undeleted advisory candidate ref.
     """
-    replayed = _replayed_for_discard(paths, project, force=force)
-    record = _discard_preflight(paths, project, force=force)
+    record = _candidate_for_discard(paths, project, force=force)
+    replayed = _replayed_for_discard(paths, project, record, force=force)
+    _discard_preflight(paths, project, record, force=force)
     commits = [entry.new for entry in replayed]
     if record is not None:
         commits.extend((record.commit, record.tip or record.commit))

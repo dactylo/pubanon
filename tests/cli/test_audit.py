@@ -2,7 +2,7 @@ import json
 import os
 import re
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
@@ -14,10 +14,9 @@ from pubanon._remote import _host
 from pubanon._snapshots import _audit, _candidate, _store
 from tests._cli import prepare, record_published_main, stub_remote
 from tests._git import git_env
-from tests._setup import configure
+from tests._setup import Script, configure
 
 _RemoteAudit = Callable[[str], tuple[_config.Paths, _config.ProjectConfig]]
-_Script = Callable[[Sequence[str | tuple[str, str]]], None]
 
 
 @pytest.fixture
@@ -58,7 +57,7 @@ def _stub_actions(
         assert command == 'pubanon audit --remote'
         return (job,)
 
-    def _log(_owner: str, _repo: str, _job: int, *, command: str) -> bytes | _host.LogAbsence:
+    def _log(_owner: str, _repo: str, _job: int, *, command: str) -> bytes | _host._LogAbsence:
         assert command == 'pubanon audit --remote'
         return 'api-404' if deleted else log
 
@@ -161,6 +160,47 @@ def test_audit_omits_reveal_line_for_public_project(
     assert 'pubanon repo reveal lists these findings' not in output
 
 
+def test_audit_refuses_missing_store_without_creating_it(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    argv = ['audit', '--project', 'demo', '--remote']
+    source = make_repo(files={'README.md': 'public\n'})
+    paths, global_config, project = configure(tmp_path, monkeypatch, source)
+    remote = tmp_path / 'host.git'
+    subprocess.run(['git', 'init', '--bare', '-q', remote], check=True, env=git_env())
+    destination = _host.Destination(
+        adapter='github',
+        owner=project.owner,
+        repo=project.repo,
+        url=remote.as_uri(),
+        account=global_config.accounts['github'],
+        visibility=project.visibility,
+    )
+
+    def _verified_destination(
+        _paths: _config.Paths,
+        _global: _config.GlobalConfig,
+        _project: _config.ProjectConfig,
+    ) -> _host.Destination:
+        return destination
+
+    monkeypatch.setattr(_host, 'verify_destination', _verified_destination)
+    store = _store.candidate_store_path(paths, project.name)
+    assert not store.exists()
+
+    assert _cli.main(argv) == 1
+
+    error = capsys.readouterr().err
+    assert 'no saved published history was found' in error
+    assert 'never been published' in error
+    assert 'pubanon prepare' in error
+    assert 'pubanon repo restore --project=demo --to local' in error
+    assert not store.exists()
+
+
 def test_audit_remote_labels_verified_history(
     tmp_path: Path,
     make_repo: Callable[..., Path],
@@ -261,7 +301,7 @@ def test_audit_remote_offers_to_delete_matching_actions_logs(
     remote_audit: _RemoteAudit,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    answers: _Script,
+    answers: Script,
     visibility: str,
 ) -> None:
     paths, project = remote_audit(visibility)
@@ -425,7 +465,6 @@ def test_audit_reports_empty_history(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     _paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
 
     assert _cli.main(['audit', '--project', project.name]) == 0
 
@@ -561,15 +600,16 @@ def test_audit_reports_hygiene_only_path_findings(
     assert 'asks before making them public' in output
 
 
+@pytest.mark.parametrize('location', ['inside', 'outside'])
 def test_audit_reports_identity_problems(
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    location: str,
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     commit = (
         subprocess.run(
             ['git', '-C', source, 'rev-parse', 'HEAD'],
@@ -594,12 +634,16 @@ def test_audit_reports_identity_problems(
         env=git_env(),
     )
 
+    monkeypatch.chdir(source if location == 'inside' else tmp_path)
     assert _cli.main(['audit', '--project', project.name]) == 0
 
     output = capsys.readouterr().out
     assert 'identity problem:' in output
     assert 'Content auditing could not be completed' in output
     assert 'No configured sensitive terms were found' not in output
+
+    selection = '' if location == 'inside' else f' --project={project.name}'
+    assert f'use pubanon prepare{selection} --replace all' in output
 
 
 def test_audit_reports_matching_nonempty_exposure_acknowledgment(

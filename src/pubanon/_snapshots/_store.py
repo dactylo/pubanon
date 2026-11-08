@@ -21,7 +21,7 @@ def candidate_store_path(paths: Paths, project: str) -> Path:
         PubanonError: The project name is invalid.
     """
     require_project_name(project)
-    return paths.data_dir / 'projects' / project / 'store.git'
+    return paths.project_data(project) / 'store.git'
 
 
 def store_path(paths: Paths, project: str) -> Path:

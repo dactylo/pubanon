@@ -14,18 +14,34 @@ class DurableWriteError(Exception):
     """Report the phase and interruption state of a failed private write.
 
     Attributes:
-        replaced: Whether replacement returned successfully.
-        replacement_attempted: Whether replacement started; an interrupt can
-            leave its outcome uncertain even when `replaced` is false.
-        interrupted: Whether a keyboard interrupt caused the failure.
+        interrupted_before_replacement: Whether an interrupt stopped the write
+            before the destination could change.
+        may_have_saved: Whether the destination may hold the new content.
     """
 
     def __init__(self, *, replaced: bool, replacement_attempted: bool, interrupted: bool) -> None:
-        """Record the failure phase for caller-specific recovery messages."""
+        """Record the failure phase for caller-specific recovery messages.
+
+        Args:
+            replaced: Whether replacement returned successfully.
+            replacement_attempted: Whether replacement started; an interrupt
+                can leave its outcome uncertain even when replaced is false.
+            interrupted: Whether a keyboard interrupt caused the failure.
+        """
         super().__init__('durable write failed')
-        self.replaced = replaced
-        self.replacement_attempted = replacement_attempted
-        self.interrupted = interrupted
+        self._replaced = replaced
+        self._replacement_attempted = replacement_attempted
+        self._interrupted = interrupted
+
+    @property
+    def interrupted_before_replacement(self) -> bool:
+        """Whether an interrupt stopped the write before the destination could change."""
+        return self._interrupted and not self._replacement_attempted
+
+    @property
+    def may_have_saved(self) -> bool:
+        """Whether the destination may already hold the new content."""
+        return self._replaced or (self._interrupted and self._replacement_attempted)
 
 
 def chmod(path: Path, mode: int, *, follow_symlinks: bool = True) -> None:
@@ -37,6 +53,11 @@ def chmod(path: Path, mode: int, *, follow_symlinks: bool = True) -> None:
             attribute.
         follow_symlinks: Whether to modify the leaf target rather than the link
             itself.
+
+    Raises:
+        OSError: The permissions or read-only attributes cannot be changed.
+        NotImplementedError: The platform cannot change permissions without
+            following symlinks.
     """
     path.chmod(mode, follow_symlinks=follow_symlinks)
 
@@ -70,6 +91,10 @@ def fchmod(fd: int, mode: int) -> None:
         fd: Borrowed descriptor that remains open.
         mode: POSIX mode; Windows uses only owner-write to select its read-only
             attribute.
+
+    Raises:
+        OSError: Permissions or read-only attributes cannot be changed on the
+            descriptor.
     """
     os.fchmod(fd, mode)
 
@@ -79,6 +104,12 @@ def remove_tree(path: Path) -> bool:
 
     Returns:
         Whether the directory existed and was removed.
+
+    Raises:
+        OSError: The root is a link or junction, or tree traversal, permission
+            restoration, or removal fails.
+        NotImplementedError: The platform cannot change permissions without
+            following symlinks.
     """
     try:
         if path.is_symlink() or path.is_junction():
@@ -100,6 +131,9 @@ def replace(source: Path, target: Path) -> None:
 
     Callers must flush and fsync the source first, then call `sync_directory`
     after replacement to commit the parent directory on POSIX.
+
+    Raises:
+        OSError: The replacement cannot be completed.
     """
     if os.name == 'nt':
         _windows_fs.replace(source, target)
@@ -114,6 +148,9 @@ def sync_directory(path: Path) -> None:
     `replace`, which commits the rename with write-through; this call only
     validates the directory. It cannot commit arbitrary Windows creates or
     deletes. Use `durable_unlink` for an authoritative file removal.
+
+    Raises:
+        OSError: The directory cannot be opened, synchronized, or validated.
     """
     if os.name == 'nt':
         _windows_fs.check_directory(path)
@@ -135,6 +172,10 @@ def durable_unlink(path: Path) -> None:
     A crash or cleanup failure can leave a private `.pubanon-delete-*.tmp`
     residue, which is never an authoritative record. Successful return also
     removes that temporary name; no unrelated temporary files are scanned.
+
+    Raises:
+        OSError: Removal, durability confirmation, or private residue cleanup
+            fails. The authoritative name may already be absent.
     """
     if os.name != 'nt':
         path.unlink()
@@ -147,6 +188,24 @@ def durable_unlink(path: Path) -> None:
         _windows_fs.replace(path, temporary)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def write_owner_only(path: Path, payload: bytes, *, exclusive: bool = False) -> None:
+    """Write a file that is created owner-only, never briefly readable by others.
+
+    Args:
+        path: File to create, or to replace in place unless `exclusive` is set.
+        payload: Complete file content.
+        exclusive: Refuse to replace an existing file.
+
+    Raises:
+        OSError: The file exists under `exclusive`, or cannot be written.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_EXCL if exclusive else os.O_TRUNC)
+    descriptor = os.open(path, flags | getattr(os, 'O_BINARY', 0), 0o600)
+    with os.fdopen(descriptor, 'wb') as handle:
+        fchmod(handle.fileno(), 0o600)
+        handle.write(payload)
 
 
 def write_private(path: Path, payload: bytes) -> None:

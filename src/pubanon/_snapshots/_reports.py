@@ -20,34 +20,15 @@ from pubanon._snapshots._records import (
     CandidateRecord,
 )
 from pubanon._terminal import (
+    display_commit,
     display_path,
     escape,
     render_fields,
-    shell_command,
     style,
     verbose_enabled,
 )
 
 _REWRITE_REPORT_FILE_LIMIT = 20
-
-
-def _replacement_scope_rows(
-    paths: Paths, project: str, record: CandidateRecord
-) -> list[tuple[str, str]]:
-    """Describe the replacement extent and tags absent from its completed poststate."""
-    if record.replace_scope == 'all':
-        if record.prestate_main is None:
-            raise PubanonError('replacement snapshot is incomplete')
-        count = len(_audit.published_commits(paths, project, new=record.prestate_main))
-        scope = f'all published history ({count} snapshots) -> one snapshot'
-    else:
-        scope = 'one published snapshot and its replayed descendants'
-    rows = [('Scope', scope)]
-    if record.poststate_tags is not None:
-        removed = sorted(record.prestate_tags.keys() - record.poststate_tags.keys())
-        if removed:
-            rows.append(('Removed tags', style(escape(', '.join(removed)), 'warning')))
-    return rows
 
 
 def _rewritten_change_report(
@@ -151,6 +132,45 @@ def _candidate_change_summary(
     return f'{heading}\n{lines}', path
 
 
+def inspect_next_action(record: CandidateRecord, g: GlobalConfig, p: ProjectConfig) -> str:
+    """Return the next inspection action, prioritizing an unknown publish outcome."""
+    if record.state == STATE_UNKNOWN_OUTCOME:
+        return 'pubanon publish --resolve'
+    if fingerprint(g, p) == record.fingerprint:
+        return 'pubanon publish'
+    return _verification.reprepare_advice(record, project=p.name)
+
+
+def replacement_scope_row(paths: Paths, project: str, record: CandidateRecord) -> tuple[str, str]:
+    """Describe how much published history a replacement rewrites.
+
+    Raises:
+        PubanonError: A whole-history replacement lacks its published starting
+            point, or its published history cannot be read.
+    """
+    if record.replace_scope != 'all':
+        return ('Scope', 'one published snapshot and its replayed descendants')
+    if record.prestate_main is None:
+        raise PubanonError('replacement snapshot is incomplete')
+    count = len(_audit.published_commits(paths, project, new=record.prestate_main))
+    return (
+        'Scope',
+        style(f'all published history ({count} snapshots) -> one snapshot', 'warning'),
+    )
+
+
+def _replacement_scope_rows(
+    paths: Paths, project: str, record: CandidateRecord
+) -> list[tuple[str, str]]:
+    """Describe the replacement extent and tags absent from its completed poststate."""
+    rows = [replacement_scope_row(paths, project, record)]
+    if record.poststate_tags is not None:
+        removed = sorted(record.prestate_tags.keys() - record.poststate_tags.keys())
+        if removed:
+            rows.append(('Removed tags', style(escape(', '.join(removed)), 'warning')))
+    return rows
+
+
 def tree_paths(paths: Paths, project: str, commit: str) -> list[str]:
     """Return the paths of one store commit without reading blob bodies.
 
@@ -180,7 +200,11 @@ def tree_paths(paths: Paths, project: str, commit: str) -> list[str]:
 
 
 def credential_warning(paths: Paths, project: str, record: CandidateRecord) -> str:
-    """Describe credential-like files included in the prepared publication history."""
+    """Describe credential-like files included in the prepared publication history.
+
+    Raises:
+        PubanonError: A retained commit's paths cannot be read.
+    """
     commits = (record.commit, *(entry.new for entry in record.replayed))
     secrets = sorted(
         {
@@ -253,14 +277,13 @@ def _candidate_report_details(
         ('Final snapshot changes' if multi_snapshot else 'Changes', summary_heading + '\n' + rest)
     )
     if record.replaces is not None:
-        width = 40 if verbose_enabled() else 12
-        rows.append(('Replaces', record.replaces[:width]))
+        rows.append(('Replaces', display_commit(record.replaces)))
         rows.extend(_replacement_scope_rows(paths, p.name, record))
         if multi_snapshot:
             rows.extend(
                 [
-                    ('Correction snapshot ID', record.commit[:width]),
-                    ('Final snapshot ID', tip[:width]),
+                    ('Correction snapshot ID', display_commit(record.commit)),
+                    ('Final snapshot ID', display_commit(tip)),
                 ]
             )
     rows.extend(extra_rows)
@@ -362,32 +385,3 @@ def publication_report(
             produced.
     """
     return _candidate_report_details(paths, proof, p)
-
-
-def reprepare_advice(record: CandidateRecord, *, project: str | None = None) -> str:
-    """Describe how to rebuild the selected source revision and release tag."""
-    selection = [f'--project={project}'] if project is not None else []
-    prepare = ['pubanon', 'prepare', *selection]
-    if record.replaces is not None:
-        selector = 'all' if record.replace_scope == 'all' else record.replaces
-        prepare.extend(('--replace', selector))
-    prepare.extend(('--source', record.pinned.commit))
-    if record.tag_intent is not None:
-        prepare.extend(('--version', record.tag_intent[1:]))
-    discard_command = shell_command('pubanon', 'discard', *selection)
-    prepare_command = shell_command(*prepare)
-    if discard_command is None or prepare_command is None:
-        return (
-            f'Select project {escape(project or "")}, then rerun discard and prepare '
-            'for this snapshot.'
-        )
-    return f'{discard_command} && {prepare_command}'
-
-
-def inspect_next_action(record: CandidateRecord, g: GlobalConfig, p: ProjectConfig) -> str:
-    """Return the next inspection action, prioritizing an unknown publish outcome."""
-    if record.state == STATE_UNKNOWN_OUTCOME:
-        return 'pubanon publish --resolve'
-    if fingerprint(g, p) == record.fingerprint:
-        return 'pubanon publish'
-    return reprepare_advice(record, project=p.name)

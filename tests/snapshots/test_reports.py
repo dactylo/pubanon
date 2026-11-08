@@ -1,5 +1,4 @@
 import re
-import shlex
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -7,7 +6,6 @@ from pathlib import Path
 import pytest
 
 from pubanon import _filesystem
-from pubanon._cli import _arguments
 from pubanon._run import run_git
 from pubanon._snapshots import (
     _candidate,
@@ -18,42 +16,25 @@ from pubanon._snapshots import (
 )
 from pubanon._snapshots._source import (
     Entry,
-    PinnedSource,
 )
 from pubanon._terminal import escape, verbose_context
 from tests._permissions import assert_private_mode
+from tests._setup import make_paths
 from tests.snapshots.test_candidate import (
-    _build,
-    _configs,
-    _paths,
-    _pinned,
-    _snapshot,
+    build,
+    configs,
+    pinned,
+    source_snapshot,
 )
-from tests.snapshots.test_verification import _complete_replacement
-
-
-def _reprepare_record() -> _records.CandidateRecord:
-    return _records.CandidateRecord(
-        commit='a' * 40,
-        tree='b' * 40,
-        snapshot_digest='c' * 64,
-        tag_intent=None,
-        fingerprint='d' * 64,
-        pinned=PinnedSource('e' * 40, 'explicit', None, None),
-        destination=_records.RecordedDestination('github', 'owner', 'repo', 'private', 'account'),
-        prestate_main=None,
-        prestate_tags={},
-        state=_candidate.STATE_RETAINED,
-        message='release',
-    )
+from tests.snapshots.test_verification import complete_replacement
 
 
 def test_inspect_report_bounds_file_list_and_saves_complete_private_report(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
-    global_config, project = _configs(tmp_path)
+    paths = make_paths(tmp_path)
+    global_config, project = configs(tmp_path)
     snapshot = tuple(Entry(f'file-{i:03}.txt', 0o100644, 'blob', b'line\n') for i in range(30))
     record = _candidate.build_candidate(
-        paths, global_config, project, _candidate.CandidateInputs(snapshot, _pinned(), None, None)
+        paths, global_config, project, _candidate.CandidateInputs(snapshot, pinned(), None, None)
     )
 
     report = _reports.inspect_report(
@@ -75,13 +56,13 @@ def test_inspect_report_bounds_file_list_and_saves_complete_private_report(tmp_p
 def test_inspect_report_marks_changed_configuration_without_claiming_current_gates(
     tmp_path: Path,
 ) -> None:
-    paths = _paths(tmp_path)
-    global_config, project_config = _configs(tmp_path)
+    paths = make_paths(tmp_path)
+    global_config, project_config = configs(tmp_path)
     record = _candidate.build_candidate(
         paths,
         global_config,
         project_config,
-        _candidate.CandidateInputs(_snapshot(), _pinned(), '1.2.3', None),
+        _candidate.CandidateInputs(source_snapshot(), pinned(), '1.2.3', None),
     )
     changed = replace(project_config, extra_terms=('new-private-term',))
 
@@ -105,15 +86,15 @@ def test_inspect_report_marks_changed_configuration_without_claiming_current_gat
 def test_inspect_report_renders_first_release_facts_and_credential_exceptions(
     tmp_path: Path,
 ) -> None:
-    paths = _paths(tmp_path)
-    global_config, project_config = _configs(tmp_path)
+    paths = make_paths(tmp_path)
+    global_config, project_config = configs(tmp_path)
     project_config = replace(project_config, secret_exceptions=('canaryx.env',))
     record = _candidate.build_candidate(
         paths,
         global_config,
         project_config,
         _candidate.CandidateInputs(
-            _snapshot(), _pinned(), '1.2.3', 'release: v1.2.3\n\nDetails: forged\x1b\rlabel'
+            source_snapshot(), pinned(), '1.2.3', 'release: v1.2.3\n\nDetails: forged\x1b\rlabel'
         ),
     )
 
@@ -161,8 +142,8 @@ def test_inspect_report_renders_untrusted_fields_without_escaping_trusted_layout
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    paths = _paths(tmp_path)
-    global_config, project_config = _configs(tmp_path)
+    paths = make_paths(tmp_path)
+    global_config, project_config = configs(tmp_path)
     term = 'private-canary'
     project_config = replace(
         project_config,
@@ -172,7 +153,7 @@ def test_inspect_report_renders_untrusted_fields_without_escaping_trusted_layout
         paths,
         global_config,
         project_config,
-        _candidate.CandidateInputs(_snapshot(), _pinned(), None, None),
+        _candidate.CandidateInputs(source_snapshot(), pinned(), None, None),
     )
 
     real_git_result = _candidate.git_result
@@ -212,8 +193,8 @@ def test_inspect_report_renders_untrusted_fields_without_escaping_trusted_layout
 def test_inspect_report_routes_unknown_outcome_to_resolution_before_configuration_drift(
     tmp_path: Path,
 ) -> None:
-    paths, project_config, record = _build(tmp_path)
-    global_config, _ = _configs(tmp_path)
+    paths, project_config, record = build(tmp_path)
+    global_config, _ = configs(tmp_path)
     changed = replace(project_config, extra_terms=('new-private-term',))
     record = replace(record, state=_candidate.STATE_UNKNOWN_OUTCOME)
     _candidate.save_candidate(paths, project_config.name, record)
@@ -232,16 +213,16 @@ def test_inspect_report_routes_unknown_outcome_to_resolution_before_configuratio
 
 
 def test_inspect_warns_only_about_credential_files_actually_in_snapshot(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
-    global_config, project = _configs(tmp_path)
+    paths = make_paths(tmp_path)
+    global_config, project = configs(tmp_path)
     project = replace(project, secret_exceptions=('kept.key', 'absent.key'))
     record = _candidate.build_candidate(
         paths,
         global_config,
         project,
         _candidate.CandidateInputs(
-            (*_snapshot(), Entry('kept.key', 0o100644, 'blob', b'public fixture')),
-            _pinned(),
+            (*source_snapshot(), Entry('kept.key', 0o100644, 'blob', b'public fixture')),
+            pinned(),
             None,
             None,
         ),
@@ -259,7 +240,7 @@ def test_inspect_warns_only_about_credential_files_actually_in_snapshot(tmp_path
 def test_multi_snapshot_replacement_keeps_correction_and_final_facts_together(
     tmp_path: Path,
 ) -> None:
-    paths, global_config, project, record = _complete_replacement(tmp_path, tagged=True)
+    paths, global_config, project, record = complete_replacement(tmp_path, tagged=True)
     assert record.tip is not None
     assert record.tip != record.commit
 
@@ -283,7 +264,7 @@ def test_multi_snapshot_replacement_keeps_correction_and_final_facts_together(
 
 
 def test_publication_report_leaves_live_facts_to_caller(tmp_path: Path) -> None:
-    paths, project, record = _build(tmp_path)
+    paths, project, record = build(tmp_path)
     report = _reports.publication_report(
         paths, _verification.prove_objects(paths, project.name, record), project
     )
@@ -301,10 +282,10 @@ def test_replacement_inspection_keeps_complete_per_release_changes_privately(
     tmp_path: Path,
 ) -> None:
     changed = (
-        *_snapshot(),
+        *source_snapshot(),
         *(Entry(f'changed/{index:02d}.txt', 0o100644, 'blob', b'public\n') for index in range(25)),
     )
-    paths, g, project, record = _complete_replacement(tmp_path, changed=changed)
+    paths, g, project, record = complete_replacement(tmp_path, changed=changed)
 
     preview = _reports.inspect_report(
         paths, _verification.prove_objects(paths, project.name, record), g, project
@@ -326,7 +307,7 @@ def test_replacement_inspection_keeps_complete_per_release_changes_privately(
 
 @pytest.mark.slow
 def test_replacement_inspection_reports_each_original_to_new_change(tmp_path: Path) -> None:
-    paths, g, project, record = _complete_replacement(tmp_path)
+    paths, g, project, record = complete_replacement(tmp_path)
     report = _reports.inspect_report(
         paths, _verification.prove_objects(paths, project.name, record), g, project
     )
@@ -341,7 +322,7 @@ def test_replacement_inspection_reports_each_original_to_new_change(tmp_path: Pa
 
 
 def test_replacement_inspection_reports_manual_resolution_paths(tmp_path: Path) -> None:
-    paths, _g, project, record = _complete_replacement(tmp_path)
+    paths, _g, project, record = complete_replacement(tmp_path)
     replay = replace(
         record.replayed[0],
         resolutions=(_records.Resolution(paths=('resolved.txt',), action='keep'),),
@@ -360,7 +341,7 @@ def test_replacement_inspection_reports_manual_resolution_paths(tmp_path: Path) 
 
 
 def test_replacement_snapshot_report_shows_tag_movements(tmp_path: Path) -> None:
-    paths, global_config, project, record = _complete_replacement(tmp_path, tagged=True)
+    paths, global_config, project, record = complete_replacement(tmp_path, tagged=True)
 
     report = _reports.inspect_report(
         paths, _verification.prove_objects(paths, project.name, record), global_config, project
@@ -373,26 +354,9 @@ def test_replacement_snapshot_report_shows_tag_movements(tmp_path: Path) -> None
     assert 'Replaced snapshots\n' in report
 
 
-@pytest.mark.parametrize('name', ['my project', "it's mine", r'a\b', '-leading'])
-def test_reprepare_advice_selects_exact_project(name: str) -> None:
-    record = _reprepare_record()
-    advice = _reports.reprepare_advice(record, project=name)
-    for command in advice.split(' && '):
-        argv = shlex.split(command)
-        assert _arguments.build_parser().parse_args(argv[1:]).project == name
-
-
-def test_reprepare_advice_shows_unrenderable_project() -> None:
-    record = _reprepare_record()
-    advice = _reports.reprepare_advice(record, project='line\nbreak')
-    assert 'line\\x0abreak' in advice
-    assert 'select' in advice.lower()
-    assert '&&' not in advice
-
-
 def test_snapshot_reports_hide_diagnostics_and_align_diffstat(tmp_path: Path) -> None:
-    paths, project, record = _build(tmp_path)
-    global_config, _ = _configs(tmp_path)
+    paths, project, record = build(tmp_path)
+    global_config, _ = configs(tmp_path)
     report = _reports.inspect_report(
         paths, _verification.prove_objects(paths, project.name, record), global_config, project
     )
@@ -421,8 +385,8 @@ def test_snapshot_reports_hide_diagnostics_and_align_diffstat(tmp_path: Path) ->
 
 
 def test_tree_paths_returns_git_order_without_reading_blob_bodies(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
-    global_config, project = _configs(tmp_path)
+    paths = make_paths(tmp_path)
+    global_config, project = configs(tmp_path)
     record = _candidate.build_candidate(
         paths,
         global_config,
@@ -432,7 +396,7 @@ def test_tree_paths_returns_git_order_without_reading_blob_bodies(tmp_path: Path
                 Entry('a', 0o100644, 'blob', b'a\n'),
                 Entry('b/c', 0o100644, 'blob', b'c\n'),
             ),
-            _pinned(),
+            pinned(),
             None,
             None,
         ),

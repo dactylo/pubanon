@@ -1,3 +1,4 @@
+import os
 import shutil
 from collections.abc import Callable, Sequence
 from dataclasses import replace
@@ -13,33 +14,35 @@ from pubanon._snapshots import (
     _candidate,
     _discard,
     _history,
+    _inspection,
     _records,
+    _rewrite,
     _source,
     _store,
 )
+from tests._git import RunGitOptions, git_bytes
 from tests.snapshots.test_candidate import (
-    _build,
-    _configs,
-    _git,
-    _oracle_commit,
-    _RunGitOptions,
+    build,
+    build_oracle_commit,
+    configs,
 )
+from tests.snapshots.test_rewrite import prepare
 
 
 def test_discard_confirmed_rewrite_preserves_correction_bookmark(
     tmp_path: Path, make_repo: Callable[..., Path]
 ) -> None:
     source = make_repo(files={'README.md': 'source'})
-    paths, project, record = _build(tmp_path)
+    paths, project, record = build(tmp_path)
     pinned = _source.pin(source, 'HEAD')
     bookmark = _source.describe_bookmark(source, project.name, record.commit)
     _source.ensure_bookmark(bookmark, pinned.commit)
     record = replace(record, pinned=pinned, source_bookmark=bookmark)
     _records.save_candidate(paths, project.name, record)
-    g, _ = _configs(tmp_path)
+    g, _ = configs(tmp_path)
     store = _store.store_path(paths, project.name)
-    derived = _oracle_commit(store, record.tree, g, 'derived release', 1_700_000_123)
-    _git(store, 'update-ref', _records.publication_ref(derived), derived)
+    derived = build_oracle_commit(store, record.tree, g, 'derived release', 1_700_000_123)
+    git_bytes(store, 'update-ref', _records.publication_ref(derived), derived)
     progress = _records.RewriteRecord(
         record.commit,
         'b' * 40,
@@ -52,7 +55,9 @@ def test_discard_confirmed_rewrite_preserves_correction_bookmark(
     with pytest.raises(PubanonError, match='confirmed publication'):
         _discard.discard(paths, project.name, force=True)
     assert (
-        _git(source, 'for-each-ref', '--format=%(objectname)', bookmark.refname).strip().decode()
+        git_bytes(source, 'for-each-ref', '--format=%(objectname)', bookmark.refname)
+        .strip()
+        .decode()
         == pinned.commit
     )
     assert _records.load_candidate(paths, project.name) == record
@@ -60,23 +65,24 @@ def test_discard_confirmed_rewrite_preserves_correction_bookmark(
 
 
 def test_discard_deletes_symbolic_private_ref_without_changing_main(tmp_path: Path) -> None:
-    paths, project, record = _build(tmp_path)
+    paths, project, record = build(tmp_path)
     store = _store.store_path(paths, project.name)
-    _git(store, 'update-ref', 'refs/heads/main', record.commit)
-    _git(store, 'symbolic-ref', _candidate.CANDIDATE_REF, 'refs/heads/main')
+    git_bytes(store, 'update-ref', 'refs/heads/main', record.commit)
+    git_bytes(store, 'symbolic-ref', _candidate.CANDIDATE_REF, 'refs/heads/main')
 
     assert _discard.discard(paths, project.name, force=False)
 
-    assert _git(store, 'rev-parse', 'refs/heads/main').strip().decode() == record.commit
-    assert _git(store, 'for-each-ref', '--format=%(refname)', _candidate.CANDIDATE_REF) == b''
+    assert git_bytes(store, 'rev-parse', 'refs/heads/main').strip().decode() == record.commit
+    assert git_bytes(store, 'for-each-ref', '--format=%(refname)', _candidate.CANDIDATE_REF) == b''
 
 
 @pytest.mark.parametrize('corrupt', [b'', b'commit = "partial'])
 def test_discard_force_removes_unreadable_candidate_state(
     corrupt: bytes,
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    paths, project, record = _build(tmp_path)
+    paths, project, record = build(tmp_path)
     project_dir = paths.data_dir / 'projects' / project.name
     record_path = project_dir / 'candidate.toml'
     inspect = project_dir / 'inspections' / record.commit
@@ -86,17 +92,18 @@ def test_discard_force_removes_unreadable_candidate_state(
 
     _discard.discard(paths, project.name, force=True)
 
+    assert capsys.readouterr().out.count('could not be verified from the malformed') == 1
     assert not record_path.exists()
     assert (inspect / 'edited.txt').read_text() == 'dirty\n'
     store = _store.store_path(paths, project.name)
-    assert _git(store, 'for-each-ref', '--format=%(refname)', _candidate.CANDIDATE_REF) == b''
+    assert git_bytes(store, 'for-each-ref', '--format=%(refname)', _candidate.CANDIDATE_REF) == b''
 
 
 @pytest.mark.parametrize('conflict', ['symbolic', 'wrong-object', 'provenance'])
 def test_discard_force_retains_conflicting_confirmation_evidence(
     tmp_path: Path, conflict: str
 ) -> None:
-    paths, project, record = _build(tmp_path)
+    paths, project, record = build(tmp_path)
     bookmark = _source.SourceBookmark(
         project.source_path,
         project.source_path / '.git',
@@ -110,9 +117,9 @@ def test_discard_force_retains_conflicting_confirmation_evidence(
     if conflict != 'provenance':
         _records.publication_path(paths, project.name, record.commit).unlink()
         if conflict == 'symbolic':
-            _git(store, 'symbolic-ref', ref, _candidate.CANDIDATE_REF)
+            git_bytes(store, 'symbolic-ref', ref, _candidate.CANDIDATE_REF)
         else:
-            _git(store, 'update-ref', ref, record.tree)
+            git_bytes(store, 'update-ref', ref, record.tree)
     else:
         record = replace(record, pinned=record.pinned._replace(commit='c' * 40))
         _candidate.save_candidate(paths, project.name, record)
@@ -122,18 +129,18 @@ def test_discard_force_retains_conflicting_confirmation_evidence(
 
 
 def test_discard_ignores_similarly_prefixed_archive_reference(tmp_path: Path) -> None:
-    paths, project, record = _build(tmp_path)
+    paths, project, record = build(tmp_path)
     store = _store.store_path(paths, project.name)
     ref = _records.publication_ref(record.commit) + '/other'
-    _git(store, 'update-ref', ref, record.commit)
+    git_bytes(store, 'update-ref', ref, record.commit)
     assert _discard.discard(paths, project.name, force=False)
-    assert _git(store, 'rev-parse', ref).decode().strip() == record.commit
+    assert git_bytes(store, 'rev-parse', ref).decode().strip() == record.commit
 
 
 def test_discard_protects_unknown_outcome_until_forced(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    paths, project_config, record = _build(tmp_path)
+    paths, project_config, record = build(tmp_path)
     inspect = paths.data_dir / 'projects' / project_config.name / 'inspections' / record.commit
     inspect.mkdir(parents=True)
     (inspect / 'edited.txt').write_text('dirty\n')
@@ -157,7 +164,7 @@ def test_discard_protects_unknown_outcome_until_forced(
     assert _records.load_candidate(paths, project_config.name) is None
     assert not inspect.exists()
     store = _store.store_path(paths, project_config.name)
-    assert _git(store, 'for-each-ref', '--format=%(refname)', _candidate.CANDIDATE_REF) == b''
+    assert git_bytes(store, 'for-each-ref', '--format=%(refname)', _candidate.CANDIDATE_REF) == b''
 
 
 @pytest.mark.parametrize('force', [False, True])
@@ -165,7 +172,7 @@ def test_discard_protects_unknown_outcome_until_forced(
 def test_discard_refuses_confirmed_publication(
     tmp_path: Path, force: bool, confirmed: str
 ) -> None:
-    paths, project, record = _build(tmp_path)
+    paths, project, record = build(tmp_path)
     bookmark = _source.SourceBookmark(
         project.source_path,
         project.source_path / '.git',
@@ -177,7 +184,7 @@ def test_discard_refuses_confirmed_publication(
     if confirmed == 'archive':
         _records.publication_path(paths, project.name, record.commit).unlink()
     else:
-        _git(
+        git_bytes(
             _store.store_path(paths, project.name),
             'update-ref',
             '-d',
@@ -195,7 +202,7 @@ def test_discard_removes_only_owned_provisional_bookmark(
     tmp_path: Path, make_repo: Callable[..., Path], condition: str, force: bool
 ) -> None:
     source = make_repo(files={'README.md': 'source'})
-    paths, project, record = _build(tmp_path)
+    paths, project, record = build(tmp_path)
     bookmark = _source.describe_bookmark(source, project.name, record.commit)
     original = _source.pin(source, 'HEAD')
     record = replace(record, pinned=original, source_bookmark=bookmark)
@@ -204,8 +211,8 @@ def test_discard_removes_only_owned_provisional_bookmark(
     if condition == 'missing':
         _source.remove_bookmark(bookmark, original.commit)
     elif condition == 'conflict':
-        _git(source, 'commit', '--allow-empty', '-qm', 'different')
-        _git(source, 'update-ref', bookmark.refname, 'HEAD')
+        git_bytes(source, 'commit', '--allow-empty', '-qm', 'different')
+        git_bytes(source, 'update-ref', bookmark.refname, 'HEAD')
     elif condition == 'inaccessible':
         source.rename(source.with_name('moved-source'))
     if condition in {'conflict', 'inaccessible'}:
@@ -215,18 +222,18 @@ def test_discard_removes_only_owned_provisional_bookmark(
     else:
         assert _discard.discard(paths, project.name, force=force)
         assert _records.load_candidate(paths, project.name) is None
-        assert _git(source, 'for-each-ref', '--format=%(refname)', bookmark.refname) == b''
-        assert _git(source, 'rev-parse', 'HEAD').decode().strip() == original.commit
+        assert git_bytes(source, 'for-each-ref', '--format=%(refname)', bookmark.refname) == b''
+        assert git_bytes(source, 'rev-parse', 'HEAD').decode().strip() == original.commit
 
 
 @pytest.mark.parametrize('force', [False, True])
 def test_discard_reports_ref_failure_and_preserves_cleanup_policy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, force: bool
 ) -> None:
-    paths, project, record = _build(tmp_path)
+    paths, project, record = build(tmp_path)
     real_git = _discard.run_git
 
-    def _fail(args: Sequence[str], **kwargs: Unpack[_RunGitOptions]) -> GitResult:
+    def _fail(args: Sequence[str], **kwargs: Unpack[RunGitOptions]) -> GitResult:
         if args[2] == 'update-ref':
             return GitResult(7, b'', b'diagnostic\x1b\\path')
         return real_git(args, **kwargs)
@@ -249,7 +256,7 @@ def test_discard_rewrite_cleanup_failure_retains_locator_for_retry(
     boundary: str,
 ) -> None:
     source = make_repo(files={'README.md': 'source'})
-    paths, project, record = _build(tmp_path)
+    paths, project, record = build(tmp_path)
     pinned = _source.pin(source, 'HEAD')
     original = _source.describe_bookmark(source, project.name, 'b' * 40)
     provisional = _source.describe_bookmark(source, project.name, 'c' * 40)
@@ -267,7 +274,7 @@ def test_discard_rewrite_cleanup_failure_retains_locator_for_retry(
     directory.mkdir()
     (directory / 'resolution').write_text('retained decision')
     store = _store.candidate_store_path(paths, project.name)
-    _git(store, 'update-ref', _candidate.REWRITE_MERGED_REF, record.commit)
+    git_bytes(store, 'update-ref', _candidate.REWRITE_MERGED_REF, record.commit)
 
     def _refuse_cleanup(_path: Path) -> None:
         raise OSError('busy')
@@ -289,37 +296,42 @@ def test_discard_rewrite_cleanup_failure_retains_locator_for_retry(
     if boundary == 'directory':
         assert (directory / 'resolution').read_text() == 'retained decision'
         for bookmark in (provisional, correction):
-            assert _git(source, 'rev-parse', bookmark.refname).strip().decode() == pinned.commit
+            assert (
+                git_bytes(source, 'rev-parse', bookmark.refname).strip().decode() == pinned.commit
+            )
     assert 'retry discard' in error.value.render()
     if boundary == 'ref':
         (store / (_candidate.REWRITE_MERGED_REF + '.lock')).unlink()
     assert _discard.discard(paths, project.name, force=False)
     assert not _records.rewrite_path(paths, project.name).exists()
     assert not directory.exists()
-    assert _git(source, 'rev-parse', original.refname).strip().decode() == pinned.commit
+    assert git_bytes(source, 'rev-parse', original.refname).strip().decode() == pinned.commit
     for bookmark in (provisional, correction):
-        assert _git(source, 'for-each-ref', '--format=%(objectname)', bookmark.refname) == b''
+        assert git_bytes(source, 'for-each-ref', '--format=%(objectname)', bookmark.refname) == b''
 
 
 def test_discard_rewrite_deletes_symbolic_private_ref_without_changing_main(
     tmp_path: Path,
 ) -> None:
-    paths, project, record = _build(tmp_path)
+    paths, project, record = build(tmp_path)
     store = _store.store_path(paths, project.name)
-    _git(store, 'update-ref', 'refs/heads/main', record.commit)
-    _git(store, 'symbolic-ref', _candidate.REWRITE_MERGED_REF, 'refs/heads/main')
+    git_bytes(store, 'update-ref', 'refs/heads/main', record.commit)
+    git_bytes(store, 'symbolic-ref', _candidate.REWRITE_MERGED_REF, 'refs/heads/main')
 
     assert _discard._discard_rewrite(paths, project.name, ())
 
-    assert _git(store, 'rev-parse', 'refs/heads/main').strip().decode() == record.commit
-    assert _git(store, 'for-each-ref', '--format=%(refname)', _candidate.REWRITE_MERGED_REF) == b''
+    assert git_bytes(store, 'rev-parse', 'refs/heads/main').strip().decode() == record.commit
+    assert (
+        git_bytes(store, 'for-each-ref', '--format=%(refname)', _candidate.REWRITE_MERGED_REF)
+        == b''
+    )
 
 
 def test_discard_rewrite_releases_derived_bookmark_but_preserves_original(
     tmp_path: Path, make_repo: Callable[..., Path]
 ) -> None:
     source = make_repo(files={'README.md': 'source'})
-    paths, project, record = _build(tmp_path)
+    paths, project, record = build(tmp_path)
     original = _source.pin(source, 'HEAD')
     old = 'b' * 40
     derived = 'c' * 40
@@ -341,26 +353,34 @@ def test_discard_rewrite_releases_derived_bookmark_but_preserves_original(
     )
     _records.save_rewrite(paths, project.name, progress)
     assert _discard.discard(paths, project.name, force=False)
-    assert _git(source, 'rev-parse', original_bookmark.refname).strip().decode() == original.commit
-    assert _git(source, 'for-each-ref', '--format=%(objectname)', derived_bookmark.refname) == b''
-    assert _git(source, 'rev-parse', 'HEAD').strip().decode() == original.commit
+    assert (
+        git_bytes(source, 'rev-parse', original_bookmark.refname).strip().decode()
+        == original.commit
+    )
+    assert (
+        git_bytes(source, 'for-each-ref', '--format=%(objectname)', derived_bookmark.refname)
+        == b''
+    )
+    assert git_bytes(source, 'rev-parse', 'HEAD').strip().decode() == original.commit
 
 
 def test_discard_without_force_preserves_unreadable_candidate_state(tmp_path: Path) -> None:
-    paths, project, record = _build(tmp_path)
+    paths, project, record = build(tmp_path)
     project_dir = paths.data_dir / 'projects' / project.name
     record_path = project_dir / 'candidate.toml'
     inspect = project_dir / 'inspections' / record.commit
     inspect.mkdir(parents=True)
     record_path.write_bytes(b'commit = "partial')
 
-    with pytest.raises(PubanonError, match='invalid snapshot record'):
+    with pytest.raises(PubanonError, match='invalid snapshot record') as exc_info:
         _discard.discard(paths, project.name, force=False)
 
     assert record_path.exists()
     assert inspect.exists()
     store = _store.store_path(paths, project.name)
-    assert _git(store, 'rev-parse', _candidate.CANDIDATE_REF).strip()
+    assert git_bytes(store, 'rev-parse', _candidate.CANDIDATE_REF).strip()
+
+    assert 'pubanon discard --force' in (exc_info.value.recovery or '')
 
 
 @pytest.mark.parametrize('nested', [False, True])
@@ -369,12 +389,12 @@ def test_force_discard_removes_record_with_broken_store(
 ) -> None:
     if nested:
         tmp_path = make_repo()
-        _git(tmp_path, 'update-ref', _candidate.CANDIDATE_REF, 'HEAD')
-    ancestor_refs = _git(tmp_path, 'for-each-ref') if nested else None
+        git_bytes(tmp_path, 'update-ref', _candidate.CANDIDATE_REF, 'HEAD')
+    ancestor_refs = git_bytes(tmp_path, 'for-each-ref') if nested else None
     ancestor_objects = (
-        _git(tmp_path, 'cat-file', '--batch-all-objects', '--batch-check') if nested else None
+        git_bytes(tmp_path, 'cat-file', '--batch-all-objects', '--batch-check') if nested else None
     )
-    paths, project, _record = _build(tmp_path)
+    paths, project, _record = build(tmp_path)
     store = paths.data_dir / 'projects' / project.name / 'store.git'
     shutil.rmtree(store / 'refs')
 
@@ -384,7 +404,61 @@ def test_force_discard_removes_record_with_broken_store(
     assert 'pubanon repo restore --to local' in exc_info.value.render()
     assert not (paths.data_dir / 'projects' / project.name / 'candidate.toml').exists()
     if nested:
-        assert _git(tmp_path, 'for-each-ref') == ancestor_refs
+        assert git_bytes(tmp_path, 'for-each-ref') == ancestor_refs
         assert (
-            _git(tmp_path, 'cat-file', '--batch-all-objects', '--batch-check') == ancestor_objects
+            git_bytes(tmp_path, 'cat-file', '--batch-all-objects', '--batch-check')
+            == ancestor_objects
         )
+
+
+@pytest.mark.slow
+def test_discard_removes_paused_rewrite_without_published_refs_or_inspection(
+    tmp_path: Path,
+) -> None:
+    paths, g, project, old, correction = prepare(tmp_path, conflict=True)
+    _rewrite.continue_rewrite(paths, g, project, env={})
+    inspect = _inspection.materialize_snapshot(
+        paths,
+        project.name,
+        correction.commit,
+        _source.read_snapshot(_store.store_path(paths, project.name), correction.commit),
+    )
+    _discard.discard(paths, project.name, force=False)
+    assert not _records.rewrite_path(paths, project.name).exists()
+    assert not _records.rewrite_directory(paths, project.name).exists()
+    assert not inspect.exists()
+    assert _candidate.published_refs(paths, project.name)[0] == old[-1]
+    assert (
+        git_bytes(
+            _store.store_path(paths, project.name),
+            'for-each-ref',
+            '--format=%(refname)',
+            'refs/pubanon',
+        ).strip()
+        == b''
+    )
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX directory permissions')
+def test_discard_removes_read_only_conflict_export(tmp_path: Path) -> None:
+    paths, g, project, _, _ = prepare(tmp_path, conflict=True)
+    _rewrite.continue_rewrite(paths, g, project, env={})
+    directory = _records.rewrite_directory(paths, project.name)
+    tree = directory / 'tree'
+    _filesystem.chmod(tree / 'base.txt', 0o400)
+    _filesystem.chmod(tree, 0o500)
+    try:
+        try:
+            (tree / '.permission-probe').touch(exist_ok=False)
+        except PermissionError:
+            pass
+        else:
+            (tree / '.permission-probe').unlink()
+            pytest.skip('filesystem does not enforce read-only directory permissions')
+        assert _discard.discard(paths, project.name, force=False)
+        assert not directory.exists()
+        assert not _records.rewrite_path(paths, project.name).exists()
+    finally:
+        if directory.exists():
+            _filesystem.remove_tree(directory)

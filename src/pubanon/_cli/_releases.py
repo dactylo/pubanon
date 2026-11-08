@@ -10,11 +10,33 @@ from pubanon import _config
 from pubanon._cli import _context
 from pubanon._errors import OperationCanceled, PubanonError
 from pubanon._remote import _host, _releases
-from pubanon._terminal import confirm, escape, fields, heading, output, verbose_enabled
+from pubanon._terminal import (
+    confirm,
+    display_commit,
+    escape,
+    fields,
+    heading,
+    output,
+)
 from pubanon._terminal import field as terminal_field
 
 if TYPE_CHECKING:
     import argparse
+
+
+def _changed_fields(change: _releases.ReleaseChange) -> list[str]:
+    """Name the page fields that confirming an edit changes."""
+    previous = change.previous
+    if previous is None:
+        return ['title', 'notes']
+    return [
+        name
+        for name, differs in (
+            ('title', change.title != previous.title),
+            ('notes', change.notes != previous.notes.encode('utf-8')),
+        )
+        if differs
+    ]
 
 
 def _print_notes(notes: str, *, label: str = 'Notes', source: str = '') -> None:
@@ -22,6 +44,19 @@ def _print_notes(notes: str, *, label: str = 'Notes', source: str = '') -> None:
     print(terminal_field(label, source))
     for line in notes.split('\n'):
         print(escape(line))
+
+
+def _read_notes_file(path: str) -> bytes:
+    """Read supplied UTF-8 notes exactly once without normalizing newlines."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError as exc:
+        raise PubanonError('cannot read release notes file', fact=escape(str(exc))) from exc
+    try:
+        data.decode('utf-8')
+    except UnicodeError as exc:
+        raise PubanonError('release notes file must be valid UTF-8') from exc
+    return data
 
 
 def _status(page: _host.GitHubRelease) -> str:
@@ -42,7 +77,7 @@ def _preview(change: _releases.ReleaseChange) -> None:
             ('Tag', escape(change.tag)),
             (
                 'Published commit',
-                escape(change.commit if verbose_enabled() else change.commit[:12]),
+                escape(display_commit(change.commit)),
             ),
             ('Title', escape(change.title)),
         ]
@@ -69,11 +104,16 @@ def _preview(change: _releases.ReleaseChange) -> None:
         previous = change.previous
         if previous is not None:
             print(terminal_field('Existing status', _status(previous)))
-        output('Confirmation updates this page title and notes.')
+        output(f"Confirmation updates this page's {' and '.join(_changed_fields(change))}.")
 
 
 def command_list(args: argparse.Namespace) -> None:
-    """List a bounded number of pages in the verified final repository."""
+    """List a bounded number of pages in the verified final repository.
+
+    Raises:
+        PubanonError: Configuration, destination verification, or the hosted
+            listing fails.
+    """
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
@@ -90,7 +130,12 @@ def command_list(args: argparse.Namespace) -> None:
 
 
 def command_show(args: argparse.Namespace) -> None:
-    """Show an explicit page and its complete hosted notes."""
+    """Show an explicit page and its complete hosted notes.
+
+    Raises:
+        PubanonError: Configuration or destination verification fails, or the
+            exact page is unavailable.
+    """
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
@@ -147,32 +192,9 @@ def create_page(
     _releases.show_draft_guidance(ctx.project, draft=result.page.draft)
 
 
-def read_notes_file(path: str) -> bytes:
-    """Read supplied UTF-8 notes exactly once without normalizing newlines.
-
-    Args:
-        path: Path to a UTF-8 Markdown file.
-
-    Returns:
-        Exact file bytes for preview, policy checks, and host write.
-
-    Raises:
-        PubanonError: The file cannot be read or is not valid UTF-8.
-    """
-    try:
-        data = Path(path).read_bytes()
-    except OSError as exc:
-        raise PubanonError('cannot read release notes file', fact=escape(str(exc))) from exc
-    try:
-        data.decode('utf-8')
-    except UnicodeError as exc:
-        raise PubanonError('release notes file must be valid UTF-8') from exc
-    return data
-
-
 def _write(args: argparse.Namespace, operation: Literal['create', 'edit']) -> None:
     """Keep the project lock through preparation, confirmation, and read-back."""
-    notes = read_notes_file(args.notes_file) if args.notes_file is not None else None
+    notes = _read_notes_file(args.notes_file) if args.notes_file is not None else None
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
@@ -189,13 +211,7 @@ def _write(args: argparse.Namespace, operation: Literal['create', 'edit']) -> No
             create_page(ctx, request, yes=args.yes)
             return
         change = _releases.prepare_change(ctx.paths, ctx.global_config, ctx.project, request)
-        previous = change.previous
-        if (
-            request.refresh_notes
-            and previous is not None
-            and change.title == previous.title
-            and change.notes == previous.notes.encode('utf-8')
-        ):
+        if not _changed_fields(change):
             _releases.show_notes_warning(change.origin)
             output('Nothing to change: the release page already has these notes and this title.')
             return
@@ -207,10 +223,39 @@ def _write(args: argparse.Namespace, operation: Literal['create', 'edit']) -> No
 
 
 def command_create(args: argparse.Namespace) -> None:
-    """Create a page for an already published tag after confirmation."""
+    """Create a page for an already published tag after confirmation.
+
+    Raises:
+        PubanonError: Publication or metadata checks fail, or the page write
+            cannot be verified.
+        OperationCanceled: An interactive decision is declined or the operation
+            is canceled.
+    """
     _write(args, 'create')
 
 
 def command_edit(args: argparse.Namespace) -> None:
-    """Edit a page's title or notes after confirmation."""
+    """Edit a page's title or notes after confirmation.
+
+    Raises:
+        PubanonError: Publication or metadata checks fail, or the page write
+            cannot be verified.
+        OperationCanceled: An interactive decision is declined or the operation
+            is canceled.
+    """
     _write(args, 'edit')
+
+
+def page_request(args: argparse.Namespace) -> _releases.PageRequest:
+    """Build the release-page request from the publish and run page options.
+
+    Raises:
+        PubanonError: The notes file cannot be read or is not UTF-8.
+    """
+    notes_file = args.release_notes_file
+    return _releases.PageRequest(
+        skip=args.no_release_page,
+        notes=_read_notes_file(notes_file) if notes_file is not None else None,
+        notes_file=Path(notes_file).absolute() if notes_file is not None else None,
+        requested=args.release_page,
+    )

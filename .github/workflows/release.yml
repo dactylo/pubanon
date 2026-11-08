@@ -166,7 +166,7 @@ jobs:
               message = f"The release page for {tag} is already published: {published['html_url']}"
           elif draft is None:
               message = (
-                  f'No release page for {tag}. If pubanon creates a draft for it later, '
+                  f'No release page for {tag}. If a draft is created for it later, '
                   'rerun this workflow to publish it.'
               )
           else:

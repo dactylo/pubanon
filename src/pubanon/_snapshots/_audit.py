@@ -7,20 +7,22 @@ from collections.abc import Collection, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import NamedTuple
 
-from pubanon._config import GlobalConfig, Paths, ProjectConfig, rule_labels
+from pubanon._config import GlobalConfig, Paths, ProjectConfig, rule_origins
 from pubanon._errors import PubanonError
 from pubanon._gate import GateHit, RuleClass, first_match, gate_unit, match_excerpt
 from pubanon._run import OID_HEX, git_failure_fact, run_git
 from pubanon._snapshots._source import (
+    SYMLINK_MODE,
     Entry,
     Snapshot,
     decode_tree_path,
+    parse_batch_header,
+    parse_batch_object,
     tree_mode,
     validate_symlink_graph,
 )
 from pubanon._snapshots._store import store_path
 
-_BATCH_HEADER_FIELD_COUNT = 3
 _DIFF_METADATA_FIELD_COUNT = 5
 _HEADER_FIELD_PATTERN = re.compile(rb'[!-~]+')
 _OID_PATTERN = re.compile(OID_HEX.encode())
@@ -28,32 +30,14 @@ _SIGNATURE_FIELDS = frozenset({b'gpgsig', b'gpgsig-sha256'})
 _STRUCTURAL_HEADER_FIELDS = frozenset(
     {b'author', b'committer', b'parent', b'tree', *_SIGNATURE_FIELDS}
 )
-_SYMLINK_MODE = 0o120000
 _ZERO_MODE = b'000000'
 
 
-class AuditFinding(NamedTuple):
-    """Identify one current-rule match in published history.
-
-    Attributes:
-        unit: Published-history unit containing the match.
-        rule_class: Publication-impact class of the matched rule.
-        term: Active rule term found in the unit.
-    """
-
-    unit: str
-    rule_class: RuleClass
-    term: str
+AuditFinding = GateHit
 
 
-class HistoryDetail(NamedTuple):
-    """Retain a finding category and unescaped operator-facing description.
-
-    Attributes:
-        rule_class: Rule category used for filtering and display labels.
-        description: Literal terms, paths, and witness context; escape for
-            display.
-    """
+class _HistoryDetail(NamedTuple):
+    """Retain a finding category and unescaped operator-facing description."""
 
     rule_class: RuleClass
     description: str
@@ -135,6 +119,30 @@ class _ParsedCommit(NamedTuple):
     problems: tuple[str, ...]
 
 
+def _check_blob_objects(store: Path, queries: Sequence[bytes]) -> dict[bytes, tuple[bytes, bytes]]:
+    """Validate ordinary blobs without bodies, returning empty identity-only payloads."""
+    if not queries:
+        return {}
+    result = run_git(
+        ['--git-dir', str(store.absolute()), 'cat-file', '--batch-check'],
+        cwd=store,
+        input_bytes=b''.join(query + b'\n' for query in queries),
+        check=False,
+    )
+    if result.returncode != 0:
+        raise PubanonError('published object read failed', fact=git_failure_fact(result))
+    objects: dict[bytes, tuple[bytes, bytes]] = {}
+    offset = 0
+    for query in queries:
+        header, offset = parse_batch_header(result.stdout, offset, query, 'published')
+        if header is None or header[0] != b'blob':
+            raise PubanonError('published blob object could not be read')
+        objects[query] = (b'blob', b'')
+    if offset != len(result.stdout):
+        raise PubanonError('Git returned trailing published object data')
+    return objects
+
+
 def _logical_commit_fields(
     oid: str,
     headers: bytes,
@@ -189,9 +197,8 @@ def _add_findings(
 ) -> None:
     """Retain the first current-rule witness for one history unit."""
     commit, location = witness
-    for hit in gate_unit(unit, data, rules):
-        finding = AuditFinding(*hit)
-        span = first_match(data, hit.term)
+    for finding in gate_unit(unit, data, rules):
+        span = first_match(data, finding.term)
         if span is None:
             raise PubanonError('gate match location could not be determined')
         start, end = span
@@ -241,7 +248,7 @@ def _apply_change(
     if object_value is None or object_value[0] != b'blob':
         raise PubanonError('published blob object could not be read')
     data = object_value[1]
-    kind = 'symlink' if change.new_mode == _SYMLINK_MODE else 'blob'
+    kind = 'symlink' if change.new_mode == SYMLINK_MODE else 'blob'
     current[change.raw_path] = _HistoryEntry(change.new_mode, kind, change.new_oid, data)
     occurrence_findings = _entry_findings(change.path, data, rules)
     active_findings[change.raw_path] = occurrence_findings
@@ -392,71 +399,6 @@ def _parse_diff(
     if offset != len(tokens):
         raise PubanonError('Git returned trailing published history diff data')
     return tuple(parsed)
-
-
-def _parse_object_header(
-    output: bytes,
-    offset: int,
-    query: bytes,
-) -> tuple[tuple[bytes, int] | None, int]:
-    """Parse the shared header grammar for body and metadata batch responses."""
-    header_end = output.find(b'\n', offset)
-    if header_end < 0:
-        raise PubanonError('Git returned an unterminated published object header')
-    raw_header = output[offset:header_end]
-    if raw_header == query + b' missing':
-        return None, header_end + 1
-    header = raw_header.split(b' ')
-    if len(header) != _BATCH_HEADER_FIELD_COUNT:
-        raise PubanonError('Git returned a malformed published object header')
-    actual_oid, object_type, raw_size = header
-    if actual_oid != query or _OID_PATTERN.fullmatch(actual_oid) is None:
-        raise PubanonError('Git returned a mismatched published object')
-    if object_type not in {b'blob', b'commit', b'tag', b'tree'}:
-        raise PubanonError('Git returned an unsupported published object type')
-    if re.fullmatch(rb'0|[1-9][0-9]*', raw_size) is None:
-        raise PubanonError('Git returned a malformed published object size')
-    return (object_type, int(raw_size)), header_end + 1
-
-
-def _check_blob_objects(store: Path, queries: Sequence[bytes]) -> dict[bytes, tuple[bytes, bytes]]:
-    """Validate ordinary blobs without bodies, returning empty identity-only payloads."""
-    if not queries:
-        return {}
-    result = run_git(
-        ['--git-dir', str(store.absolute()), 'cat-file', '--batch-check'],
-        cwd=store,
-        input_bytes=b''.join(query + b'\n' for query in queries),
-        check=False,
-    )
-    if result.returncode != 0:
-        raise PubanonError('published object read failed', fact=git_failure_fact(result))
-    objects: dict[bytes, tuple[bytes, bytes]] = {}
-    offset = 0
-    for query in queries:
-        header, offset = _parse_object_header(result.stdout, offset, query)
-        if header is None or header[0] != b'blob':
-            raise PubanonError('published blob object could not be read')
-        objects[query] = (b'blob', b'')
-    if offset != len(result.stdout):
-        raise PubanonError('Git returned trailing published object data')
-    return objects
-
-
-def _parse_object_response(
-    output: bytes,
-    offset: int,
-    query: bytes,
-) -> tuple[tuple[bytes, bytes] | None, int]:
-    """Parse one exact `cat-file --batch` response."""
-    header, data_start = _parse_object_header(output, offset, query)
-    if header is None:
-        return None, data_start
-    object_type, size = header
-    data_end = data_start + size
-    if data_end >= len(output) or output[data_end : data_end + 1] != b'\n':
-        raise PubanonError('Git returned a truncated published object')
-    return (object_type, output[data_start:data_end]), data_end + 1
 
 
 def _read_history_diff(
@@ -662,7 +604,7 @@ def _walk_history(
                 rules,
             )
             # Old modes have been checked against current state, including deletions.
-            if change.new_mode == _SYMLINK_MODE:
+            if change.new_mode == SYMLINK_MODE:
                 entry = current[change.raw_path]
                 symlinks[change.raw_path] = Entry(change.path, entry.mode, entry.kind, entry.data)
                 symlinks_changed = True
@@ -722,7 +664,7 @@ def history_details(
     derived: Collection[str],
     *,
     short_commits: bool = False,
-) -> tuple[HistoryDetail, ...]:
+) -> tuple[_HistoryDetail, ...]:
     """Collect literal history evidence for operator review.
 
     Args:
@@ -737,16 +679,16 @@ def history_details(
         terms and paths; callers escape these values for terminal display.
     """
     evidence = {item.finding: item for item in audit.evidence}
-    details: list[HistoryDetail] = []
+    details: list[_HistoryDetail] = []
     for finding in audit.findings:
         item = evidence[finding]
         location = item.description
         if item.commit is not None:
             commit = item.commit[:12] if short_commits else item.commit
             location = f'commit {commit}; {location}'
-        sources = ', '.join(rule_labels(GateHit(*finding), g, p, derived))
+        sources = ', '.join(map(str, rule_origins(finding, g, p, derived)))
         details.append(
-            HistoryDetail(
+            _HistoryDetail(
                 finding.rule_class,
                 f'{finding.unit}; {sources}; {location}; term {finding.term}',
             )
@@ -818,7 +760,7 @@ def read_objects(
     objects: dict[bytes, tuple[bytes, bytes] | None] = {}
     offset = 0
     for query in queries:
-        objects[query], offset = _parse_object_response(output, offset, query)
+        objects[query], offset = parse_batch_object(output, offset, query, 'published')
     if offset != len(output):
         raise PubanonError('Git returned trailing published object data')
     return objects
@@ -864,8 +806,8 @@ def audit_history_pair(  # noqa: PLR0913, PLR0917
         an empty focused result as evidence of content cleanliness.
 
     Raises:
-        PubanonError: Published Git data or a requested projection is
-            malformed.
+        PubanonError: Published Git data cannot be read, or the data or
+            requested projection is malformed.
     """
     store = store_path(paths, project)
     raw_commits = _parse_commit_ids(commits)
@@ -898,7 +840,7 @@ def audit_history_pair(  # noqa: PLR0913, PLR0917
                 change.new_oid
                 for _commit, changes in parsed_diff
                 for change in changes
-                if change.new_mode == _SYMLINK_MODE
+                if change.new_mode == SYMLINK_MODE
             }
             # A shared file/symlink blob needs its body for every symlink occurrence.
             objects.update(

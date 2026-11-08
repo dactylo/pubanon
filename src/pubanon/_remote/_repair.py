@@ -1,6 +1,5 @@
 """Rebuild the local published-history store from the host."""
 
-import os
 import re
 from contextlib import suppress
 from pathlib import Path
@@ -10,16 +9,15 @@ from pubanon._config import (
     GlobalConfig,
     Paths,
     ProjectConfig,
-    assemble_rules,
-    derived_private_terms,
+    current_rules,
 )
 from pubanon._errors import OperationCanceled, PubanonError
 from pubanon._remote import _host
 from pubanon._remote._host import Destination, RemoteRefs
 from pubanon._run import OID_HEX, run_git
 from pubanon._snapshots import _audit
-from pubanon._snapshots._candidate import STATE_UNKNOWN_OUTCOME, published_refs
-from pubanon._snapshots._records import load_candidate
+from pubanon._snapshots._candidate import published_refs
+from pubanon._snapshots._records import STATE_UNKNOWN_OUTCOME, load_candidate
 from pubanon._snapshots._store import store_path
 from pubanon._terminal import confirm, escape, heading, output, style
 
@@ -222,7 +220,7 @@ def rebuild_store(
         fetched = _repair_refs(store)
         if fetched.main is None:
             raise PubanonError('fetched repair main is absent')
-        rules = assemble_rules(g, p, derived_private_terms(paths, p, os.environ))
+        rules = current_rules(paths, g, p)
         commits = _audit.published_commits(paths, p.name, new=fetched.main)
         audit = _audit.audit_history(
             paths,
@@ -230,7 +228,7 @@ def rebuild_store(
             commits,
             fetched.tags,
             rules,
-            f'{g.anon_name} <{g.anon_email}>',
+            g.identity,
             tip=fetched.main,
         )
 

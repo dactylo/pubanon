@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, cast
 
 from pubanon import (
+    _changelog,
     _config,
     _run,
 )
@@ -20,12 +21,13 @@ from pubanon._terminal import (
     confirm,
     detail,
     detail_fields,
+    display_commit,
     escape,
     heading,
     next_step,
     output,
+    project_command,
     style,
-    verbose_enabled,
 )
 from pubanon._terminal import (
     field as terminal_field,
@@ -74,7 +76,7 @@ class _PreparePlan:
     replace_scope: Literal['one', 'all'] | None = None
 
 
-def _build_candidate(plan: _PreparePlan, options: PrepareOptions) -> _candidate.CandidateRecord:
+def _build_candidate(plan: _PreparePlan, options: PrepareOptions) -> _records.CandidateRecord:
     """Build a snapshot from an unchanged plan while holding its project lock."""
     record = _candidate.build_candidate(
         plan.ctx.paths,
@@ -192,6 +194,40 @@ def _publication_version(snapshot: _source.Snapshot, requested: str | None) -> s
     return version
 
 
+def _require_changelog_version(
+    settings: _config.ReleasePageSettings | None,
+    snapshot: _source.Snapshot,
+    version: str | None,
+) -> None:
+    """Refuse a tagged release unless it is the changelog's newest recognized version."""
+    if version is None:
+        return
+    page = settings or _config.ReleasePageSettings()
+    path = page.changelog_path
+    entry = next((item for item in snapshot if item.path == path and item.kind == 'blob'), None)
+    if entry is None:
+        return
+    versions = _changelog.recognize(entry.data, page.changelog_heading).versions
+    # A changelog without recognized version headings cannot name a release.
+    if not versions or versions[0] == version:
+        return
+    newest = versions[0]
+    shown = escape(path)
+    if _changelog.version_key(newest) < _changelog.version_key(version):
+        recovery = f'add a {version} section to {shown} and commit it, then prepare again'
+    else:
+        recovery = (
+            f'update and commit the package version to {newest}, or remove the unreleased '
+            f'{newest} section from {shown}, then prepare again'
+        )
+    raise PubanonError(
+        f'release version is not the newest version in {shown}',
+        expected=escape(version),
+        actual=escape(newest),
+        recovery=recovery,
+    )
+
+
 def _require_no_prepared_candidate(ctx: _context.ProjectContext) -> None:
     """Keep the saved snapshot available and explain how to continue."""
     record = _records.load_candidate(ctx.paths, ctx.project.name)
@@ -201,8 +237,9 @@ def _require_no_prepared_candidate(ctx: _context.ProjectContext) -> None:
             raise PubanonError(
                 'a rewrite is already retained',
                 recovery=(
-                    f'{_context.project_command(ctx.project.name, "discard", selection)}, then '
-                    f'{_context.project_command(ctx.project.name, "prepare", selection)}'
+                    'to start over, which deletes your conflict edits: '
+                    f'{project_command(ctx.project.name, "discard", selection)}, then '
+                    f'{project_command(ctx.project.name, "prepare", selection)}'
                 ),
             )
         return
@@ -211,22 +248,22 @@ def _require_no_prepared_candidate(ctx: _context.ProjectContext) -> None:
         raise PubanonError(
             'a rewrite is already retained',
             recovery=(
-                f'{_context.project_command(ctx.project.name, "prepare", selection, "--continue")}'
+                f'{project_command(ctx.project.name, "prepare", selection, "--continue")}'
                 '; '
-                'to replace it: '
-                f'{_context.project_command(ctx.project.name, "discard", selection)}, '
-                f'then {_context.project_command(ctx.project.name, "prepare", selection)}'
+                'to start over, which deletes your conflict edits: '
+                f'{project_command(ctx.project.name, "discard", selection)}, '
+                f'then {project_command(ctx.project.name, "prepare", selection)}'
             ),
         )
     version = f'for {escape(record.tag_intent)}' if record.tag_intent else 'without a version tag'
     raise PubanonError(
         f'a snapshot is already prepared {version}',
         recovery=(
-            f'to use it: {_context.project_command(ctx.project.name, "inspect", selection)}, then '
-            f'{_context.project_command(ctx.project.name, "publish", selection)}; '
+            f'to use it: {project_command(ctx.project.name, "inspect", selection)}, then '
+            f'{project_command(ctx.project.name, "publish", selection)}; '
             'to replace it: '
-            f'{_context.project_command(ctx.project.name, "discard", selection)}, '
-            f'then {_context.project_command(ctx.project.name, "prepare", selection)}'
+            f'{project_command(ctx.project.name, "discard", selection)}, '
+            f'then {project_command(ctx.project.name, "prepare", selection)}'
         ),
     )
 
@@ -267,7 +304,7 @@ def _show_source_selection(
     """Identify the committed selection and count omitted working changes."""
     changes = _source.working_changes(ctx.project.source_path)
     selector = (pinned.selector_name or options.source).removeprefix('refs/heads/')
-    commit = pinned.commit if verbose_enabled() else pinned.commit[:12]
+    commit = display_commit(pinned.commit)
     omitted = ', '.join(
         f'{count} {label} {"change" if count == 1 else "changes"}'
         for label, count in (
@@ -331,7 +368,7 @@ def _plan_prepare_locked(
             'intended tag is already published',
             recovery=(
                 'choose a new version; to correct the snapshot that carries this tag: '
-                + _context.project_command(
+                + project_command(
                     ctx.project.name,
                     'prepare',
                     f'--project={ctx.project.name}',
@@ -362,7 +399,7 @@ def _plan_prepare_locked(
             recovery=(
                 'update and commit the package version before preparing a new release; '
                 'to correct the snapshot that carries this tag: '
-                + _context.project_command(
+                + project_command(
                     ctx.project.name,
                     'prepare',
                     f'--project={ctx.project.name}',
@@ -371,6 +408,7 @@ def _plan_prepare_locked(
                 )
             ),
         )
+    _require_changelog_version(ctx.project.release_page, sanitized, version)
     new_paths = _new_paths(ctx, sanitized, published[0])
     if new_paths:
         _selection.show_new_paths(ctx, new_paths, show=published[0] is not None)
@@ -381,8 +419,21 @@ def _plan_prepare_locked(
 def prepare_locked(
     ctx: _context.ProjectContext,
     options: PrepareOptions,
-) -> _candidate.CandidateRecord:
-    """Prepare one snapshot while the caller holds the project lock."""
+) -> _records.CandidateRecord:
+    """Prepare one snapshot while the caller holds the project lock.
+
+    No host operation is performed. Accepted file-selection changes may be
+    saved before candidate construction.
+
+    Returns:
+        The retained candidate. A replacement can remain incomplete and require
+        continuation before publication.
+
+    Raises:
+        PubanonError: Source selection, current gates, saved state, or
+            candidate construction fails.
+        OperationCanceled: Interactive selection or confirmation is canceled.
+    """
     plan = _plan_prepare_locked(ctx, options)
     first_release = plan.published[0] is None
     if plan.new_paths and not first_release and not options.acknowledge_new_paths:
@@ -402,7 +453,14 @@ def prepare_locked(
 
 
 def command_prepare(args: argparse.Namespace) -> None:
-    """Prepare one retained snapshot without host contact."""
+    """Prepare one retained snapshot without host contact.
+
+    Raises:
+        PubanonError: Configuration, source selection, current gates, or
+            retained preparation fails.
+        OperationCanceled: An interactive decision is declined or the operation
+            is canceled.
+    """
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
@@ -445,8 +503,6 @@ def command_prepare(args: argparse.Namespace) -> None:
             detail_fields([('Operation', 'replacement')])
             print('\n'.join(_status.rewrite_status(paths, name, record)))
             if record.tip is None:
-                next_step(
-                    _context.project_command(name, 'prepare', f'--project={name}', '--continue')
-                )
+                next_step(project_command(name, 'prepare', f'--project={name}', '--continue'))
                 return
     next_step('pubanon inspect')

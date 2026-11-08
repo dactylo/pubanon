@@ -1,10 +1,24 @@
 """Encode the TOML string subset shared by pubanon records."""
 
 import json
+import re
 from collections.abc import Iterable
 
+_DECODE_POSITION = re.compile(r'\(at line (\d+), column (\d+)\)$')
 _SURROGATE_MAX = 0xDFFF
 _SURROGATE_MIN = 0xD800
+
+
+def decode_error_position(error: ValueError) -> str | None:
+    """Return a TOML decoding error's position as `line L, column C`.
+
+    Python 3.13 exposes the position only in the message's standard suffix.
+    The rest of the parser text can quote private content and is never
+    returned.
+    """
+    if position := _DECODE_POSITION.search(str(error)):
+        return f'line {position[1]}, column {position[2]}'
+    return None
 
 
 def toml_multiline_string(value: str) -> str:

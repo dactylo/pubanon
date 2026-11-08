@@ -317,7 +317,6 @@ def test_history_empty_does_not_create_store(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, _global, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     monkeypatch.chdir(tmp_path)
 
     assert _cli.main(['list', '--project', project.name]) == 0
@@ -451,7 +450,6 @@ def test_history_reports_publication_record_scan_failure(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, _global, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     directory = _records.publication_path(paths, project.name, 'a' * 40).parent
     directory.mkdir(parents=True)
     real_scandir = os.scandir

@@ -31,7 +31,7 @@ else:
 
     _TERMINAL_ERRORS = (EOFError, OSError, termios.error)
 
-PROJECT_COMMANDS: tuple[str, ...] = (
+_PROJECT_COMMANDS: tuple[str, ...] = (
     'audit',
     'clean',
     'delete',
@@ -64,7 +64,7 @@ PROJECT_COMMANDS: tuple[str, ...] = (
 )
 
 _BYTE_ESCAPE_MAX = 0xFF
-_CHOICE_PAIR_SIZE = 2
+_PAIR_SIZE = 2
 _COLOR_MODE: ContextVar[str] = ContextVar('color_mode', default='auto')
 _GUIDANCE_IMPLICIT_PROJECT: ContextVar[str | None] = ContextVar(
     'guidance_implicit_project', default=None
@@ -73,7 +73,7 @@ _GUIDANCE_PROJECT: ContextVar[str | None] = ContextVar('guidance_project', defau
 _GUIDANCE_WORKFLOW: ContextVar[bool] = ContextVar('guidance_workflow', default=False)
 _NO = frozenset({'n'})
 _SHORT_ESCAPE_MAX = 0xFFFF
-_STYLES: dict[StyleKind, str] = {
+_STYLES: dict[_StyleKind, str] = {
     'plain': '',
     'note': '2',
     'label': '1',
@@ -87,7 +87,7 @@ _VERBOSE: ContextVar[bool] = ContextVar('verbose', default=False)
 _YES = frozenset({'y'})
 
 
-type StyleKind = Literal[
+type _StyleKind = Literal[
     'plain', 'note', 'label', 'heading', 'choice', 'success', 'warning', 'error'
 ]
 
@@ -117,9 +117,6 @@ def color_context(mode: str) -> Generator[None]:
     Args:
         mode: `auto` uses each destination's terminal status and `NO_COLOR`;
             `always` and `never` override both.
-
-    Raises:
-        ValueError: The color mode is unknown.
     """
     if mode not in {'auto', 'always', 'never'}:
         raise ValueError(f'invalid color mode: {mode}')
@@ -137,6 +134,11 @@ def color_enabled(*, stream: TextIO | None = None) -> bool:
     return mode == 'always' or (
         mode == 'auto' and 'NO_COLOR' not in os.environ and target.isatty()
     )
+
+
+def counted(count: int, noun: str) -> str:
+    """Return a count with a regular plural noun, such as `1 run` or `3 runs`."""
+    return f'{count} {noun}' if count == 1 else f'{count} {noun}s'
 
 
 def display_duration(seconds: int) -> str:
@@ -321,7 +323,11 @@ def guidance_context(
 
 @contextmanager
 def output_encoding_context() -> Generator[None]:
-    """Display unencodable CLI text visibly while retaining stream settings."""
+    """Display unencodable CLI text visibly while retaining stream settings.
+
+    Raises:
+        OSError: Reconfiguring or restoring a stream fails while flushing it.
+    """
     # Transitional protection while stdio may use a non-UTF-8 locale encoding.
     # PEP 686 defaults to UTF-8 mode in Python 3.15, but PYTHONUTF8=0 still
     # disables it; revisit when Python 3.15 becomes the minimum.
@@ -380,6 +386,19 @@ def project_fallback(project: str, action: str, mode: str | None) -> str:
     )
 
 
+def series(items: Sequence[str], conjunction: str = 'and') -> str:
+    """Join items as `a`, `a and b`, or `a, b, and c`.
+
+    Two items that already contain the conjunction also get the serial comma,
+    so `a and b, and c` stays unambiguous.
+    """
+    if len(items) <= 1:
+        return ''.join(items)
+    if len(items) == _PAIR_SIZE and not any(f' {conjunction} ' in item for item in items):
+        return f'{items[0]} {conjunction} {items[1]}'
+    return ', '.join(items[:-1]) + f', {conjunction} {items[-1]}'
+
+
 def shell_command(*args: str) -> str | None:
     """Render a shell command only when visible text preserves its arguments."""
     command = shlex.join(args)
@@ -422,7 +441,7 @@ def guidance(text: str) -> str:
 
     return re.sub(
         r'(?P<command>(?<![\w/\\])pubanon (?:'
-        + '|'.join(re.escape(command) for command in PROJECT_COMMANDS)
+        + '|'.join(re.escape(command) for command in _PROJECT_COMMANDS)
         + r')(?![\w/-]))'
         + r'(?P<rest>(?:(?![`;\n,]| then | or | && ).)*)',
         _qualify,
@@ -430,17 +449,24 @@ def guidance(text: str) -> str:
     )
 
 
-@contextmanager
-def verbose_context(enabled: bool) -> Generator[None]:
-    """Scope diagnostic output, restoring the previous setting on every exit."""
-    token = _VERBOSE.set(enabled)
-    try:
-        yield
-    finally:
-        _VERBOSE.reset(token)
+def project_command(name: str, *args: str) -> str:
+    """Render a pubanon command, or direct recovery to the project's registered directory.
+
+    Args:
+        name: Project selected by the command.
+        *args: Command words after `pubanon`, including any `--project` option.
+    """
+    command = shell_command('pubanon', *args)
+    if command is not None:
+        return command
+    # Running from the registered directory selects the project, so keep every other argument.
+    kept = [arg for arg in args if not arg.startswith('--project=')]
+    modes = [arg for arg in kept if arg in {'--clean', '--continue', '--resolve'}]
+    action = ' '.join(arg for arg in kept if arg not in modes)
+    return project_fallback(name, action, ' '.join(modes) or None)
 
 
-def style(text: str, kind: StyleKind = 'label', *, stream: TextIO | None = None) -> str:
+def style(text: str, kind: _StyleKind = 'label', *, stream: TextIO | None = None) -> str:
     """Style terminal text according to the scoped color mode.
 
     Args:
@@ -493,7 +519,7 @@ def diagnostic(error: _errors.PubanonError, *, stream: TextIO | None = None) -> 
     return '\n'.join(lines)
 
 
-def field(label: str, value: str, *, kind: StyleKind = 'plain') -> str:
+def field(label: str, value: str, *, kind: _StyleKind = 'plain') -> str:
     """Render a bold field label and optionally styled value.
 
     Args:
@@ -503,65 +529,6 @@ def field(label: str, value: str, *, kind: StyleKind = 'plain') -> str:
             `style`.
     """
     return f'{style(label + ":")} {style(value, kind)}'
-
-
-def next_step(text: str) -> None:
-    """Print the next command unless an enclosing workflow owns the next step."""
-    if not text or _GUIDANCE_WORKFLOW.get():
-        return
-    print(f'{style("Next:")} {style(guidance(text), "choice")}')
-
-
-def render_fields(
-    rows: Sequence[tuple[str, str]], *, indent: int = 0, align_continuations: bool = True
-) -> str:
-    """Render already escaped field rows with bold labels and aligned values.
-
-    Args:
-        rows: Pairs of field labels without colons and field values. Later
-            lines of a multi-line value align under its first line unless
-            `align_continuations` is false.
-        indent: Number of spaces before each label.
-        align_continuations: Add value-column indentation to continuation
-            lines; disable for blocks whose layout is already formatted.
-    """
-    width = max((len(label) for label, _value in rows), default=0)
-    continuation = '\n' + ' ' * (indent + width + 2) if align_continuations else '\n'
-    return '\n'.join(
-        ' ' * indent
-        + style(label + ':')
-        + ' ' * (width - len(label) + 1)
-        + value.replace('\n', continuation)
-        for label, value in rows
-    )
-
-
-def fields(rows: Sequence[tuple[str, str]], *, indent: int = 0) -> None:
-    """Print already escaped field rows with bold labels and aligned values.
-
-    Args:
-        rows: Pairs of field labels without colons and field values. Later
-            lines of a multi-line value align under its first line.
-        indent: Number of spaces before each label.
-    """
-    if rows:
-        print(render_fields(rows, indent=indent))
-
-
-def verbose_enabled() -> bool:
-    """Return whether diagnostic output is enabled for the current command."""
-    return _VERBOSE.get()
-
-
-def detail_fields(rows: Sequence[tuple[str, str]], *, indent: int = 0) -> None:
-    """Print already escaped aligned field rows only in verbose mode.
-
-    Args:
-        rows: Pairs of field labels without colons and field values.
-        indent: Number of spaces before each label.
-    """
-    if verbose_enabled():
-        fields(rows, indent=indent)
 
 
 def heading(text: str, *, separate: bool = False) -> None:
@@ -574,7 +541,14 @@ def heading(text: str, *, separate: bool = False) -> None:
     print(('\n' if separate else '') + style(text.removesuffix(':'), 'heading'))
 
 
-def output(text: str = '', *, kind: StyleKind = 'plain') -> None:
+def next_step(text: str) -> None:
+    """Print the next command unless an enclosing workflow owns the next step."""
+    if not text or _GUIDANCE_WORKFLOW.get():
+        return
+    print(f'{style("Next:")} {style(guidance(text), "choice")}')
+
+
+def output(text: str = '', *, kind: _StyleKind = 'plain') -> None:
     """Print one terminal message using its presentation role.
 
     Args:
@@ -582,12 +556,6 @@ def output(text: str = '', *, kind: StyleKind = 'plain') -> None:
         kind: Presentation role accepted by `style`.
     """
     print(style(text, kind))
-
-
-def detail(text: str = '') -> None:
-    """Print already escaped diagnostic text as a note only in verbose mode."""
-    if verbose_enabled():
-        output(text, kind='note')
 
 
 def ask(
@@ -632,11 +600,7 @@ def ask(
     separator = '' if question.endswith(('?', ':')) else ':'
     prompt = f'{style(question + separator)} {style(rendered + suffix, "choice")}: '
     words = [word for word, _letter, _rendered in parsed]
-    hint = 'Choose ' + (
-        f'{words[0]} or {words[1]}.'
-        if len(words) == _CHOICE_PAIR_SIZE
-        else ', '.join(words[:-1]) + f', or {words[-1]}.'
-    )
+    hint = f'Choose {series(words, "or")}.'
     while True:
         answer = _read(prompt, key=True).strip().casefold()
         if not answer and default is not None:
@@ -674,3 +638,76 @@ def confirm(question: str, *, default: bool | None = None) -> bool:
         if answer in _NO:
             return False
         output('Enter y or n.', kind='warning')
+
+
+def render_fields(
+    rows: Sequence[tuple[str, str]], *, indent: int = 0, align_continuations: bool = True
+) -> str:
+    """Render already escaped field rows with bold labels and aligned values.
+
+    Args:
+        rows: Pairs of field labels without colons and field values. Later
+            lines of a multi-line value align under its first line unless
+            `align_continuations` is false.
+        indent: Number of spaces before each label.
+        align_continuations: Add value-column indentation to continuation
+            lines; disable for blocks whose layout is already formatted.
+    """
+    width = max((len(label) for label, _value in rows), default=0)
+    continuation = '\n' + ' ' * (indent + width + 2) if align_continuations else '\n'
+    return '\n'.join(
+        ' ' * indent
+        + style(label + ':')
+        + ' ' * (width - len(label) + 1)
+        + value.replace('\n', continuation)
+        for label, value in rows
+    )
+
+
+def fields(rows: Sequence[tuple[str, str]], *, indent: int = 0) -> None:
+    """Print already escaped field rows with bold labels and aligned values.
+
+    Args:
+        rows: Pairs of field labels without colons and field values. Later
+            lines of a multi-line value align under its first line.
+        indent: Number of spaces before each label.
+    """
+    if rows:
+        print(render_fields(rows, indent=indent))
+
+
+@contextmanager
+def verbose_context(enabled: bool) -> Generator[None]:
+    """Scope diagnostic output, restoring the previous setting on every exit."""
+    token = _VERBOSE.set(enabled)
+    try:
+        yield
+    finally:
+        _VERBOSE.reset(token)
+
+
+def verbose_enabled() -> bool:
+    """Return whether diagnostic output is enabled for the current command."""
+    return _VERBOSE.get()
+
+
+def detail(text: str = '') -> None:
+    """Print already escaped diagnostic text as a note only in verbose mode."""
+    if verbose_enabled():
+        output(text, kind='note')
+
+
+def detail_fields(rows: Sequence[tuple[str, str]], *, indent: int = 0) -> None:
+    """Print already escaped aligned field rows only in verbose mode.
+
+    Args:
+        rows: Pairs of field labels without colons and field values.
+        indent: Number of spaces before each label.
+    """
+    if verbose_enabled():
+        fields(rows, indent=indent)
+
+
+def display_commit(commit: str) -> str:
+    """Show a full commit ID in verbose output and its 12-character prefix otherwise."""
+    return commit if verbose_enabled() else commit[:12]

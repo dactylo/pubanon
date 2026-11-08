@@ -25,12 +25,15 @@ from pubanon._terminal import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Collection, Iterable
     from pathlib import Path
 
     from pubanon._snapshots import _source
 
 
 from pubanon._cli import _context
+
+_UNDECIDED_SHOWN = 5
 
 
 def _confirm_effect(pattern: str, action: str, membership: _policy.Membership) -> bool:
@@ -106,36 +109,50 @@ def _save_new_path_list(
     """Write a complete path batch with owner-only POSIX permissions and return its path."""
     path = _config.create_data_dirs(ctx.paths, ctx.project.name) / f'{list_name}.json'
     try:
-        path.write_text(
-            json.dumps(new_paths, ensure_ascii=False, indent=2) + '\n',
-            encoding='utf-8',
+        _filesystem.write_owner_only(
+            path, (json.dumps(new_paths, ensure_ascii=False, indent=2) + '\n').encode('utf-8')
         )
-        _filesystem.chmod(path, 0o600)
     except (OSError, UnicodeError) as exc:
         raise PubanonError('cannot write complete path list') from exc
     return path
 
 
-def policy_decision(
-    pattern: str, admitted: list[str], membership: _policy.Membership, *, back: bool = False
-) -> tuple[str, str]:
-    """Read a group choice that changes the selection, optionally undoing the previous one.
+def _undecided_fact(paths: list[str]) -> str:
+    """Name the first undecided paths and count the rest."""
+    shown = ', '.join(escape(path) for path in paths[:_UNDECIDED_SHOWN])
+    rest = len(paths) - _UNDECIDED_SHOWN
+    more = f', and {rest} more' if rest > 0 else ''
+    noun = 'file' if len(paths) == 1 else 'files'
+    return f'{len(paths)} undecided {noun}: {shown}{more}'
+
+
+def ask_credential_file(path: str, *, back: bool = False) -> str:
+    """Warn about one credential-like filename and ask whether to publish it.
 
     Args:
-        pattern: Offered pattern for the group.
-        admitted: Undecided paths in the group, shown before the choice.
-        membership: Current selection. Its unmatched paths are undecided and
-            its allowed paths are already included; a choice that changes
-            neither, or an unconfirmed exclusion of included paths, asks again.
-        back: Whether to offer undoing the previous choice.
+        path: Source-relative path whose name looks credential-like.
+        back: Offer a return to the previous choice.
 
     Returns:
-        `('publish', pattern)` or `('deny', pattern)` with the offered or
-        custom pattern, or `('back', pattern)` to undo the previous choice.
+        `include`, `exclude`, `quit`, or `back` when offered.
 
     Raises:
-        OperationCanceled: The operator chose quit.
+        PubanonError: Input ended or an interactive terminal is unavailable.
+        OperationCanceled: The prompt is interrupted.
     """
+    output(
+        'This filename can contain credentials. A name match is a warning, not proof of a secret.',
+        kind='warning',
+    )
+    print(f'\n{style("Credential-like file:")} {escape(path)}')
+    choices = ['include', 'exclude', *(['back'] if back else []), 'quit']
+    return ask('Include it?', choices=choices)
+
+
+def _policy_decision(
+    pattern: str, admitted: list[str], membership: _policy.Membership, *, back: bool = False
+) -> tuple[str, str]:
+    """Read a group choice that changes the selection, optionally undoing the previous one."""
     while True:
         print(style('Undecided files:'))
         for path in admitted:
@@ -160,7 +177,6 @@ def _apply_policy_offers(
     ctx: _context.ProjectContext,
     snapshot: _source.Snapshot,
     *,
-    persist: bool = True,
     yes: bool,
 ) -> _context.ProjectContext:
     """Resolve unmatched and credential-like path decisions."""
@@ -172,14 +188,17 @@ def _apply_policy_offers(
     )
     _policy_review_notice(membership, project.secret_exceptions)
     if membership.unmatched and yes:
-        raise PubanonError('--yes cannot answer policy proposals')
+        raise PubanonError(
+            '--yes cannot answer policy proposals',
+            fact=_undecided_fact(membership.unmatched),
+            recovery='rerun without --yes to decide them',
+        )
     allow = list(project.allow)
     deny = list(project.deny)
     exceptions = list(project.secret_exceptions)
-    membership = _policy.evaluate_membership(paths, tuple(allow), deny, global_deny=global_deny)
     while membership.unmatched:
         pattern, admitted = _policy.narrowest_offer(membership.unmatched, guided=False)[0]
-        action, selected = policy_decision(pattern, admitted, membership)
+        action, selected = _policy_decision(pattern, admitted, membership)
         (allow if action == 'publish' else deny).append(selected)
         membership = _policy.evaluate_membership(
             paths, tuple(allow), deny, global_deny=global_deny
@@ -188,9 +207,12 @@ def _apply_policy_offers(
     allowed = membership.allowed
     for path in _policy.secret_like(allowed, exceptions):
         if yes:
-            raise PubanonError('--yes cannot answer credential-like path warnings')
-        print(f'{style("Credential-like file:")} {escape(path)}')
-        decision = ask('Include it?', choices=['include', 'exclude', 'quit'])
+            raise PubanonError(
+                '--yes cannot answer credential-like path warnings',
+                fact=f'path: {escape(path)}',
+                recovery='rerun without --yes to decide it',
+            )
+        decision = ask_credential_file(path)
         if decision == 'include':
             exceptions.append(path)
         elif decision == 'exclude':
@@ -198,14 +220,42 @@ def _apply_policy_offers(
         else:
             raise OperationCanceled('Canceled. Nothing was saved.')
     project = replace(project, deny=tuple(deny), secret_exceptions=tuple(exceptions))
-    if persist and project != ctx.project:
-        _config.save_project(ctx.paths, project)
     membership = _policy.evaluate_membership(
         paths, project.allow, project.deny, global_deny=global_deny
     )
     if membership.unmatched:
         raise PubanonError('project policy still has unmatched paths')
     return _context.ProjectContext(ctx.paths, ctx.global_config, project)
+
+
+def ask_next_group(
+    paths: Iterable[str],
+    allow: Collection[str],
+    deny: Collection[str],
+    *,
+    global_deny: Collection[str],
+) -> tuple[str, str] | None:
+    """Ask about the narrowest undecided group, offering Back.
+
+    Args:
+        paths: Paths eligible for a group decision.
+        allow: Include patterns decided so far.
+        deny: Exclude patterns decided so far.
+        global_deny: Patterns every project excludes.
+
+    Returns:
+        `None` when no path is undecided; otherwise the `_policy_decision`
+        result, whose action is `publish`, `deny`, or `back`.
+
+    Raises:
+        PubanonError: Input ended or an interactive terminal is unavailable.
+        OperationCanceled: The selection is canceled or interrupted.
+    """
+    membership = _policy.evaluate_membership(paths, allow, deny, global_deny=global_deny)
+    if not membership.unmatched:
+        return None
+    pattern, admitted = _policy.narrowest_offer(membership.unmatched, guided=True)[0]
+    return _policy_decision(pattern, admitted, membership, back=True)
 
 
 def _review_groups(ctx: _context.ProjectContext, paths: list[str]) -> _context.ProjectContext:
@@ -215,12 +265,9 @@ def _review_groups(ctx: _context.ProjectContext, paths: list[str]) -> _context.P
     project = replace(ctx.project, allow=(), deny=())
     previous: list[_config.ProjectConfig] = []
     while (
-        membership := _policy.evaluate_membership(
-            eligible, project.allow, project.deny, global_deny=global_deny
-        )
-    ).unmatched:
-        pattern, admitted = _policy.narrowest_offer(membership.unmatched, guided=True)[0]
-        action, selected = policy_decision(pattern, admitted, membership, back=True)
+        decision := ask_next_group(eligible, project.allow, project.deny, global_deny=global_deny)
+    ) is not None:
+        action, selected = decision
         if action == 'back':
             if previous:
                 project = previous.pop()
@@ -239,7 +286,11 @@ def _review_groups(ctx: _context.ProjectContext, paths: list[str]) -> _context.P
 def sanitized_snapshot(
     ctx: _context.ProjectContext, snapshot: _source.Snapshot
 ) -> _source.Snapshot:
-    """Retain only paths explicitly allowed after deny precedence."""
+    """Retain only paths explicitly allowed after deny precedence.
+
+    Raises:
+        PubanonError: Selected source paths remain undecided.
+    """
     membership = _policy.evaluate_membership(
         [entry.path for entry in snapshot],
         ctx.project.allow,
@@ -255,7 +306,11 @@ def sanitized_snapshot(
 def show_new_paths(
     ctx: _context.ProjectContext, new_paths: list[str], *, show: bool = True
 ) -> None:
-    """Save every new path and optionally list paths for a later release review."""
+    """Save every new path and optionally list paths for a later release review.
+
+    Raises:
+        PubanonError: The complete private path report cannot be saved.
+    """
     saved = _save_new_path_list(ctx, new_paths)
     if show:
         heading('Files not in the last release', separate=True)
@@ -266,7 +321,12 @@ def show_new_paths(
 
 
 def show_selection(ctx: _context.ProjectContext, paths: list[str]) -> None:
-    """Display and save the exact proposed selection with exclusion reasons."""
+    """Display and save the exact proposed selection with exclusion reasons.
+
+    Raises:
+        PubanonError: Paths remain undecided or the complete private selection
+            report cannot be saved.
+    """
     membership = _policy.evaluate_membership(
         paths,
         ctx.project.allow,
@@ -328,9 +388,15 @@ def review_selection(
 
     Unattended preparation keeps the existing policy-proposal refusals. An
     interactive cancellation leaves the saved project configuration unchanged.
+
+    Raises:
+        PubanonError: Unattended selection requires new decisions, selection
+            reporting or saving fails, or interactive input is unavailable or
+            ends.
+        OperationCanceled: The review is canceled or interrupted.
     """
     original = ctx.project
-    ctx = _apply_policy_offers(ctx, snapshot, persist=False, yes=yes)
+    ctx = _apply_policy_offers(ctx, snapshot, yes=yes)
     if not yes:
         paths = [entry.path for entry in snapshot]
         while True:
@@ -341,9 +407,7 @@ def review_selection(
             if choice == 'continue':
                 break
             print('Review each group below. Customize takes a pattern to include or exclude.')
-            ctx = _apply_policy_offers(
-                _review_groups(ctx, paths), snapshot, persist=False, yes=False
-            )
+            ctx = _apply_policy_offers(_review_groups(ctx, paths), snapshot, yes=False)
     if ctx.project != original:
         _config.save_project(ctx.paths, ctx.project)
     return ctx

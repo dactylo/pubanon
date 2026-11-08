@@ -1,6 +1,5 @@
 """Resume frozen publication-history replay without changing published refs."""
 
-import re
 import time
 from collections.abc import Mapping
 from dataclasses import replace
@@ -10,13 +9,13 @@ from typing import Literal
 from pubanon import _filesystem
 from pubanon._config import GlobalConfig, Paths, ProjectConfig, fingerprint
 from pubanon._errors import PubanonError
-from pubanon._run import OID_HEX, run_git
+from pubanon._run import run_git
 from pubanon._snapshots import (
     _candidate,
     _conflicts,
     _history,
     _records,
-    _reports,
+    _source,
     _store,
     _verification,
 )
@@ -54,30 +53,17 @@ def _clear_pause(paths: Paths, project: str, store: Path) -> None:
 
 def _commit_replay(store: Path, g: GlobalConfig, old: str, base: str, tree: str) -> str:
     """Create a commit even when replay produced no file changes."""
-    raw = run_git(
-        ['--git-dir', str(store.absolute()), 'cat-file', 'commit', old], cwd=store
-    ).stdout
-    headers, _, message = raw.partition(b'\n\n')
-    author = next(line for line in headers.splitlines() if line.startswith(b'author '))
-    date = b' '.join(author.rsplit(b' ', 2)[-2:]).decode('ascii')
-    env = {
-        'GIT_AUTHOR_NAME': g.anon_name,
-        'GIT_AUTHOR_EMAIL': g.anon_email,
-        'GIT_AUTHOR_DATE': date,
-        'GIT_COMMITTER_NAME': g.anon_name,
-        'GIT_COMMITTER_EMAIL': g.anon_email,
-        'GIT_COMMITTER_DATE': f'{int(time.time())} +0000',
-    }
+    _tree, _parents, date, message = _candidate.commit_fields(store, old)
+    env = _candidate.identity_env(
+        g, author_date=date.decode('ascii'), committer_date=f'{int(time.time())} +0000'
+    )
     result = run_git(
         ['--git-dir', str(store.absolute()), 'commit-tree', tree, '-p', base],
         cwd=store,
         input_bytes=message,
         env_extra=env,
     )
-    commit = result.stdout.strip().decode('ascii')
-    if re.fullmatch(OID_HEX, commit) is None:
-        raise PubanonError('Git returned an invalid replay commit ID')
-    return commit
+    return _source.parse_oid(result.stdout, 'Git returned an invalid replay commit ID')
 
 
 def _complete(record: CandidateRecord, progress: RewriteRecord) -> CandidateRecord:
@@ -240,12 +226,16 @@ def continue_rewrite(
     durable awaiting-resolution record and export. Calling while awaiting
     validates user decisions; calling while exporting only restores the export.
     No source lookup or host operation is performed.
+
+    Raises:
+        PubanonError: Saved progress, current configuration or gates, conflict
+            decisions, replay, or cleanup fails.
     """
     record = _records.load_candidate(paths, p.name)
     progress = _records.load_rewrite(paths, p.name)
     if record is None or record.replaces is None:
         raise PubanonError('no rewrite is in progress')
-    recovery = _reports.reprepare_advice(record, project=p.name)
+    recovery = _verification.reprepare_advice(record, project=p.name)
     if fingerprint(g, p) != record.fingerprint:
         raise PubanonError(
             'the configuration changed after the snapshot was prepared',
@@ -300,6 +290,11 @@ def resolve_replacement(
 
     `all` selects current main and requests a fresh root; every other selector
     preserves the exact selected publication for a one-publication correction.
+
+    Raises:
+        PubanonError: Publication history is unavailable, the selector is
+            unknown or ambiguous, or the selected commit is outside linear main
+            ancestry.
     """
     main, _ = _candidate.published_refs(paths, project)
     if main is None:

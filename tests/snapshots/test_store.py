@@ -8,7 +8,7 @@ from pubanon._errors import PubanonError
 from pubanon._run import GitResult
 from pubanon._snapshots import _store
 from tests._git import git_env
-from tests.snapshots.test_candidate import _paths
+from tests._setup import make_paths
 
 
 def test_candidate_store_initialization_reports_child_failure(
@@ -19,7 +19,7 @@ def test_candidate_store_initialization_reports_child_failure(
 
     monkeypatch.setattr(_store, 'run_git', _fail)
     with pytest.raises(PubanonError, match='cannot initialize snapshot store') as error:
-        _store.store_path(_paths(tmp_path), 'example')
+        _store.store_path(make_paths(tmp_path), 'example')
     assert error.value.fact == r'exit status 7: diagnostic\x1b\\path'
 
 
@@ -28,7 +28,7 @@ def test_candidate_store_path_refuses_invalid_project_names(
     tmp_path: Path,
     project: str,
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
 
     with pytest.raises(PubanonError, match='invalid project name'):
         _store.candidate_store_path(paths, project)
@@ -37,7 +37,7 @@ def test_candidate_store_path_refuses_invalid_project_names(
 
 
 def test_candidate_store_path_returns_absent_store_without_creating_it(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
 
     store = _store.candidate_store_path(paths, 'example')
 
@@ -46,7 +46,7 @@ def test_candidate_store_path_returns_absent_store_without_creating_it(tmp_path:
 
 
 def test_store_path_initializes_project_bare_repository(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
 
     store = _store.store_path(paths, 'example')
 

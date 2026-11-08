@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from pubanon import _filesystem
+from tests._permissions import assert_private_mode
 
 
 def test_durable_unlink_refuses_a_missing_file_without_residue(tmp_path: Path) -> None:
@@ -101,6 +102,28 @@ def test_windows_cleanup_restores_file_access_without_changing_link_targets(
     assert sentinel.read_bytes() == b'preserve'
 
 
+def test_write_owner_only_creates_private_file_and_tightens_existing(tmp_path: Path) -> None:
+    created = tmp_path / 'created.json'
+    _filesystem.write_owner_only(created, b'first\n')
+    assert created.read_bytes() == b'first\n'
+    assert_private_mode(created, 0o600)
+
+    existing = tmp_path / 'existing.json'
+    existing.write_bytes(b'old content that is longer\n')
+    existing.chmod(0o644)
+    _filesystem.write_owner_only(existing, b'new\n')
+    assert existing.read_bytes() == b'new\n'
+    assert_private_mode(existing, 0o600)
+
+
+def test_write_owner_only_exclusive_refuses_existing_file(tmp_path: Path) -> None:
+    existing = tmp_path / 'existing.json'
+    existing.write_bytes(b'kept\n')
+    with pytest.raises(FileExistsError):
+        _filesystem.write_owner_only(existing, b'replaced\n', exclusive=True)
+    assert existing.read_bytes() == b'kept\n'
+
+
 def test_write_private_preserves_uncertainty_when_replace_finishes_then_interrupts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -118,9 +141,9 @@ def test_write_private_preserves_uncertainty_when_replace_finishes_then_interrup
     with pytest.raises(_filesystem.DurableWriteError) as raised:
         _filesystem.write_private(path, b'new')
 
-    assert not raised.value.replaced
-    assert raised.value.replacement_attempted
-    assert raised.value.interrupted
+    assert not raised.value._replaced
+    assert raised.value._replacement_attempted
+    assert raised.value._interrupted
     assert path.read_bytes() == b'new'
     assert list(directory.iterdir()) == [path]
 
@@ -168,9 +191,71 @@ def test_write_private_reports_failure_phase_and_cleans_temporary(
     with pytest.raises(_filesystem.DurableWriteError) as raised:
         _filesystem.write_private(path, b'new')
 
-    assert raised.value.replaced is (phase == 'directory_sync')
-    assert raised.value.replacement_attempted is (phase != 'file_sync')
-    assert raised.value.interrupted is (failure is KeyboardInterrupt)
+    assert raised.value._replaced is (phase == 'directory_sync')
+    assert raised.value._replacement_attempted is (phase != 'file_sync')
+    assert raised.value._interrupted is (failure is KeyboardInterrupt)
     assert raised.value.__cause__ is error
     assert path.read_bytes() == (b'new' if phase == 'directory_sync' else b'old')
     assert list(directory.iterdir()) == [path]
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='requires native Windows filesystem behavior')
+def test_cleanup_permission_change_does_not_follow_link(tmp_path: Path) -> None:
+    target = tmp_path / 'target'
+    target.write_bytes(b'outside')
+    _filesystem.chmod(target, 0o400)
+    link = tmp_path / 'link'
+    link.symlink_to(target)
+    try:
+        _filesystem.chmod(link, 0o600, follow_symlinks=False)
+        link.unlink()
+        with pytest.raises(PermissionError):
+            target.write_bytes(b'changed')
+    finally:
+        _filesystem.chmod(target, 0o600)
+    assert target.read_bytes() == b'outside'
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='requires native Windows filesystem behavior')
+def test_readonly_files_prevent_accidental_edits_and_allow_cleanup(tmp_path: Path) -> None:
+    directory = tmp_path / 'inspection'
+    directory.mkdir()
+    _filesystem.chmod(directory, 0o700)
+    file = directory / 'content'
+    with file.open('wb') as stream:
+        _filesystem.fchmod(stream.fileno(), 0o600)
+        stream.write(b'private')
+    _filesystem.chmod(file, 0o400)
+    _filesystem.chmod(directory, 0o500)
+    try:
+        assert file.read_bytes() == b'private'
+        with pytest.raises(PermissionError):
+            file.write_bytes(b'changed')
+        with pytest.raises(PermissionError):
+            file.unlink()
+    finally:
+        _filesystem.chmod(directory, 0o700)
+        _filesystem.chmod(file, 0o600)
+    file.unlink()
+    directory.rmdir()
+    assert not directory.exists()
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='requires native Windows filesystem behavior')
+@pytest.mark.parametrize('directory', [False, True])
+def test_writable_cleanup_clears_existing_dos_readonly_attribute(
+    tmp_path: Path, directory: bool
+) -> None:
+    path = tmp_path / 'readonly'
+    if directory:
+        path.mkdir()
+    else:
+        path.write_bytes(b'content')
+    path.chmod(0o400)
+    _filesystem.chmod(path, 0o700 if directory else 0o600)
+    if directory:
+        path.rmdir()
+    else:
+        path.write_bytes(b'updated')
+        path.unlink()
+    assert not path.exists()

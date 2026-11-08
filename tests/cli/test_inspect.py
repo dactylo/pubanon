@@ -12,16 +12,13 @@ from pubanon import (
     _filesystem,
 )
 from pubanon._cli import _context, _inspect
-from pubanon._errors import PubanonError
 from pubanon._remote import _host, _releases, _stage
 from pubanon._snapshots import (
     _candidate,
-    _discard,
     _history,
     _records,
     _reports,
     _source,
-    _store,
     _verification,
 )
 from pubanon._terminal import escape
@@ -29,96 +26,6 @@ from tests._cli import gh_calls, prepare, record_published_main
 from tests._git import git_env, remove_tree
 from tests._permissions import assert_private_mode
 from tests._setup import configure
-
-
-def test_inspect_ambiguous_tags_offer_one_manual_command_per_tag(
-    tmp_path: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    fake_gh: Path,
-) -> None:
-    source = make_repo(files={'README.md': 'public\n'})
-    paths, project, original = prepare(tmp_path, source, monkeypatch)
-    store = _store.candidate_store_path(paths, project.name)
-    tags = ('v1.2.1', 'v1.2.2')
-    for ref in ('refs/heads/main', *(f'refs/tags/{tag}' for tag in tags)):
-        subprocess.run(
-            ['git', '-C', store, 'update-ref', ref, original.commit], check=True, env=git_env()
-        )
-    _discard.discard(paths, project.name, force=False)
-    assert _cli.main(['prepare', '--project', project.name, '--replace', '--yes']) == 0
-    replacement = _records.load_candidate(paths, project.name)
-    assert replacement is not None
-    assert replacement.replaces == original.commit
-    assert replacement.tag_intent is None
-    assert replacement.poststate_tags == dict.fromkeys(tags, replacement.commit)
-    before = gh_calls(fake_gh.parent)
-    capsys.readouterr()
-
-    assert _cli.main(['inspect', '--project', project.name]) == 0
-
-    rendered = capsys.readouterr().out
-    assert 'Release page (planned): not created' in rendered
-    assert 'v1.2.1 and v1.2.2' in rendered
-    assert 'pubanon release create v1.2.1 --project=demo' in rendered
-    assert 'pubanon release create v1.2.2 --project=demo' in rendered
-    assert 'create "v1.2.1"' not in rendered
-    assert gh_calls(fake_gh.parent) == before
-
-
-@pytest.mark.parametrize(
-    'case',
-    [
-        (
-            {'README.md': 'public\n'},
-            _config.ReleasePageSettings(enabled=True),
-            'create "v1.2.3" with empty notes (no CHANGELOG.md; set release_page.changelog)',
-        ),
-        (
-            {'README.md': 'public\n'},
-            _config.ReleasePageSettings(enabled=True, draft=True),
-            'create draft "v1.2.3" with empty notes (no CHANGELOG.md; set release_page.changelog)',
-        ),
-        (
-            {'README.md': 'public\n'},
-            None,
-            'not created; release pages are off for this project',
-        ),
-        (
-            {'README.md': 'public\n'},
-            _config.ReleasePageSettings(),
-            'not created; release pages are off for this project',
-        ),
-        (
-            {'README.md': 'public\n'},
-            _config.ReleasePageSettings(enabled=False),
-            'not created; release pages are off for this project',
-        ),
-    ],
-)
-def test_inspect_explains_page_without_changelog_or_when_disabled(
-    tmp_path: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    case: tuple[dict[str, str], _config.ReleasePageSettings | None, str],
-) -> None:
-    files, release_page, expected = case
-    source = make_repo(files=files)
-    paths, project, _record = prepare(tmp_path, source, monkeypatch, version='1.2.3')
-    _config.save_project(
-        paths,
-        replace(
-            project,
-            release_page=release_page,
-        ),
-    )
-    capsys.readouterr()
-
-    assert _cli.main(['inspect', '--project', project.name]) == 0
-
-    assert f'Release page (planned): {expected}' in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
@@ -146,7 +53,7 @@ def test_inspect_guides_saved_route_without_host_reads_and_keeps_review_copy(
         _stage._save_stage(
             paths,
             project.name,
-            _stage.StageRecord(record.commit, project.owner, _config.stage_repository(project)),
+            _stage._StageRecord(record.commit, project.owner, _config.stage_repository(project)),
         )
         project = replace(project, required_checks=('build',))
         _config.save_project(paths, project)
@@ -181,7 +88,6 @@ def test_inspect_lists_preserved_copies_without_a_candidate(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     root = paths.data_dir / 'projects' / project.name
     copies = [root / 'inspections' / (oid * 40) for oid in ('a', 'b')]
     for copy in copies:
@@ -431,31 +337,6 @@ def test_inspect_refresh_reports_exact_location_before_removal(
     assert _records.load_candidate(paths, project.name) == record
 
 
-def test_inspect_reports_rendering_failure_without_failing_command(
-    tmp_path: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    source = make_repo(files={'README.md': 'public\n'})
-    paths, project, _record = prepare(tmp_path, source, monkeypatch, version='1.2.3')
-    _config.save_project(
-        paths, replace(project, release_page=_config.ReleasePageSettings(enabled=True))
-    )
-
-    def _fail_render(*_args: object, **_kwargs: object) -> Never:
-        raise PubanonError('bad\nnotes')
-
-    monkeypatch.setattr(_releases, '_render_page', _fail_render)
-    capsys.readouterr()
-
-    assert _cli.main(['inspect', '--project', project.name]) == 0
-
-    rendered = capsys.readouterr()
-    assert f'Release page (planned): cannot be planned: {escape("bad\nnotes")}' in rendered.out
-    assert rendered.err == ''
-
-
 def test_inspect_rewrite_delegates_selector_and_refresh(
     tmp_path: Path,
     make_repo: Callable[..., Path],
@@ -510,30 +391,3 @@ def test_inspect_rewrite_delegates_selector_and_refresh(
         == 1
     )
     assert calls == [('v1.0.0', True)]
-
-
-def test_inspect_shows_hints_for_a_refused_notes_template(
-    tmp_path: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    source = make_repo(
-        files={'README.md': 'public\n', 'CHANGELOG.md': '# Changelog\n\n## Version 1.2.3\n- a\n'}
-    )
-    paths, project, _record = prepare(tmp_path, source, monkeypatch, version='1.2.3')
-    settings = _config.ReleasePageSettings(enabled=True, notes='{changelog_section}')
-    _config.save_project(paths, replace(project, release_page=settings))
-    capsys.readouterr()
-
-    assert _cli.main(['inspect', '--project', project.name]) == 0
-
-    assert (
-        'Release page (planned): cannot be planned: release_page.notes uses '
-        '{changelog_section}, but CHANGELOG.md has no heading for 1.2.3\n'
-        '  line 3 mentions 1.2.3: ## Version 1.2.3\n'
-        '  to use headings like this, add changelog_heading = "## Version {version}" '
-        'to [release_page]\n'
-        '  add or correct the 1.2.3 section, use a notes file, '
-        'or remove {changelog_section} from release_page.notes\n'
-    ) in capsys.readouterr().out

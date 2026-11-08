@@ -1,9 +1,10 @@
 """Observe exact CI and package-release targets without mutation."""
 
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from typing import NamedTuple
 
+from pubanon._changelog import version_from_tag
 from pubanon._config import (
     GlobalConfig,
     PackageObservation,
@@ -27,7 +28,7 @@ from pubanon._remote._host import (
 )
 from pubanon._remote._package import PackageRelease, release_state
 from pubanon._remote._stage import candidate_next_action, load_stage, verify_staged_target
-from pubanon._snapshots._candidate import published_refs, tag_intent_for, version_from_tag
+from pubanon._snapshots._candidate import published_refs, tag_intent_for
 from pubanon._snapshots._records import load_candidate
 from pubanon._terminal import (
     detail,
@@ -78,18 +79,6 @@ def _pause_or_expire(deadline: float, error: PubanonError) -> None:
     _sleep(min(_POLL_SECONDS, remaining))
     if _monotonic() >= deadline:
         raise error
-
-
-def _published_next_action(
-    p: ProjectConfig, *, package_complete: bool = False, version: str | None = None
-) -> str:
-    """Choose the next configured step after a published observation."""
-    if not package_complete and p.package is not None:
-        selected = f' --version {escape(version)}' if version is not None else ''
-        return f'pubanon package watch{selected}'
-    if p.visibility == 'private':
-        return 'pubanon repo reveal'
-    return ''
 
 
 def _report_check_changes(
@@ -372,25 +361,32 @@ def _wait_for_run(
         _pause_or_expire(deadline, _timeout_error('CI run', retry=retry))
 
 
-def ci_verdicts(
-    dest: Destination,
-    commit: str,
-    checks: Iterable[str],
-) -> list[CheckVerdict]:
-    """Read each configured CI check once for an exact commit.
+def next_after_publication(
+    p: ProjectConfig,
+    *,
+    version: str | None = None,
+    ci_observed: bool = False,
+    package_observed: bool = False,
+) -> str:
+    """Choose the next configured step after publication.
 
     Args:
-        dest: Verified host destination to query.
-        commit: Exact commit object ID to observe.
-        checks: Configured check names in display order.
+        p: Published project.
+        version: Release version to keep in observation commands.
+        ci_observed: Whether required checks were already observed.
+        package_observed: Whether the package release was already observed.
 
     Returns:
-        One current verdict per configured check.
-
-    Raises:
-        PubanonError: A host response is invalid or cannot be read.
+        The next command, or an empty string when no configured step remains.
     """
-    return [_host.check_result((dest.owner, dest.repo), commit, name) for name in checks]
+    selected = f' --version {escape(version)}' if version is not None else ''
+    if not ci_observed and (p.required_checks or p.ci_workflow):
+        return f'pubanon repo watch{selected}'
+    if not package_observed and p.package is not None:
+        return f'pubanon package watch{selected}'
+    if p.visibility == 'private':
+        return 'pubanon repo reveal'
+    return ''
 
 
 def select_package_release(
@@ -478,7 +474,10 @@ def watch_ci(  # noqa: PLR0913
     if not (p.required_checks or p.ci_workflow):
         raise PubanonError(
             'no required checks are configured',
-            recovery='add required_checks to the project configuration',
+            recovery=(
+                'choose a CI workflow or required checks in the checks section of '
+                '`pubanon init --edit`'
+            ),
         )
     retry = (
         'rerun `pubanon stage watch`'
@@ -536,7 +535,7 @@ def watch_ci(  # noqa: PLR0913
     next_action = (
         candidate_next_action(paths, g, p, load_candidate(paths, p.name), checked_commit=commit)
         if staged
-        else _published_next_action(p, version=version)
+        else next_after_publication(p, version=version, ci_observed=True)
     )
     _report_ci(next_action)
 
@@ -612,7 +611,9 @@ def watch_package(
             raise _timeout_error('package release', retry=retry) from exc
         _remaining(deadline, 'package release', retry=retry)
         if release is not None and release.files:
-            _report_package(release, _published_next_action(p, package_complete=True))
+            _report_package(
+                release, next_after_publication(p, ci_observed=True, package_observed=True)
+            )
             return
         state = 'absent' if release is None else 'metadata found; no distribution files'
         if state != previous:

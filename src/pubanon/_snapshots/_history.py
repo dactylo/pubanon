@@ -9,12 +9,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from pubanon import _filesystem
+from pubanon._changelog import version_from_tag
 from pubanon._config import Paths, ProjectConfig
 from pubanon._errors import OperationCanceled, PubanonError
 from pubanon._run import OID_HEX, git_failure_fact, run_git
 from pubanon._snapshots import _candidate, _inspection, _records, _source, _store, _verification
 from pubanon._snapshots._records import CandidateRecord, PublicationRecord
-from pubanon._terminal import escape, path_text, project_fallback, shell_command
+from pubanon._terminal import escape, path_text, project_command, shell_command
 from pubanon._terminal import field as display_field
 
 _OID_PREFIX = re.compile(r'[0-9a-fA-F]+')
@@ -22,7 +23,6 @@ _PUBLICATION_REPAIR = (
     'Restore the local publication store from a backup, or use '
     '`pubanon repo restore --to local` if the host still contains this published snapshot.'
 )
-_VERSION_TAG = re.compile(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)')
 
 
 @dataclass(frozen=True)
@@ -351,7 +351,7 @@ def _worktree_guidance(
     if source is None:
         return ()
     destination = (
-        paths.data_dir / 'projects' / project.name / 'source-worktrees' / record.commit
+        paths.project_data(project.name) / 'source-worktrees' / record.commit
     ).absolute()
     lines = [
         (
@@ -410,7 +410,12 @@ def _worktree_guidance(
 def delete_guidance(
     paths: Paths, project: ProjectConfig, entry: PublicationEntry
 ) -> tuple[str, ...]:
-    """Preflight cleanup under the project lock and describe its exact scope."""
+    """Preflight cleanup under the project lock and describe its exact scope.
+
+    Raises:
+        PubanonError: Retained recovery dependencies or conflicting ownership
+            prevent deletion, or required evidence cannot be read.
+    """
     _delete_preflight(paths, project, entry)
     return (
         display_field('Snapshot', entry.commit[:12]),
@@ -428,6 +433,12 @@ def delete_publication(paths: Paths, project: ProjectConfig, entry: PublicationE
     their recovery record until last; recordless entries save the deletion
     before releasing their archive. A partial failure reports the retry
     command.
+
+    Raises:
+        PubanonError: Ownership checks fail or local cleanup is incomplete.
+            Cleanup failures report completed work and remaining recovery.
+        OperationCanceled: Cleanup is interrupted; the error reports completed
+            work and remaining recovery.
     """
     bookmark = _delete_preflight(paths, project, entry)
     record = entry.record
@@ -448,14 +459,16 @@ def delete_publication(paths: Paths, project: ProjectConfig, entry: PublicationE
                 if isinstance(exc, (KeyboardInterrupt, OperationCanceled))
                 else PubanonError
             )
-            retry = shell_command('pubanon', 'delete', entry.commit, f'--project={project.name}')
+            retry = project_command(
+                project.name, 'delete', entry.commit, f'--project={project.name}'
+            )
             raise error_type(
                 'local preservation cleanup is incomplete',
                 fact=(
                     f'Completed: {", ".join(completed) or "none"}. '
                     f'Remaining: {", ".join(remaining)}. {escape(str(exc))}'
                 ),
-                recovery=retry or project_fallback(project.name, 'delete', None),
+                recovery=retry,
             ) from exc
         return
     if bookmark is not None and bookmark != record.source_bookmark:
@@ -497,14 +510,14 @@ def delete_publication(paths: Paths, project: ProjectConfig, entry: PublicationE
                     'an archived snapshot may no longer appear in local history.'
                 ),
             ) from exc
-        retry = shell_command('pubanon', 'delete', entry.commit, f'--project={project.name}')
+        retry = project_command(project.name, 'delete', entry.commit, f'--project={project.name}')
         raise error_type(
             'local preservation cleanup is incomplete',
             fact=(
                 f'Completed: {", ".join(completed) or "none"}. '
                 f'Remaining: {", ".join(remaining)}. {escape(str(exc))}'
             ),
-            recovery=retry or project_fallback(project.name, 'delete', None),
+            recovery=retry,
         ) from exc
 
 
@@ -531,7 +544,8 @@ def inspect_publication(
 
     Raises:
         PubanonError: The saved commit or objects are missing or inconsistent,
-            or the existing review copy has local edits without `refresh`.
+            the existing review copy has local edits without `refresh`, or the
+            copy cannot be safely materialized.
     """
     if re.fullmatch(OID_HEX, entry.commit) is None:
         raise PubanonError('invalid published snapshot commit')
@@ -549,13 +563,11 @@ def inspect_publication(
         raise PubanonError(
             'published commit is unavailable', fact=entry.commit, recovery=_PUBLICATION_REPAIR
         )
-    first_line = result.stdout.partition(b'\n')[0]
-    if (
-        not first_line.startswith(b'tree ')
-        or re.fullmatch(OID_HEX.encode(), first_line[5:]) is None
-    ):
-        raise PubanonError('published commit has an invalid tree')
-    if entry.record is not None and first_line[5:].decode('ascii') != entry.record.tree:
+    try:
+        tree = _candidate.parse_commit_fields(result.stdout)[0]
+    except PubanonError as exc:
+        raise PubanonError('published commit has an invalid tree') from exc
+    if entry.record is not None and tree != entry.record.tree:
         raise PubanonError('published tree conflicts with its record')
     snapshot = _source.read_snapshot(store, entry.commit, git_dir=store)
     if (
@@ -574,7 +586,12 @@ def inspect_publication(
 
 
 def preserve_previous_tip(paths: Paths, project: str, candidate: CandidateRecord) -> None:
-    """Retain the complete old history, including recordless commits, before transport."""
+    """Retain the complete old history, including recordless commits, before transport.
+
+    Raises:
+        PubanonError: The previous publication archive cannot be verified or
+            created.
+    """
     if candidate.replaces is not None and candidate.prestate_main is not None:
         _archive_publication(paths, project, candidate.prestate_main)
 
@@ -593,6 +610,10 @@ def publications(
     time, falling back to commit time, with deterministic object-ID
     tie-breaking. Invalid records or archive ownership fail the operation
     without a partial result.
+
+    Raises:
+        PubanonError: Records, deletion markers, archive ownership, or the
+            publication graph cannot be read or validated.
     """
     records = {record.commit: record for record in _records.list_publications(paths, project)}
     main, current_tags = _candidate.published_refs(paths, project)
@@ -622,7 +643,7 @@ def publications(
     known = (reachable - deleted) | records.keys()
     tags: dict[str, set[str]] = {oid: set() for oid in known}
     for tag, oid in current_tags.items():
-        if _VERSION_TAG.fullmatch(tag) is not None and oid in tags:
+        if version_from_tag(tag) is not None and oid in tags:
             tags[oid].add(tag)
     for oid, record in records.items():
         if record.tag_intent is not None:
@@ -655,8 +676,9 @@ def record_publication(
         transaction tip whose proof is saved first.
 
     Raises:
-        PubanonError: A retained publication record conflicts with the
-            candidate's provenance.
+        PubanonError: Retained objects or provenance cannot be verified, or an
+            archive or confirmation record cannot be persisted. Earlier writes
+            remain available for retry.
     """
     _verification.verify_publication_objects(paths, project.name, candidate)
     commits = (candidate.commit, *(entry.new for entry in candidate.replayed))
@@ -709,7 +731,8 @@ def select_publication(
             `include_deleted` setting, read under the same project lock.
 
     Raises:
-        PubanonError: The selector is absent or ambiguous in local history.
+        PubanonError: Local history cannot be read, or the selector is absent
+            or ambiguous in that history.
     """
     if entries is None:
         entries = publications(paths, project, include_deleted=include_deleted)
@@ -731,7 +754,7 @@ def select_publication(
         raise PubanonError(
             'latest published snapshot was deleted locally', recovery='pubanon list'
         )
-    if _VERSION_TAG.fullmatch(selector) is not None:
+    if version_from_tag(selector) is not None:
         matches = [entry for entry in entries if selector in entry.tags]
         _, current_tags = _candidate.published_refs(paths, project)
         current = current_tags.get(selector)
@@ -754,7 +777,12 @@ def select_publication(
 
 
 def source_cleanup_guidance(project: ProjectConfig, entry: PublicationEntry) -> tuple[str, ...]:
-    """Describe existing detached source worktrees without suggesting creation."""
+    """Describe existing detached source worktrees without suggesting creation.
+
+    Raises:
+        PubanonError: Available source worktree registrations cannot be read or
+            are malformed.
+    """
     record = entry.record
     if record is None or record.source_bookmark is None:
         return ()
@@ -788,7 +816,12 @@ def source_cleanup_guidance(project: ProjectConfig, entry: PublicationEntry) -> 
 def source_guidance(
     paths: Paths, project: ProjectConfig, entry: PublicationEntry
 ) -> tuple[str, ...]:
-    """Describe complete-source recovery and user-managed worktree commands."""
+    """Describe complete-source recovery and user-managed worktree commands.
+
+    Raises:
+        PubanonError: Verified source worktree registrations or the suggested
+            worktree location cannot be inspected.
+    """
     record = entry.record
     if record is None:
         return ('Source: not recorded; the original source location cannot be verified.',)

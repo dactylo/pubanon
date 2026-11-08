@@ -14,6 +14,7 @@ from pubanon._errors import PubanonError
 from pubanon._remote import _releases, _stage
 from pubanon._snapshots import _history, _inspection, _records, _reports, _verification
 from pubanon._terminal import (
+    display_commit,
     display_path,
     escape,
     fields,
@@ -21,6 +22,7 @@ from pubanon._terminal import (
     heading,
     next_step,
     output,
+    project_command,
     style,
     verbose_enabled,
 )
@@ -64,17 +66,17 @@ def _inspect_published(ctx: _context.ProjectContext, selector: str, *, refresh: 
         sys.stdout.flush()
     inspection = _history.inspect_publication(ctx.paths, ctx.project.name, entry, refresh=refresh)
     identity = escape(', '.join(entry.tags) or 'untagged')
-    snapshot_id = entry.commit if verbose_enabled() else entry.commit[:12]
+    snapshot_id = display_commit(entry.commit)
     heading('Published snapshot', separate=refresh)
     fields([('Snapshot', snapshot_id), ('Version', identity)])
     print('\n' + _inspection_details(inspection, copies))
     print()
     next_step(
-        _context.project_command(
+        project_command(
             ctx.project.name,
             'show',
             f'--project={ctx.project.name}',
-            entry.commit if verbose_enabled() else entry.commit[:12],
+            display_commit(entry.commit),
         )
     )
 
@@ -104,7 +106,7 @@ def _inspect_rewritten_copy(
         + _inspection_details(
             selected,
             copies,
-            snapshot=commit if verbose_enabled() else commit[:12],
+            snapshot=display_commit(commit),
         )
     )
     print()
@@ -146,6 +148,8 @@ def inspection_copy(
 ) -> Path:
     """Materialize a selected copy and describe its deliberate retention lifecycle.
 
+    The caller must hold the project lock for this proof and its consumers.
+
     Args:
         ctx: Project context for the retained snapshot.
         proof: Object evidence obtained for this review step.
@@ -156,6 +160,10 @@ def inspection_copy(
     Returns:
         The inspection directory, retained until explicitly cleaned or
         refreshed.
+
+    Raises:
+        PubanonError: Saved snapshot or staging evidence, an edited existing
+            copy, materialization, or report generation prevents inspection.
     """
     record = proof.record
     selected = _inspection.inspection_path(
@@ -183,7 +191,12 @@ def inspection_copy(
 
 
 def command_inspect(args: argparse.Namespace) -> None:
-    """Materialize or report one retained snapshot inspection."""
+    """Materialize or report one retained snapshot inspection.
+
+    Raises:
+        PubanonError: The selected snapshot cannot be verified, reported, or
+            materialized.
+    """
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     if args.rewritten is not None and args.published is not None:

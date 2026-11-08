@@ -11,8 +11,8 @@ _SPAN_REGION_SIZE = 4096
 class RuleClass(enum.Enum):
     """Classify content rules by publication impact.
 
-    Both classes block matching candidate content and the pre-reveal history
-    audit.
+    Both classes block matching candidate content. The pre-reveal history audit
+    lists findings of both classes for confirmation.
 
     Attributes:
         IDENTITY_CRITICAL: Private terms whose historical exposure requires

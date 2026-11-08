@@ -2,23 +2,22 @@
 
 from collections.abc import Collection, Iterable, Mapping, Sequence
 
-from pubanon._config import GlobalConfig, ProjectConfig, rule_labels
+from pubanon._config import GlobalConfig, ProjectConfig, RuleOrigin, RuleSource, rule_origins
 from pubanon._gate import GateHit, RuleClass
 from pubanon._snapshots import _audit
-from pubanon._terminal import color_enabled, escape, style, verbose_enabled
+from pubanon._terminal import (
+    color_enabled,
+    counted,
+    display_commit,
+    escape,
+    style,
+)
 
-_EARLIEST_UNKNOWN = 'the earliest affected release'
 HISTORY_LABELS = {
     RuleClass.IDENTITY_CRITICAL: 'historical exposure',
     RuleClass.HYGIENE: 'policy mismatch',
 }
-_RULE_SOURCES = (
-    'global sensitive_terms',
-    'project extra_terms',
-    'derived private path',
-    'built-in hygiene rule',
-    'project hygiene_terms',
-)
+_EARLIEST_UNKNOWN = 'the earliest affected release'
 _SUMMARY_HEADLINES = {
     RuleClass.IDENTITY_CRITICAL: 'Sensitive terms in published history',
     RuleClass.HYGIENE: 'Policy terms in published history',
@@ -26,16 +25,11 @@ _SUMMARY_HEADLINES = {
 _SUMMARY_LABEL_WIDTH = 40
 _SUMMARY_ROW_LIMIT = 20
 
-type SummaryRow = tuple[str, Sequence[str], Sequence[str]]
-type SummaryGroup = tuple[str, Sequence[SummaryRow]]
+type _SummaryRow = tuple[str, Sequence[str], Sequence[str]]
+type SummaryGroup = tuple[str, Sequence[_SummaryRow]]
 
 
-def _counted(count: int, noun: str) -> str:
-    """Return a count with a regular plural noun."""
-    return f'{count} {noun}' if count == 1 else f'{count} {noun}s'
-
-
-def _finding_lines(evidence: _audit.HistoryEvidence, origins: tuple[str, ...]) -> list[str]:
+def _finding_lines(evidence: _audit.HistoryEvidence, origins: tuple[RuleOrigin, ...]) -> list[str]:
     """Render one escaped finding with its location before its supporting evidence."""
     finding = evidence.finding
     location = evidence.label
@@ -45,7 +39,10 @@ def _finding_lines(evidence: _audit.HistoryEvidence, origins: tuple[str, ...]) -
         location = f'{finding.unit.removeprefix("path:")} ({location})'
     elif finding.unit.startswith('tag:'):
         location = f'tag {finding.unit.removeprefix("tag:")}'
-    sources = '; '.join(label.replace(' entry ', ', item ') for label in origins)
+    sources = '; '.join(
+        origin.source if origin.entry is None else f'{origin.source}, item {origin.entry}'
+        for origin in origins
+    )
     lines = [
         '  ' + style(escape(location), 'label'),
         f'    Rule: {escape(sources)}',
@@ -86,7 +83,7 @@ def _snapshot_heading(commit: str | None, tags: Mapping[str, str]) -> str:
     """Label the witness snapshot with its published tags and commit ID."""
     identity = 'unknown'
     if commit is not None:
-        identity = commit if verbose_enabled() else commit[:12]
+        identity = display_commit(commit)
         versions = ', '.join(name for name, target in tags.items() if target == commit)
         if versions:
             identity = f'{versions} ({identity})'
@@ -97,7 +94,7 @@ def _summary_heading(commit: str | None, tags: Mapping[str, str]) -> str:
     """Label one summary group by the snapshot that first published it."""
     if commit is None:
         return 'Not in published commits:'
-    identity = commit if verbose_enabled() else commit[:12]
+    identity = display_commit(commit)
     versions = ', '.join(escape(name) for name, target in tags.items() if target == commit)
     if versions:
         return f'First published in {versions} ({identity}):'
@@ -177,7 +174,7 @@ def finding_groups(
                 continue
             lines.extend(('', _snapshot_heading(commit, tags)))
             for item in groups[commit]:
-                origins = rule_labels(GateHit(*item.finding), global_config, project, derived)
+                origins = rule_origins(item.finding, global_config, project, derived)
                 lines.extend(('', *_finding_lines(item, origins)))
     if lines:
         lines.append('')
@@ -193,8 +190,8 @@ def history_reminder(findings: Collection[_audit.AuditFinding]) -> str:
     Returns:
         A one-line reminder naming distinct term and location counts.
     """
-    terms = _counted(len({finding.term for finding in findings}), 'flagged term')
-    locations = _counted(len({finding.unit for finding in findings}), 'location')
+    terms = counted(len({finding.term for finding in findings}), 'flagged term')
+    locations = counted(len({finding.unit for finding in findings}), 'location')
     return (
         f'Published history contains {terms} in {locations}. pubanon repo reveal asks '
         'before making them public; pubanon audit shows them.'
@@ -202,7 +199,7 @@ def history_reminder(findings: Collection[_audit.AuditFinding]) -> str:
 
 
 def rules_line(
-    findings: Iterable[GateHit | _audit.AuditFinding],
+    findings: Iterable[GateHit],
     configs: tuple[GlobalConfig, ProjectConfig],
     derived: Collection[str],
 ) -> str:
@@ -218,16 +215,14 @@ def rules_line(
         `Rules: ` followed by each configured source and its entry numbers.
     """
     global_config, project = configs
-    entries: dict[str, set[int]] = {}
+    entries: dict[RuleSource, set[int]] = {}
     for finding in findings:
-        for label in rule_labels(GateHit(*finding), global_config, project, derived):
-            source, separator, number = label.rpartition(' entry ')
-            if separator:
-                entries.setdefault(source, set()).add(int(number))
-            else:
-                entries.setdefault(label, set())
+        for origin in rule_origins(finding, global_config, project, derived):
+            numbers = entries.setdefault(origin.source, set())
+            if origin.entry is not None:
+                numbers.add(origin.entry)
     parts: list[str] = []
-    for source in (*_RULE_SOURCES, *(name for name in entries if name not in _RULE_SOURCES)):
+    for source in RuleSource:
         if source not in entries:
             continue
         numbers = sorted(entries[source])
@@ -259,7 +254,7 @@ def summary_block(
         Styled display lines, ending with a count of omitted rows when any.
     """
     terms, locations = counts
-    title = f'{headline}: {_counted(terms, "term")} in {_counted(locations, "location")}'
+    title = f'{headline}: {counted(terms, "term")} in {counted(locations, "location")}'
     labels = [label for _heading, rows in groups for label, _terms, _details in rows]
     width = max((len(label) for label in labels if len(label) <= _SUMMARY_LABEL_WIDTH), default=0)
     limit = None if unlimited else _SUMMARY_ROW_LIMIT
@@ -278,7 +273,7 @@ def summary_block(
             lines.extend(f'      {line}' for line in details)
             shown += 1
     if len(labels) > shown:
-        lines.append(f'  and {_counted(len(labels) - shown, "more row")}')
+        lines.append(f'  and {counted(len(labels) - shown, "more row")}')
     return lines
 
 

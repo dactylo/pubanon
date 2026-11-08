@@ -11,7 +11,7 @@ from pubanon._errors import PubanonError
 from pubanon._gate import RuleClass
 from pubanon._remote import _actions, _host
 from pubanon._snapshots import _audit, _candidate, _records
-from pubanon._terminal import escape, output
+from pubanon._terminal import escape, guidance, output
 
 if TYPE_CHECKING:
     import argparse
@@ -32,7 +32,7 @@ def _audit_actions(ctx: _context.ProjectContext, destination: _host.Destination)
     _actions.offer_log_deletion(
         review, (g, p), derived, account, already_public=destination.visibility == 'public'
     )
-    inventory = _host.disclosure(p.owner, p.repo)
+    inventory = _host.disclosure(p.owner, p.repo, command=_AUDIT_COMMAND)
     _actions.show_unchecked(
         (p.owner, p.repo),
         [entry.identifier for entry in inventory.runs],
@@ -62,7 +62,7 @@ def _audit_report(
         commits,
         tags,
         rules,
-        f'{ctx.global_config.anon_name} <{ctx.global_config.anon_email}>',
+        ctx.global_config.identity,
         tip=main,
     )
     label = 'audit: local copy of published history'
@@ -80,6 +80,12 @@ def _audit_report(
     lines.extend(f'identity problem: {escape(problem)}' for problem in result.identity_problems)
     if result.identity_problems:
         lines.append('Content auditing could not be completed reliably.')
+        lines.append(
+            guidance(
+                'To replace published history under the current identity, '
+                'use pubanon prepare --replace all.'
+            )
+        )
     elif not has_exposure:
         lines.append('No configured sensitive terms were found in the checked history.')
     elif _audit.exposure_digest(result.findings) == ctx.project.acknowledged_exposure:
@@ -101,7 +107,15 @@ def _audit_report(
 
 
 def command_audit(args: argparse.Namespace) -> None:
-    """Audit published history; with --remote, verify host refs and check Actions logs."""
+    """Audit published history; with --remote, verify host refs and check Actions logs.
+
+    Remote audits offer confirmed deletion of Actions logs with findings.
+
+    Raises:
+        PubanonError: Configuration, saved history, host verification, or
+            requested log deletion fails.
+        OperationCanceled: Interactive log review or deletion is interrupted.
+    """
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
@@ -115,7 +129,7 @@ def command_audit(args: argparse.Namespace) -> None:
         if args.remote:
             destination = _host.verify_destination(ctx.paths, ctx.global_config, ctx.project)
             remote = _host.ls_remote(destination, paths, name)
-            _context.refuse_unexpected_branches(remote)
+            _host.refuse_unexpected_branches(remote)
             if (remote.main, remote.tags) != (main, tags):
                 raise PubanonError(
                     'GitHub branches and tags do not match saved published history',

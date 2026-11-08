@@ -424,6 +424,16 @@ def test_fetch_translates_worker_timeout(monkeypatch: pytest.MonkeyPatch) -> Non
         _package._fetch('https://example.invalid')
 
 
+def test_fetch_worker_ignores_modules_in_working_directory(tmp_path: Path) -> None:
+    (tmp_path / 'json.py').write_text('raise SystemExit(98)')
+    result = subprocess.run(
+        _package._fetch_command(), input=b'', capture_output=True, check=False, cwd=tmp_path
+    )
+    assert result.returncode == 1
+    assert result.stdout == b''
+    assert result.stderr == b''
+
+
 def test_fetch_worker_uses_current_package_over_ambient_pythonpath(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -539,7 +549,7 @@ def test_release_state_refuses_unexpected_status_without_exposing_response(
     assert 'PyPI returned HTTP 500' in raised.value.fact
     assert 'release status is unknown' in raised.value.fact
     assert raised.value.recovery is not None
-    assert 'Retry the package check' in raised.value.recovery
+    assert 'Rerun pubanon package watch' in raised.value.recovery
     assert response_canary not in raised.value.render()
 
 

@@ -10,10 +10,12 @@ from pathlib import Path
 from typing import Literal, cast
 
 from pubanon import _filesystem
+from pubanon._changelog import version_from_tag
 from pubanon._config import Paths, create_data_dirs, require_project_name, validate_host_segment
 from pubanon._errors import PubanonError
 from pubanon._run import OID_HEX
 from pubanon._snapshots._source import (
+    TREE_MODES,
     PinnedSource,
     SourceBookmark,
     bookmark_ref,
@@ -88,9 +90,7 @@ _PUBLICATION_REQUIRED = _PUBLICATION_KEYS - {
 _REWRITE_KEYS = frozenset(
     {'correction', 'replaces', 'prestate_main', 'descendants', 'phase', 'replayed', 'pause'}
 )
-_VALID_MODES = frozenset({0o100644, 0o100755, 0o120000})
 _VALID_STATES = frozenset({STATE_RETAINED, STATE_UNKNOWN_OUTCOME})
-_VERSION_PATTERN = re.compile(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)')
 type _TOML_VALUE = (
     str | int | datetime | tuple[str, ...] | dict[str, _TOML_VALUE] | list[dict[str, _TOML_VALUE]]
 )
@@ -328,6 +328,17 @@ def _conflict_data(conflict: ConflictEntry) -> dict[str, _TOML_VALUE]:
             for stage in conflict.stages
         ],
     }
+
+
+def _incomplete_replacement() -> PubanonError:
+    """Build the refusal for a replacement that lacks its retained poststate."""
+    return PubanonError(
+        'replacement snapshot is incomplete',
+        recovery=(
+            'run pubanon prepare --continue, or pubanon discard '
+            'to drop the rewrite and its conflict edits'
+        ),
+    )
 
 
 def _integer(data: Mapping[str, object], key: str, error: str) -> int:
@@ -621,8 +632,10 @@ def _candidate_text(record: CandidateRecord) -> str:
     if record.prestate_main is not None:
         data['prestate_main'] = record.prestate_main
     if record.replaces is not None:
+        if record.replace_scope is None:
+            raise ValueError('replacement record lacks its scope')
         data['replaces'] = record.replaces
-        data['replace_scope'] = cast('str', record.replace_scope)
+        data['replace_scope'] = record.replace_scope
     if record.tip is not None:
         data['tip'] = record.tip
         data['replayed'] = [_replay_data(entry) for entry in record.replayed]
@@ -647,8 +660,10 @@ def _publication_text(record: PublicationRecord) -> str:
     if record.tag_intent is not None:
         data['tag_intent'] = record.tag_intent
     if record.replaces is not None:
+        if record.replace_scope is None:
+            raise ValueError('replacement record lacks its scope')
         data['replaces'] = record.replaces
-        data['replace_scope'] = cast('str', record.replace_scope)
+        data['replace_scope'] = record.replace_scope
     data.update(_shared_data(record))
     if record.derivation is not None:
         derivation = record.derivation
@@ -753,7 +768,7 @@ def _validate_conflict(conflict: ConflictEntry, error: str) -> None:
         key = stage.path, stage.stage
         if (
             type(stage.mode) is not int
-            or stage.mode not in _VALID_MODES
+            or stage.mode not in TREE_MODES
             or type(stage.stage) is not int
             or stage.stage not in {1, 2, 3}
             or _OID_PATTERN.fullmatch(stage.oid) is None
@@ -815,13 +830,7 @@ def _validate_common(
             re.fullmatch(r'[0-9a-f]{64}', digest) is None
             for digest in (record.snapshot_digest, record.fingerprint)
         )
-        or (
-            record.tag_intent is not None
-            and (
-                not record.tag_intent.startswith('v')
-                or _VERSION_PATTERN.fullmatch(record.tag_intent[1:]) is None
-            )
-        )
+        or (record.tag_intent is not None and version_from_tag(record.tag_intent) is None)
         or not record.message
         or '\0' in record.message
         or not all(
@@ -958,13 +967,9 @@ def _write(
     except UnicodeError as exc:
         raise PubanonError(error, fact=fact) from exc
     except _filesystem.DurableWriteError as exc:
-        if exc.interrupted and not exc.replacement_attempted:
+        if exc.interrupted_before_replacement:
             raise KeyboardInterrupt from exc.__cause__
-        message = (
-            saved_error
-            if exc.replaced or (exc.interrupted and exc.replacement_attempted)
-            else error
-        )
+        message = saved_error if exc.may_have_saved else error
         raise PubanonError(message, fact=fact) from exc.__cause__
 
 
@@ -977,10 +982,7 @@ def candidate_tip(record: CandidateRecord) -> str:
     if record.replaces is None:
         return record.commit
     if record.tip is None or record.poststate_tags is None:
-        raise PubanonError(
-            'replacement snapshot is incomplete',
-            recovery='run pubanon prepare --continue or pubanon discard',
-        )
+        raise _incomplete_replacement()
     return record.tip
 
 
@@ -992,7 +994,9 @@ def candidate_poststate(record: CandidateRecord) -> tuple[str, dict[str, str]]:
     """
     tip = candidate_tip(record)
     if record.replaces is not None:
-        return tip, dict(cast('dict[str, str]', record.poststate_tags))
+        if record.poststate_tags is None:
+            raise _incomplete_replacement()
+        return tip, dict(record.poststate_tags)
     tags = dict(record.prestate_tags)
     if record.tag_intent is not None:
         tags[record.tag_intent] = record.commit
@@ -1006,16 +1010,25 @@ def project_dir(paths: Paths, project: str) -> Path:
         PubanonError: The project name is invalid.
     """
     require_project_name(project)
-    return paths.data_dir / 'projects' / project
+    return paths.project_data(project)
 
 
 def candidate_path(paths: Paths, project: str) -> Path:
-    """Return the active snapshot record path."""
+    """Return the active snapshot record path.
+
+    Raises:
+        PubanonError: The project name is invalid.
+    """
     return project_dir(paths, project) / 'candidate.toml'
 
 
 def deleted_publications(paths: Paths, project: str) -> set[str]:
-    """Read local deletions that must not be rediscovered through Git history."""
+    """Read local deletions that must not be rediscovered through Git history.
+
+    Raises:
+        PubanonError: The project name is invalid or local deletion markers
+            cannot be listed.
+    """
     directory = project_dir(paths, project) / 'publications'
     return {
         path.stem
@@ -1027,7 +1040,11 @@ def deleted_publications(paths: Paths, project: str) -> set[str]:
 
 
 def publication_path(paths: Paths, project: str, commit: str) -> Path:
-    """Return a confirmed record path keyed by its full commit ID."""
+    """Return a confirmed record path keyed by its full commit ID.
+
+    Raises:
+        PubanonError: The project name or publication commit ID is invalid.
+    """
     path = project_dir(paths, project) / 'publications' / f'{commit}.toml'
     if _OID_PATTERN.fullmatch(commit) is None:
         raise PubanonError('invalid published snapshot commit ID', fact=escape(path_text(path)))
@@ -1041,8 +1058,8 @@ def load_publication(paths: Paths, project: str, commit: str) -> PublicationReco
         The validated record, or `None` when it is absent.
 
     Raises:
-        PubanonError: The record has malformed or unsupported schema or
-            provenance, or its commit does not match its filename.
+        PubanonError: The record is unreadable, has malformed or unsupported
+            schema or provenance, or its commit does not match its filename.
     """
     error = 'invalid published snapshot record'
     path = publication_path(paths, project, commit)
@@ -1083,8 +1100,9 @@ def list_publications(paths: Paths, project: str) -> tuple[PublicationRecord, ..
     """List every valid confirmed record without treating temporary files as entries.
 
     Raises:
-        PubanonError: An entry is invalid or disappears during the listing. No
-            partial result is returned.
+        PubanonError: The inventory or a record cannot be read, or an entry is
+            invalid or disappears during the listing. No partial result is
+            returned.
     """
     directory = project_dir(paths, project) / 'publications'
     paths_found = sorted(
@@ -1105,6 +1123,10 @@ def mark_publication_deleted(paths: Paths, project: str, commit: str) -> None:
     """Persist a deletion without retaining Git objects or source provenance.
 
     The caller must hold the project lock for the complete operation.
+
+    Raises:
+        PubanonError: The identifiers are invalid or the local deletion cannot
+            be durably saved.
     """
     path = publication_path(paths, project, commit).with_suffix('.deleted')
     try:
@@ -1122,7 +1144,11 @@ def mark_publication_deleted(paths: Paths, project: str, commit: str) -> None:
 
 
 def publication_ref(commit: str) -> str:
-    """Return the publication-store reference protecting one commit."""
+    """Return the publication-store reference protecting one commit.
+
+    Raises:
+        PubanonError: The commit is not a full supported lowercase object ID.
+    """
     if _OID_PATTERN.fullmatch(commit) is None:
         raise PubanonError('invalid published snapshot commit ID')
     return f'refs/pubanon/published/{commit}'
@@ -1147,6 +1173,10 @@ def relocate_publication_source(
     Callers hold the project lock and verify the exact bookmark and source OID
     at the relocated repository. All provenance and confirmation time remain
     unchanged; a changed or missing prior record refuses the replacement.
+
+    Raises:
+        PubanonError: The locator conflicts, prior provenance changed, or the
+            replacement cannot be durably saved.
     """
     if expected.source_bookmark is None or bookmark.refname != expected.source_bookmark.refname:
         raise PubanonError('relocated source bookmark conflicts with publication')
@@ -1225,15 +1255,8 @@ def _validate_candidate(record: CandidateRecord, project: str) -> None:
         raise PubanonError(error)
 
 
-def load_candidate(paths: Paths, project: str) -> CandidateRecord | None:
-    """Load one strict snapshot record if present.
-
-    Returns:
-        The validated record, or `None` when it is absent.
-
-    Raises:
-        PubanonError: The stored schema or candidate state is invalid.
-    """
+def _read_candidate(paths: Paths, project: str) -> CandidateRecord | None:
+    """Read and validate a retained snapshot record when present."""
     error = 'invalid snapshot record'
     data = _read(candidate_path(paths, project), error)
     if data is None:
@@ -1270,13 +1293,39 @@ def load_candidate(paths: Paths, project: str) -> CandidateRecord | None:
     return record
 
 
+def load_candidate(paths: Paths, project: str) -> CandidateRecord | None:
+    """Load one strict snapshot record if present.
+
+    Returns:
+        The validated record, or `None` when it is absent.
+
+    Raises:
+        PubanonError: The record cannot be read, or the stored schema or
+            candidate state is invalid.
+    """
+    try:
+        return _read_candidate(paths, project)
+    except PubanonError as error:
+        if error.recovery is None:
+            error.recovery = 'pubanon discard --force, then pubanon prepare'
+        raise
+
+
 def rewrite_directory(paths: Paths, project: str) -> Path:
-    """Return the private conflict export directory without creating it."""
+    """Return the private conflict export directory without creating it.
+
+    Raises:
+        PubanonError: The project name is invalid.
+    """
     return project_dir(paths, project) / 'rewrite'
 
 
 def rewrite_path(paths: Paths, project: str) -> Path:
-    """Return the private durable rewrite record path."""
+    """Return the private durable rewrite record path.
+
+    Raises:
+        PubanonError: The project name is invalid.
+    """
     return project_dir(paths, project) / 'rewrite.toml'
 
 
@@ -1287,8 +1336,8 @@ def load_rewrite(paths: Paths, project: str) -> RewriteRecord | None:
         The validated progress, or `None` when it is absent.
 
     Raises:
-        PubanonError: Progress is invalid, including inconsistent phase and
-            pause relationships.
+        PubanonError: Progress cannot be read or is invalid, including
+            inconsistent phase and pause relationships.
     """
     error = 'invalid rewrite record'
     data = _read(rewrite_path(paths, project), error)
@@ -1316,6 +1365,17 @@ def load_rewrite(paths: Paths, project: str) -> RewriteRecord | None:
     )
     _validate_rewrite(record, project)
     return record
+
+
+def rewrite_incomplete(paths: Paths, project: str, record: CandidateRecord) -> bool:
+    """Report whether a retained replacement still needs `prepare --continue`.
+
+    Raises:
+        PubanonError: Saved rewrite progress cannot be read or is invalid.
+    """
+    return record.replaces is not None and (
+        record.tip is None or load_rewrite(paths, project) is not None
+    )
 
 
 def save_candidate(paths: Paths, project: str, record: CandidateRecord) -> None:

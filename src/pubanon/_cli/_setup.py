@@ -6,6 +6,7 @@ import os
 import sys
 import tomllib
 from dataclasses import replace
+from typing import TYPE_CHECKING
 
 from pubanon import (
     _config,
@@ -27,13 +28,18 @@ from pubanon._terminal import (
     style,
 )
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+_DEFAULT_ROUTE_PROMPT = 'Default publication route (staged/direct)'
+
 
 def _check_global_identity(paths: _config.Paths, global_config: _config.GlobalConfig) -> None:
     """Refuse colliding global identity and check its active rules."""
     machine_terms = _config.machine_private_terms(paths, os.environ)
     terms = (*global_config.sensitive_terms, *machine_terms)
 
-    identity = f'{global_config.anon_name} <{global_config.anon_email}>'
+    identity = global_config.identity
     identity_hits = gate_unit(
         'publication identity',
         identity.encode(),
@@ -53,13 +59,14 @@ def _check_global_readiness(paths: _config.Paths, global_config: _config.GlobalC
     )
 
 
-def _check_setup_account(expected: str, actual: str) -> None:
+def _check_setup_account(expected: str, actual: str, *, recovery: str | None = None) -> None:
     """Refuse account drift with escaped expected and actual values."""
     if actual != expected:
         raise PubanonError(
             'authenticated account does not match configuration',
             expected=escape(expected),
             actual=escape(actual),
+            recovery=recovery,
         )
 
 
@@ -116,7 +123,7 @@ def _setup_account() -> str:
     while True:
         try:
             return _host.authenticated_account()
-        except OperationCanceled:
+        except (OperationCanceled, _host.GitHubCliUnavailableError):
             raise
         except PubanonError as error:
             if not sys.stdin.isatty():
@@ -134,7 +141,7 @@ def _setup_account() -> str:
         )
         try:
             _host.login()
-        except OperationCanceled:
+        except (OperationCanceled, _host.GitHubCliUnavailableError):
             raise
         except PubanonError:
             raise PubanonError(
@@ -154,7 +161,14 @@ def _setup_expected_account(
     actual = _setup_account()
     expected = config.accounts[_config.DEFAULT_HOST]
     if expected and not allow_change:
-        _check_setup_account(expected, actual)
+        _check_setup_account(
+            expected,
+            actual,
+            recovery=(
+                f'run gh auth switch --user {escape(expected)}, then rerun pubanon setup; '
+                'to expect a different account, run pubanon setup --edit'
+            ),
+        )
         return config
     print(f'{style("Verified GitHub account:")} {escape(actual)}')
     if actual == expected:
@@ -213,17 +227,6 @@ def _setup_review(
         print(f'  {entry_id}. {escape(term)}')
 
 
-def _setup_route(default: str) -> str:
-    """Read the default route for future projects."""
-    print('Staged: try snapshots privately before final publication.')
-    print('Direct: upload straight to the final repository.')
-    while True:
-        route = ask('Default publication route (staged/direct)', default=default).casefold()
-        if route in _config.PUBLICATION_ROUTES:
-            return route
-        output('Choose staged or direct.', kind='warning')
-
-
 def _setup_term_id(terms: dict[int, str], *, prompt: str = 'Term number') -> int:
     """Read one listed entry number."""
     while True:
@@ -237,62 +240,64 @@ def _setup_term_id(terms: dict[int, str], *, prompt: str = 'Term number') -> int
         output('Choose one listed number.', kind='warning')
 
 
-def _setup_edit_directories(config: _config.GlobalConfig) -> _config.GlobalConfig:
-    """Edit literal directory exclusions shared by existing and future projects."""
-    directories = list(config.ignored_directories)
-    print('Enter directories relative to each source root, such as docs/private.')
+def _setup_edit_exclusions(
+    entries: tuple[str, ...],
+    *,
+    names: tuple[str, str],
+    hint: str,
+    suffix: str,
+    validate: Callable[[str], str],
+) -> tuple[str, ...]:
+    """Edit one literal exclusion list shared by existing and future projects."""
+    singular, plural = names
+    edited = list(entries)
+    print(hint)
     print('These exclusions override project includes; text references are still checked.')
     while True:
-        heading('Excluded directories (all projects):')
-        for entry_id, directory in enumerate(directories, 1):
-            print(f'  {entry_id}. {escape(directory)}/')
-        if not directories:
+        heading(f'Excluded {plural} (all projects):')
+        for entry_id, entry in enumerate(edited, 1):
+            print(f'  {entry_id}. {escape(entry)}{suffix}')
+        if not edited:
             print('  None.')
-        action = ask('Directories:', choices=['add', 'remove', 'done'])
+        action = ask(f'{plural.capitalize()}:', choices=['add', 'remove', 'done'])
         if action == 'done':
-            return replace(config, ignored_directories=tuple(directories))
+            return tuple(edited)
         if action == 'remove':
-            if directories:
-                entry_id = _setup_term_id(
-                    dict(enumerate(directories, 1)), prompt='Directory number'
-                )
-                directories.pop(entry_id - 1)
+            if edited:
+                entry_id = _setup_term_id(dict(enumerate(edited, 1)), prompt=f'{singular} number')
+                edited.pop(entry_id - 1)
             continue
         try:
-            directory = _config.validate_ignored_directory(ask('Directory'))
+            entry = validate(ask(singular))
         except PubanonError as error:
             print(diagnostic(error))
             continue
-        if directory not in directories:
-            directories.append(directory)
+        if entry not in edited:
+            edited.append(entry)
+
+
+def _setup_edit_directories(config: _config.GlobalConfig) -> _config.GlobalConfig:
+    """Edit literal directory exclusions shared by existing and future projects."""
+    directories = _setup_edit_exclusions(
+        config.ignored_directories,
+        names=('Directory', 'directories'),
+        hint='Enter directories relative to each source root, such as docs/private.',
+        suffix='/',
+        validate=_config.validate_ignored_directory,
+    )
+    return replace(config, ignored_directories=directories)
 
 
 def _setup_edit_files(config: _config.GlobalConfig) -> _config.GlobalConfig:
     """Edit literal file exclusions shared by existing and future projects."""
-    files = list(config.ignored_files)
-    print('Enter files as a basename at any depth, or a path relative to the source root.')
-    print('These exclusions override project includes; text references are still checked.')
-    while True:
-        heading('Excluded files (all projects):')
-        for entry_id, file in enumerate(files, 1):
-            print(f'  {entry_id}. {escape(file)}')
-        if not files:
-            print('  None.')
-        action = ask('Files:', choices=['add', 'remove', 'done'])
-        if action == 'done':
-            return replace(config, ignored_files=tuple(files))
-        if action == 'remove':
-            if files:
-                entry_id = _setup_term_id(dict(enumerate(files, 1)), prompt='File number')
-                files.pop(entry_id - 1)
-            continue
-        try:
-            file = _config.validate_ignored_file(ask('File'))
-        except PubanonError as error:
-            print(diagnostic(error))
-            continue
-        if file not in files:
-            files.append(file)
+    files = _setup_edit_exclusions(
+        config.ignored_files,
+        names=('File', 'files'),
+        hint='Enter files as a basename at any depth, or a path relative to the source root.',
+        suffix='',
+        validate=_config.validate_ignored_file,
+    )
+    return replace(config, ignored_files=files)
 
 
 def _setup_terms_from_scratch() -> tuple[str, ...]:
@@ -402,6 +407,54 @@ def _setup_edit_terms(config: _config.GlobalConfig) -> _config.GlobalConfig:
                 next_id += 1
 
 
+def _setup_verify_saved(paths: _config.Paths, config: _config.GlobalConfig) -> None:
+    """Check saved configuration while preserving completion facts on interruption."""
+    try:
+        _check_global_identity(paths, config)
+        _check_setup_account(config.accounts[_config.DEFAULT_HOST], _host.authenticated_account())
+    except OperationCanceled as error:
+        saved = 'configuration was saved; the saved configuration was retained'
+        error.fact = f'{error.fact}; {saved}' if error.fact else saved
+        raise
+    except KeyboardInterrupt:
+        raise OperationCanceled(
+            'Canceled.',
+            fact='configuration was saved; the saved configuration was retained',
+            recovery='rerun pubanon setup',
+        ) from None
+    except (PubanonError, EOFError) as exc:
+        raise PubanonError(
+            'configuration was saved, but readiness could not be verified',
+            fact=exc.fact if isinstance(exc, PubanonError) else None,
+            expected=exc.expected if isinstance(exc, PubanonError) else None,
+            actual=exc.actual if isinstance(exc, PubanonError) else None,
+            recovery='rerun pubanon setup; the saved configuration was retained',
+        ) from None
+
+
+def ask_route(prompt: str, *, default: str) -> str:
+    """Explain both publication routes and read one.
+
+    Args:
+        prompt: Question naming which route is being chosen.
+        default: Route used for an empty answer.
+
+    Returns:
+        The chosen route, case-folded.
+
+    Raises:
+        PubanonError: Input ended or an interactive terminal is unavailable.
+        OperationCanceled: The prompt is interrupted.
+    """
+    print('Staged: try snapshots privately before final publication.')
+    print('Direct: upload straight to the final repository.')
+    while True:
+        route = ask(prompt, default=default).casefold()
+        if route in _config.PUBLICATION_ROUTES:
+            return route
+        output('Choose staged or direct.', kind='warning')
+
+
 def _setup_edit(config: _config.GlobalConfig) -> _config.GlobalConfig:
     """Edit one selected setup section while preserving the other values."""
     action = ask(
@@ -429,34 +482,12 @@ def _setup_edit(config: _config.GlobalConfig) -> _config.GlobalConfig:
         return updated
     if action == 'route':
         return replace(
-            config, default_publication_route=_setup_route(config.default_publication_route)
+            config,
+            default_publication_route=ask_route(
+                _DEFAULT_ROUTE_PROMPT, default=config.default_publication_route
+            ),
         )
     return config
-
-
-def _setup_verify_saved(paths: _config.Paths, config: _config.GlobalConfig) -> None:
-    """Check saved configuration while preserving completion facts on interruption."""
-    try:
-        _check_global_identity(paths, config)
-        _check_setup_account(config.accounts[_config.DEFAULT_HOST], _host.authenticated_account())
-    except OperationCanceled as error:
-        saved = 'configuration was saved; the saved configuration was retained'
-        error.fact = f'{error.fact}; {saved}' if error.fact else saved
-        raise
-    except KeyboardInterrupt:
-        raise OperationCanceled(
-            'Canceled.',
-            fact='configuration was saved; the saved configuration was retained',
-            recovery='rerun pubanon setup',
-        ) from None
-    except (PubanonError, EOFError) as exc:
-        raise PubanonError(
-            'configuration was saved, but readiness could not be verified',
-            fact=exc.fact if isinstance(exc, PubanonError) else None,
-            expected=exc.expected if isinstance(exc, PubanonError) else None,
-            actual=exc.actual if isinstance(exc, PubanonError) else None,
-            recovery='rerun pubanon setup; the saved configuration was retained',
-        ) from None
 
 
 def _setup_save_loop(
@@ -535,21 +566,35 @@ def _setup_locked(paths: _config.Paths, *, edit: bool = False) -> None:
             'then leave blank to finish:'
         )
         terms = _setup_terms_from_scratch()
-        route = _setup_route('staged')
+        route = ask_route(_DEFAULT_ROUTE_PROMPT, default='staged')
         config = _config.GlobalConfig(name, email, {_config.DEFAULT_HOST: ''}, terms, route)
     initial = config
     _setup_save_loop(paths, initial, config, original)
 
 
 def doctor() -> None:
-    """Validate configuration, publication identity, and authenticated account."""
+    """Validate configuration, publication identity, and authenticated account.
+
+    Raises:
+        PubanonError: Configuration, the required CLI version, publication
+            identity, or authenticated account is not ready.
+    """
     paths = _config.derive_paths(os.environ)
-    _check_global_readiness(paths, _config.load_global(paths))
+    global_config = _config.load_global(paths)
+    _host.check_cli_version()
+    _check_global_readiness(paths, global_config)
     output('Your configuration and GitHub login are ready.', kind='success')
 
 
 def setup(*, edit: bool = False) -> None:
-    """Guide first-run global configuration or verify an existing completed setup."""
+    """Guide first-run global configuration or verify an existing completed setup.
+
+    Raises:
+        PubanonError: Setup prerequisites, configuration, authentication,
+            locking, or saving fail.
+        OperationCanceled: Setup is canceled or interrupted; completed
+            authentication and saved configuration remain in effect.
+    """
     paths = _config.derive_paths(os.environ)
     try:
         _run.check_floors()

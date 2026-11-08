@@ -4,6 +4,7 @@ import stat
 import subprocess
 from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import NotRequired, TypedDict
 
 from pubanon._snapshots._source import Snapshot
 
@@ -23,6 +24,24 @@ _ISOLATED_GIT_ENV = {
 }
 
 
+class RunGitOptions(TypedDict):
+    check: NotRequired[bool]
+    cwd: Path | None
+    env_extra: NotRequired[Mapping[str, str] | None]
+    input_bytes: NotRequired[bytes | None]
+    timeout: NotRequired[float | None]
+
+
+def git_bytes(repo: Path, *args: str, input_bytes: bytes | None = None) -> bytes:
+    return subprocess.run(
+        ['git', '-C', repo, *args],
+        check=True,
+        capture_output=True,
+        input=input_bytes,
+        env=git_env(),
+    ).stdout
+
+
 def git_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]:
     environment = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
     environment.update(_ISOLATED_GIT_ENV)
@@ -33,6 +52,10 @@ def git_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]:
     if overrides is not None:
         environment.update(overrides)
     return environment
+
+
+def git_text(repo: Path, *args: str, input_bytes: bytes | None = None) -> str:
+    return git_bytes(repo, *args, input_bytes=input_bytes).decode().strip()
 
 
 def oracle_tree(store: Path, snapshot: Snapshot) -> str:

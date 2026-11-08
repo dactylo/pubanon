@@ -11,9 +11,7 @@ import pytest
 from pubanon import _config, _terminal
 from pubanon._remote import _host
 from tests._git import git_env
-from tests._setup import configure
-
-_Script = Callable[[Sequence[str | tuple[str, str]]], None]
+from tests._setup import Script, configure
 
 _FAKE_GH_SCRIPT = """#!/usr/bin/env python
 import json
@@ -25,6 +23,9 @@ sys.stdout.reconfigure(encoding="utf-8", newline="\\n")
 sys.stderr.reconfigure(encoding="utf-8", newline="\\n")
 
 args = sys.argv[1:]
+if args == ["--version"]:
+    print("gh version " + os.environ.get("PUBANON_FAKE_GH_VERSION", "2.97.0") + " (2026-01-01)")
+    raise SystemExit(0)
 stdin = sys.stdin.read() if args[:2] == ["auth", "git-credential"] else ""
 calls_path = Path(os.environ["PUBANON_FAKE_GH_CALLS"])
 call = {"args": args, "stdin": stdin}
@@ -81,7 +82,7 @@ def _refuse_unscripted_read_pause(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def answers(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Script]:
+def answers(monkeypatch: pytest.MonkeyPatch) -> Iterator[Script]:
     remaining: list[str | tuple[str, str]] = []
 
     def _reply(prompt: object = '') -> str:
@@ -193,5 +194,4 @@ def configured_project(
 ) -> tuple[_config.Paths, _config.GlobalConfig, _config.ProjectConfig]:
     source = make_repo(files={'README.md': 'public\n'})
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     return paths, global_config, project

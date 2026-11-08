@@ -18,15 +18,15 @@ from pubanon._cli._downstream import (
 class _FailingStream(io.StringIO):
     def __init__(self, error: OSError) -> None:
         super().__init__()
-        self.error = error
+        self._error = error
         self.attempts = 0
 
     def flush(self) -> None:
-        raise self.error
+        raise self._error
 
     def write(self, _text: str) -> int:
         self.attempts += 1
-        raise self.error
+        raise self._error
 
 
 @pytest.mark.parametrize('windows', [False, True])
@@ -184,15 +184,15 @@ class _FakeOs:
 
     def __init__(self, *, redirect_error: OSError | None) -> None:
         self.events: list[tuple[str, int]] = []
-        self.redirect_error = redirect_error
+        self._redirect_error = redirect_error
 
     def close(self, fd: int) -> None:
         self.events.append(('close', fd))
 
     def dup2(self, source: int, _target: int) -> None:
         self.events.append(('dup2', source))
-        if self.redirect_error is not None:
-            raise self.redirect_error
+        if self._redirect_error is not None:
+            raise self._redirect_error
 
     def open(self, _path: str, _flags: int) -> int:
         return 37

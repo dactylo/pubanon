@@ -12,8 +12,8 @@
 # tag's draft release page. Running it again for the same version is safe. To
 # publish a tagged commit by hand, run it from the Actions tab on its tag. If a
 # run fails, rerun that run instead of starting a new one. If the fault is in
-# this file, every rerun fails the same way; see "Publish pages after the
-# package upload" in pubanon's guide.
+# this file, every rerun fails the same way, because each run uses the workflow
+# file of the tagged commit.
 #
 # If your CI workflow file is not ci.yml, change CI_WORKFLOW_FILE. If your
 # version is dynamic, change how the verify step reads it. To approve each
@@ -201,7 +201,7 @@ jobs:
               message = f"The release page for {tag} is already published: {published['html_url']}"
           elif draft is None:
               message = (
-                  f'No release page for {tag}. If pubanon creates a draft for it later, '
+                  f'No release page for {tag}. If a draft is created for it later, '
                   'rerun this workflow to publish it.'
               )
           else:

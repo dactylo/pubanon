@@ -9,10 +9,10 @@ from collections.abc import Mapping, Sequence
 from typing import Protocol
 
 # Hang guard, not a performance assertion. Allow for scheduling on shared CI hosts.
-CHILD_TIMEOUT_SECONDS = 300
+_CHILD_TIMEOUT_SECONDS = 300
+_PROCESS_GROUP_FLAGS = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == 'win32' else 0
 _COLLECT_AFTER_KILL_SECONDS = 10
 _CONTROL_CHARACTERS = re.compile(r'[\x00-\x08\x0b-\x1f\x7f-\x9f]')
-PROCESS_GROUP_FLAGS = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == 'win32' else 0
 _TRANSCRIPT_FIELD_CHARACTERS = 2048
 _TRANSCRIPT_HEAD_BYTES = 2048
 _TRANSCRIPT_TAIL_BYTES = 6144
@@ -118,10 +118,10 @@ def _kill_and_describe[T: (str, bytes)](process: subprocess.Popen[T], *, reason:
     return process_transcript(killed, note=reason)
 
 
-def finish_process[T: (str, bytes)](
+def _finish_process[T: (str, bytes)](
     process: subprocess.Popen[T],
     *,
-    timeout: float = CHILD_TIMEOUT_SECONDS,
+    timeout: float = _CHILD_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[T]:
     try:
         stdout, stderr = process.communicate(timeout=timeout)
@@ -136,7 +136,7 @@ def run_closing_after_first_line(
     arguments: Sequence[str],
     *,
     env: Mapping[str, str] | None = None,
-    timeout: float = CHILD_TIMEOUT_SECONDS,
+    timeout: float = _CHILD_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[bytes]:
     process = subprocess.Popen(
         [sys.executable, *arguments],
@@ -145,7 +145,7 @@ def run_closing_after_first_line(
         stderr=subprocess.PIPE,
         env=None if env is None else dict(env),
         start_new_session=True,
-        creationflags=PROCESS_GROUP_FLAGS,
+        creationflags=_PROCESS_GROUP_FLAGS,
     )
     stdout = process.stdout
     assert stdout is not None
@@ -166,14 +166,14 @@ def run_closing_after_first_line(
         )
     stdout.close()
     process.stdout = None  # communicate() must not read the closed pipe on Windows
-    return finish_process(process, timeout=timeout)
+    return _finish_process(process, timeout=timeout)
 
 
 def run_with_closed_output(
     arguments: Sequence[str],
     *,
     env: Mapping[str, str] | None = None,
-    timeout: float = CHILD_TIMEOUT_SECONDS,
+    timeout: float = _CHILD_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[bytes]:
     read_fd, write_fd = os.pipe()
     os.close(read_fd)  # every write to stdout happens after its reader closed
@@ -185,8 +185,8 @@ def run_with_closed_output(
             stderr=subprocess.PIPE,
             env=None if env is None else dict(env),
             start_new_session=True,
-            creationflags=PROCESS_GROUP_FLAGS,
+            creationflags=_PROCESS_GROUP_FLAGS,
         )
     finally:
         os.close(write_fd)
-    return finish_process(process, timeout=timeout)
+    return _finish_process(process, timeout=timeout)

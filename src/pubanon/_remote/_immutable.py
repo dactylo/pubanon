@@ -1,10 +1,10 @@
 """Offer GitHub immutable releases once the final repository is public."""
 
-from pubanon._config import ProjectConfig
+from pubanon._config import ProjectConfig, release_pages_enabled
 from pubanon._errors import OperationCanceled, PubanonError
 from pubanon._remote import _host
 from pubanon._remote._host import Destination, GitHubRelease, ImmutableReleases
-from pubanon._terminal import confirm, escape, output
+from pubanon._terminal import confirm, counted, escape, output
 
 _CANCELED = 'Canceled. The repository is public; immutable releases are unchanged.'
 _EXPLANATION = (
@@ -51,11 +51,6 @@ def _convert(destination: Destination, page: GitHubRelease, sent: list[str]) -> 
         )
 
 
-def _counted(count: int, noun: str) -> str:
-    """Return a count with a regular plural noun."""
-    return f'{count} {noun}' if count == 1 else f'{count} {noun}s'
-
-
 def _enable(destination: Destination, sent: list[str]) -> None:
     """Enable immutable releases with the configured account and verify the setting."""
     _host.require_authenticated_account(destination.account, authority='configuration')
@@ -73,13 +68,13 @@ def _note_untitled(tags: list[str]) -> None:
 
 def _prompt(setting: ImmutableReleases, count: int) -> tuple[str, str] | None:
     """Return the status line and question, or None when nothing applies."""
-    pages = _counted(count, 'existing release page')
+    pages = counted(count, 'existing release page')
     if setting.enabled:
         if not count:
             return None
         verb = 'is' if count == 1 else 'are'
         return (
-            f'Immutable releases: on; {_counted(count, "release page")} {verb} still mutable',
+            f'Immutable releases: on; {counted(count, "release page")} {verb} still mutable',
             f'Make the {pages} immutable?',
         )
     if setting.enforced_by_owner:
@@ -159,7 +154,7 @@ def offer(p: ProjectConfig, destination: Destination) -> None:
     """
     try:
         pages = _host.all_releases(destination)
-        enabled = p.release_page is not None and p.release_page.enabled is True
+        enabled = release_pages_enabled(p)
         if not enabled and not pages:
             return
         setting = _host.immutable_releases(destination.owner, destination.repo)
@@ -189,7 +184,7 @@ def offer(p: ProjectConfig, destination: Destination) -> None:
             kind='warning',
         )
         return
-    count = _counted(len(convertible), 'existing release page')
+    count = counted(len(convertible), 'existing release page')
     if not accepted:
         if setting.enabled:
             verb = 'stays' if len(convertible) == 1 else 'stay'

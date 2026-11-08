@@ -1,6 +1,7 @@
 """Pin and read safe source repository snapshots."""
 
 import hashlib
+import ntpath
 import os
 import re
 import unicodedata
@@ -15,13 +16,18 @@ from pubanon._errors import PubanonError
 from pubanon._run import OID_HEX, GitResult, git_failure_fact, run_git
 from pubanon._terminal import escape, path_text
 
+EXECUTABLE_MODE = 0o100755
+REGULAR_MODE = 0o100644
+SYMLINK_MODE = 0o120000
+FILE_MODES = frozenset({REGULAR_MODE, EXECUTABLE_MODE})
+TREE_MODES = FILE_MODES | {SYMLINK_MODE}
 _BATCH_HEADER_FIELD_COUNT = 3
 _BOOKMARK_REF = re.compile(rf'refs/pubanon/publications/([^/]+)/({OID_HEX})')
 _BOOKMARK_SAFE = frozenset(b'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_')
 _GITLINK_MODE = b'160000'
-_SYMLINK_MODE = 0o120000
+_MALFORMED_OID = 'Git returned malformed object identity output'
+_RAW_TREE_MODES = frozenset(b'%o' % mode for mode in TREE_MODES)
 _TREE_METADATA_FIELD_COUNT = 3
-_TREE_MODES = frozenset({b'100644', b'100755', b'120000'})
 
 type Snapshot = tuple[Entry, ...]
 type _TreeEntry = tuple[bytes, str, int, bytes]
@@ -112,15 +118,8 @@ class SourceRecovery:
     reason: str | None
 
 
-class WorkingChanges(NamedTuple):
-    """Count working changes omitted from a committed source snapshot.
-
-    Attributes:
-        staged: Entries changed in the index relative to HEAD.
-        unstaged: Tracked entries changed in the worktree relative to the
-            index.
-        untracked: Individual untracked files. Ignored files are excluded.
-    """
+class _WorkingChanges(NamedTuple):
+    """Count working changes omitted from a committed source snapshot."""
 
     staged: int
     unstaged: int
@@ -158,81 +157,6 @@ def _matches_git_path_output(output: bytes, expected: PurePath) -> bool:
         and b'\0' not in output
         and output[:-1] == os.fsencode(expected.as_posix())
     )
-
-
-def _parse_oid(output: bytes) -> str:
-    """Parse one unambiguous object ID line."""
-    if not output.endswith(b'\n') or b'\n' in output[:-1]:
-        raise PubanonError('Git returned ambiguous object identity output')
-    raw_oid = output[:-1]
-    if re.fullmatch(OID_HEX.encode(), raw_oid) is None:
-        raise PubanonError('Git returned malformed object identity output')
-    return raw_oid.decode('ascii')
-
-
-def _bookmark_target(bookmark: SourceBookmark) -> str | None:
-    """Read a direct bookmark without following a symbolic reference."""
-    symbolic = _bookmark_git(bookmark, ['symbolic-ref', '-q', bookmark.refname])
-    if symbolic.returncode == 0:
-        raise PubanonError('source bookmark is symbolic and cannot be changed')
-    if symbolic.returncode != 1:
-        raise PubanonError('cannot inspect source bookmark', fact=git_failure_fact(symbolic))
-    current = _bookmark_git(
-        bookmark, ['for-each-ref', '--format=%(refname) %(objectname)', bookmark.refname]
-    )
-    if current.returncode != 0:
-        raise PubanonError('cannot inspect source bookmark', fact=git_failure_fact(current))
-    if not current.stdout:
-        return None
-    prefix = bookmark.refname.encode() + b' '
-    if not current.stdout.startswith(prefix):
-        raise PubanonError('Git returned an unexpected source bookmark')
-    return _parse_oid(current.stdout[len(prefix) :])
-
-
-def _read_blobs(
-    root: Path, entries: list[_TreeEntry], *, git_dir: Path | None = None
-) -> list[bytes]:
-    """Read exact blob bytes through one `cat-file --batch` process."""
-    if not entries:
-        return []
-    selector = ['--git-dir', str(git_dir.absolute())] if git_dir is not None else []
-    result = run_git(
-        [*selector, 'cat-file', '--batch'],
-        cwd=root,
-        input_bytes=b''.join(oid + b'\n' for _, _, _, oid in entries),
-        check=False,
-    )
-    if result.returncode != 0:
-        raise PubanonError('source object read failed', fact=git_failure_fact(result))
-    output = result.stdout
-    blobs: list[bytes] = []
-    offset = 0
-    for _raw_path, path, _mode, expected_oid in entries:
-        header_end = output.find(b'\n', offset)
-        if header_end < 0:
-            raise PubanonError('Git returned an unterminated object header')
-        header = output[offset:header_end].split(b' ')
-        if len(header) != _BATCH_HEADER_FIELD_COUNT:
-            raise PubanonError(
-                'source object could not be read',
-                fact=f'entry: {escape(path)}',
-            )
-        actual_oid, object_type, raw_size = header
-        if actual_oid != expected_oid or object_type != b'blob':
-            raise PubanonError('Git returned an ambiguous object response')
-        if re.fullmatch(rb'0|[1-9][0-9]*', raw_size) is None:
-            raise PubanonError('Git returned a malformed object size')
-        size = int(raw_size)
-        data_start = header_end + 1
-        data_end = data_start + size
-        if data_end >= len(output) or output[data_end : data_end + 1] != b'\n':
-            raise PubanonError('Git returned a truncated object')
-        blobs.append(output[data_start:data_end])
-        offset = data_end + 1
-    if offset != len(output):
-        raise PubanonError('Git returned trailing object data')
-    return blobs
 
 
 def _source_commit_exists(bookmark: SourceBookmark, source_commit: str) -> bool:
@@ -295,31 +219,6 @@ def _check_bookmark(bookmark: SourceBookmark, source_commit: str) -> None:
         raise PubanonError('recorded source repository is unavailable')
 
 
-def check_bookmark_release(bookmark: SourceBookmark, source_commit: str) -> bool:
-    """Verify that an owned bookmark can be released at its recorded commit.
-
-    An absent ref is safe to treat as an already completed release.
-
-    Args:
-        bookmark: Recorded location and name of the owned source ref.
-        source_commit: Exact commit expected at the ref.
-
-    Returns:
-        Whether the bookmark still exists at `source_commit`.
-
-    Raises:
-        PubanonError: The repository or bookmark is invalid, the ref is
-            symbolic or points elsewhere, or its target cannot be inspected.
-    """
-    _check_bookmark(bookmark, source_commit)
-    current = _bookmark_target(bookmark)
-    if current is None:
-        return False
-    if current != source_commit:
-        raise PubanonError('source bookmark changed to another commit')
-    return True
-
-
 def check_source_safety(root: Path) -> None:
     """Require a source repository suitable for isolated object reads.
 
@@ -350,8 +249,8 @@ def check_source_safety(root: Path) -> None:
                 'run git repack -a while alternates still exist; then temporarily rename '
                 f'{escape(path_text(alternates))} and verify all branch/tag tips and '
                 'reachable objects with git fsck --full before removing the saved file. '
-                'Restore it on any failure; see '
-                'docs/guide.md#disconnecting-an-alternate-object-store'
+                'Restore it on any failure; see "Disconnecting an alternate object store" in '
+                'the operations guide'
             ),
         )
 
@@ -415,6 +314,163 @@ def decode_tree_path(raw_path: bytes) -> str:
     return path
 
 
+def parse_batch_header(
+    output: bytes, offset: int, query: bytes, subject: str
+) -> tuple[tuple[bytes, int] | None, int]:
+    """Parse one `cat-file --batch` or `--batch-check` response header.
+
+    Args:
+        output: Complete batch output.
+        offset: Start of this response.
+        query: Full object ID that was requested.
+        subject: Word naming the objects in failure messages, such as `source`.
+
+    Returns:
+        The object type and size, or `None` for a missing object, and the
+        offset just past the header.
+
+    Raises:
+        PubanonError: The header is malformed or names another object.
+    """
+    header_end = output.find(b'\n', offset)
+    if header_end < 0:
+        raise PubanonError(f'Git returned an unterminated {subject} object header')
+    raw_header = output[offset:header_end]
+    if raw_header == query + b' missing':
+        return None, header_end + 1
+    header = raw_header.split(b' ')
+    if len(header) != _BATCH_HEADER_FIELD_COUNT:
+        raise PubanonError(f'Git returned a malformed {subject} object header')
+    actual_oid, object_type, raw_size = header
+    if actual_oid != query or re.fullmatch(OID_HEX.encode(), actual_oid) is None:
+        raise PubanonError(f'Git returned a mismatched {subject} object')
+    if object_type not in {b'blob', b'commit', b'tag', b'tree'}:
+        raise PubanonError(f'Git returned an unsupported {subject} object type')
+    if re.fullmatch(rb'0|[1-9][0-9]*', raw_size) is None:
+        raise PubanonError(f'Git returned a malformed {subject} object size')
+    return (object_type, int(raw_size)), header_end + 1
+
+
+def parse_batch_object(
+    output: bytes, offset: int, query: bytes, subject: str
+) -> tuple[tuple[bytes, bytes] | None, int]:
+    """Parse one exact `cat-file --batch` response.
+
+    Args:
+        output: Complete batch output.
+        offset: Start of this response.
+        query: Full object ID that was requested.
+        subject: Word naming the objects in failure messages, such as `source`.
+
+    Returns:
+        The object type and exact contents, or `None` for a missing object, and
+        the offset of the next response.
+
+    Raises:
+        PubanonError: The response is malformed, truncated, or names another
+            object.
+    """
+    header, data_start = parse_batch_header(output, offset, query, subject)
+    if header is None:
+        return None, data_start
+    object_type, size = header
+    data_end = data_start + size
+    if data_end >= len(output) or output[data_end : data_end + 1] != b'\n':
+        raise PubanonError(f'Git returned a truncated {subject} object')
+    return (object_type, output[data_start:data_end]), data_end + 1
+
+
+def _read_blobs(
+    root: Path, entries: list[_TreeEntry], *, git_dir: Path | None = None
+) -> list[bytes]:
+    """Read exact blob bytes through one `cat-file --batch` process."""
+    if not entries:
+        return []
+    selector = ['--git-dir', str(git_dir.absolute())] if git_dir is not None else []
+    result = run_git(
+        [*selector, 'cat-file', '--batch'],
+        cwd=root,
+        input_bytes=b''.join(oid + b'\n' for _, _, _, oid in entries),
+        check=False,
+    )
+    if result.returncode != 0:
+        raise PubanonError('source object read failed', fact=git_failure_fact(result))
+    output = result.stdout
+    blobs: list[bytes] = []
+    offset = 0
+    for _raw_path, path, _mode, oid in entries:
+        parsed, offset = parse_batch_object(output, offset, oid, 'source')
+        if parsed is None or parsed[0] != b'blob':
+            raise PubanonError('source object could not be read', fact=f'entry: {escape(path)}')
+        blobs.append(parsed[1])
+    if offset != len(output):
+        raise PubanonError('Git returned trailing source object data')
+    return blobs
+
+
+def parse_oid(output: bytes, failure: str = _MALFORMED_OID) -> str:
+    """Parse output that must be exactly one object ID line.
+
+    Args:
+        output: Git output to parse.
+        failure: Message for any other output, which is never echoed.
+
+    Returns:
+        The object ID.
+
+    Raises:
+        PubanonError: The output is not exactly one object ID and a newline.
+    """
+    if not output.endswith(b'\n') or re.fullmatch(OID_HEX.encode(), output[:-1]) is None:
+        raise PubanonError(failure)
+    return output[:-1].decode('ascii')
+
+
+def _bookmark_target(bookmark: SourceBookmark) -> str | None:
+    """Read a direct bookmark without following a symbolic reference."""
+    symbolic = _bookmark_git(bookmark, ['symbolic-ref', '-q', bookmark.refname])
+    if symbolic.returncode == 0:
+        raise PubanonError('source bookmark is symbolic and cannot be changed')
+    if symbolic.returncode != 1:
+        raise PubanonError('cannot inspect source bookmark', fact=git_failure_fact(symbolic))
+    current = _bookmark_git(
+        bookmark, ['for-each-ref', '--format=%(refname) %(objectname)', bookmark.refname]
+    )
+    if current.returncode != 0:
+        raise PubanonError('cannot inspect source bookmark', fact=git_failure_fact(current))
+    if not current.stdout:
+        return None
+    prefix = bookmark.refname.encode() + b' '
+    if not current.stdout.startswith(prefix):
+        raise PubanonError('Git returned an unexpected source bookmark')
+    return parse_oid(current.stdout[len(prefix) :])
+
+
+def check_bookmark_release(bookmark: SourceBookmark, source_commit: str) -> bool:
+    """Verify that an owned bookmark can be released at its recorded commit.
+
+    An absent ref is safe to treat as an already completed release.
+
+    Args:
+        bookmark: Recorded location and name of the owned source ref.
+        source_commit: Exact commit expected at the ref.
+
+    Returns:
+        Whether the bookmark still exists at `source_commit`.
+
+    Raises:
+        PubanonError: The repository or bookmark is invalid, the ref is
+            symbolic or points elsewhere, or its target cannot be inspected.
+    """
+    _check_bookmark(bookmark, source_commit)
+    current = _bookmark_target(bookmark)
+    if current is None:
+        return False
+    if current != source_commit:
+        raise PubanonError('source bookmark changed to another commit')
+    return True
+
+
 def ensure_bookmark(bookmark: SourceBookmark, source_commit: str) -> None:
     """Idempotently create or verify the owned bookmark at one exact commit.
 
@@ -468,7 +524,7 @@ def matching_commits(root: Path, sources: Collection[str]) -> dict[str, SourceMa
             )
             if result.returncode != 0:
                 continue
-            tree = _parse_oid(result.stdout)
+            tree = parse_oid(result.stdout)
         commits = trees.get(tree, [])
         matches[source] = SourceMatches(
             branch, commits[0] if commits else None, len(commits), source in reachable
@@ -514,7 +570,8 @@ def pin(root: Path, rev: str) -> PinnedSource:
         The pinned commit and selector intent.
 
     Raises:
-        PubanonError: The selector is invalid or Git returns ambiguous output.
+        PubanonError: Git cannot read the selector, the selector is invalid, or
+            Git returns ambiguous output.
     """
     symbolic = run_git(
         ['rev-parse', '--symbolic-full-name', '--verify', rev], cwd=root, check=False
@@ -554,10 +611,10 @@ def pin(root: Path, rev: str) -> PinnedSource:
                 ),
             )
         return PinnedSource(
-            _parse_oid(commit_result.stdout),
+            parse_oid(commit_result.stdout),
             'ref',
             selector_name,
-            _parse_oid(selector_result.stdout),
+            parse_oid(selector_result.stdout),
         )
 
     commit_result = run_git(['rev-parse', '--verify', f'{rev}^{{commit}}'], cwd=root, check=False)
@@ -567,7 +624,7 @@ def pin(root: Path, rev: str) -> PinnedSource:
             fact=git_failure_fact(commit_result),
             recovery='Select an existing branch, tag, or commit and retry preparation.',
         )
-    return PinnedSource(_parse_oid(commit_result.stdout), 'explicit', None, None)
+    return PinnedSource(parse_oid(commit_result.stdout), 'explicit', None, None)
 
 
 def remove_bookmark(bookmark: SourceBookmark, source_commit: str) -> None:
@@ -685,6 +742,21 @@ def _relocated_recovery(
     return SourceRecovery('protected', relocated.source_path, None)
 
 
+def require_commit(root: Path) -> None:
+    """Refuse a source repository whose `HEAD` has no commit yet.
+
+    Raises:
+        PubanonError: Git cannot inspect `HEAD`, or `HEAD` does not name a
+            commit.
+    """
+    result = run_git(['rev-parse', '--verify', '--quiet', 'HEAD^{commit}'], cwd=root, check=False)
+    if result.returncode != 0:
+        raise PubanonError(
+            'the source repository has no commits yet',
+            recovery='commit the files to publish, then rerun pubanon init',
+        )
+
+
 def snapshot_digest(snapshot: Iterable[Entry]) -> str:
     """Hash length-framed snapshot records in path-byte order.
 
@@ -764,7 +836,7 @@ def tree_mode(raw_mode: bytes, path: str) -> int:
             fact=f'gitlink: {escape(path)}',
             recovery='select a commit without the submodule or vendor its content and rerun',
         )
-    if raw_mode not in _TREE_MODES:
+    if raw_mode not in _RAW_TREE_MODES:
         raise PubanonError(
             'source tree contains an unsupported mode',
             fact=f'entry: {escape(path)}',
@@ -821,7 +893,7 @@ def update_source_tag(root: Path, label: str, target: str, known_sources: Collec
     """
     ref = f'refs/tags/pubanon/{label}'
     current = run_git(['show-ref', '--verify', '--hash', ref], cwd=root, check=False)
-    old = _parse_oid(current.stdout) if current.returncode == 0 else None
+    old = parse_oid(current.stdout) if current.returncode == 0 else None
     if old == target:
         return
     if old is not None:
@@ -859,7 +931,7 @@ def validate_symlink_graph(snapshot: Collection[Entry]) -> None:
     symlink_paths = frozenset(
         '/'.join(path_portability_keys(entry.path))
         for entry in snapshot
-        if entry.mode == _SYMLINK_MODE
+        if entry.mode == SYMLINK_MODE
     )
     for entry in snapshot:
         if entry.kind != 'symlink':
@@ -886,7 +958,8 @@ def read_snapshot(root: Path, commit: str, *, git_dir: Path | None = None) -> Sn
         The immutable source snapshot in path-byte order.
 
     Raises:
-        PubanonError: The tree or an object is malformed or unsupported.
+        PubanonError: The tree or an object cannot be read, is malformed, or is
+            unsupported.
     """
     selector = ['--git-dir', str(git_dir.absolute())] if git_dir is not None else []
     result = run_git(
@@ -898,17 +971,38 @@ def read_snapshot(root: Path, commit: str, *, git_dir: Path | None = None) -> Sn
     blobs = _read_blobs(root, tree_entries, git_dir=git_dir)
     snapshot: list[Entry] = []
     for (_raw_path, path, mode, _oid), data in zip(tree_entries, blobs, strict=True):
-        kind = 'symlink' if mode == _SYMLINK_MODE else 'blob'
+        kind = 'symlink' if mode == SYMLINK_MODE else 'blob'
         snapshot.append(Entry(path, mode, kind, data))
     validate_symlink_graph(snapshot)
     return tuple(snapshot)
 
 
-def working_changes(root: Path) -> WorkingChanges:
+def windows_unrepresentable(path: str) -> bool:
+    """Report whether Windows cannot represent a slash-separated path or link target.
+
+    Args:
+        path: Snapshot path or symlink target using `/` separators.
+
+    Returns:
+        Whether it contains a backslash or colon, or a component reserved on
+        Windows, including device names, trailing dots or spaces, wildcards,
+        and control characters.
+    """
+    return (
+        '\\' in path
+        or ':' in path
+        or any(ntpath.isreserved(part) for part in path.split('/') if part not in {'', '.', '..'})
+    )
+
+
+def working_changes(root: Path) -> _WorkingChanges:
     """Count omitted worktree and index changes without refreshing the index.
 
     A path changed in both the index and worktree contributes to both counts.
     Rename sources are consumed as part of their destination record.
+
+    Raises:
+        PubanonError: Git cannot read the working-tree and index status.
     """
     output = run_git(
         ['status', '--porcelain=v1', '-z', '--untracked-files=all'],
@@ -928,4 +1022,4 @@ def working_changes(root: Path) -> WorkingChanges:
             unstaged += worktree != ord(' ')
             if index in b'RC' or worktree in b'RC':
                 next(records)
-    return WorkingChanges(staged, unstaged, untracked)
+    return _WorkingChanges(staged, unstaged, untracked)

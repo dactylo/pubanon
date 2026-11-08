@@ -123,6 +123,10 @@ class Draft:
     release_page_sections: bool | None = None
 
 
+class DraftSaveError(PubanonError):
+    """Indicate that saving the latest setup answers failed."""
+
+
 class InvalidDraftError(PubanonError):
     """Indicate that a saved setup draft cannot be resumed."""
 
@@ -174,7 +178,7 @@ def _pairs(data: dict[str, object], key: str) -> tuple[tuple[str, str], ...]:
 
 def _path(paths: Paths, name: str) -> Path:
     """Return the durable init-draft path for one project."""
-    return paths.data_dir / 'projects' / name / 'init-draft.json'
+    return paths.project_data(name) / 'init-draft.json'
 
 
 def _payload(draft: Draft) -> dict[str, object]:
@@ -349,26 +353,27 @@ def save(paths: Paths, name: str, draft: Draft) -> None:
         draft: Complete guided-init state to persist.
 
     Raises:
-        PubanonError: The draft is invalid or cannot be saved. A failure after
-            replacement reports that it may have been saved.
+        InvalidDraftError: The draft's fields or state relationships are
+            invalid.
+        PubanonError: The project data directory cannot be prepared.
+        DraftSaveError: Serialization or durable writing fails. A failure after
+            replacement reports that the draft may have been saved.
     """
     payload = _payload(draft)
     _draft(payload)
     try:
         content = (json.dumps(payload, ensure_ascii=False, indent=2) + '\n').encode('utf-8')
     except (TypeError, ValueError, UnicodeError) as exc:
-        raise PubanonError('invalid init draft') from exc
+        raise DraftSaveError('invalid init draft') from exc
 
     create_data_dirs(paths, name)
     destination = _path(paths, name)
     try:
         _filesystem.write_private(destination, content)
     except _filesystem.DurableWriteError as exc:
-        if exc.interrupted and not exc.replacement_attempted:
+        if exc.interrupted_before_replacement:
             raise KeyboardInterrupt from exc.__cause__
         message = (
-            'init draft may have been saved'
-            if exc.replaced or (exc.interrupted and exc.replacement_attempted)
-            else 'cannot save init draft'
+            'init draft may have been saved' if exc.may_have_saved else 'cannot save init draft'
         )
-        raise PubanonError(message) from exc.__cause__
+        raise DraftSaveError(message) from exc.__cause__

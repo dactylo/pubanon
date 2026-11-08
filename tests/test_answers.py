@@ -1,12 +1,11 @@
 import sys
-from collections.abc import Callable, Sequence
 
 import pytest
 
-_Script = Callable[[Sequence[str | tuple[str, str]]], None]
+from tests._setup import Script
 
 
-def test_answers_reject_an_unexpected_prompt(answers: _Script) -> None:
+def test_answers_reject_an_unexpected_prompt(answers: Script) -> None:
     answers([('Expected: ', 'value')])
     with pytest.raises(AssertionError, match='expected prompt'):
         input('Other: ')
@@ -14,14 +13,14 @@ def test_answers_reject_an_unexpected_prompt(answers: _Script) -> None:
     assert input('Expected: ') == 'value'
 
 
-def test_answers_reject_more_prompts_than_replies(answers: _Script) -> None:
+def test_answers_reject_more_prompts_than_replies(answers: Script) -> None:
     answers([('Only: ', 'value')])
     assert input('Only: ') == 'value'
     with pytest.raises(AssertionError, match='unexpected prompt'):
         input('Only: ')
 
 
-def test_answers_return_scripted_replies_in_order(answers: _Script) -> None:
+def test_answers_return_scripted_replies_in_order(answers: Script) -> None:
     answers(['one', ('Second: ', 'two')])
     assert input('A menu whose wording may change: ') == 'one'
     assert input('Second: ') == 'two'

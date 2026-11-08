@@ -28,6 +28,8 @@ from pubanon._snapshots._source import (
 )
 from pubanon._terminal import (
     escape,
+    project_fallback,
+    shell_command,
 )
 
 
@@ -59,7 +61,7 @@ def _candidate_gate_units(
     units = [(entry.path, entry.path.encode(), 'filename') for entry in snapshot]
     units.extend((entry.path, entry.data, 'blob') for entry in snapshot)
     units.append(('commit message', record.message.encode(), 'message'))
-    identity = f'{global_config.anon_name} <{global_config.anon_email}>'.encode()
+    identity = global_config.identity.encode()
     units.append(('publication identity', identity, 'header identity value'))
     if record.tag_intent is not None:
         units.append(('tag intent', record.tag_intent.encode(), 'tag name'))
@@ -338,6 +340,23 @@ def materialize_inspect(
     return _inspection.materialize_snapshot(paths, project, commit, snapshot, refresh=refresh)
 
 
+def reprepare_advice(record: CandidateRecord, *, project: str | None = None) -> str:
+    """Describe how to rebuild the selected source revision and release tag."""
+    selection = [f'--project={project}'] if project is not None else []
+    prepare = ['pubanon', 'prepare', *selection]
+    if record.replaces is not None:
+        selector = 'all' if record.replace_scope == 'all' else record.replaces
+        prepare.extend(('--replace', selector))
+    prepare.extend(('--source', record.pinned.commit))
+    if record.tag_intent is not None:
+        prepare.extend(('--version', record.tag_intent[1:]))
+    discard_command = shell_command('pubanon', 'discard', *selection)
+    prepare_command = shell_command(*prepare)
+    if discard_command is None or prepare_command is None:
+        return project_fallback(project or '', 'discard and prepare', None)
+    return f'{discard_command} && {prepare_command}'
+
+
 def select_rewritten_commit(record: CandidateRecord, selector: str | None) -> str:
     """Resolve a rewritten commit or moved tag from one candidate record.
 
@@ -459,6 +478,10 @@ def confirmed_publication(paths: Paths, project: str, record: CandidateRecord) -
     A strict matching publication record or an owned direct archive ref is
     sufficient. Conflicting provenance or refs raise `PubanonError`; absent
     evidence returns false. This does not observe the host's current state.
+
+    Raises:
+        PubanonError: Saved records, owned archive references, or retained
+            objects are unreadable, malformed, or inconsistent.
     """
     if record.replaces is not None and record.tip is None:
         if _records.load_publication(
@@ -491,7 +514,7 @@ def verify_retained_candidate(  # noqa: PLR0913
     record: CandidateRecord,
     *,
     env: Mapping[str, str],
-    recovery: str = 'pubanon discard, then pubanon prepare',
+    recovery: str | None = None,
 ) -> Snapshot:
     """Re-prove one retained candidate against current content gates.
 
@@ -507,6 +530,8 @@ def verify_retained_candidate(  # noqa: PLR0913
 
         env: Current command environment for dynamic private-path terms.
         recovery: Advice for invalid retained objects or failed current gates.
+            By default, discard and prepare again, keeping a replacement's
+            `--replace`, `--source`, and `--version` choices.
 
     Returns:
         The verified resulting tip snapshot. The record's tree, digest, and
@@ -515,6 +540,12 @@ def verify_retained_candidate(  # noqa: PLR0913
     Raises:
         PubanonError: The record, candidate objects, or current gates fail.
     """
+    if recovery is None:
+        recovery = (
+            'pubanon discard, then pubanon prepare'
+            if record.replaces is None
+            else reprepare_advice(record, project=project.name)
+        )
     proof = prove_objects(paths, project.name, record, recovery=recovery)
     snapshot, identity = proof.snapshot, proof.identity
     _verify_replacement_objects(paths, project.name, record, identity)
@@ -524,7 +555,7 @@ def verify_retained_candidate(  # noqa: PLR0913
             'the configuration changed after the snapshot was prepared',
             recovery=recovery,
         )
-    current_identity = f'{global_config.anon_name} <{global_config.anon_email}>'.encode()
+    current_identity = global_config.identity.encode()
     # _verify_replacement_objects audited history with this verified identity.
     if identity != current_identity:
         raise PubanonError(

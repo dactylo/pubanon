@@ -15,7 +15,7 @@ from pubanon._cli import _selection
 from pubanon._cli._context import ProjectContext
 from pubanon._cli._selection import (
     _apply_policy_offers,
-    policy_decision,
+    _policy_decision,
     sanitized_snapshot,
     show_selection,
 )
@@ -33,7 +33,6 @@ def test_adjust_reoffers_unmatched_remainder(
     source = tmp_path / 'source'
     source.mkdir()
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     project = replace(project, allow=())
     ctx = ProjectContext(paths, global_config, project)
     snapshot = (
@@ -46,7 +45,7 @@ def test_adjust_reoffers_unmatched_remainder(
         return next(answers)
 
     monkeypatch.setattr('builtins.input', _answer)
-    updated = _apply_policy_offers(ctx, snapshot, persist=False, yes=False)
+    updated = _apply_policy_offers(ctx, snapshot, yes=False)
     membership = _policy.evaluate_membership(
         ['pkg/a.py', 'pkg/b.py'], updated.project.allow, updated.project.deny
     )
@@ -60,7 +59,6 @@ def test_first_policy_pass_owns_new_credential_like_paths(
     source = tmp_path / 'source'
     source.mkdir()
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     ctx = ProjectContext(paths, global_config, project)
     snapshot = (
         _source.Entry('README.md', 0o100644, 'blob', b'public\n'),
@@ -72,7 +70,7 @@ def test_first_policy_pass_owns_new_credential_like_paths(
         return next(answers)
 
     monkeypatch.setattr('builtins.input', _answer)
-    updated = _apply_policy_offers(ctx, snapshot, persist=False, yes=False)
+    updated = _apply_policy_offers(ctx, snapshot, yes=False)
     membership = _policy.evaluate_membership(
         [entry.path for entry in snapshot], updated.project.allow, updated.project.deny
     )
@@ -160,7 +158,6 @@ def test_new_path_batch_json_preserves_controls_and_terminal_output_escapes_them
     source = make_repo(files={raw_path: 'public\n'})
     unsafe_root = tmp_path / ('data\\\x1broot' if os.name != 'nt' else 'data\u2028root')
     paths, global_config, project = configure(unsafe_root, monkeypatch, source)
-    assert project is not None
     monkeypatch.chdir(source)
 
     assert _cli.main(['prepare', '--acknowledge-new-paths', '--yes', '--verbose']) == 0
@@ -197,7 +194,7 @@ def test_policy_decision_accepts_single_key_and_renders_matches(
     monkeypatch.setattr('builtins.input', _answer)
     membership = _policy.evaluate_membership(['src/a.py', 'src/b.py'], (), ())
 
-    assert policy_decision('src/**', ['src/a.py', 'src/b.py'], membership) == (
+    assert _policy_decision('src/**', ['src/a.py', 'src/b.py'], membership) == (
         'publish',
         'src/**',
     )
@@ -227,7 +224,7 @@ def test_policy_decision_confirms_exclusion_of_included_files(
         (),
     )
 
-    assert policy_decision('tests/**', membership.unmatched, membership) == (
+    assert _policy_decision('tests/**', membership.unmatched, membership) == (
         'deny',
         'tests/**',
     )
@@ -258,7 +255,7 @@ def test_policy_decision_customize_excludes_typed_pattern(
     paths = ['tests/test_a.py', 'tests/human/a.py', 'tests/human/b.py']
     membership = _policy.evaluate_membership(paths, (), ())
 
-    assert policy_decision('tests/**', paths, membership) == ('deny', 'tests/human/**')
+    assert _policy_decision('tests/**', paths, membership) == ('deny', 'tests/human/**')
     assert prompts[1:] == [
         'Custom pattern: ',
         'Include or exclude matching files? [i]nclude / [e]xclude: ',
@@ -274,7 +271,7 @@ def test_policy_decision_quit_refuses_run(monkeypatch: pytest.MonkeyPatch) -> No
     membership = _policy.evaluate_membership(['README.md'], (), ())
 
     with pytest.raises(OperationCanceled, match=r'Canceled\.') as error:
-        policy_decision('**', ['README.md'], membership)
+        _policy_decision('**', ['README.md'], membership)
     assert 'Nothing was saved.' in str(error.value)
 
 
@@ -292,7 +289,7 @@ def test_policy_decision_reasks_when_pattern_changes_nothing(
         ['scripts/a.py', 'scripts/b.py'], ('scripts/a.py',), ()
     )
 
-    assert policy_decision('scripts/b.py', ['scripts/b.py'], membership) == (
+    assert _policy_decision('scripts/b.py', ['scripts/b.py'], membership) == (
         'publish',
         'scripts/b.py',
     )
@@ -311,7 +308,6 @@ def test_policy_offers_explain_selection_rules_once_by_default(
     source = tmp_path / 'source'
     source.mkdir()
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     ctx = ProjectContext(paths, global_config, project)
     snapshot = (_source.Entry('KEY.PEM', 0o100644, 'blob', b'key'),)
 
@@ -323,7 +319,6 @@ def test_policy_offers_explain_selection_rules_once_by_default(
     updated = _apply_policy_offers(
         ctx,
         snapshot,
-        persist=False,
         yes=False,
     )
 
@@ -338,7 +333,6 @@ def test_policy_offers_skip_groups_decided_by_custom_pattern(
     source = tmp_path / 'source'
     source.mkdir()
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     ctx = ProjectContext(paths, global_config, replace(project, allow=()))
     snapshot = (
         _source.Entry('docs/guide.md', 0o100644, 'blob', b'guide'),
@@ -350,10 +344,32 @@ def test_policy_offers_skip_groups_decided_by_custom_pattern(
         return next(answers)
 
     monkeypatch.setattr('builtins.input', _answer)
-    updated = _apply_policy_offers(ctx, snapshot, persist=False, yes=False)
+    updated = _apply_policy_offers(ctx, snapshot, yes=False)
 
     assert updated.project.allow == ('**',)
     assert next(answers, None) is None
+
+
+def test_policy_offers_yes_names_undecided_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / 'source'
+    source.mkdir()
+    paths, global_config, project = configure(tmp_path, monkeypatch, source)
+    ctx = ProjectContext(paths, global_config, replace(project, allow=(), deny=()))
+    snapshot = tuple(
+        _source.Entry(f'docs/{index}.md', 0o100644, 'blob', b'text') for index in range(7)
+    )
+
+    with pytest.raises(PubanonError, match='--yes cannot answer policy proposals') as exc_info:
+        _apply_policy_offers(ctx, snapshot, yes=True)
+
+    fact = exc_info.value.fact or ''
+    assert '7 undecided files' in fact
+    assert 'docs/0.md' in fact
+    assert 'and 2 more' in fact
+    assert 'without --yes' in (exc_info.value.recovery or '')
 
 
 def test_policy_offers_yes_still_refuses_credential_warning_without_input(
@@ -363,7 +379,6 @@ def test_policy_offers_yes_still_refuses_credential_warning_without_input(
     source = tmp_path / 'source'
     source.mkdir()
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     ctx = ProjectContext(paths, global_config, project)
     snapshot = (_source.Entry('KEY.PEM', 0o100644, 'blob', b'key'),)
 
@@ -372,8 +387,13 @@ def test_policy_offers_yes_still_refuses_credential_warning_without_input(
 
     monkeypatch.setattr('builtins.input', _unexpected_input)
 
-    with pytest.raises(PubanonError, match='--yes cannot answer credential-like path warnings'):
-        _apply_policy_offers(ctx, snapshot, persist=False, yes=True)
+    with pytest.raises(
+        PubanonError, match='--yes cannot answer credential-like path warnings'
+    ) as exc_info:
+        _apply_policy_offers(ctx, snapshot, yes=True)
+
+    assert 'KEY.PEM' in (exc_info.value.fact or '')
+    assert 'without --yes' in (exc_info.value.recovery or '')
 
 
 @pytest.mark.parametrize('decision', ['continue', 'quit'])
@@ -385,7 +405,6 @@ def test_selection_review_preserves_saved_choices(
     source = tmp_path / 'source'
     source.mkdir()
     paths, config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     project = replace(project, allow=('README.md', 'future/**'), deny=('notes/**',))
     _config.save_project(paths, project)
     ctx = ProjectContext(paths, config, project)
@@ -417,7 +436,6 @@ def test_selection_review_applies_edited_groups_only_on_acceptance(
     source = tmp_path / 'source'
     source.mkdir()
     paths, config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     config = replace(config, ignored_directories=('private',))
     ctx = ProjectContext(paths, config, project)
     snapshot = tuple(
@@ -453,7 +471,6 @@ def test_global_directory_exclusions_override_includes_and_skip_proposals(
     source = tmp_path / 'source'
     source.mkdir()
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     global_config = replace(
         global_config, ignored_directories=('DOCS/Private', 'Notes/CONFIDENTIAL')
     )
@@ -465,7 +482,7 @@ def test_global_directory_exclusions_override_includes_and_skip_proposals(
         _source.Entry('docs/private/private.key', 0o100644, 'blob', b'private'),
         _source.Entry('notes/confidential/nested/notes.md', 0o100644, 'blob', b'private'),
     )
-    updated = _apply_policy_offers(ctx, snapshot, persist=False, yes=True)
+    updated = _apply_policy_offers(ctx, snapshot, yes=True)
     assert [entry.path for entry in sanitized_snapshot(updated, snapshot)] == [
         'README.md',
         'docs/private-copy/guide.md',

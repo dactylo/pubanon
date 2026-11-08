@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from pubanon import _changelog
-from pubanon._changelog import Lookup, NearMiss, Recognition
+from pubanon._changelog import Lookup, NearMiss, _Recognition
 
 _CHANGELOG = Path(__file__).parents[1] / 'CHANGELOG.md'
 _SEMANTIC_RELEASE = (
@@ -150,25 +150,25 @@ def test_recognize_lists_distinct_versions_newest_first() -> None:
         b'# Changelog\n## 0.2.0 (2026-01-02)\n- b\n## 0.10.0 (2026-01-03)\n- c\n'
         b'## 0.2.0\n## [Unreleased]\n## 0.1.0-rc.1\n## 0.1.0\n'
     )
-    assert _changelog.recognize(data) == Recognition(('0.10.0', '0.2.0', '0.1.0'))
+    assert _changelog.recognize(data) == _Recognition(('0.10.0', '0.2.0', '0.1.0'))
 
 
 @pytest.mark.parametrize('template', [None, '## Version {version}'])
 @pytest.mark.parametrize('version', ['01.2.3', '1.02.3', '1.2.03'])
 def test_recognize_rejects_leading_zero_components(template: str | None, version: str) -> None:
     heading = (template or '## {version}').format(version=version)
-    assert _changelog.recognize(f'{heading}\n- a\n'.encode(), template) == Recognition(())
+    assert _changelog.recognize(f'{heading}\n- a\n'.encode(), template) == _Recognition(())
 
 
 def test_recognize_reports_text_that_is_not_utf8() -> None:
-    assert _changelog.recognize(b'\xff') == Recognition((), readable=False)
+    assert _changelog.recognize(b'\xff') == _Recognition((), readable=False)
 
 
 @pytest.mark.parametrize('template', [None, '## Version {version}'])
 def test_recognize_retains_zero_components(template: str | None) -> None:
     heading = template or '## {version}'
     data = '\n'.join(heading.format(version=v) for v in ('0.0.0', '0.1.0', '1.0.0'))
-    assert _changelog.recognize(data.encode(), template) == Recognition(
+    assert _changelog.recognize(data.encode(), template) == _Recognition(
         ('1.0.0', '0.1.0', '0.0.0')
     )
 
@@ -179,7 +179,7 @@ def test_recognize_uses_the_heading_template() -> None:
 
 
 def test_recognize_without_matches_gives_hints() -> None:
-    assert _changelog.recognize(b'# Changelog\n## Version 0.6.0\n- a\n') == Recognition(
+    assert _changelog.recognize(b'# Changelog\n## Version 0.6.0\n- a\n') == _Recognition(
         (), near_misses=(NearMiss(2, '## Version 0.6.0'),), suggestion='## Version {version}'
     )
 
@@ -189,7 +189,7 @@ def test_recognize_without_matches_hints_only_at_canonical_versions(
     template: str | None,
 ) -> None:
     data = b'## Version 01.2.3\n## Version 1.02.3\n## Version 1.2.03\n## Version 0.0.0\n'
-    assert _changelog.recognize(data, template) == Recognition(
+    assert _changelog.recognize(data, template) == _Recognition(
         (), near_misses=(NearMiss(4, '## Version 0.0.0'),), suggestion='## Version {version}'
     )
 

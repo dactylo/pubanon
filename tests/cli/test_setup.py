@@ -2,7 +2,6 @@ import json
 import os
 import subprocess
 import sys
-from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
 
@@ -17,9 +16,29 @@ from pubanon._errors import PubanonError
 from pubanon._remote import _host
 from tests._cli import gh_calls
 from tests._permissions import assert_private_mode
-from tests._setup import configure
+from tests._setup import Script, configure
 
-_Script = Callable[[Sequence[str | tuple[str, str]]], None]
+
+def test_setup_account_mismatch_names_switch_and_edit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    answers: Script,
+) -> None:
+    configure(tmp_path, monkeypatch)
+
+    def _account(*, timeout: float | None = None) -> str:
+        del timeout
+        return 'other-account'
+
+    monkeypatch.setattr(_host, '_authenticated_account', _account)
+    answers([])
+
+    assert _cli.main(['setup']) == 1
+
+    error = capsys.readouterr().err
+    assert 'gh auth switch --user anonymous-account' in error
+    assert 'pubanon setup --edit' in error
 
 
 @pytest.mark.parametrize('failure', [EOFError(), KeyboardInterrupt()])
@@ -209,7 +228,7 @@ def test_setup_creates_complete_owner_only_global_configuration(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     fake_gh: Path,
-    answers: _Script,
+    answers: Script,
 ) -> None:
     monkeypatch.setenv('HOME', str(tmp_path))
     monkeypatch.delenv('XDG_CONFIG_HOME', raising=False)
@@ -262,7 +281,7 @@ def test_setup_edit_account_mismatch_can_be_corrected_before_readiness(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     fake_gh: Path,
-    answers: _Script,
+    answers: Script,
 ) -> None:
     paths, original, _ = configure(tmp_path, monkeypatch)
     fake_gh.write_text(
@@ -290,13 +309,12 @@ def test_setup_edit_changes_default_without_changing_existing_project(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     fake_gh: Path,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     source = tmp_path / 'source'
     source.mkdir()
     paths, _, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     _config.save_project(paths, replace(project, publication_route='staged'))
     fake_gh.write_text(
         json.dumps([{'args': ['api', 'user', '--jq', '.login'], 'stdout': 'anonymous-account\n'}])
@@ -322,7 +340,7 @@ def test_setup_edit_completed_config_preserves_unedited_values(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     fake_gh: Path,
-    answers: _Script,
+    answers: Script,
 ) -> None:
     paths, original, _ = configure(tmp_path, monkeypatch)
     fake_gh.write_text(
@@ -356,7 +374,7 @@ def test_setup_edit_corrects_identity_before_save(
     monkeypatch: pytest.MonkeyPatch,
     fake_gh: Path,
     capsys: pytest.CaptureFixture[str],
-    answers: _Script,
+    answers: Script,
 ) -> None:
     paths, _, _ = configure(tmp_path, monkeypatch)
     fake_gh.write_text(
@@ -390,7 +408,7 @@ def test_setup_edit_preserves_commit_messages_when_route_changes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     fake_gh: Path,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     paths, _, _ = configure(tmp_path, monkeypatch)
@@ -425,7 +443,7 @@ def test_setup_edit_save_preserves_direct_default(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     fake_gh: Path,
-    answers: _Script,
+    answers: Script,
 ) -> None:
     paths, original, _ = configure(tmp_path, monkeypatch)
     _config.save_global(
@@ -509,7 +527,7 @@ def test_setup_interrupt_after_save_retains_configuration_and_facts(
     monkeypatch: pytest.MonkeyPatch,
     fake_gh: Path,
     capsys: pytest.CaptureFixture[str],
-    answers: _Script,
+    answers: Script,
 ) -> None:
     paths, _, _ = configure(tmp_path, monkeypatch)
     paths.global_config.unlink()
@@ -569,7 +587,7 @@ def test_setup_post_save_readiness_failure_retains_valid_config(
     monkeypatch: pytest.MonkeyPatch,
     fake_gh: Path,
     capsys: pytest.CaptureFixture[str],
-    answers: _Script,
+    answers: Script,
 ) -> None:
     paths, _, _ = configure(tmp_path, monkeypatch)
     paths.global_config.unlink()
@@ -612,7 +630,7 @@ def test_setup_post_save_readiness_failure_retains_valid_config(
 def test_setup_preserves_nonblank_term_whitespace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    answers: _Script,
+    answers: Script,
 ) -> None:
     paths, _, _ = configure(tmp_path, monkeypatch)
     paths.global_config.unlink()
@@ -675,7 +693,7 @@ def test_setup_retries_colliding_new_identity_without_removing_terms(
     monkeypatch: pytest.MonkeyPatch,
     fake_gh: Path,
     capsys: pytest.CaptureFixture[str],
-    answers: _Script,
+    answers: Script,
 ) -> None:
     paths, _, _ = configure(tmp_path, monkeypatch)
     paths.global_config.unlink()
@@ -710,7 +728,7 @@ def test_setup_retries_invalid_new_fields_and_terms(
     monkeypatch: pytest.MonkeyPatch,
     fake_gh: Path,
     capsys: pytest.CaptureFixture[str],
-    answers: _Script,
+    answers: Script,
 ) -> None:
     paths, _, _ = configure(tmp_path, monkeypatch)
     paths.global_config.unlink()
@@ -811,7 +829,7 @@ def test_setup_incomplete_account_requires_save_decision(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    answers: _Script,
+    answers: Script,
     action: str,
 ) -> None:
     paths, _, _ = configure(tmp_path, monkeypatch)
@@ -852,7 +870,7 @@ def test_setup_failed_authentication_offers_explicit_actions(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     action: str,
-    answers: _Script,
+    answers: Script,
 ) -> None:
     paths, _, _ = configure(tmp_path, monkeypatch)
     original = paths.global_config.read_bytes()
@@ -897,7 +915,7 @@ def test_setup_login_never_saves_without_verified_matching_account(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     login_result: str,
-    answers: _Script,
+    answers: Script,
 ) -> None:
     paths, _, _ = configure(tmp_path, monkeypatch)
     original = paths.global_config.read_bytes()
@@ -977,7 +995,7 @@ def test_setup_save_decline_leaves_original_bytes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     fake_gh: Path,
-    answers: _Script,
+    answers: Script,
 ) -> None:
     paths, _, _ = configure(tmp_path, monkeypatch)
     original = paths.global_config.read_bytes()
@@ -1014,11 +1032,11 @@ def test_setup_saved_account_mismatch_preserves_exact_review_details(
     assert 'private-account-canary' in raised.value.render()
 
 
-def test_setup_shows_terms_while_editing_and_before_saving(
+def test_setup_shows_terms_before_saving(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     fake_gh: Path,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     paths, _, _ = configure(tmp_path, monkeypatch)
@@ -1042,7 +1060,6 @@ def test_setup_shows_terms_while_editing_and_before_saving(
     )
     assert _cli.main(['setup']) == 0
     out = capsys.readouterr().out
-    assert '  1. first-canary' in out
     assert 'Sensitive terms:' in out
     assert _config.load_global(paths).sensitive_terms == ('first-canary',)
 
@@ -1053,7 +1070,7 @@ def test_setup_term_edit_retries_blank_before_valid_value(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     fake_gh: Path,
-    answers: _Script,
+    answers: Script,
 ) -> None:
     paths, config, _ = configure(tmp_path, monkeypatch)
     _config.save_global(paths, config, paths.global_config.read_bytes())
@@ -1091,7 +1108,8 @@ def test_setup_term_review_keeps_ids_after_earlier_removal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     fake_gh: Path,
-    answers: _Script,
+    answers: Script,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     paths, config, _ = configure(tmp_path, monkeypatch)
     _config.save_global(
@@ -1117,7 +1135,26 @@ def test_setup_term_review_keeps_ids_after_earlier_removal(
         ]
     )
 
+    scripted_input = input
+    displayed = [
+        ['  1. first-canary', '  2. second-canary', '  3. third-canary'],
+        ['  2. second-canary', '  3. third-canary'],
+        ['  2. second-canary', '  3. third-canary', '  4. fourth-canary'],
+        ['  3. third-canary', '  4. fourth-canary'],
+    ]
+
+    def _answer(prompt: str) -> str:
+        output = capsys.readouterr().out
+        if prompt.startswith('Terms:'):
+            assert displayed, 'unexpected term editor screen'
+            assert [
+                line for line in output.splitlines() if line.startswith('  ') and '. ' in line
+            ] == displayed.pop(0)
+        return scripted_input(prompt)
+
+    monkeypatch.setattr('builtins.input', _answer)
     assert _cli.main(['setup', '--edit']) == 0
+    assert displayed == []
     assert _config.load_global(paths).sensitive_terms == ('third-canary', 'fourth-canary')
 
 
@@ -1126,7 +1163,7 @@ def test_setup_term_review_lists_terms_by_number(
     monkeypatch: pytest.MonkeyPatch,
     fake_gh: Path,
     capsys: pytest.CaptureFixture[str],
-    answers: _Script,
+    answers: Script,
 ) -> None:
     paths, config, _ = configure(tmp_path, monkeypatch)
     _config.save_global(
@@ -1151,20 +1188,50 @@ def test_setup_term_review_lists_terms_by_number(
         ]
     )
 
+    scripted_input = input
+    displayed = [
+        ['  1. first-canary', '  2. second-canary'],
+        ['  1. replacement-canary', '  2. second-canary'],
+        ['  1. replacement-canary'],
+    ]
+
+    def _answer(prompt: str) -> str:
+        output = capsys.readouterr().out
+        if prompt.startswith('Terms:'):
+            assert displayed, 'unexpected term editor screen'
+            assert [
+                line for line in output.splitlines() if line.startswith('  ') and '. ' in line
+            ] == displayed.pop(0)
+        return scripted_input(prompt)
+
+    monkeypatch.setattr('builtins.input', _answer)
     assert _cli.main(['setup', '--edit']) == 0
+    assert displayed == []
     assert _config.load_global(paths).sensitive_terms == ('replacement-canary',)
-    output = capsys.readouterr().out
-    assert '  1. first-canary' in output
-    assert '  2. second-canary' in output
-    for term in ('first-canary', 'second-canary', 'replacement-canary'):
-        assert term in output
+
+
+def test_setup_without_github_cli_names_install_step(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    answers: Script,
+) -> None:
+    configure(tmp_path, monkeypatch)
+    monkeypatch.setattr(_host, '_GH', str(tmp_path / 'missing-gh'))
+    answers([])
+
+    assert _cli.main(['setup']) == 1
+
+    error = capsys.readouterr().err
+    assert 'cannot run GitHub CLI' in error
+    assert 'install GitHub CLI' in error
 
 
 def test_setup_writes_nothing_until_save(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     fake_gh: Path,
-    answers: _Script,
+    answers: Script,
 ) -> None:
     paths, _, _ = configure(tmp_path, monkeypatch)
     paths.global_config.unlink()

@@ -25,7 +25,7 @@ _COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
             ('prepare', 'create a snapshot from committed files'),
             ('inspect', 'show snapshot details and where its review copy is'),
             ('publish', 'send the prepared snapshot to the final repository'),
-            ('discard', 'drop the prepared snapshot and its review copies'),
+            ('discard', 'drop the prepared snapshot, its review copies, and any paused rewrite'),
             ('status', "show the project's current state"),
             ('run', 'run a declared release workflow'),
         ),
@@ -62,132 +62,6 @@ _COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
 _COMMAND_HELP = {name: text for _title, commands in _COMMAND_GROUPS for name, text in commands}
 
 
-@contextmanager
-def _help_color_context() -> Generator[None]:
-    """Keep argparse's color override active through lazy help rendering."""
-    previous = os.environ.get('PYTHON_COLORS')
-    os.environ['PYTHON_COLORS'] = '1' if color_enabled() else '0'
-    try:
-        yield
-    finally:
-        if previous is None:
-            os.environ.pop('PYTHON_COLORS', None)
-        else:
-            os.environ['PYTHON_COLORS'] = previous
-
-
-class _ArgumentParser(argparse.ArgumentParser):
-    """Group command options and style parser errors."""
-
-    def _add_common_options(self, *, root: bool = False, project: bool = True) -> None:
-        """Register shared options without nested defaults hiding parent selections."""
-        self._optionals.title = 'common options'
-        if project:
-            self.add_argument(
-                '-p',
-                '--project',
-                metavar='NAME',
-                default=None if root else argparse.SUPPRESS,
-                help='registered project name',
-            )
-        self.add_argument(
-            '-v',
-            '--verbose',
-            action='store_true',
-            default=False if root else argparse.SUPPRESS,
-            help='show full identifiers, paths, and supporting details',
-        )
-        self.add_argument(
-            '--color',
-            choices=('auto', 'always', 'never'),
-            default='auto' if root else argparse.SUPPRESS,
-            help='control terminal color (default: auto)',
-        )
-        if root:
-            self.add_argument(
-                '--version',
-                dest='root_version',
-                action='store_true',
-                help='show the version and exit',
-            )
-        else:
-            # Route subsequent options into the command's own native argument group.
-            command = self.prog.removeprefix('pubanon ')
-            self._optionals = self.add_argument_group(f'{command} options')
-
-    def _resolved_option(self, option: str) -> argparse.Action | None:
-        """Resolve an option using this parser's accepted long-option prefixes."""
-        for action in self._actions:
-            if option in action.option_strings:
-                return action
-        if not self.allow_abbrev or not option.startswith('--'):
-            return None
-        matches = [
-            action
-            for action in self._actions
-            for name in action.option_strings
-            if name.startswith('--') and name.startswith(option)
-        ]
-        return matches[0] if len(matches) == 1 else None
-
-    @override
-    def error(self, message: str) -> NoReturn:
-        self.print_usage(sys.stderr)
-        rendered = f'{self.prog}: error: {message}'
-        self.exit(2, style(rendered, 'error', stream=sys.stderr) + '\n')
-
-    @override
-    @_help_color_context()
-    def format_help(self, formatter: argparse.HelpFormatter | None = None) -> str:
-        if sys.version_info >= (3, 15):
-            return super().format_help(formatter=formatter)
-        return super().format_help()
-
-    @override
-    @_help_color_context()
-    def format_usage(self, formatter: argparse.HelpFormatter | None = None) -> str:
-        if sys.version_info >= (3, 15):
-            return super().format_usage(formatter=formatter)
-        return super().format_usage()
-
-    def selected_color_mode(self, arguments: list[str]) -> str:
-        """Find the last color option accepted at its parser level."""
-        mode = 'auto'
-        parser = self
-        index = 0
-        while index < len(arguments):
-            argument = arguments[index]
-            if argument == '--':
-                break
-            if argument.startswith('-') and argument != '-':
-                option, equals, explicit = argument.partition('=')
-                action = parser._resolved_option(option)
-                if action is None:
-                    index += 1
-                    continue
-                if action.dest == 'color':
-                    value = (
-                        explicit
-                        if equals
-                        else arguments[index + 1]
-                        if index + 1 < len(arguments)
-                        else None
-                    )
-                    if value in {'auto', 'always', 'never'}:
-                        mode = value
-                if not equals and action.nargs is None:
-                    index += 1
-                index += 1
-                continue
-            for action in parser._actions:
-                choices = action.choices
-                if not action.option_strings and isinstance(choices, dict) and argument in choices:
-                    parser = cast('_ArgumentParser', choices[argument])
-                    break
-            index += 1
-        return mode
-
-
 class _Commands(Protocol):
     """Describe the subparser operation used while building the CLI."""
 
@@ -195,29 +69,6 @@ class _Commands(Protocol):
     def add_parser(self) -> Callable[..., argparse.ArgumentParser]:
         """Return the subparser creation operation."""
         ...
-
-
-class _RootParser(_ArgumentParser):
-    """Group top-level commands using argparse's action rendering."""
-
-    @override
-    @_help_color_context()
-    def format_help(self, formatter: argparse.HelpFormatter | None = None) -> str:
-        if formatter is None:
-            formatter = self._get_formatter()
-        formatter.add_usage(self.usage, self._actions, self._mutually_exclusive_groups)
-        formatter.add_text(self.description)
-        for title, commands in _COMMAND_GROUPS:
-            formatter.start_section(title)
-            formatter.add_arguments(
-                [argparse.Action([], name, help=text) for name, text in commands]
-            )
-            formatter.end_section()
-        formatter.start_section('common options')
-        formatter.add_arguments(self._get_optional_actions())
-        formatter.end_section()
-        formatter.add_text(self.epilog)
-        return formatter.format_help()
 
 
 def _add_command_parser(
@@ -238,7 +89,7 @@ def _add_command_parser(
             formatter_class=argparse.RawDescriptionHelpFormatter,
         ),
     )
-    parser._add_common_options(project=project)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    parser.add_common_options(project=project)
     return parser
 
 
@@ -379,10 +230,9 @@ def _add_prepare_parser(commands: _Commands) -> None:
     )
 
 
-def _add_publish_parser(commands: _Commands) -> None:
-    """Add publication options and mutually exclusive page overrides."""
-    publish = _add_command_parser(commands, 'publish', _COMMAND_HELP['publish'])
-    page = publish.add_mutually_exclusive_group()
+def _add_release_page_options(parser: argparse.ArgumentParser) -> None:
+    """Add the mutually exclusive release-page overrides shared by publish and run."""
+    page = parser.add_mutually_exclusive_group()
     page.add_argument(
         '--release-page',
         action='store_true',
@@ -398,6 +248,12 @@ def _add_publish_parser(commands: _Commands) -> None:
         metavar='FILE',
         help='use this UTF-8 Markdown file as the release page notes',
     )
+
+
+def _add_publish_parser(commands: _Commands) -> None:
+    """Add publication options and mutually exclusive page overrides."""
+    publish = _add_command_parser(commands, 'publish', _COMMAND_HELP['publish'])
+    _add_release_page_options(publish)
     publish.add_argument(
         '--resolve', action='store_true', help='check whether an interrupted publication completed'
     )
@@ -416,22 +272,7 @@ def _add_run_parser(commands: _Commands) -> None:
     run = _add_command_parser(commands, 'run', _COMMAND_HELP['run'])
     run.add_argument('name', help='configured workflow name')
     run.add_argument('--version', help='release version in X.Y.Z form')
-    page = run.add_mutually_exclusive_group()
-    page.add_argument(
-        '--release-page',
-        action='store_true',
-        help='create a release page for this publication even when release pages are off',
-    )
-    page.add_argument(
-        '--no-release-page',
-        action='store_true',
-        help='publish without creating or looking up a release page',
-    )
-    page.add_argument(
-        '--release-notes-file',
-        metavar='FILE',
-        help='use this UTF-8 Markdown file as the release page notes',
-    )
+    _add_release_page_options(run)
     run.add_argument(
         '--acknowledge-new-paths',
         action='store_true',
@@ -445,6 +286,182 @@ def _add_run_parser(commands: _Commands) -> None:
             'first staging creation, earlier privacy findings, or exposing Actions logs'
         ),
     )
+
+
+@contextmanager
+def _help_color_context() -> Generator[None]:
+    """Keep argparse's color override active through lazy help rendering."""
+    previous = os.environ.get('PYTHON_COLORS')
+    os.environ['PYTHON_COLORS'] = '1' if color_enabled() else '0'
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop('PYTHON_COLORS', None)
+        else:
+            os.environ['PYTHON_COLORS'] = previous
+
+
+class _ArgumentParser(argparse.ArgumentParser):
+    """Group command options and style parser errors."""
+
+    def _resolved_option(self, option: str) -> argparse.Action | None:
+        """Resolve an option using this parser's accepted long-option prefixes."""
+        for action in self._actions:
+            if option in action.option_strings:
+                return action
+        if not self.allow_abbrev or not option.startswith('--'):
+            return None
+        matches = [
+            action
+            for action in self._actions
+            for name in action.option_strings
+            if name.startswith('--') and name.startswith(option)
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def add_common_options(self, *, root: bool = False, project: bool = True) -> None:
+        """Register shared options without nested defaults hiding parent selections."""
+        self._optionals.title = 'common options'
+        if project:
+            self.add_argument(
+                '-p',
+                '--project',
+                metavar='NAME',
+                default=None if root else argparse.SUPPRESS,
+                help='registered project name',
+            )
+        self.add_argument(
+            '-v',
+            '--verbose',
+            action='store_true',
+            default=False if root else argparse.SUPPRESS,
+            help='show full identifiers, paths, and supporting details',
+        )
+        self.add_argument(
+            '--color',
+            choices=('auto', 'always', 'never'),
+            default='auto' if root else argparse.SUPPRESS,
+            help='control terminal color (default: auto)',
+        )
+        if root:
+            self.add_argument(
+                '--version',
+                dest='root_version',
+                action='store_true',
+                help='show the version and exit',
+            )
+        else:
+            # Route subsequent options into the command's own native argument group.
+            command = self.prog.removeprefix('pubanon ')
+            self._optionals = self.add_argument_group(f'{command} options')
+
+    @override
+    def error(self, message: str) -> NoReturn:
+        """Print usage and a styled error to standard error, then exit.
+
+        Args:
+            message: Explanation of the argument-parsing failure.
+
+        Raises:
+            SystemExit: Always, with exit status 2.
+        """
+        self.print_usage(sys.stderr)
+        rendered = f'{self.prog}: error: {message}'
+        self.exit(2, style(rendered, 'error', stream=sys.stderr) + '\n')
+
+    @override
+    @_help_color_context()
+    def format_help(self, formatter: argparse.HelpFormatter | None = None) -> str:
+        """Render help with the selected color policy.
+
+        Args:
+            formatter: Formatter to use on Python 3.15 or newer; ignored on
+                older Python versions. None uses the parser's default
+                formatter.
+        """
+        if sys.version_info >= (3, 15):
+            return super().format_help(formatter=formatter)
+        return super().format_help()
+
+    @override
+    @_help_color_context()
+    def format_usage(self, formatter: argparse.HelpFormatter | None = None) -> str:
+        """Render usage with the selected color policy.
+
+        Args:
+            formatter: Formatter to use on Python 3.15 or newer; ignored on
+                older Python versions. None uses the parser's default
+                formatter.
+        """
+        if sys.version_info >= (3, 15):
+            return super().format_usage(formatter=formatter)
+        return super().format_usage()
+
+    def selected_color_mode(self, arguments: list[str]) -> str:
+        """Find the last color option accepted at its parser level."""
+        mode = 'auto'
+        parser = self
+        index = 0
+        while index < len(arguments):
+            argument = arguments[index]
+            if argument == '--':
+                break
+            if argument.startswith('-') and argument != '-':
+                option, equals, explicit = argument.partition('=')
+                action = parser._resolved_option(option)
+                if action is None:
+                    index += 1
+                    continue
+                if action.dest == 'color':
+                    value = (
+                        explicit
+                        if equals
+                        else arguments[index + 1]
+                        if index + 1 < len(arguments)
+                        else None
+                    )
+                    if value in {'auto', 'always', 'never'}:
+                        mode = value
+                if not equals and action.nargs is None:
+                    index += 1
+                index += 1
+                continue
+            for action in parser._actions:
+                choices = action.choices
+                if not action.option_strings and isinstance(choices, dict) and argument in choices:
+                    parser = cast('_ArgumentParser', choices[argument])
+                    break
+            index += 1
+        return mode
+
+
+class _RootParser(_ArgumentParser):
+    """Group top-level commands using argparse's action rendering."""
+
+    @override
+    @_help_color_context()
+    def format_help(self, formatter: argparse.HelpFormatter | None = None) -> str:
+        """Render top-level help with grouped commands and common options.
+
+        Args:
+            formatter: Formatter to use, or None to create one for this parser.
+        """
+        if formatter is None:
+            formatter = self._get_formatter()
+        formatter.add_usage(self.usage, self._actions, self._mutually_exclusive_groups)
+        formatter.add_text(self.description)
+        for title, commands in _COMMAND_GROUPS:
+            formatter.start_section(title)
+            formatter.add_arguments(
+                [argparse.Action([], name, help=text) for name, text in commands]
+            )
+            formatter.end_section()
+        formatter.start_section('common options')
+        formatter.add_arguments(self._get_optional_actions())
+        formatter.end_section()
+        formatter.add_text(self.epilog)
+        return formatter.format_help()
 
 
 def _positive_release_limit(value: str) -> int:
@@ -559,7 +576,11 @@ def _add_stage_observation_parsers(commands: _Commands) -> None:
 
 def _validate_release_options(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     """Reject conflicting release title and notes options before dispatch."""
-    if args.release_command in {'create', 'edit'} and args.title == '':
+    if (
+        args.release_command in {'create', 'edit'}
+        and args.title is not None
+        and not args.title.strip()
+    ):
         parser.error('--title must not be empty')
     if args.release_command == 'edit':
         if args.refresh_notes and args.notes_file is not None:
@@ -579,7 +600,7 @@ def build_parser() -> _RootParser:
             'Direct route: prepare -> inspect -> publish'
         ),
     )
-    parser._add_common_options(root=True)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    parser.add_common_options(root=True)
     commands = parser.add_subparsers(
         dest='command', metavar='COMMAND', parser_class=_ArgumentParser
     )
@@ -723,7 +744,12 @@ def build_parser() -> _RootParser:
 
 
 def validate_options(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    """Reject conflicting modes before dispatch."""
+    """Reject conflicting modes before dispatch.
+
+    Raises:
+        SystemExit: An absent command or incompatible options produce parser
+            error exit 2.
+    """
     if args.command is None:
         parser.error('the following arguments are required: COMMAND')
     if args.command in {'setup', 'doctor'} and args.project is not None:

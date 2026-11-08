@@ -23,14 +23,14 @@ from pubanon._snapshots._source import (
     Snapshot,
 )
 from tests._permissions import assert_private_mode
+from tests._setup import make_paths
 from tests.snapshots.test_candidate import (
-    _build,
-    _paths,
-    _snapshot,
+    build,
+    source_snapshot,
 )
 
 
-def _dirty_inspection(paths: Paths, project: str) -> Path:
+def dirty_inspection(paths: Paths, project: str) -> Path:
     inspect = paths.data_dir / 'projects' / project / 'inspections' / ('a' * 40)
     inspect.mkdir(parents=True)
     marker = inspect / 'edited.txt'
@@ -39,7 +39,7 @@ def _dirty_inspection(paths: Paths, project: str) -> Path:
 
 
 def test_clean_inspect_refuses_a_symlink_root(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     inspect = paths.data_dir / 'projects' / 'example' / 'inspections' / ('a' * 40)
     inspect.parent.mkdir(parents=True)
     outside = tmp_path / 'outside'
@@ -64,7 +64,7 @@ def test_clean_inspect_removes_restricted_directories_without_changing_link_targ
     tmp_path: Path,
     directory_mode: int,
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     inspect = paths.data_dir / 'projects' / 'example' / 'inspections' / ('a' * 40)
     nested = inspect / 'build' / 'nested'
     nested.mkdir(parents=True)
@@ -97,8 +97,8 @@ def test_clean_inspect_removes_restricted_directories_without_changing_link_targ
 
 
 def test_inspect_clean_removes_known_copies_and_preserves_other_state(tmp_path: Path) -> None:
-    paths, project, record = _build(tmp_path)
-    previous_marker = _dirty_inspection(paths, project.name)
+    paths, project, record = build(tmp_path)
+    previous_marker = dirty_inspection(paths, project.name)
     selected = _verification.materialize_inspect(
         paths, project.name, _verification.prove_objects(paths, project.name, record)
     )
@@ -117,10 +117,10 @@ def test_inspect_creates_regular_files_exclusively(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     project = 'example'
     commit = 'b' * 40
-    snapshot = _snapshot()
+    snapshot = source_snapshot()
     inspect = paths.data_dir / 'projects' / project / 'inspections' / commit
     original_open = cast('Callable[..., object]', Path.open)
     modes: list[str] = []
@@ -139,14 +139,88 @@ def test_inspect_creates_regular_files_exclusively(
     assert modes == ['xb', 'xb']
 
 
+def test_inspect_interruption_removes_new_partial_copy_and_retry_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = make_paths(tmp_path)
+    project = 'example'
+    commit = 'b' * 40
+    snapshot = (
+        Entry('README.md', 0o100644, 'blob', b'public\n'),
+        Entry('bin/run', 0o100755, 'blob', b'#!/bin/sh\n'),
+    )
+    inspection = paths.data_dir / 'projects' / project / 'inspections' / commit
+    previous_marker = dirty_inspection(paths, project)
+    original_chmod = _filesystem.chmod
+    interruption = KeyboardInterrupt()
+    written: list[Path] = []
+
+    def _interrupt_after_first_file(
+        path: Path, mode: int, *, follow_symlinks: bool = True
+    ) -> None:
+        original_chmod(path, mode, follow_symlinks=follow_symlinks)
+        if path == inspection / 'README.md' and not written:
+            assert path.read_bytes() == b'public\n'
+            written.append(path)
+            raise interruption
+
+    monkeypatch.setattr(_filesystem, 'chmod', _interrupt_after_first_file)
+    with pytest.raises(KeyboardInterrupt) as error:
+        _inspection.materialize_snapshot(paths, project, commit, snapshot)
+    assert error.value is interruption
+    assert written == [inspection / 'README.md']
+    assert not inspection.exists()
+    assert previous_marker.read_text() == 'keep this edit\n'
+
+    monkeypatch.setattr(_filesystem, 'chmod', original_chmod)
+    assert _inspection.materialize_snapshot(paths, project, commit, snapshot) == inspection
+    for entry in snapshot:
+        assert (inspection / entry.path).read_bytes() == entry.data
+        assert_private_mode(inspection / entry.path, 0o500 if entry.mode == 0o100755 else 0o400)
+
+
+def test_inspect_refresh_replaces_only_selected_candidate_copy(tmp_path: Path) -> None:
+    paths = make_paths(tmp_path)
+    project = 'example'
+    commit = 'c' * 40
+    snapshot = (Entry('README.md', 0o100644, 'blob', b'public\n'),)
+    previous = _inspection.materialize_snapshot(paths, project, 'b' * 40, snapshot)
+    selected = _inspection.materialize_snapshot(paths, project, commit, snapshot)
+    assert selected != previous
+    assert selected.name == commit
+    _filesystem.chmod(previous, 0o700)
+    notes = previous / 'notes.txt'
+    notes.write_text('keep previous notes')
+    _filesystem.chmod(selected, 0o700)
+    _filesystem.chmod(selected / 'README.md', 0o600)
+    (selected / 'README.md').write_text('edited copy')
+    (selected / 'build').mkdir()
+    (selected / 'build/output').write_bytes(b'build output')
+
+    assert (
+        _inspection.materialize_snapshot(
+            paths,
+            project,
+            commit,
+            snapshot,
+            refresh=True,
+        )
+        == selected
+    )
+
+    assert (selected / 'README.md').read_bytes() == b'public\n'
+    assert not (selected / 'build').exists()
+    assert notes.read_text() == 'keep previous notes'
+
+
 @pytest.mark.parametrize('symlink_parent', [False, True])
 def test_inspect_refuses_symlink_copy_or_parent_without_touching_target(
     tmp_path: Path, symlink_parent: bool
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     project = 'example'
     commit = 'b' * 40
-    snapshot = _snapshot()
+    snapshot = source_snapshot()
     root = paths.data_dir / 'projects' / project / 'inspections'
     root.parent.mkdir(parents=True)
     outside = tmp_path / 'outside'
@@ -168,7 +242,7 @@ def test_inspect_refuses_unexpected_filesystem_directory_collision(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     project = 'example'
     commit = 'b' * 40
     snapshot = (
@@ -202,10 +276,10 @@ def test_inspect_refuses_unexpected_filesystem_directory_collision(
 def test_inspect_reuse_refuses_changed_copy_until_explicit_refresh(
     tmp_path: Path, change: str
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     project = 'example'
     commit = 'b' * 40
-    snapshot = (*_snapshot(), Entry('link', 0o120000, 'symlink', b'README.md'))
+    snapshot = (*source_snapshot(), Entry('link', 0o120000, 'symlink', b'README.md'))
     inspect = _inspection.materialize_snapshot(paths, project, commit, snapshot)
     _filesystem.chmod(inspect, 0o700)
     if change == 'content':
@@ -247,10 +321,10 @@ def test_inspect_reuse_refuses_changed_copy_until_explicit_refresh(
 def test_inspect_reuse_refuses_symlink_directory_without_touching_external_tree(
     tmp_path: Path,
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     project = 'example'
     commit = 'b' * 40
-    snapshot = _snapshot()
+    snapshot = source_snapshot()
     inspect = _inspection.materialize_snapshot(paths, project, commit, snapshot)
     outside = tmp_path / 'outside'
     outside.mkdir()
@@ -276,10 +350,10 @@ def test_inspect_reuse_refuses_symlink_directory_without_touching_external_tree(
 def test_inspect_reuse_reports_access_failures_separately_from_mismatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     project = 'example'
     commit = 'b' * 40
-    snapshot = _snapshot()
+    snapshot = source_snapshot()
     inspect = _inspection.materialize_snapshot(paths, project, commit, snapshot)
     if operation == 'read':
         original_read = Path.read_bytes
@@ -318,10 +392,10 @@ def test_inspect_reuse_reports_access_failures_separately_from_mismatch(
 
 
 def test_inspect_reuse_verifies_existing_editable_copy_then_locks_it(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     project = 'example'
     commit = 'b' * 40
-    snapshot = _snapshot()
+    snapshot = source_snapshot()
     inspect = _inspection.materialize_snapshot(paths, project, commit, snapshot)
     _filesystem.chmod(inspect, 0o700)
     _filesystem.chmod(inspect / 'bin', 0o700)
@@ -336,7 +410,7 @@ def test_inspect_reuse_verifies_existing_editable_copy_then_locks_it(tmp_path: P
 
 
 def test_inspection_path_validates_components_without_creating_directories(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     commit = 'a' * 40
 
     inspection = _inspection.inspection_path(paths, 'example', commit)
@@ -409,10 +483,10 @@ def test_materialize_directory_is_exclusive_private_and_cleans_partial_copy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     target = tmp_path / 'resolution'
-    _inspection.materialize_directory(target, _snapshot())
+    _inspection.materialize_directory(target, source_snapshot())
     assert_private_mode(target, 0o700)
     with pytest.raises(PubanonError):
-        _inspection.materialize_directory(target, _snapshot())
+        _inspection.materialize_directory(target, source_snapshot())
     assert target.exists()
     broken = tmp_path / 'broken'
 
@@ -421,7 +495,7 @@ def test_materialize_directory_is_exclusive_private_and_cleans_partial_copy(
 
     monkeypatch.setattr(_inspection, '_materialize_inspection_files', _fail)
     with pytest.raises(PubanonError):
-        _inspection.materialize_directory(broken, _snapshot())
+        _inspection.materialize_directory(broken, source_snapshot())
     assert not broken.exists()
 
 
@@ -527,3 +601,55 @@ def test_windows_materialization_refuses_native_path_aliases_before_creation(
     with pytest.raises(PubanonError, match='cannot represent snapshot'):
         _inspection.materialize_directory(target, (entry,))
     assert not target.exists()
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX symlink target bytes')
+def test_inspect_preserves_raw_symlink_targets_across_reuse_and_refresh(tmp_path: Path) -> None:
+    paths = make_paths(tmp_path)
+    project = 'example'
+    commit = 'b' * 40
+    snapshot = (
+        Entry('file', 0o100644, 'blob', b'root\n'),
+        Entry('relative/file', 0o100644, 'blob', b'nested\n'),
+        Entry('dot-link', 0o120000, 'symlink', b'./file'),
+        Entry('double-link', 0o120000, 'symlink', b'relative//file'),
+    )
+
+    inspect = _inspection.materialize_snapshot(paths, project, commit, snapshot)
+
+    def _assert_raw_targets() -> None:
+        assert os.fsencode(os.readlink(inspect / 'dot-link', dir_fd=None)) == b'./file'
+        assert os.fsencode(os.readlink(inspect / 'double-link', dir_fd=None)) == b'relative//file'
+
+    _assert_raw_targets()
+    assert (
+        _inspection.materialize_snapshot(
+            paths,
+            project,
+            commit,
+            snapshot,
+        )
+        == inspect
+    )
+    _assert_raw_targets()
+    assert (
+        _inspection.materialize_snapshot(
+            paths,
+            project,
+            commit,
+            snapshot,
+            refresh=True,
+        )
+        == inspect
+    )
+    _assert_raw_targets()
+    assert (
+        _inspection.materialize_snapshot(
+            paths,
+            project,
+            commit,
+            snapshot,
+        )
+        == inspect
+    )
+    _assert_raw_targets()

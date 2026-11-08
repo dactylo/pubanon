@@ -1,8 +1,9 @@
 import re
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
-from typing import NotRequired, TypedDict, Unpack
+from typing import TypedDict, Unpack
 from unittest.mock import patch
 
 import pytest
@@ -14,7 +15,8 @@ from pubanon._run import GitResult, run_git
 from pubanon._snapshots import _audit, _source
 from pubanon._snapshots._source import Entry, Snapshot, read_snapshot
 from pubanon._snapshots._store import store_path
-from tests._git import oracle_tree
+from tests._git import RunGitOptions, oracle_tree
+from tests._setup import make_global_config, make_paths
 
 _ANON_EMAIL = 'anonymous@example.invalid'
 _ANON_NAME = 'Anonymous Publisher'
@@ -27,13 +29,6 @@ class _CommitOptions(TypedDict, total=False):
     committer_offset: str
     parent: str | None
     path: str
-
-
-class _RunGitOptions(TypedDict):
-    check: NotRequired[bool]
-    cwd: Path | None
-    env_extra: NotRequired[Mapping[str, str] | None]
-    input_bytes: NotRequired[bytes | None]
 
 
 class _SnapshotCommitOptions(TypedDict, total=False):
@@ -67,7 +62,8 @@ def _commit_object(paths: Paths, commit: str) -> tuple[bytes, bytes]:
 
 
 def _global_config() -> GlobalConfig:
-    return GlobalConfig(
+    return replace(
+        make_global_config(),
         anon_name=_ANON_NAME,
         anon_email=_ANON_EMAIL,
         accounts={'github': 'release-account'},
@@ -77,12 +73,6 @@ def _global_config() -> GlobalConfig:
 
 def _oid(output: bytes) -> str:
     return output.decode('ascii').strip()
-
-
-def _paths(tmp_path: Path) -> Paths:
-    config_dir = tmp_path / 'config' / 'pubanon'
-    data_dir = tmp_path / 'data' / 'pubanon'
-    return Paths(config_dir, data_dir, config_dir / 'config.toml', data_dir / 'registry.json')
 
 
 def _slow_audit_history(
@@ -103,9 +93,7 @@ def _slow_audit_history(
         headers, separator, message = raw.partition(b'\n\n')
         if not separator:
             raise PubanonError('Git returned a malformed published commit')
-        findings.update(
-            _audit.AuditFinding(*hit) for hit in gate_unit(f'{oid[:12]}:message', message, rules)
-        )
+        findings.update(gate_unit(f'{oid[:12]}:message', message, rules))
         header_lines = headers.splitlines()
         identity = (
             re.escape(f'{global_config.anon_name} <{global_config.anon_email}>'.encode())
@@ -120,12 +108,8 @@ def _slow_audit_history(
             identity_problems.append(f'{oid[:12]}: commit is signed')
         for entry in read_snapshot(store, oid):
             unit = f'path:{entry.path}'
-            findings.update(
-                _audit.AuditFinding(*hit) for hit in gate_unit(unit, entry.path.encode(), rules)
-            )
-            findings.update(
-                _audit.AuditFinding(*hit) for hit in gate_unit(unit, entry.data, rules)
-            )
+            findings.update(gate_unit(unit, entry.path.encode(), rules))
+            findings.update(gate_unit(unit, entry.data, rules))
     for name, oid in tags.items():
         findings.update(
             _audit.AuditFinding(*hit) for hit in gate_unit(f'tag:{name}', name.encode(), rules)
@@ -261,7 +245,7 @@ def test_changed_entries_preserves_whole_entries_for_new_changed_and_mode_only_p
 
 
 def test_clean_two_commit_history_has_no_audit_problems(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     first = _write_commit(paths, data=b'public\n', message=b'first\n')
     second = _write_commit(
         paths,
@@ -380,7 +364,7 @@ def test_history_audit_classifies_literal_tree_failure_before_diff(
     problem: str,
     tmp_path: Path,
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     original = _write_snapshot_commit(paths, (), b'release\n')
     headers, message = _commit_object(paths, original)
     records = headers.split(b'\n')
@@ -404,7 +388,7 @@ def test_history_audit_classifies_tags_by_validated_commit_membership(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     root = _write_commit(paths, data=b'root\n', message=b'root\n')
     middle = _write_commit(paths, data=b'middle\n', message=b'middle\n', parent=root)
     tip = _write_commit(paths, data=b'tip\n', message=b'tip\n', parent=middle)
@@ -427,7 +411,7 @@ def test_history_audit_classifies_tags_by_validated_commit_membership(
     calls: list[tuple[str, ...]] = []
     real_run_git = _audit.run_git
 
-    def _record_run_git(args: Sequence[str], **kwargs: Unpack[_RunGitOptions]) -> GitResult:
+    def _record_run_git(args: Sequence[str], **kwargs: Unpack[RunGitOptions]) -> GitResult:
         calls.append(tuple(args))
         return real_run_git(args, **kwargs)
 
@@ -458,7 +442,7 @@ def test_history_audit_classifies_tags_by_validated_commit_membership(
 
 
 def test_history_audit_deduplicates_blob_findings_across_commits(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     first = _write_commit(paths, data=b'canaryx orchidx\n', message=b'first\n')
     second = _write_commit(paths, data=b'new orchidx canaryx\n', message=b'second\n', parent=first)
     third = _write_snapshot_commit(paths, (), b'deleted\n', parent=second)
@@ -481,11 +465,9 @@ def test_history_audit_deduplicates_blob_findings_across_commits(tmp_path: Path)
     assert full.findings == focused.findings == expected
     for result, witness in ((full, first), (focused, second)):
         assert tuple(item.finding for item in result.evidence) == expected
+        data = run_git(['show', f'{witness}:history.txt'], cwd=store_path(paths, _PROJECT)).stdout
         for item in result.evidence:
             assert item.commit == witness
-            data = run_git(
-                ['show', f'{item.commit}:history.txt'], cwd=store_path(paths, _PROJECT)
-            ).stdout
             location = re.fullmatch(r'blob bytes ([0-9]+):([0-9]+)', item.location)
             assert location is not None
             start, end = map(int, location.groups())
@@ -495,7 +477,7 @@ def test_history_audit_deduplicates_blob_findings_across_commits(tmp_path: Path)
 
 def test_history_audit_finds_intact_utf8_term_in_mixed_blob(tmp_path: Path) -> None:
     term = 'Privat\u00e9Alias'
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     commit = _write_commit(
         paths,
         data=b'\xffPrivat\xc3\xa9Alias\n',
@@ -515,7 +497,7 @@ def test_history_audit_finds_intact_utf8_term_in_mixed_blob(tmp_path: Path) -> N
 
 
 def test_history_audit_gates_complete_non_structural_header_values(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     root = _write_snapshot_commit(paths, (), b'root\n')
     original = _write_snapshot_commit(paths, (), b'release\n', parent=root)
     headers, message = _commit_object(paths, original)
@@ -599,7 +581,7 @@ def test_history_audit_keeps_carriage_return_in_identity_value(
     problem: str,
     tmp_path: Path,
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     original = _write_snapshot_commit(paths, (), b'release\n')
     headers, message = _commit_object(paths, original)
     records = headers.split(b'\n')
@@ -614,7 +596,7 @@ def test_history_audit_keeps_carriage_return_in_identity_value(
 
 
 def test_history_audit_labels_hygiene_term_in_commit_message(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     commit = _write_commit(
         paths,
         data=b'public\n',
@@ -634,7 +616,7 @@ def test_history_audit_labels_hygiene_term_in_commit_message(tmp_path: Path) -> 
 
 
 def test_history_audit_labels_sensitive_path_and_direct_tag(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     commit = _write_commit(
         paths,
         data=b'public\n',
@@ -668,7 +650,7 @@ def test_history_audit_labels_sensitive_path_and_direct_tag(tmp_path: Path) -> N
 
 
 def test_history_audit_reports_every_unsupported_topology(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     root = _write_snapshot_commit(
         paths,
         (Entry('history.txt', 0o100644, 'blob', b'root\n'),),
@@ -746,7 +728,7 @@ def test_history_audit_reports_newly_sensitive_anonymous_identity(
     term: str,
     rule_class: RuleClass,
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     first = _write_snapshot_commit(paths, (), b'first\n')
     second = _write_snapshot_commit(paths, (), b'second\n', parent=first)
     commits = (second, first)
@@ -779,7 +761,7 @@ def test_history_audit_reports_newly_sensitive_anonymous_identity(
 
 
 def test_history_audit_reports_non_utc_committer(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     commit = _write_commit(
         paths,
         data=b'public\n',
@@ -794,7 +776,7 @@ def test_history_audit_reports_non_utc_committer(tmp_path: Path) -> None:
 
 
 def test_history_audit_reports_only_invalid_author(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     commit = _write_commit(
         paths,
         author_name='Private Author',
@@ -811,7 +793,7 @@ def test_history_audit_reports_only_invalid_author(tmp_path: Path) -> None:
 
 
 def test_history_audit_reports_signed_commit(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     unsigned = _write_commit(paths, data=b'public\n', message=b'release\n')
     signed = _with_gpgsig(paths, unsigned)
 
@@ -830,7 +812,7 @@ def test_history_audit_reports_signed_commit(tmp_path: Path) -> None:
 
 @pytest.mark.slow
 def test_history_batch_matches_oracle_for_unchanged_and_shared_blobs(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     empty = _write_snapshot_commit(paths, (), b'empty root\n')
     shared = (
         Entry('copy-one.txt', 0o100644, 'blob', b'shared-secret\n'),
@@ -946,7 +928,7 @@ def test_history_batch_process_count_does_not_scale_per_commit_or_blob(tmp_path:
     rules = {RuleClass.IDENTITY_CRITICAL: ('payload-canary', 'removed-canary')}
     # Vary history length and blobs per tree separately at the same directory depth.
     for commit_count, blob_count in ((2, 2), (16, 2), (2, 16)):
-        paths = _paths(tmp_path / f'{commit_count}-{blob_count}')
+        paths = make_paths(tmp_path / f'{commit_count}-{blob_count}')
         commits: list[str] = []
         for revision in range(commit_count):
             snapshot = tuple(
@@ -971,8 +953,16 @@ def test_history_batch_process_count_does_not_scale_per_commit_or_blob(tmp_path:
             )
         tip = commits[0]
         tags = {'v2.0.0': tip}
-        expected_full = _slow_audit_history(paths, commits, tags, rules, tip=tip)
-        expected_focused = _slow_audit_history(paths, (tip,), tags, rules, tip=tip)
+        expected_focused = tuple(
+            _audit.AuditFinding(
+                f'path:file-{index}.txt', RuleClass.IDENTITY_CRITICAL, 'payload-canary'
+            )
+            for index in sorted(range(blob_count), key=lambda index: f'file-{index}.txt')
+        )
+        expected_full = (
+            *expected_focused,
+            _audit.AuditFinding('path:removed.txt', RuleClass.IDENTITY_CRITICAL, 'removed-canary'),
+        )
 
         # Count the operation across module boundaries without fixing Git command syntax.
         with patch('subprocess.Popen', wraps=subprocess.Popen) as processes:
@@ -989,8 +979,8 @@ def test_history_batch_process_count_does_not_scale_per_commit_or_blob(tmp_path:
             )
         counts.append(processes.call_count)
 
-        assert _summary(full) == expected_full
-        assert _summary(focused) == expected_focused
+        assert _summary(full) == (expected_full, ())
+        assert _summary(focused) == (expected_focused, ())
         removed = _audit.AuditFinding(
             'path:removed.txt', RuleClass.IDENTITY_CRITICAL, 'removed-canary'
         )
@@ -1004,7 +994,7 @@ def test_history_batch_process_count_does_not_scale_per_commit_or_blob(tmp_path:
 
 
 def test_history_batch_refuses_gitlink_from_raw_diff(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     root = _write_snapshot_commit(paths, (), b'empty root\n')
     store = store_path(paths, _PROJECT)
     tree = _oid(
@@ -1054,7 +1044,7 @@ def test_history_batch_refuses_malformed_diff_stream(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     commit = _write_snapshot_commit(
         paths,
         (Entry('file.txt', 0o100644, 'blob', b'data\n'),),
@@ -1062,7 +1052,7 @@ def test_history_batch_refuses_malformed_diff_stream(
     )
     real_run_git = _audit.run_git
 
-    def _malformed_run_git(args: Sequence[str], **kwargs: Unpack[_RunGitOptions]) -> GitResult:
+    def _malformed_run_git(args: Sequence[str], **kwargs: Unpack[RunGitOptions]) -> GitResult:
         result = real_run_git(args, **kwargs)
         if args[2:4] != ['diff-tree', '--stdin']:
             return result
@@ -1114,7 +1104,7 @@ def test_history_batch_refuses_malformed_object_stream(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     commit = _write_snapshot_commit(
         paths,
         (Entry('file.txt', 0o100644, 'blob', b'data\n'),),
@@ -1122,7 +1112,7 @@ def test_history_batch_refuses_malformed_object_stream(
     )
     real_run_git = _audit.run_git
 
-    def _malformed_run_git(args: Sequence[str], **kwargs: Unpack[_RunGitOptions]) -> GitResult:
+    def _malformed_run_git(args: Sequence[str], **kwargs: Unpack[RunGitOptions]) -> GitResult:
         result = real_run_git(args, **kwargs)
         if args[2:] != ['cat-file', '--batch']:
             return result
@@ -1207,7 +1197,7 @@ def test_history_batch_refuses_unsafe_symlink_from_reconstructed_history(
     problem: str,
     path: str,
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     safe = _write_snapshot_commit(
         paths,
         (
@@ -1309,7 +1299,7 @@ def test_history_evidence_describes_text_and_retains_binary_offsets(
 def test_history_evidence_identifies_filename_blob_message_header_and_tag_bytes(
     tmp_path: Path,
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     path = 'path-canary-shared-canary.txt'
     original = _write_commit(
         paths, path=path, data=b'blob-canary shared-canary\n', message=b'message-canary\n'
@@ -1338,19 +1328,18 @@ def test_history_evidence_identifies_filename_blob_message_header_and_tag_bytes(
     )
     assert full == focused
     assert len(full.evidence) == len(full.findings) == 8
+    actual_headers, actual_message = _commit_object(paths, commit)
+    snapshot = read_snapshot(store_path(paths, _PROJECT), commit)
+    blob = run_git(['show', f'{commit}:{path}'], cwd=store_path(paths, _PROJECT)).stdout
     for item in full.evidence:
         assert item.commit == commit
         assert item.commit is not None
         unit, offsets = item.location.rsplit(' bytes ', 1)
         start, end = map(int, offsets.split(':'))
-        actual_headers, actual_message = _commit_object(paths, item.commit)
         if unit == 'filename':
-            snapshot = read_snapshot(store_path(paths, _PROJECT), item.commit)
             data = next(entry.path.encode() for entry in snapshot if entry.path == path)
         elif unit == 'blob':
-            data = run_git(
-                ['show', f'{item.commit}:{path}'], cwd=store_path(paths, _PROJECT)
-            ).stdout
+            data = blob
         elif unit == 'message':
             data = actual_message
         elif unit == 'tag name':
@@ -1368,7 +1357,7 @@ def test_history_evidence_identifies_filename_blob_message_header_and_tag_bytes(
 
 
 def test_identity_only_audit_reads_only_required_object_bodies(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     store = store_path(paths, _PROJECT)
     snapshot = (
         Entry('file.txt', 0o100644, 'blob', b'ordinary content'),
@@ -1430,11 +1419,11 @@ def test_identity_only_audit_reads_only_required_object_bodies(tmp_path: Path) -
 def test_identity_only_audit_validates_blob_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str, error: str
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     commit = _write_commit(paths, data=b'ordinary content', message=b'commit\n')
     real_run_git = _audit.run_git
 
-    def _malformed_run_git(args: Sequence[str], **kwargs: Unpack[_RunGitOptions]) -> GitResult:
+    def _malformed_run_git(args: Sequence[str], **kwargs: Unpack[RunGitOptions]) -> GitResult:
         result = real_run_git(args, **kwargs)
         if args[2:] != ['cat-file', '--batch-check']:
             return result
@@ -1459,7 +1448,7 @@ def test_identity_only_audit_validates_blob_metadata(
 
 
 def test_published_commits_with_old_returns_only_newer_commits(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     first = _write_commit(paths, data=b'first\n', message=b'first\n')
     second = _write_commit(
         paths,

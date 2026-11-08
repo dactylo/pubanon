@@ -1,6 +1,5 @@
 """Export grouped merge conflicts and accept only declared file decisions."""
 
-import ntpath
 import os
 import re
 import stat
@@ -14,9 +13,12 @@ from typing import Literal, cast
 from pubanon import _filesystem, _windows_fs
 from pubanon._errors import PubanonError
 from pubanon._run import OID_HEX, GitResult, run_git
-from pubanon._snapshots._inspection import materialize_directory
+from pubanon._snapshots._inspection import materialize_directory, validate_tree_paths
 from pubanon._snapshots._records import ConflictEntry, ConflictStage, Resolution, RewritePause
 from pubanon._snapshots._source import (
+    EXECUTABLE_MODE,
+    REGULAR_MODE,
+    SYMLINK_MODE,
     Entry,
     Snapshot,
     decode_tree_path,
@@ -24,15 +26,13 @@ from pubanon._snapshots._source import (
     read_snapshot,
     tree_mode,
     validate_symlink_graph,
+    windows_unrepresentable,
 )
-from pubanon._terminal import escape, output
-from pubanon._toml import toml_array, toml_string
+from pubanon._terminal import display_path, escape, output
+from pubanon._toml import decode_error_position, toml_array, toml_string
 
 _LABELS = {1: 'base', 2: 'ours', 3: 'theirs'}
 _MIN_MERGE_FIELDS = 2
-_MODE_EXECUTABLE = 0o100755
-_MODE_FILE = 0o100644
-_MODE_LINK = 0o120000
 _STAGE_FIELDS = 3
 
 
@@ -91,9 +91,7 @@ def _path(raw: bytes) -> str:
     path = decode_tree_path(raw)
     if '\0' in path or '.git' in path_portability_keys(path):
         raise PubanonError('invalid conflict path')
-    if sys.platform == 'win32' and (
-        '\\' in path or ':' in path or any(ntpath.isreserved(part) for part in path.split('/'))
-    ):
+    if sys.platform == 'win32' and windows_unrepresentable(path):
         raise PubanonError('conflict path cannot be represented safely on Windows')
     return path
 
@@ -112,7 +110,10 @@ def _decision(value: object, expected_path: str) -> Resolution:
         or not isinstance(value['action'], str)
         or value['action'] not in {'keep', 'delete'}
     ):
-        raise PubanonError('manifest contains an unresolved or unknown action')
+        raise PubanonError(
+            'manifest contains an unresolved or unknown action',
+            fact=f'path: {escape(expected_path)}',
+        )
     action: Literal['keep', 'delete'] = 'keep' if value['action'] == 'keep' else 'delete'
     return Resolution((expected_path,), action)
 
@@ -176,7 +177,7 @@ def _messages(fields: list[bytes], stages: tuple[ConflictStage, ...]) -> tuple[C
 
 
 def _read_entry(
-    root: Path, path: str, frozen_mode: int = _MODE_FILE, *, trusted_parent: Path
+    root: Path, path: str, frozen_mode: int = REGULAR_MODE, *, trusted_parent: Path
 ) -> Entry:
     """Read a declared file without following parent or leaf symlinks."""
     _path(path.encode('utf-8'))
@@ -189,22 +190,14 @@ def _read_entry(
         mode, data = _windows_fs.read_entry(root / path)
         if stat.S_ISLNK(mode):
             target = os.fsdecode(data)
-            if (
-                '\\' in target
-                or ':' in target
-                or any(
-                    ntpath.isreserved(part)
-                    for part in target.split('/')
-                    if part not in {'', '.', '..'}
-                )
-            ):
+            if windows_unrepresentable(target):
                 raise PubanonError(
                     'resolution symlink target is not safely representable on Windows'
                 )
-            return Entry(path, _MODE_LINK, 'symlink', data)
+            return Entry(path, SYMLINK_MODE, 'symlink', data)
         if not stat.S_ISREG(mode):
             raise PubanonError('resolution requires a regular file or symlink')
-        git_mode = _MODE_EXECUTABLE if frozen_mode == _MODE_EXECUTABLE else _MODE_FILE
+        git_mode = EXECUTABLE_MODE if frozen_mode == EXECUTABLE_MODE else REGULAR_MODE
         return Entry(path, git_mode, 'blob', data)
     parent = _open_directory(root / Path(path).parent, trusted_parent=trusted_parent)
     try:
@@ -212,7 +205,7 @@ def _read_entry(
         mode = os.stat(name, dir_fd=parent, follow_symlinks=False).st_mode
         if stat.S_ISLNK(mode):
             data = os.fsencode(os.readlink(name, dir_fd=parent))
-            return Entry(path, _MODE_LINK, 'symlink', data)
+            return Entry(path, SYMLINK_MODE, 'symlink', data)
         if not stat.S_ISREG(mode):
             raise PubanonError('resolution requires a regular file or symlink')
         descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
@@ -221,7 +214,7 @@ def _read_entry(
             if not stat.S_ISREG(actual):
                 raise PubanonError('resolution requires a regular file')
             data = stream.read()
-        git_mode = _MODE_EXECUTABLE if actual & stat.S_IXUSR else _MODE_FILE
+        git_mode = EXECUTABLE_MODE if actual & stat.S_IXUSR else REGULAR_MODE
         return Entry(path, git_mode, 'blob', data)
     finally:
         os.close(parent)
@@ -258,7 +251,7 @@ def _report_undeclared(directory: Path, snapshot: Snapshot, declared: set[str]) 
                 entry = _read_entry(
                     root,
                     path,
-                    previous.mode if previous else _MODE_FILE,
+                    previous.mode if previous else REGULAR_MODE,
                     trusted_parent=directory.parent,
                 )
             except (OSError, PubanonError):
@@ -287,7 +280,7 @@ def _text_conflicts(store: Path, pause: RewritePause) -> set[str]:
     stages = {stage for group in pause.conflicts for stage in group.stages}
     text_stages: dict[str, set[int]] = {}
     for stage in stages:
-        if stage.stage in {2, 3} and stage.mode != _MODE_LINK:
+        if stage.stage in {2, 3} and stage.mode != SYMLINK_MODE:
             data = run_git(
                 ['--git-dir', str(store.absolute()), 'cat-file', 'blob', stage.oid], cwd=store
             ).stdout
@@ -298,20 +291,7 @@ def _text_conflicts(store: Path, pause: RewritePause) -> set[str]:
 
 def _validate_outputs(entries: Snapshot) -> None:
     """Refuse portable path aliases and file/directory collisions before index writes."""
-    files: set[str] = set()
-    directories: dict[str, str] = {}
-    for entry in sorted(entries, key=lambda item: os.fsencode(item.path)):
-        parts = path_portability_keys(entry.path)
-        key = '/'.join(parts)
-        if key in files or key in directories:
-            raise PubanonError('resolution destinations collide')
-        for depth in range(1, len(parts)):
-            ancestor = '/'.join(parts[:depth])
-            literal = '/'.join(entry.path.split('/')[:depth])
-            if ancestor in files or (ancestor in directories and directories[ancestor] != literal):
-                raise PubanonError('resolution destinations collide')
-            directories[ancestor] = literal
-        files.add(key)
+    validate_tree_paths(entries, collision='resolution destinations collide')
     validate_symlink_graph(entries)
 
 
@@ -340,12 +320,22 @@ def _resolved_entries(
         if path in retained or path in additions:
             raise PubanonError('resolution destination would overwrite a retained entry')
         # Windows has no executable bit; keep the saved source mode across renames.
-        entry = _read_entry(
-            directory / 'tree',
-            path,
-            modes.get(decision.paths[0], _MODE_FILE),
-            trusted_parent=directory.parent,
-        )
+        try:
+            entry = _read_entry(
+                directory / 'tree',
+                path,
+                modes.get(decision.paths[0], REGULAR_MODE),
+                trusted_parent=directory.parent,
+            )
+        except FileNotFoundError as exc:
+            raise PubanonError(
+                'a declared resolution file is missing',
+                fact=display_path(directory / 'tree' / path),
+                recovery=(
+                    'put the resolved file there, or change its decision in '
+                    'resolutions.toml, then rerun pubanon prepare --continue'
+                ),
+            ) from exc
         if (
             decision.paths[0] in text_paths
             and entry.kind == 'blob'
@@ -355,7 +345,9 @@ def _resolved_entries(
                 for line in entry.data.splitlines()
             )
         ):
-            raise PubanonError('resolution still contains conflict markers')
+            raise PubanonError(
+                'resolution still contains conflict markers', fact=f'path: {escape(path)}'
+            )
         additions[path] = entry
     _validate_outputs(tuple((retained | additions).values()))
     return additions
@@ -417,7 +409,23 @@ def _read_manifest(directory: Path, pause: RewritePause) -> tuple[Resolution, ..
     entry = _read_entry(directory, 'resolutions.toml', trusted_parent=directory.parent)
     if entry.kind != 'blob':
         raise PubanonError('resolution manifest must be a regular file')
-    data: dict[str, object] = tomllib.loads(entry.data.decode('utf-8'))
+    recovery = 'correct resolutions.toml, then rerun pubanon prepare --continue'
+    manifest = display_path(directory / 'resolutions.toml')
+    try:
+        data: dict[str, object] = tomllib.loads(entry.data.decode('utf-8'))
+    except tomllib.TOMLDecodeError as exc:
+        position = decode_error_position(exc)
+        raise PubanonError(
+            'cannot read the conflict resolution manifest',
+            fact=f'{manifest}: malformed TOML' + (f' at {position}' if position else ''),
+            recovery=recovery,
+        ) from exc
+    except UnicodeDecodeError as exc:
+        raise PubanonError(
+            'cannot read the conflict resolution manifest',
+            fact=f'{manifest}: invalid UTF-8',
+            recovery=recovery,
+        ) from exc
     expected = tomllib.loads(_manifest(pause, _versions(pause)))
     groups = data.get('conflicts')
     if (
@@ -484,6 +492,10 @@ def expand_conflicts(store: Path, result: MergeResult) -> tuple[ConflictEntry, .
 
     Diagnostic groups are unchanged. Empty or unrepresentable conflicts are
     refused before callers can save a durable pause.
+
+    Raises:
+        PubanonError: Merged objects cannot be read or conflicts have no safe
+            representable decisions.
     """
     if not result.conflicted:
         return ()
@@ -540,6 +552,10 @@ def export_conflicts(store: Path, directory: Path, pause: RewritePause) -> None:
     phase.
     A successful return includes a flushed manifest and directory entry.
     The caller must hold the project lock for the complete operation.
+
+    Raises:
+        PubanonError: Frozen evidence, directory safety, object reads, or
+            durable export fails. A partial export may remain.
     """
     snapshot = _validate_pause(store, pause)
     versions = _versions(pause)
@@ -563,16 +579,14 @@ def export_conflicts(store: Path, directory: Path, pause: RewritePause) -> None:
             blob = run_git(
                 ['--git-dir', str(store.absolute()), 'cat-file', 'blob', stage.oid], cwd=store
             ).stdout
-            with target.open('xb') as stream:
-                stream.write(blob)
-            _filesystem.chmod(target, 0o600)
+            _filesystem.write_owner_only(target, blob, exclusive=True)
         _filesystem.write_private(directory / 'resolutions.toml', content)
     except _filesystem.DurableWriteError as exc:
-        if exc.interrupted and not exc.replacement_attempted:
+        if exc.interrupted_before_replacement:
             raise KeyboardInterrupt from exc.__cause__
         message = (
             'merge conflict export may have been saved'
-            if exc.replaced or (exc.interrupted and exc.replacement_attempted)
+            if exc.may_have_saved
             else 'cannot export saved merge conflicts'
         )
         raise PubanonError(message) from exc.__cause__
@@ -585,6 +599,10 @@ def parse_merge_result(result: GitResult) -> MergeResult:
 
     Exit 1 remains conflicted even when neither structured section supplies
     actionable files. Other exits and malformed records are refused.
+
+    Raises:
+        PubanonError: Git failed or returned malformed, truncated, or
+            inconsistent merge output.
     """
     if result.returncode not in {0, 1}:
         detail = escape((result.stdout + result.stderr)[:512].decode(errors='replace'))
@@ -628,7 +646,7 @@ def read_resolutions(
 
     Raises:
         PubanonError: The conflict export, manifest, or a declared resolution
-            is invalid or cannot be read.
+            is invalid or unreadable, or Git cannot write the resolved tree.
     """
     snapshot = _validate_pause(store, pause)
     try:

@@ -3,6 +3,7 @@ import subprocess
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
+from typing import NotRequired, TypedDict, cast
 
 import pytest
 
@@ -11,17 +12,25 @@ from pubanon import (
     _config,
 )
 from pubanon._errors import PubanonError
-from pubanon._remote import _host, _watch
+from pubanon._remote import _ci, _host
 from pubanon._snapshots import _candidate, _discard, _history, _records, _source, _store
 from tests._git import git_env
 from tests._setup import configure
 
 
-def gh_calls(tmp_path: Path) -> list[list[str]]:
-    path = tmp_path / 'fake-gh-calls.jsonl'
-    if not path.exists():
-        return []
-    return [json.loads(line)['args'] for line in path.read_text().splitlines()]
+class FakeGhCall(TypedDict):
+    args: list[str]
+    stdin: str
+    gh_host: NotRequired[str | None]
+    gh_config_dir: NotRequired[str | None]
+
+
+class FakeGhResponse(TypedDict):
+    args: list[str]
+    stdout: NotRequired[str]
+    stderr: NotRequired[str]
+    returncode: NotRequired[int]
+    once: NotRequired[bool]
 
 
 def prepare(
@@ -36,7 +45,6 @@ def prepare(
     if version is not None:
         argv.extend(['--version', version])
     assert _cli.main(argv) == 0
-    assert project_config is not None
     record = _records.load_candidate(paths, project_config.name)
     assert record is not None
     return paths, project_config, record
@@ -109,8 +117,18 @@ def published_package_reveal_context(
     monkeypatch.setattr(_host, 'ls_remote', _remote_refs)
     monkeypatch.setattr(_host, 'require_authenticated_account', _require_account)
     monkeypatch.setattr(_host, 'repository_facts', _repository_facts)
-    monkeypatch.setattr(_watch, 'ci_verdicts', _successful_checks)
+    monkeypatch.setattr(_ci, 'ci_verdicts', _successful_checks)
     return paths, project
+
+
+def read_gh_calls(path: Path) -> list[FakeGhCall]:
+    if not path.exists():
+        return []
+    return [cast('FakeGhCall', json.loads(line)) for line in path.read_text().splitlines()]
+
+
+def gh_calls(tmp_path: Path) -> list[list[str]]:
+    return [call['args'] for call in read_gh_calls(tmp_path / 'fake-gh-calls.jsonl')]
 
 
 def record_publication(
@@ -185,7 +203,7 @@ def stub_remote(
         del command
         return ()
 
-    def _no_disclosure(_owner: str, _repo: str) -> _host.Disclosure:
+    def _no_disclosure(_owner: str, _repo: str, **_options: object) -> _host.Disclosure:
         return _host.Disclosure((), ())
 
     def _no_caches(_owner: str, _repo: str) -> int:

@@ -14,7 +14,7 @@ from pubanon import (
 from pubanon._cli import _context
 from pubanon._errors import ObservationTimeoutError, PubanonError
 from pubanon._remote import _host, _publish
-from pubanon._snapshots import _candidate, _inspection, _records, _reports, _store, _verification
+from pubanon._snapshots import _candidate, _inspection, _records, _store, _verification
 from pubanon._terminal import (
     display_path,
     display_time,
@@ -22,6 +22,7 @@ from pubanon._terminal import (
     fields,
     heading,
     next_step,
+    project_command,
     style,
     verbose_enabled,
 )
@@ -71,7 +72,7 @@ def _head_has_static_version(ctx: _context.ProjectContext) -> bool:
 
 
 def _ordinary_reprepare_advice(
-    ctx: _context.ProjectContext, record: _candidate.CandidateRecord
+    ctx: _context.ProjectContext, record: _records.CandidateRecord
 ) -> str:
     """Select current HEAD and retain only a version that HEAD cannot infer."""
     suffix = (
@@ -84,7 +85,7 @@ def _ordinary_reprepare_advice(
 
 def _next_action(
     ctx: _context.ProjectContext,
-    record: _candidate.CandidateRecord | None,
+    record: _records.CandidateRecord | None,
     causes: list[str],
     comparison: str | None,
     *,
@@ -101,14 +102,12 @@ def _next_action(
         if record.replaces is None:
             action = _ordinary_reprepare_advice(ctx, record)
         elif source_available:
-            action = _reports.reprepare_advice(record, project=ctx.project.name)
+            action = _verification.reprepare_advice(record, project=ctx.project.name)
         else:
             action = 'pubanon discard && pubanon prepare'
         return action
-    if record.replaces is not None and (
-        record.tip is None or _records.load_rewrite(ctx.paths, ctx.project.name) is not None
-    ):
-        return _context.project_command(
+    if _records.rewrite_incomplete(ctx.paths, ctx.project.name, record):
+        return project_command(
             ctx.project.name, 'prepare', f'--project={ctx.project.name}', '--continue'
         )
     return 'pubanon inspect'
@@ -170,7 +169,7 @@ def _remote_comparison(
     tags: dict[str, str],
     remote: _host.RemoteRefs,
     destination: _host.Destination,
-    record: _candidate.CandidateRecord | None,
+    record: _records.CandidateRecord | None,
 ) -> tuple[str, list[str]]:
     """Classify GitHub against saved published history and explain the result."""
     if (remote.main, remote.tags) == (main, tags):
@@ -191,7 +190,7 @@ def _remote_comparison(
     return 'mismatch', details
 
 
-def _replacement_summary(record: _candidate.CandidateRecord) -> str:
+def _replacement_summary(record: _records.CandidateRecord) -> str:
     """Explain which published history the replacement changes."""
     if record.replace_scope == 'all':
         return 'Replace all published history and tags with one new initial publication.'
@@ -213,7 +212,7 @@ def _selector_text(name: str) -> str:
 
 def _snapshot_provenance(
     ctx: _context.ProjectContext,
-    record: _candidate.CandidateRecord,
+    record: _records.CandidateRecord,
     *,
     source_changed: bool,
 ) -> list[str]:
@@ -241,10 +240,12 @@ def _snapshot_provenance(
     return lines
 
 
-def rewrite_status(
-    paths: _config.Paths, name: str, record: _candidate.CandidateRecord
-) -> list[str]:
-    """Summarize replacement preparation and actionable incomplete progress."""
+def rewrite_status(paths: _config.Paths, name: str, record: _records.CandidateRecord) -> list[str]:
+    """Summarize replacement preparation and actionable incomplete progress.
+
+    Raises:
+        PubanonError: Saved rewrite progress is unreadable or invalid.
+    """
     progress = _records.load_rewrite(paths, name)
     label = ', '.join(tag for tag, oid in record.prestate_tags.items() if oid == record.replaces)
     selected = label or (record.replaces or record.commit)[:12]
@@ -307,7 +308,7 @@ def rewrite_status(
 
 def _status_candidate(
     ctx: _context.ProjectContext,
-    record: _candidate.CandidateRecord | None,
+    record: _records.CandidateRecord | None,
 ) -> tuple[list[str], list[str], bool, bool]:
     """Report snapshot recovery before considering publication or remote status."""
     paths, name = ctx.paths, ctx.project.name
@@ -317,23 +318,21 @@ def _status_candidate(
     source_available = False
     if record is None:
         pass
-    elif record.state == _candidate.STATE_UNKNOWN_OUTCOME and _verification.confirmed_publication(
+    elif record.state == _records.STATE_UNKNOWN_OUTCOME and _verification.confirmed_publication(
         paths, name, record
     ):
         details.append(style('Snapshot published; local recording needs completion.', 'warning'))
     else:
-        incomplete = record.replaces is not None and (
-            record.tip is None or _records.load_rewrite(paths, name) is not None
-        )
+        incomplete = _records.rewrite_incomplete(paths, name, record)
         title = (
             'Snapshot with unknown publish outcome'
-            if record.state == _candidate.STATE_UNKNOWN_OUTCOME
+            if record.state == _records.STATE_UNKNOWN_OUTCOME
             else 'Snapshot preparation incomplete'
             if incomplete
             else 'Prepared snapshot'
         )
         details.extend([style(title, 'warning')] if title != 'Prepared snapshot' else [])
-        if record.replaces is not None and record.state != _candidate.STATE_UNKNOWN_OUTCOME:
+        if record.replaces is not None and record.state != _records.STATE_UNKNOWN_OUTCOME:
             details.extend(rewrite_status(paths, name, record))
         if record.pinned.selector_kind == 'ref' and record.pinned.selector_name is not None:
             current = _run.run_git(
@@ -371,7 +370,12 @@ def _status_candidate(
 
 
 def command_status(args: argparse.Namespace) -> None:
-    """Report local snapshot, invalidation, and optional remote state."""
+    """Report local snapshot, invalidation, and optional remote state.
+
+    Raises:
+        PubanonError: Configuration or local state is unreadable, or requested
+            host checks fail.
+    """
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
@@ -387,7 +391,7 @@ def command_status(args: argparse.Namespace) -> None:
         if args.remote:
             destination = _host.verify_destination(ctx.paths, ctx.global_config, ctx.project)
             remote = _host.ls_remote(destination, paths, name)
-            _context.refuse_unexpected_branches(remote)
+            _host.refuse_unexpected_branches(remote)
             comparison, remote_details = _remote_comparison(
                 main, tags, remote, destination, record
             )

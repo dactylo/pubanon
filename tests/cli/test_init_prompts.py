@@ -1,12 +1,11 @@
-from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
 
 from pubanon._cli import _init, _init_draft
 from pubanon._snapshots import _source
+from tests._setup import Script
 
-_Script = Callable[[Sequence[tuple[str, str]]], None]
 _CONDITIONAL = """\
 on: push
 jobs:
@@ -43,7 +42,7 @@ def _workflows(**files: str) -> _source.Snapshot:
 
 def test_draft_description_escapes_saved_default(
     tmp_path: Path,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     description = 'Example\x1b[31m'
@@ -56,11 +55,21 @@ def test_draft_description_escapes_saved_default(
     assert '\x1b' not in output
 
 
-@pytest.mark.parametrize('saved', [None, '', 'Saved description'])
-@pytest.mark.parametrize('action', ['', 'r', 'c'])
+@pytest.mark.parametrize(
+    ('saved', 'action'),
+    [
+        (None, ''),
+        (None, 'r'),
+        (None, 'c'),
+        ('', ''),
+        ('Saved description', ''),
+        ('Saved description', 'r'),
+        ('Saved description', 'c'),
+    ],
+)
 def test_draft_description_suggests_metadata_without_overriding_saved(
     tmp_path: Path,
-    answers: _Script,
+    answers: Script,
     saved: str | None,
     action: str,
 ) -> None:
@@ -84,7 +93,7 @@ def test_draft_description_suggests_metadata_without_overriding_saved(
 )
 def test_draft_description_without_metadata_allows_blank(
     tmp_path: Path,
-    answers: _Script,
+    answers: Script,
     metadata: str | None,
 ) -> None:
     if metadata is not None:
@@ -96,13 +105,13 @@ def test_draft_description_without_metadata_allows_blank(
     )
 
 
-def test_required_check_default_round_trips_names_containing_commas(answers: _Script) -> None:
+def test_required_check_default_round_trips_names_containing_commas(answers: Script) -> None:
     current = ('quality', 'tests (ubuntu-24.04, 3.13)')
     answers(
         [
             (
                 (
-                    'Required CI checks (comma separated, blank for none) '
+                    'Required CI checks (comma separated, blank to keep, none to clear) '
                     '[quality,"tests (ubuntu-24.04, 3.13)"]: '
                 ),
                 '',
@@ -121,7 +130,7 @@ def test_required_check_default_round_trips_names_containing_commas(answers: _Sc
     ],
 )
 def test_required_check_names_preserve_quoted_commas(
-    answers: _Script,
+    answers: Script,
     reply: str,
     expected: tuple[str, ...],
 ) -> None:
@@ -129,14 +138,26 @@ def test_required_check_names_preserve_quoted_commas(
     assert _init._required_checks_prompt() == expected
 
 
-def test_required_check_prompt_retries_malformed_quoting(answers: _Script) -> None:
+def test_required_check_prompt_clears_current_checks_with_none(answers: Script) -> None:
+    answers(
+        [
+            (
+                'Required CI checks (comma separated, blank to keep, none to clear) [quality]: ',
+                'none',
+            )
+        ]
+    )
+    assert _init._required_checks_prompt(default=('quality',)) == ()
+
+
+def test_required_check_prompt_retries_malformed_quoting(answers: Script) -> None:
     prompt = 'Required CI checks (comma separated, blank for none): '
     answers([(prompt, '"unfinished'), (prompt, '"tests (linux, 3.13)"')])
     assert _init._required_checks_prompt() == ('tests (linux, 3.13)',)
 
 
 def test_required_checks_default_to_all_listed_for_a_connected_workflow(
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     answers([(_MENU_ALL, '')])
@@ -150,7 +171,7 @@ def test_required_checks_default_to_all_listed_for_a_connected_workflow(
 
 
 def test_required_checks_for_a_connected_workflow_omit_other_workflows(
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     release = 'on: release\njobs:\n  publish:\n    runs-on: linux\n'
@@ -162,7 +183,7 @@ def test_required_checks_for_a_connected_workflow_omit_other_workflows(
     assert 'publish' not in capsys.readouterr().out
 
 
-def test_required_checks_keep_current_requirements_by_default(answers: _Script) -> None:
+def test_required_checks_keep_current_requirements_by_default(answers: Script) -> None:
     answers([(_MENU_KEEP, '')])
 
     assert _init._required_checks_prompt(
@@ -174,7 +195,7 @@ def test_required_checks_keep_current_requirements_by_default(answers: _Script) 
     ('numbers', 'expected'), [('1', ('quality',)), ('1 2 3', ('quality', 'optional', 'Upload'))]
 )
 def test_required_checks_needing_review_offer_explicit_selection(
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
     numbers: str,
     expected: tuple[str, ...],
@@ -209,7 +230,7 @@ def test_required_checks_needing_review_offer_explicit_selection(
 
 
 def test_required_checks_offer_all_listed_without_a_default_for_flagged_jobs(
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     answers([(_MENU, 'a')])
@@ -262,7 +283,7 @@ def test_workflow_check_selection_supports_all_subset_none_manual_and_keep(
 
 @pytest.mark.parametrize('connected', [None, 'ci.yml'])
 def test_required_checks_have_no_default_when_discovery_is_incomplete(
-    answers: _Script,
+    answers: Script,
     connected: str | None,
 ) -> None:
     answers([(_MENU, 'n')])

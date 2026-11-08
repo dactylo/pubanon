@@ -8,7 +8,16 @@ from pubanon import _config, _filesystem
 from pubanon._cli import _context
 from pubanon._errors import OperationCanceled, PubanonError
 from pubanon._snapshots import _discard
-from pubanon._terminal import confirm, display_path, escape, field, heading, output, shell_command
+from pubanon._terminal import (
+    confirm,
+    display_path,
+    escape,
+    field,
+    heading,
+    output,
+    project_command,
+    shell_command,
+)
 
 
 def _check_worktrees(directory: Path, source: str) -> None:
@@ -56,12 +65,19 @@ def _remove_entries(entries: list[Path]) -> None:
 
 
 def command_forget(args: argparse.Namespace) -> None:
-    """Preview and remove local project data while retaining its operation lock."""
+    """Preview and remove local project data while retaining its operation lock.
+
+    Raises:
+        PubanonError: Configuration, retained recovery evidence, or local
+            removal cannot be verified or completed.
+        OperationCanceled: An interactive decision is declined or the operation
+            is canceled.
+    """
     paths = _config.derive_paths(os.environ)
     selected = args.project if args.project is not None else _context.project_name(paths, None)
     name = _config.require_project_name(selected)
-    directory = paths.data_dir / 'projects' / name
-    configuration = paths.config_dir / 'projects' / f'{name}.toml'
+    directory = paths.project_data(name)
+    configuration = paths.project_file(name)
     try:
         if (
             _config.registry_source(paths, name) is None
@@ -126,7 +142,7 @@ def command_forget(args: argparse.Namespace) -> None:
         raise PubanonError(
             'cannot finish removing local project data',
             fact=escape(str(exc)),
-            recovery=_context.project_command(name, 'forget', f'--project={name}'),
+            recovery=project_command(name, 'forget', f'--project={name}'),
         ) from exc
     output('Forgot the local project data.', kind='success')
     print('Run pubanon init in the source to register the project again.')

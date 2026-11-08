@@ -1,10 +1,10 @@
 import os
 import re
 import subprocess
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import Literal, NotRequired, TypedDict, Unpack
+from typing import Literal, Unpack
 from unittest.mock import patch
 
 import pytest
@@ -28,8 +28,9 @@ from pubanon._snapshots._source import (
     read_snapshot,
 )
 from pubanon._terminal import color_context
-from tests._git import git_env, oracle_tree
+from tests._git import RunGitOptions, git_bytes, git_env, oracle_tree
 from tests._permissions import assert_private_mode
+from tests._setup import make_global_config, make_paths, make_project_config
 
 _PROCESS_BOUND_CASES = (
     ('root', ''),
@@ -76,61 +77,7 @@ _TREE_ORACLE_CASES: tuple[tuple[str, Snapshot], ...] = (
 )
 
 
-class _RunGitOptions(TypedDict):
-    check: NotRequired[bool]
-    cwd: Path | None
-    env_extra: NotRequired[Mapping[str, str] | None]
-    input_bytes: NotRequired[bytes | None]
-
-
-def _configs(tmp_path: Path, name: str = 'example') -> tuple[GlobalConfig, ProjectConfig]:
-    source = tmp_path / 'source'
-    source.mkdir(exist_ok=True)
-    return (
-        GlobalConfig(
-            anon_name='Anonymous Publisher',
-            anon_email='anonymous@example.invalid',
-            accounts={'github': 'release-account'},
-            sensitive_terms=('Private Person',),
-        ),
-        ProjectConfig(
-            name=name,
-            source_path=source.resolve(),
-            host='github',
-            owner='public-owner',
-            repo='public-repo',
-            visibility='public',
-            allow=('**',),
-            deny=(),
-            secret_exceptions=('.env.example',),
-            extra_terms=(),
-            hygiene_terms=(),
-            self_publication=True,
-            required_checks=(),
-        ),
-    )
-
-
-def _git(repo: Path, *args: str) -> bytes:
-    return subprocess.run(
-        ['git', '-C', repo, *args],
-        check=True,
-        capture_output=True,
-        env=git_env(),
-    ).stdout
-
-
-def _git_input(repo: Path, *args: str, input_bytes: bytes) -> bytes:
-    return subprocess.run(
-        ['git', '-C', repo, *args],
-        input=input_bytes,
-        check=True,
-        capture_output=True,
-        env=git_env(),
-    ).stdout
-
-
-def _oracle_commit(
+def build_oracle_commit(
     store: Path,
     tree: str,
     global_config: GlobalConfig,
@@ -161,26 +108,35 @@ def _oracle_commit(
     )
 
 
-def _paths(tmp_path: Path) -> Paths:
-    config_dir = tmp_path / 'config' / 'pubanon'
-    data_dir = tmp_path / 'data' / 'pubanon'
-    return Paths(config_dir, data_dir, config_dir / 'config.toml', data_dir / 'registry.json')
+def configs(tmp_path: Path, name: str = 'example') -> tuple[GlobalConfig, ProjectConfig]:
+    source = tmp_path / 'source'
+    source.mkdir(exist_ok=True)
+    return (
+        replace(make_global_config(), accounts={'github': 'release-account'}),
+        replace(
+            make_project_config(source.resolve()),
+            name=name,
+            owner='public-owner',
+            visibility='public',
+            secret_exceptions=('.env.example',),
+        ),
+    )
 
 
-def _pinned() -> PinnedSource:
+def pinned() -> PinnedSource:
     return PinnedSource('a' * 40, 'ref', 'refs/heads/main', 'a' * 40)
 
 
-def _replacement_history(
+def replacement_history(
     tmp_path: Path,
     *,
     stage: bool = False,
 ) -> tuple[Paths, GlobalConfig, ProjectConfig, tuple[str, ...]]:
-    paths = _paths(tmp_path)
-    g, project = _configs(tmp_path)
+    paths = make_paths(tmp_path)
+    g, project = configs(tmp_path)
     if stage:
         g = replace(g, accounts={'github': 'stage-owner'})
-        project = replace(project, owner='stage-owner', _stage_repo='staging-repo')
+        project = replace(project, owner='stage-owner', stage_repo='staging-repo')
     commits: list[str] = []
     for index in range(3):
         record = _candidate.build_candidate(
@@ -189,75 +145,84 @@ def _replacement_history(
             project,
             _candidate.CandidateInputs(
                 (Entry('file.txt', 0o100644, 'blob', f'old {index}'.encode()),),
-                _pinned(),
+                pinned(),
                 None,
                 f'release {index}',
             ),
         )
         commits.append(record.commit)
         store = _store.store_path(paths, project.name)
-        _git(store, 'update-ref', 'refs/heads/main', record.commit)
+        git_bytes(store, 'update-ref', 'refs/heads/main', record.commit)
         _records.candidate_path(paths, project.name).unlink()
     return paths, g, project, tuple(commits)
 
 
-def _snapshot() -> tuple[Entry, ...]:
+def source_snapshot() -> tuple[Entry, ...]:
     return (
         Entry('README.md', 0o100644, 'blob', b'public\n'),
         Entry('bin/tool', 0o100755, 'blob', b'#!/bin/sh\n'),
     )
 
 
-def _build(tmp_path: Path) -> tuple[Paths, ProjectConfig, _candidate.CandidateRecord]:
-    paths = _paths(tmp_path)
-    global_config, project_config = _configs(tmp_path)
+def build(tmp_path: Path) -> tuple[Paths, ProjectConfig, _candidate.CandidateRecord]:
+    paths = make_paths(tmp_path)
+    global_config, project_config = configs(tmp_path)
     record = _candidate.build_candidate(
         paths,
         global_config,
         project_config,
-        _candidate.CandidateInputs(_snapshot(), _pinned(), None, None),
+        _candidate.CandidateInputs(source_snapshot(), pinned(), None, None),
     )
     return paths, project_config, record
 
 
 def test_build_candidate_gates_rendered_configured_message(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
-    g, project = _configs(tmp_path)
+    paths = make_paths(tmp_path)
+    g, project = configs(tmp_path)
     g = replace(g, commit_message=CommitMessageSettings(tagged='Private Person release {tag}'))
 
-    with pytest.raises(PubanonError, match='snapshot commit message did not pass content checks'):
+    with pytest.raises(
+        PubanonError, match='snapshot commit message did not pass content checks'
+    ) as raised:
         _candidate.build_candidate(
             paths,
             g,
             project,
-            _candidate.CandidateInputs(_snapshot(), _pinned(), '1.2.3', None),
+            _candidate.CandidateInputs(source_snapshot(), pinned(), '1.2.3', None),
         )
+    assert raised.value.fact == 'message: Private Person release v1.2.3'
+    assert raised.value.recovery is not None
+    assert '--message' in raised.value.recovery
 
 
 def test_build_candidate_gates_tag_intent_with_custom_message(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
-    global_config, project_config = _configs(tmp_path)
+    paths = make_paths(tmp_path)
+    global_config, project_config = configs(tmp_path)
     global_config = replace(global_config, sensitive_terms=('v1.2.3',))
 
-    with pytest.raises(PubanonError, match='the release tag did not pass content checks'):
+    with pytest.raises(
+        PubanonError, match='the release tag did not pass content checks'
+    ) as raised:
         _candidate.build_candidate(
             paths,
             global_config,
             project_config,
             _candidate.CandidateInputs(
-                _snapshot(),
-                _pinned(),
+                source_snapshot(),
+                pinned(),
                 '1.2.3',
                 'safe custom message',
             ),
         )
+    assert raised.value.fact == 'tag: v1.2.3'
+    assert raised.value.recovery is not None
 
 
 def test_build_candidate_preserves_explicit_message_with_configured_template(
     tmp_path: Path,
 ) -> None:
-    paths = _paths(tmp_path)
-    g, project = _configs(tmp_path)
+    paths = make_paths(tmp_path)
+    g, project = configs(tmp_path)
     g = replace(g, commit_message=CommitMessageSettings(tagged='Release {tag}'))
     message = 'Keep {tag}\n\n'
 
@@ -265,17 +230,17 @@ def test_build_candidate_preserves_explicit_message_with_configured_template(
         paths,
         g,
         project,
-        _candidate.CandidateInputs(_snapshot(), _pinned(), '1.2.3', message),
+        _candidate.CandidateInputs(source_snapshot(), pinned(), '1.2.3', message),
     )
 
-    raw = _git(_store.store_path(paths, project.name), 'cat-file', 'commit', record.commit)
+    raw = git_bytes(_store.store_path(paths, project.name), 'cat-file', 'commit', record.commit)
     assert record.message == message
     assert raw.partition(b'\n\n')[2] == message.encode() + b'\n'
 
 
 def test_build_candidate_refuses_git_metadata_inspection_path(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
-    global_config, project_config = _configs(tmp_path)
+    paths = make_paths(tmp_path)
+    global_config, project_config = configs(tmp_path)
 
     with pytest.raises(PubanonError, match='unsupported snapshot'):
         _candidate.build_candidate(
@@ -284,7 +249,7 @@ def test_build_candidate_refuses_git_metadata_inspection_path(tmp_path: Path) ->
             project_config,
             _candidate.CandidateInputs(
                 (Entry('.git/config', 0o100644, 'blob', b'not metadata\n'),),
-                _pinned(),
+                pinned(),
                 None,
                 None,
             ),
@@ -292,14 +257,14 @@ def test_build_candidate_refuses_git_metadata_inspection_path(tmp_path: Path) ->
 
 
 def test_build_candidate_refuses_identity_containing_private_path(tmp_path: Path) -> None:
-    global_config, project = _configs(tmp_path)
+    global_config, project = configs(tmp_path)
     global_config = replace(global_config, anon_name=f'Publisher {project.source_path}')
     with pytest.raises(PubanonError, match='publication identity matches') as error:
         _candidate.build_candidate(
-            _paths(tmp_path),
+            make_paths(tmp_path),
             global_config,
             project,
-            _candidate.CandidateInputs(_snapshot(), _pinned(), None, None),
+            _candidate.CandidateInputs(source_snapshot(), pinned(), None, None),
         )
     assert error.value.fact == 'rule source: private path'
     assert str(project.source_path) not in error.value.render()
@@ -336,16 +301,16 @@ def test_build_candidate_refuses_identity_naming_each_rule_source(
     project_changes: dict[str, object],
     expected_fact: str,
 ) -> None:
-    global_config, project = _configs(tmp_path)
+    global_config, project = configs(tmp_path)
     global_config = replace(global_config, **global_changes)
     project = replace(project, **project_changes)
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     with pytest.raises(PubanonError, match='publication identity matches') as error:
         _candidate.build_candidate(
             paths,
             global_config,
             project,
-            _candidate.CandidateInputs(_snapshot(), _pinned(), None, None),
+            _candidate.CandidateInputs(source_snapshot(), pinned(), None, None),
         )
     assert error.value.fact == expected_fact
     assert error.value.recovery is not None
@@ -356,7 +321,7 @@ def test_build_candidate_refuses_identity_naming_each_rule_source(
 def test_build_candidate_refuses_identity_without_disclosing_active_terms(
     tmp_path: Path,
 ) -> None:
-    global_config, project = _configs(tmp_path)
+    global_config, project = configs(tmp_path)
     global_config = replace(
         global_config,
         anon_email='anon@identity.invalid',
@@ -365,10 +330,10 @@ def test_build_candidate_refuses_identity_without_disclosing_active_terms(
     project = replace(project, extra_terms=('publication',))
     with pytest.raises(PubanonError) as error:
         _candidate.build_candidate(
-            _paths(tmp_path),
+            make_paths(tmp_path),
             global_config,
             project,
-            _candidate.CandidateInputs(_snapshot(), _pinned(), None, None),
+            _candidate.CandidateInputs(source_snapshot(), pinned(), None, None),
         )
     assert error.value.fact == 'rule source: sensitive_terms'
     assert str(error.value) == 'publication identity matches an active disclosure rule'
@@ -378,8 +343,8 @@ def test_build_candidate_refuses_identity_without_disclosing_active_terms(
 
 
 def test_build_candidate_refuses_unsupported_snapshot_state(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
-    global_config, project_config = _configs(tmp_path)
+    paths = make_paths(tmp_path)
+    global_config, project_config = configs(tmp_path)
 
     with pytest.raises(PubanonError, match='unsupported snapshot'):
         _candidate.build_candidate(
@@ -388,7 +353,7 @@ def test_build_candidate_refuses_unsupported_snapshot_state(tmp_path: Path) -> N
             project_config,
             _candidate.CandidateInputs(
                 (Entry('special', 0o100644, 'unknown', b'data'),),
-                _pinned(),
+                pinned(),
                 None,
                 None,
             ),
@@ -396,41 +361,45 @@ def test_build_candidate_refuses_unsupported_snapshot_state(tmp_path: Path) -> N
 
 
 def test_build_candidate_refuses_when_record_exists(tmp_path: Path) -> None:
-    paths, project_config, _record = _build(tmp_path)
-    global_config, _ = _configs(tmp_path)
+    paths, project_config, _record = build(tmp_path)
+    global_config, _ = configs(tmp_path)
 
     with pytest.raises(PubanonError, match='snapshot is already prepared'):
         _candidate.build_candidate(
             paths,
             global_config,
             project_config,
-            _candidate.CandidateInputs(_snapshot(), _pinned(), None, None),
+            _candidate.CandidateInputs(source_snapshot(), pinned(), None, None),
         )
 
 
 def test_build_candidate_replaces_symbolic_private_ref_without_changing_main(
     tmp_path: Path,
 ) -> None:
-    paths, project, first = _build(tmp_path)
+    paths, project, first = build(tmp_path)
     store = _store.store_path(paths, project.name)
     _records.candidate_path(paths, project.name).unlink()
-    _git(store, 'update-ref', 'refs/heads/main', first.commit)
-    _git(store, 'symbolic-ref', _candidate.CANDIDATE_REF, 'refs/heads/main')
-    global_config, _ = _configs(tmp_path)
+    git_bytes(store, 'update-ref', 'refs/heads/main', first.commit)
+    git_bytes(store, 'symbolic-ref', _candidate.CANDIDATE_REF, 'refs/heads/main')
+    global_config, _ = configs(tmp_path)
 
     second = _candidate.build_candidate(
         paths,
         global_config,
         project,
         _candidate.CandidateInputs(
-            (Entry('second.txt', 0o100644, 'blob', b'second\n'),), _pinned(), None, None
+            (Entry('second.txt', 0o100644, 'blob', b'second\n'),), pinned(), None, None
         ),
     )
 
     assert second.commit != first.commit
-    assert _git(store, 'rev-parse', 'refs/heads/main').strip().decode() == first.commit
-    assert _git(store, 'rev-parse', _candidate.CANDIDATE_REF).strip().decode() == second.commit
-    assert _git(store, 'for-each-ref', '--format=%(symref)', _candidate.CANDIDATE_REF) == b'\n'
+    assert git_bytes(store, 'rev-parse', 'refs/heads/main').strip().decode() == first.commit
+    assert (
+        git_bytes(store, 'rev-parse', _candidate.CANDIDATE_REF).strip().decode() == second.commit
+    )
+    assert (
+        git_bytes(store, 'for-each-ref', '--format=%(symref)', _candidate.CANDIDATE_REF) == b'\n'
+    )
 
 
 @pytest.mark.parametrize(
@@ -471,8 +440,8 @@ def test_build_candidate_resolves_message_template_by_key(
     version: str | None,
     expected: str,
 ) -> None:
-    paths = _paths(tmp_path)
-    g, project = _configs(tmp_path)
+    paths = make_paths(tmp_path)
+    g, project = configs(tmp_path)
     g = replace(g, commit_message=global_messages)
     project = replace(project, commit_message=project_messages)
 
@@ -480,32 +449,32 @@ def test_build_candidate_resolves_message_template_by_key(
         paths,
         g,
         project,
-        _candidate.CandidateInputs(_snapshot(), _pinned(), version, None),
+        _candidate.CandidateInputs(source_snapshot(), pinned(), version, None),
     )
 
-    raw = _git(_store.store_path(paths, project.name), 'cat-file', 'commit', record.commit)
+    raw = git_bytes(_store.store_path(paths, project.name), 'cat-file', 'commit', record.commit)
     assert record.message == expected
     assert raw.partition(b'\n\n')[2] == expected.encode() + b'\n'
 
 
 def test_build_candidate_tree_is_deterministic_for_same_snapshot(tmp_path: Path) -> None:
-    first_paths = _paths(tmp_path / 'first')
-    second_paths = _paths(tmp_path / 'second')
-    global_config, project_config = _configs(tmp_path)
+    first_paths = make_paths(tmp_path / 'first')
+    second_paths = make_paths(tmp_path / 'second')
+    global_config, project_config = configs(tmp_path)
 
     first = _candidate.build_candidate(
         first_paths,
         global_config,
         project_config,
-        _candidate.CandidateInputs(_snapshot(), _pinned(), None, None),
+        _candidate.CandidateInputs(source_snapshot(), pinned(), None, None),
     )
     second = _candidate.build_candidate(
         second_paths,
         global_config,
         project_config,
         _candidate.CandidateInputs(
-            tuple(reversed(_snapshot())),
-            _pinned(),
+            tuple(reversed(source_snapshot())),
+            pinned(),
             None,
             None,
         ),
@@ -524,37 +493,39 @@ def test_build_candidate_tree_is_deterministic_for_same_snapshot(tmp_path: Path)
 def test_build_candidate_trims_only_configured_final_line_breaks(
     tmp_path: Path, template: str, expected: str
 ) -> None:
-    paths = _paths(tmp_path)
-    g, project = _configs(tmp_path)
+    paths = make_paths(tmp_path)
+    g, project = configs(tmp_path)
     g = replace(g, commit_message=CommitMessageSettings(tagged=template))
 
     record = _candidate.build_candidate(
         paths,
         g,
         project,
-        _candidate.CandidateInputs(_snapshot(), _pinned(), '1.2.3', None),
+        _candidate.CandidateInputs(source_snapshot(), pinned(), '1.2.3', None),
     )
 
-    raw = _git(_store.store_path(paths, project.name), 'cat-file', 'commit', record.commit)
+    raw = git_bytes(_store.store_path(paths, project.name), 'cat-file', 'commit', record.commit)
     assert record.message == expected
     assert raw.partition(b'\n\n')[2] == expected.encode() + b'\n'
 
 
 def test_build_candidate_uses_exact_gated_message_override(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
-    global_config, project_config = _configs(tmp_path)
+    paths = make_paths(tmp_path)
+    global_config, project_config = configs(tmp_path)
     record = _candidate.build_candidate(
         paths,
         global_config,
         project_config,
         _candidate.CandidateInputs(
-            _snapshot(),
-            _pinned(),
+            source_snapshot(),
+            pinned(),
             None,
             'public release message',
         ),
     )
-    raw = _git(_store.store_path(paths, project_config.name), 'cat-file', 'commit', record.commit)
+    raw = git_bytes(
+        _store.store_path(paths, project_config.name), 'cat-file', 'commit', record.commit
+    )
     assert raw.partition(b'\n\n')[2] == b'public release message\n'
 
     _discard.discard(paths, project_config.name, force=False)
@@ -564,8 +535,8 @@ def test_build_candidate_uses_exact_gated_message_override(tmp_path: Path) -> No
             global_config,
             project_config,
             _candidate.CandidateInputs(
-                _snapshot(),
-                _pinned(),
+                source_snapshot(),
+                pinned(),
                 None,
                 'Private Person release',
             ),
@@ -573,17 +544,19 @@ def test_build_candidate_uses_exact_gated_message_override(tmp_path: Path) -> No
 
 
 def test_build_candidate_writes_anonymous_unsigned_utc_commit(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
-    global_config, project_config = _configs(tmp_path)
+    paths = make_paths(tmp_path)
+    global_config, project_config = configs(tmp_path)
 
     record = _candidate.build_candidate(
         paths,
         global_config,
         project_config,
-        _candidate.CandidateInputs(_snapshot(), _pinned(), '1.2.3', None),
+        _candidate.CandidateInputs(source_snapshot(), pinned(), '1.2.3', None),
     )
 
-    raw = _git(_store.store_path(paths, project_config.name), 'cat-file', 'commit', record.commit)
+    raw = git_bytes(
+        _store.store_path(paths, project_config.name), 'cat-file', 'commit', record.commit
+    )
     assert re.search(
         rb'^author Anonymous Publisher <anonymous@example\.invalid> \d+ \+0000$',
         raw,
@@ -612,13 +585,13 @@ def test_candidate_commit_matches_independent_fixed_metadata_git_oracle(
         Entry('bin/tool', 0o100755, 'blob', b'#!/bin/sh\n'),
         Entry('link', 0o120000, 'symlink', b'bin/tool'),
     )
-    paths = _paths(tmp_path / 'candidate')
-    global_config, project_config = _configs(tmp_path)
-    oracle_store = _store.store_path(_paths(tmp_path / 'oracle'), 'example')
+    paths = make_paths(tmp_path / 'candidate')
+    global_config, project_config = configs(tmp_path)
+    oracle_store = _store.store_path(make_paths(tmp_path / 'oracle'), 'example')
     monkeypatch.setattr(_candidate.time, 'time', lambda: epoch)
 
     expected_tree = oracle_tree(oracle_store, snapshot)
-    oracle_commit = _oracle_commit(
+    oracle_commit = build_oracle_commit(
         oracle_store,
         expected_tree,
         global_config,
@@ -629,13 +602,13 @@ def test_candidate_commit_matches_independent_fixed_metadata_git_oracle(
         paths,
         global_config,
         project_config,
-        _candidate.CandidateInputs(snapshot, _pinned(), None, message, (None, {})),
+        _candidate.CandidateInputs(snapshot, pinned(), None, message, (None, {})),
     )
     candidate_store = _store.store_path(paths, project_config.name)
 
     assert record.tree == expected_tree
     assert record.commit == oracle_commit
-    assert _git(candidate_store, 'cat-file', 'commit', record.commit) == _git(
+    assert git_bytes(candidate_store, 'cat-file', 'commit', record.commit) == git_bytes(
         oracle_store,
         'cat-file',
         'commit',
@@ -649,12 +622,12 @@ def test_candidate_commit_matches_independent_fixed_metadata_git_oracle(
 def test_candidate_subprocess_failure_reports_escaped_stderr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    paths = _paths(tmp_path)
-    global_config, project_config = _configs(tmp_path)
+    paths = make_paths(tmp_path)
+    global_config, project_config = configs(tmp_path)
     _store.store_path(paths, project_config.name)
     original_run_git = _candidate.run_git
 
-    def _fail_blob_import(args: Sequence[str], **kwargs: Unpack[_RunGitOptions]) -> GitResult:
+    def _fail_blob_import(args: Sequence[str], **kwargs: Unpack[RunGitOptions]) -> GitResult:
         if args[2] == 'fast-import':
             return GitResult(1, b'private-output-canary', b'/private/path-canary\x1b\\detail')
         return original_run_git(args, **kwargs)
@@ -666,7 +639,7 @@ def test_candidate_subprocess_failure_reports_escaped_stderr(
             paths,
             global_config,
             project_config,
-            _candidate.CandidateInputs(_snapshot(), _pinned(), None, None),
+            _candidate.CandidateInputs(source_snapshot(), pinned(), None, None),
         )
 
     rendered = exc_info.value.render()
@@ -683,8 +656,8 @@ def test_candidate_tree_matches_independent_git_oracle(
     snapshot: Snapshot,
     tmp_path: Path,
 ) -> None:
-    oracle_store = _store.store_path(_paths(tmp_path / 'oracle'), 'example')
-    candidate_store = _store.store_path(_paths(tmp_path / 'candidate'), 'example')
+    oracle_store = _store.store_path(make_paths(tmp_path / 'oracle'), 'example')
+    candidate_store = _store.store_path(make_paths(tmp_path / 'candidate'), 'example')
 
     expected_tree = oracle_tree(oracle_store, snapshot)
     candidate_tree = _write_tree(candidate_store, snapshot)
@@ -719,20 +692,14 @@ def test_candidate_tree_process_count_scales_with_depth_not_objects(
             ),
             Entry(f'{directory.format(index=0)}link', 0o120000, 'symlink', b'file-0.txt'),
         )
-        paths = _paths(tmp_path / str(size))
+        paths = make_paths(tmp_path / str(size))
         store = _store.store_path(paths, 'candidate')
-        oracle_store = _store.store_path(paths, 'oracle')
-        expected_tree = oracle_tree(oracle_store, snapshot)
 
         # Count actual child launches, excluding setup and independent readback.
         with patch('subprocess.Popen', wraps=subprocess.Popen) as processes:
             tree = _write_tree(store, snapshot)
         counts.append(processes.call_count)
 
-        assert tree == expected_tree
-        assert _git(store, 'ls-tree', '-rz', tree) == _git(
-            oracle_store, 'ls-tree', '-rz', expected_tree
-        )
         assert frozenset(read_snapshot(store, tree)) == frozenset(snapshot)
         depth = max(entry.path.count('/') for entry in snapshot)
         # Allow constant setup/batching overhead and work for each directory depth.
@@ -757,7 +724,7 @@ def test_candidate_tree_refuses_malformed_blob_batch_output(
 ) -> None:
     original_run_git = _candidate.run_git
 
-    def _malformed_run_git(args: Sequence[str], **kwargs: Unpack[_RunGitOptions]) -> GitResult:
+    def _malformed_run_git(args: Sequence[str], **kwargs: Unpack[RunGitOptions]) -> GitResult:
         if args[2:] == ['fast-import', '--quiet']:
             return GitResult(0, output, b'private-output-canary')
         return original_run_git(args, **kwargs)
@@ -766,7 +733,7 @@ def test_candidate_tree_refuses_malformed_blob_batch_output(
 
     with pytest.raises(PubanonError, match='invalid snapshot blob ID') as exc_info:
         _write_tree(
-            _store.store_path(_paths(tmp_path), 'example'),
+            _store.store_path(make_paths(tmp_path), 'example'),
             (Entry('file.txt', 0o100644, 'blob', b'data\n'),),
         )
 
@@ -789,7 +756,7 @@ def test_candidate_tree_refuses_malformed_tree_batch_output(
 ) -> None:
     original_run_git = _candidate.run_git
 
-    def _malformed_run_git(args: Sequence[str], **kwargs: Unpack[_RunGitOptions]) -> GitResult:
+    def _malformed_run_git(args: Sequence[str], **kwargs: Unpack[RunGitOptions]) -> GitResult:
         if args[2:] == ['mktree', '-z', '--batch']:
             return GitResult(0, output, b'private-output-canary')
         return original_run_git(args, **kwargs)
@@ -798,7 +765,7 @@ def test_candidate_tree_refuses_malformed_tree_batch_output(
 
     with pytest.raises(PubanonError, match='invalid snapshot tree ID') as exc_info:
         _write_tree(
-            _store.store_path(_paths(tmp_path), 'example'),
+            _store.store_path(make_paths(tmp_path), 'example'),
             (Entry('file.txt', 0o100644, 'blob', b'data\n'),),
         )
 
@@ -812,12 +779,12 @@ def test_candidate_tree_validates_complete_snapshot_before_writes(
     calls: list[tuple[str, ...]] = []
     original_run_git = _candidate.run_git
 
-    def _record_run_git(args: Sequence[str], **kwargs: Unpack[_RunGitOptions]) -> GitResult:
+    def _record_run_git(args: Sequence[str], **kwargs: Unpack[RunGitOptions]) -> GitResult:
         calls.append(tuple(args))
         return original_run_git(args, **kwargs)
 
     monkeypatch.setattr(_candidate, 'run_git', _record_run_git)
-    store = _store.store_path(_paths(tmp_path), 'example')
+    store = _store.store_path(make_paths(tmp_path), 'example')
     calls.clear()
 
     with pytest.raises(PubanonError, match='unsupported snapshot entry'):
@@ -845,18 +812,18 @@ def test_correction_infers_only_one_strict_release_tag(
     tags: tuple[str, ...],
     expected: str | None,
 ) -> None:
-    paths, g, project, commits = _replacement_history(tmp_path)
+    paths, g, project, commits = replacement_history(tmp_path)
     store = _store.store_path(paths, project.name)
     for tag in tags:
-        _git(store, 'update-ref', f'refs/tags/{tag}', commits[-1])
+        git_bytes(store, 'update-ref', f'refs/tags/{tag}', commits[-1])
 
     record = _candidate.build_candidate(
         paths,
         g,
         project,
         _candidate.CandidateInputs(
-            _snapshot(),
-            _pinned(),
+            source_snapshot(),
+            pinned(),
             None,
             None,
             replaces=commits[-1],
@@ -871,15 +838,15 @@ def test_correction_infers_only_one_strict_release_tag(
 def test_correction_inherits_selected_parents_and_message(
     tmp_path: Path, selected: int, scope: Literal['one', 'all']
 ) -> None:
-    paths, g, project, commits = _replacement_history(tmp_path)
+    paths, g, project, commits = replacement_history(tmp_path)
     before = _candidate.published_refs(paths, project.name)
     record = _candidate.build_candidate(
         paths,
         g,
         project,
         _candidate.CandidateInputs(
-            _snapshot(),
-            _pinned(),
+            source_snapshot(),
+            pinned(),
             None,
             None,
             replaces=commits[selected],
@@ -888,14 +855,14 @@ def test_correction_inherits_selected_parents_and_message(
     )
     assert record.message == f'release {selected}'
     store = _store.store_path(paths, project.name)
-    parents = _git(store, 'show', '-s', '--format=%P', record.commit).strip().decode()
+    parents = git_bytes(store, 'show', '-s', '--format=%P', record.commit).strip().decode()
     assert parents == (commits[selected - 1] if selected and scope == 'one' else '')
     assert _candidate.published_refs(paths, project.name) == before
     assert record.tip == (record.commit if selected == 2 else None)
     if selected == 2:
         assert (
             _verification.verify_retained_candidate(paths, g, project, record, env={})
-            == _snapshot()
+            == source_snapshot()
         )
     else:
         with pytest.raises(PubanonError, match='incomplete'):
@@ -906,17 +873,17 @@ def test_correction_inherits_selected_parents_and_message(
 def test_correction_preserves_exact_message_with_configured_template(
     tmp_path: Path, explicit: bool
 ) -> None:
-    paths = _paths(tmp_path)
-    g, project = _configs(tmp_path)
+    paths = make_paths(tmp_path)
+    g, project = configs(tmp_path)
     message = 'Keep {tag}\n\n'
     original = _candidate.build_candidate(
         paths,
         g,
         project,
-        _candidate.CandidateInputs(_snapshot(), _pinned(), '1.2.3', message),
+        _candidate.CandidateInputs(source_snapshot(), pinned(), '1.2.3', message),
     )
     store = _store.store_path(paths, project.name)
-    _git(store, 'update-ref', 'refs/heads/main', original.commit)
+    git_bytes(store, 'update-ref', 'refs/heads/main', original.commit)
     _records.candidate_path(paths, project.name).unlink()
     g = replace(g, commit_message=CommitMessageSettings(tagged='Release {tag}'))
 
@@ -925,8 +892,8 @@ def test_correction_preserves_exact_message_with_configured_template(
         g,
         project,
         _candidate.CandidateInputs(
-            _snapshot(),
-            _pinned(),
+            source_snapshot(),
+            pinned(),
             '1.2.3',
             message if explicit else None,
             replaces=original.commit,
@@ -934,7 +901,7 @@ def test_correction_preserves_exact_message_with_configured_template(
         ),
     )
 
-    raw = _git(store, 'cat-file', 'commit', record.commit)
+    raw = git_bytes(store, 'cat-file', 'commit', record.commit)
     assert record.message == message
     assert raw.partition(b'\n\n')[2] == message.encode() + b'\n'
 
@@ -943,17 +910,17 @@ def test_correction_preserves_exact_message_with_configured_template(
 def test_correction_moves_all_selected_tags_without_saved_provenance(
     tmp_path: Path, tags: tuple[str, ...]
 ) -> None:
-    paths, g, project, commits = _replacement_history(tmp_path)
+    paths, g, project, commits = replacement_history(tmp_path)
     store = _store.store_path(paths, project.name)
     for tag in tags:
-        _git(store, 'update-ref', f'refs/tags/{tag}', commits[-1])
+        git_bytes(store, 'update-ref', f'refs/tags/{tag}', commits[-1])
     record = _candidate.build_candidate(
         paths,
         g,
         project,
         _candidate.CandidateInputs(
-            _snapshot(),
-            _pinned(),
+            source_snapshot(),
+            pinned(),
             None,
             None,
             replaces=commits[-1],
@@ -970,13 +937,13 @@ def test_correction_version_must_match_one_of_several_moved_tags(
     tmp_path: Path,
     version: str,
 ) -> None:
-    paths, g, project, commits = _replacement_history(tmp_path)
+    paths, g, project, commits = replacement_history(tmp_path)
     store = _store.store_path(paths, project.name)
     for tag in ('v1.2.3', 'v2.0.0'):
-        _git(store, 'update-ref', f'refs/tags/{tag}', commits[-1])
+        git_bytes(store, 'update-ref', f'refs/tags/{tag}', commits[-1])
     inputs = _candidate.CandidateInputs(
-        _snapshot(),
-        _pinned(),
+        source_snapshot(),
+        pinned(),
         version,
         None,
         replaces=commits[-1],
@@ -994,8 +961,8 @@ def test_correction_version_must_match_one_of_several_moved_tags(
 def test_initial_record_sync_failure_removes_commit_point_and_reruns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    paths = _paths(tmp_path)
-    global_config, project_config = _configs(tmp_path)
+    paths = make_paths(tmp_path)
+    global_config, project_config = configs(tmp_path)
     record_path = paths.data_dir / 'projects' / project_config.name / 'candidate.toml'
     original_fsync = os.fsync
     failed = False
@@ -1017,7 +984,7 @@ def test_initial_record_sync_failure_removes_commit_point_and_reruns(
             paths,
             global_config,
             project_config,
-            _candidate.CandidateInputs(_snapshot(), _pinned(), None, None),
+            _candidate.CandidateInputs(source_snapshot(), pinned(), None, None),
         )
 
     assert exc_info.value.render() == 'error: cannot save snapshot record'
@@ -1029,7 +996,7 @@ def test_initial_record_sync_failure_removes_commit_point_and_reruns(
         paths,
         global_config,
         project_config,
-        _candidate.CandidateInputs(_snapshot(), _pinned(), None, None),
+        _candidate.CandidateInputs(source_snapshot(), pinned(), None, None),
     )
     assert _records.load_candidate(paths, project_config.name) == record
 
@@ -1038,11 +1005,11 @@ def test_published_refs_refuses_malformed_tag_line(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     _store.store_path(paths, 'example')
     original_run_git = _candidate.run_git
 
-    def _malformed_tags(args: Sequence[str], **kwargs: Unpack[_RunGitOptions]) -> GitResult:
+    def _malformed_tags(args: Sequence[str], **kwargs: Unpack[RunGitOptions]) -> GitResult:
         if args[-1] == 'refs/tags':
             return GitResult(0, b'malformed\n', b'')
         return original_run_git(args, **kwargs)
@@ -1054,7 +1021,7 @@ def test_published_refs_refuses_malformed_tag_line(
 
 
 def test_published_refs_returns_empty_without_creating_store(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     store = paths.data_dir / 'projects' / 'example' / 'store.git'
 
     assert _candidate.published_refs(paths, 'example') == (None, {})
@@ -1062,7 +1029,7 @@ def test_published_refs_returns_empty_without_creating_store(tmp_path: Path) -> 
 
 
 def test_published_refs_returns_main_and_complete_tag_map(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     store = _store.store_path(paths, 'example')
 
     environment = {
@@ -1102,21 +1069,21 @@ def test_published_refs_returns_main_and_complete_tag_map(tmp_path: Path) -> Non
 def test_read_ref_ignores_refs_below_the_requested_name(
     tmp_path: Path, nested: tuple[str, ...]
 ) -> None:
-    paths, project, record = _build(tmp_path)
+    paths, project, record = build(tmp_path)
     store = _store.candidate_store_path(paths, project.name)
     ref = _candidate.REWRITE_MERGED_REF
     for name in nested:
-        _git(store, 'update-ref', f'{ref}/{name}', record.commit)
+        git_bytes(store, 'update-ref', f'{ref}/{name}', record.commit)
     assert _candidate.read_ref(store, ref) is None
     for name in nested:
-        _git(store, 'update-ref', '-d', f'{ref}/{name}')
-    _git(store, 'update-ref', ref, record.commit)
+        git_bytes(store, 'update-ref', '-d', f'{ref}/{name}')
+    git_bytes(store, 'update-ref', ref, record.commit)
     assert _candidate.read_ref(store, ref) == record.commit
 
 
 @pytest.mark.parametrize('case', ['missing-oid', 'invalid-oid', 'duplicate', 'malformed-nested'])
 def test_read_ref_refuses_malformed_output(tmp_path: Path, case: str) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     store = _store.candidate_store_path(paths, 'example')
     ref = _candidate.REWRITE_MERGED_REF
     valid = ref.encode() + b' ' + b'a' * 40 + b'\n'
@@ -1136,8 +1103,8 @@ def test_read_ref_refuses_malformed_output(tmp_path: Path, case: str) -> None:
 def test_record_write_failure_leaves_rerunnable_anchor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    paths = _paths(tmp_path)
-    global_config, project_config = _configs(tmp_path)
+    paths = make_paths(tmp_path)
+    global_config, project_config = configs(tmp_path)
     original_save = _candidate.save_candidate
     attempts = 0
 
@@ -1159,36 +1126,36 @@ def test_record_write_failure_leaves_rerunnable_anchor(
             paths,
             global_config,
             project_config,
-            _candidate.CandidateInputs(_snapshot(), _pinned(), None, None),
+            _candidate.CandidateInputs(source_snapshot(), pinned(), None, None),
         )
 
     store = _store.store_path(paths, project_config.name)
     assert _records.load_candidate(paths, project_config.name) is None
-    assert _git(store, 'rev-parse', _candidate.CANDIDATE_REF).strip()
+    assert git_bytes(store, 'rev-parse', _candidate.CANDIDATE_REF).strip()
 
     record = _candidate.build_candidate(
         paths,
         global_config,
         project_config,
-        _candidate.CandidateInputs(_snapshot(), _pinned(), None, None),
+        _candidate.CandidateInputs(source_snapshot(), pinned(), None, None),
     )
     assert _records.load_candidate(paths, project_config.name) == record
 
 
 def test_regular_file_bytes_reads_only_exact_regular_files(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     store = _store.candidate_store_path(paths, 'example')
     store.mkdir(parents=True)
-    _git(store, 'init', '--bare', '-q')
-    blob = _git_input(store, 'hash-object', '-w', '--stdin', input_bytes=b'content').strip()
-    child_tree = _git_input(
+    git_bytes(store, 'init', '--bare', '-q')
+    blob = git_bytes(store, 'hash-object', '-w', '--stdin', input_bytes=b'content').strip()
+    child_tree = git_bytes(
         store, 'mktree', input_bytes=b'100644 blob ' + blob + b'\tchild\n'
     ).strip()
-    submodule = _git_input(
+    submodule = git_bytes(
         store, 'commit-tree', child_tree.decode(), input_bytes=b'Submodule\n'
     ).strip()
     tree = (
-        _git_input(
+        git_bytes(
             store,
             'mktree',
             input_bytes=(
@@ -1202,7 +1169,7 @@ def test_regular_file_bytes_reads_only_exact_regular_files(tmp_path: Path) -> No
         .decode()
         .strip()
     )
-    commit = _git_input(store, 'commit-tree', tree, input_bytes=b'Published\n').decode().strip()
+    commit = git_bytes(store, 'commit-tree', tree, input_bytes=b'Published\n').decode().strip()
 
     assert _candidate.regular_file_bytes(paths, 'example', commit, 'plain') == b'content'
     assert _candidate.regular_file_bytes(paths, 'example', commit, 'executable') == b'content'
@@ -1219,7 +1186,7 @@ def test_regular_file_bytes_rejects_malformed_store_read(
 
     monkeypatch.setattr(_candidate, 'git_result', _malformed)
     with pytest.raises(PubanonError, match='cannot read published file'):
-        _candidate.regular_file_bytes(_paths(tmp_path), 'example', 'a' * 40, 'plain')
+        _candidate.regular_file_bytes(make_paths(tmp_path), 'example', 'a' * 40, 'plain')
 
 
 @pytest.mark.parametrize('visibility', ['public', 'private'])
@@ -1227,19 +1194,19 @@ def test_replace_all_retires_old_tags_and_creates_only_intended_tag(
     tmp_path: Path,
     visibility: str,
 ) -> None:
-    paths, g, project, commits = _replacement_history(tmp_path)
+    paths, g, project, commits = replacement_history(tmp_path)
     project = replace(project, visibility=visibility)
     store = _store.store_path(paths, project.name)
     for index, commit in enumerate(commits):
-        _git(store, 'update-ref', f'refs/tags/v{index}.0.0', commit)
+        git_bytes(store, 'update-ref', f'refs/tags/v{index}.0.0', commit)
     before = _candidate.published_refs(paths, project.name)
     record = _candidate.build_candidate(
         paths,
         g,
         project,
         _candidate.CandidateInputs(
-            _snapshot(),
-            _pinned(),
+            source_snapshot(),
+            pinned(),
             '1.0.0',
             None,
             replaces=commits[-1],
@@ -1266,13 +1233,13 @@ def test_replace_all_retires_old_tags_and_creates_only_intended_tag(
 
 @pytest.mark.slow
 def test_replacement_descendants_batches_selected_walk(tmp_path: Path) -> None:
-    store = _store.store_path(_paths(tmp_path), 'example')
+    store = _store.store_path(make_paths(tmp_path), 'example')
     tree = oracle_tree(store, ())
     commits: list[str] = []
     for index in range(4):
         parents = ('-p', commits[-1]) if commits else ()
         commit = (
-            _git_input(
+            git_bytes(
                 store, 'commit-tree', tree, *parents, input_bytes=f'revision {index}\n'.encode()
             )
             .strip()
@@ -1290,13 +1257,13 @@ def test_replacement_descendants_batches_selected_walk(tmp_path: Path) -> None:
 
 
 def test_replacement_descendants_checks_only_selected_ancestry(tmp_path: Path) -> None:
-    store = _store.store_path(_paths(tmp_path), 'example')
+    store = _store.store_path(make_paths(tmp_path), 'example')
     tree = oracle_tree(store, ())
 
     def _commit(message: str, *parents: str) -> str:
         parent_args = tuple(arg for parent in parents for arg in ('-p', parent))
         return (
-            _git_input(store, 'commit-tree', tree, *parent_args, input_bytes=message.encode())
+            git_bytes(store, 'commit-tree', tree, *parent_args, input_bytes=message.encode())
             .strip()
             .decode('ascii')
         )
@@ -1319,26 +1286,26 @@ def test_replacement_descendants_checks_only_selected_ancestry(tmp_path: Path) -
 
 
 def test_second_candidate_has_sole_parent_and_diff_summary(tmp_path: Path) -> None:
-    paths, project_config, first = _build(tmp_path)
+    paths, project_config, first = build(tmp_path)
     store = _store.store_path(paths, project_config.name)
-    _git(store, 'update-ref', 'refs/heads/main', first.commit)
-    _git(store, 'update-ref', 'refs/tags/v0.1.0', first.commit)
+    git_bytes(store, 'update-ref', 'refs/heads/main', first.commit)
+    git_bytes(store, 'update-ref', 'refs/tags/v0.1.0', first.commit)
     _discard.discard(paths, project_config.name, force=False)
-    global_config, _ = _configs(tmp_path)
+    global_config, _ = configs(tmp_path)
     changed = (Entry('README.md', 0o100644, 'blob', b'changed\n'),)
 
     second = _candidate.build_candidate(
         paths,
         global_config,
         project_config,
-        _candidate.CandidateInputs(changed, _pinned(), None, None),
+        _candidate.CandidateInputs(changed, pinned(), None, None),
     )
 
-    raw = _git(store, 'cat-file', 'commit', second.commit)
+    raw = git_bytes(store, 'cat-file', 'commit', second.commit)
     assert raw.splitlines().count(f'parent {first.commit}'.encode()) == 1
     assert second.prestate_main == first.commit
     assert second.prestate_tags == {'v0.1.0': first.commit}
-    _git(store, 'update-ref', 'refs/heads/main', second.commit)
+    git_bytes(store, 'update-ref', 'refs/heads/main', second.commit)
     report = _reports.inspect_report(
         paths,
         _verification.prove_objects(paths, project_config.name, second),
@@ -1356,9 +1323,9 @@ def test_store_write_refuses_damaged_store_inside_ancestor_repository(
     ancestor = make_repo()
     store = ancestor / 'state' / 'store.git'
     store.mkdir(parents=True)
-    commit = _git(ancestor, 'rev-parse', 'HEAD').decode().strip()
-    refs = _git(ancestor, 'for-each-ref')
-    objects = _git(ancestor, 'cat-file', '--batch-all-objects', '--batch-check')
+    commit = git_bytes(ancestor, 'rev-parse', 'HEAD').decode().strip()
+    refs = git_bytes(ancestor, 'for-each-ref')
+    objects = git_bytes(ancestor, 'cat-file', '--batch-all-objects', '--batch-check')
     args = (
         ['update-ref', _candidate.CANDIDATE_REF, commit]
         if operation == 'ref'
@@ -1371,8 +1338,8 @@ def test_store_write_refuses_damaged_store_inside_ancestor_repository(
         )
 
     assert 'not a git repository' in error.value.render()
-    assert _git(ancestor, 'for-each-ref') == refs
-    assert _git(ancestor, 'cat-file', '--batch-all-objects', '--batch-check') == objects
+    assert git_bytes(ancestor, 'for-each-ref') == refs
+    assert git_bytes(ancestor, 'cat-file', '--batch-all-objects', '--batch-check') == objects
 
 
 @pytest.mark.slow
@@ -1382,7 +1349,7 @@ def test_unchanged_correction_warns_and_stays_distinct_with_same_second_timestam
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(_candidate.time, 'time', lambda: 1700000000)
-    paths, g, project, commits = _replacement_history(tmp_path)
+    paths, g, project, commits = replacement_history(tmp_path)
     snapshot = (Entry('file.txt', 0o100644, 'blob', b'old 2'),)
     record = _candidate.build_candidate(
         paths,
@@ -1390,7 +1357,7 @@ def test_unchanged_correction_warns_and_stays_distinct_with_same_second_timestam
         project,
         _candidate.CandidateInputs(
             snapshot,
-            _pinned(),
+            pinned(),
             None,
             None,
             replaces=commits[-1],
@@ -1409,7 +1376,7 @@ def test_write_tree_accepts_distinct_paths(tmp_path: Path) -> None:
         Entry('Docs/guide.txt', 0o100644, 'blob', b'3'),
         Entry('docs-archive/guide.txt', 0o100644, 'blob', b'4'),
     )
-    store = _store.store_path(_paths(tmp_path), 'example')
+    store = _store.store_path(make_paths(tmp_path), 'example')
     assert _write_tree(store, snapshot)
 
 
@@ -1431,7 +1398,7 @@ def test_write_tree_refuses_every_portability_collision_before_object_write(
     conflicting: tuple[str, str],
 ) -> None:
     snapshot = tuple(Entry(path, 0o100644, 'blob', b'data') for path in paths)
-    store = _store.store_path(_paths(tmp_path), 'example')
+    store = _store.store_path(make_paths(tmp_path), 'example')
 
     def _forbidden_write(_store: Path, _snapshot: Snapshot) -> list[str]:
         pytest.fail('portability validation wrote candidate objects')
@@ -1450,7 +1417,7 @@ def test_write_tree_refuses_git_metadata_path_before_object_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    store = _store.store_path(_paths(tmp_path), 'example')
+    store = _store.store_path(make_paths(tmp_path), 'example')
 
     def _forbidden_write(_store: Path, _snapshot: Snapshot) -> list[str]:
         pytest.fail('snapshot validation wrote candidate objects')
@@ -1470,7 +1437,7 @@ def test_write_tree_terminal_renders_both_portability_collision_paths(
         Entry(f'{term}-ONE\x1b', 0o100644, 'blob', b'one'),
         Entry(f'{term}-one\x1b', 0o100644, 'blob', b'two'),
     )
-    store = _store.store_path(_paths(tmp_path), 'example')
+    store = _store.store_path(make_paths(tmp_path), 'example')
 
     def _forbidden_write(_store: Path, _snapshot: Snapshot) -> list[str]:
         pytest.fail('portability validation wrote candidate objects')

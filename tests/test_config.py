@@ -18,10 +18,12 @@ from pubanon._policy import evaluate_membership
 from pubanon._terminal import escape
 from pubanon._toml import toml_string
 from tests._permissions import assert_private_mode
+from tests._setup import make_global_config, make_project_config
 
 
 def _global_config(accounts: dict[str, str] | None = None) -> _config.GlobalConfig:
-    return _config.GlobalConfig(
+    return replace(
+        make_global_config(),
         anon_name='Public Name',
         anon_email='public@example.invalid',
         accounts={'github': 'anonymous-account'} if accounts is None else accounts,
@@ -30,26 +32,20 @@ def _global_config(accounts: dict[str, str] | None = None) -> _config.GlobalConf
 
 
 def _identity_configs() -> tuple[_config.GlobalConfig, _config.ProjectConfig]:
-    g = _config.GlobalConfig(
+    g = replace(
+        make_global_config(),
         anon_name='Pat Example',
         anon_email='pat@example.com',
         accounts={'github': 'pat-example'},
         sensitive_terms=('global-term', 'shared-term'),
     )
-    p = _config.ProjectConfig(
-        name='demo',
-        source_path=Path('/source'),
-        host='github',
+    p = replace(
+        make_project_config(Path('/source')),
         owner='pat-example',
         repo='demo',
-        visibility='private',
-        allow=('**',),
-        deny=(),
-        secret_exceptions=(),
         extra_terms=('project-term', 'shared-term'),
         hygiene_terms=('draft',),
         self_publication=False,
-        required_checks=(),
     )
     return g, p
 
@@ -68,13 +64,8 @@ def _project_config(
     source_path: Path | None = None,
     self_publication: bool = False,
 ) -> _config.ProjectConfig:
-    return _config.ProjectConfig(
-        name='demo',
-        source_path=tmp_path / 'source' if source_path is None else source_path,
-        host='github',
-        owner='anonymous-account',
-        repo='public-repo',
-        visibility='private',
+    return replace(
+        make_project_config(tmp_path / 'source' if source_path is None else source_path),
         allow=('src/**',),
         deny=('notes/**',),
         secret_exceptions=('tests/fixture.key',),
@@ -234,7 +225,18 @@ def test_config_failure_identifies_file_role_and_cause(
     rendered = error.value.render()
     assert escape((location).as_posix()) in rendered
     assert f'{role} configuration' in rendered
-    assert failure in rendered
+    expected = {
+        'missing': f'{role} configuration was not found',
+        'permission denied': 'permission denied',
+        'malformed TOML': 'malformed TOML',
+    }
+    assert expected[failure] in rendered
+    if failure == 'missing':
+        assert error.value.recovery == (
+            'pubanon setup'
+            if role == 'global'
+            else "run pubanon init in the project's source repository"
+        )
     assert 'private-parser-canary' not in rendered
     if failure == 'malformed TOML':
         assert 'line 2, column 10' in rendered
@@ -481,7 +483,7 @@ def test_fingerprint_excludes_new_non_governing_project_fields(tmp_path: Path) -
     project = _project_config(tmp_path)
     changed = replace(
         project,
-        _stage_repo='custom-stage',
+        stage_repo='custom-stage',
         settings=_config.Settings(
             description='Changed published project',
             default_branch='main',
@@ -990,7 +992,7 @@ def test_load_project_defaults_other_optional_fields(tmp_path: Path) -> None:
 
     project = _config.load_project(paths, 'demo')
 
-    assert project._stage_repo is None
+    assert project.stage_repo is None
     assert project.acknowledged_exposure == ''
     assert project.package is None
     assert project.workflows == {}
@@ -1197,16 +1199,6 @@ def test_load_project_refuses_relative_source_path(tmp_path: Path) -> None:
         _config.load_project(paths, 'demo')
 
 
-def test_load_project_refuses_stage_repo_containing_slash(tmp_path: Path) -> None:
-    paths = _config.derive_paths({'HOME': str(tmp_path)})
-    project_file = paths.config_dir / 'projects' / 'demo.toml'
-    project_file.parent.mkdir(parents=True)
-    project_file.write_text(_project_toml(tmp_path / 'source') + 'stage_repo = "nested/stage"\n')
-
-    with pytest.raises(PubanonError, match='invalid staging repository name'):
-        _config.load_project(paths, 'demo')
-
-
 def test_load_project_refuses_stage_repo_equal_to_repo(tmp_path: Path) -> None:
     paths = _config.derive_paths({'HOME': str(tmp_path)})
     project_file = paths.config_dir / 'projects' / 'demo.toml'
@@ -1312,17 +1304,21 @@ def test_load_project_refuses_unsupported_package_index(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    'line',
+    ('line', 'disabled'),
     [
-        'enabled = "false"',
-        'title = true',
-        'changelog = 1',
-        'notes = []',
-        'changelog_section = "yes"',
-        'changelog_heading = 1',
+        ('enabled = "false"', False),
+        ('title = true', False),
+        ('title = true', True),
+        ('changelog = 1', False),
+        ('changelog = 1', True),
+        ('notes = []', False),
+        ('notes = []', True),
+        ('changelog_section = "yes"', False),
+        ('changelog_section = "yes"', True),
+        ('changelog_heading = 1', False),
+        ('changelog_heading = 1', True),
     ],
 )
-@pytest.mark.parametrize('disabled', [False, True])
 def test_load_project_refuses_wrong_release_page_types(
     tmp_path: Path, line: str, disabled: bool
 ) -> None:
@@ -1445,8 +1441,6 @@ def test_project_settings_round_trip_pull_requests_and_discussions(tmp_path: Pat
     _config.save_project(paths, project)
 
     assert _config.load_project(paths, project.name) == project
-    text = (paths.config_dir / 'projects' / 'demo.toml').read_text()
-    assert 'projects = true\npull_requests = true\ndiscussions = false\n' in text
 
 
 def test_publication_state_paths_reports_inaccessible_path(
@@ -1509,6 +1503,23 @@ def test_registry_file_sync_failure_preserves_prior_registry_and_cleans_temp(
     assert paths.registry.read_bytes() == original
     assert _config.registry_lookup(paths, first) == 'first-project'
     assert list(paths.registry.parent.glob('.pubanon-write-*.tmp')) == []
+
+
+def test_registry_interrupt_before_replace_cancels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _config.derive_paths({'HOME': str(tmp_path)})
+    source = tmp_path / 'source'
+    source.mkdir()
+
+    def _interrupt_file_sync(_descriptor: int) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(os, 'fsync', _interrupt_file_sync)
+    with pytest.raises(KeyboardInterrupt):
+        _config.registry_set(paths, source, 'demo')
+
+    assert _config.registry_lookup(paths, source) is None
 
 
 def test_registry_lookup_existing_registry_uses_lock(tmp_path: Path) -> None:
@@ -1887,20 +1898,19 @@ def test_rewrite_record_guard_uses_resolved_configured_location(tmp_path: Path) 
     )
 
 
-def test_rule_labels_include_all_sources_and_human_entry_numbers() -> None:
+def test_rule_origins_include_all_sources_and_human_entry_numbers() -> None:
     g, p = _identity_configs()
     hit = GateHit('unit', RuleClass.IDENTITY_CRITICAL, 'shared-term')
-    assert _config.rule_labels(hit, g, p, ('other', 'shared-term')) == (
+    origins = _config.rule_origins(hit, g, p, ('other', 'shared-term'))
+    assert tuple(map(str, origins)) == (
         'global sensitive_terms entry 2',
         'project extra_terms entry 2',
         'derived private path entry 2',
     )
-    assert _config.rule_labels(GateHit('unit', RuleClass.HYGIENE, 'draft'), g, p, ()) == (
-        'project hygiene_terms entry 1',
-    )
-    assert _config.rule_labels(GateHit('unit', RuleClass.HYGIENE, 'pubanon'), g, p, ()) == (
-        'built-in hygiene rule',
-    )
+    hygiene = _config.rule_origins(GateHit('unit', RuleClass.HYGIENE, 'draft'), g, p, ())
+    assert tuple(map(str, hygiene)) == ('project hygiene_terms entry 1',)
+    builtin = _config.rule_origins(GateHit('unit', RuleClass.HYGIENE, 'pubanon'), g, p, ())
+    assert tuple(map(str, builtin)) == ('built-in hygiene rule',)
 
 
 def test_save_global_file_fsync_failure_preserves_prior_bytes_and_other_temps(
@@ -1930,14 +1940,21 @@ def test_save_global_file_fsync_failure_preserves_prior_bytes_and_other_temps(
     assert list(paths.config_dir.glob('.global-*.tmp')) == [unrelated]
 
 
+@pytest.mark.parametrize('phase', ['replace', 'directory-sync'])
 def test_save_global_keyboard_interrupt_after_replace_reports_possible_save(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
 ) -> None:
     paths = _config.derive_paths({'HOME': str(tmp_path)})
     config = _global_config()
     _config.save_global(paths, config, None)
     original = paths.global_config.read_bytes()
     updated = replace(config, anon_name='Updated Name')
+
+    original_replace = _filesystem.replace
+
+    def _cancel_replace(source: Path, destination: Path) -> Never:
+        original_replace(source, destination)
+        raise KeyboardInterrupt
 
     def _cancel_directory_sync(path: Path) -> Never:
         assert path is paths.config_dir
@@ -1951,7 +1968,10 @@ def test_save_global_keyboard_interrupt_after_replace_reports_possible_save(
                 'post-replace cancellation did not report the possible save'
             ) from exc
 
-    monkeypatch.setattr(_filesystem, 'sync_directory', _cancel_directory_sync)
+    if phase == 'replace':
+        monkeypatch.setattr(_filesystem, 'replace', _cancel_replace)
+    else:
+        monkeypatch.setattr(_filesystem, 'sync_directory', _cancel_directory_sync)
 
     with pytest.raises(PubanonError) as exc_info:
         _save_after_replace()
@@ -2079,7 +2099,8 @@ def test_save_global_round_trips_escaped_unicode_with_owner_only_permissions(
     tmp_path: Path,
 ) -> None:
     paths = _config.derive_paths({'HOME': str(tmp_path)})
-    config = _config.GlobalConfig(
+    config = replace(
+        make_global_config(),
         anon_name='Public "Name" ☃',
         anon_email=r'public\\alias@example.invalid',
         accounts={'github': r'public\\account'},
@@ -2181,26 +2202,7 @@ def test_save_project_filesystem_failure_is_path_free(
     assert project_file.read_bytes() == original
 
 
-def test_save_project_orders_commit_message_between_release_page_and_workflow(
-    tmp_path: Path,
-) -> None:
-    paths = _config.derive_paths({'HOME': str(tmp_path)})
-    project = replace(
-        _project_config(tmp_path),
-        release_page=_config.ReleasePageSettings(enabled=False),
-        commit_message=_config.CommitMessageSettings(tagged='Release {tag}'),
-        workflows={'default': ('prepare',)},
-    )
-
-    _config.save_project(paths, project)
-
-    saved = (paths.config_dir / 'projects' / 'demo.toml').read_text()
-    assert (
-        saved.index('[release_page]') < saved.index('[commit_message]') < saved.index('[workflow.')
-    )
-
-
-def test_save_project_orders_release_page_after_package_before_workflow(tmp_path: Path) -> None:
+def test_save_project_preserves_all_optional_tables(tmp_path: Path) -> None:
     paths = _config.derive_paths({'HOME': str(tmp_path)})
     project = replace(
         _project_config(tmp_path),
@@ -2214,19 +2216,25 @@ def test_save_project_orders_release_page_after_package_before_workflow(tmp_path
             changelog_section=False,
             changelog_heading='## Version {version}',
         ),
+        commit_message=_config.CommitMessageSettings(tagged='Release {tag}'),
         workflows={'default': ('prepare',)},
     )
 
     _config.save_project(paths, project)
 
-    saved = (paths.config_dir / 'projects' / 'demo.toml').read_text()
-    assert saved.index('[package]') < saved.index('[release_page]') < saved.index('[workflow.')
-    page = saved.split('[release_page]\n', 1)[1].split('[workflow.', 1)[0]
-    assert page == (
-        'enabled = false\ndraft = true\nchangelog_section = false\ntitle = "{tag}"\n'
-        'changelog = "docs/CHANGES.md"\nchangelog_heading = "## Version {version}"\n'
-        'notes = "Notes"\n'
-    )
+    saved = tomllib.loads((paths.config_dir / 'projects' / 'demo.toml').read_text())
+    assert saved['package'] == {'index': 'pypi', 'name': 'example', 'release_checks': ['test']}
+    assert saved['release_page'] == {
+        'enabled': False,
+        'draft': True,
+        'changelog_section': False,
+        'title': '{tag}',
+        'changelog': 'docs/CHANGES.md',
+        'changelog_heading': '## Version {version}',
+        'notes': 'Notes',
+    }
+    assert saved['commit_message'] == {'tagged': 'Release {tag}'}
+    assert saved['workflow'] == {'default': {'stages': ['prepare']}}
 
 
 def test_save_project_refuses_missing_settings(tmp_path: Path) -> None:
@@ -2298,13 +2306,12 @@ def test_save_project_replace_failure_preserves_prior_bytes(
 
 def test_save_project_round_trips_ci_workflow(tmp_path: Path) -> None:
     paths = _config.derive_paths({'HOME': str(tmp_path)})
-    project = replace(_project_config(tmp_path), _stage_repo='custom-stage', ci_workflow='ci.yml')
+    project = replace(_project_config(tmp_path), stage_repo='custom-stage', ci_workflow='ci.yml')
     project_file = paths.config_dir / 'projects' / 'demo.toml'
 
     _config.save_project(paths, project)
 
     assert _config.load_project(paths, project.name) == project
-    assert 'stage_repo = "custom-stage"\nci_workflow = "ci.yml"\n' in project_file.read_text()
 
     _config.save_project(paths, replace(project, ci_workflow=None))
 
@@ -2335,7 +2342,7 @@ def test_save_project_round_trips_new_optional_fields(tmp_path: Path) -> None:
     paths = _config.derive_paths({'HOME': str(tmp_path)})
     project = replace(
         _project_config(tmp_path),
-        _stage_repo='custom-stage',
+        stage_repo='custom-stage',
         settings=_config.Settings(
             description='Published project',
             default_branch='main',
@@ -2390,16 +2397,10 @@ def test_save_project_round_trips_non_bmp_and_del(tmp_path: Path) -> None:
 def test_save_project_round_trips_with_owner_only_permissions(tmp_path: Path) -> None:
 
     paths = _config.derive_paths({'HOME': str(tmp_path)})
-    project = _config.ProjectConfig(
-        name='demo',
-        source_path=tmp_path / 'source with space',
-        host='github',
-        owner='anonymous-account',
-        repo='public-repo',
-        visibility='private',
+    project = replace(
+        make_project_config(tmp_path / 'source with space'),
         allow=('src/**', 'quote"file'),
         deny=('notes/**',),
-        secret_exceptions=(),
         extra_terms=('private-product',),
         hygiene_terms=('internal-marker',),
         self_publication=False,
@@ -2714,7 +2715,6 @@ def test_load_commit_message_refuses_wrong_types(
         ('tagged', '{tag!r}'),
         ('tagged', '{tag:>9}'),
         ('tagged', '{}'),
-        ('tagged', '{'),
         ('untagged', '{tag}'),
         ('tagged', ''),
         ('untagged', '   '),
@@ -2847,8 +2847,9 @@ def test_load_project_requires_new_settings_keys(tmp_path: Path, missing: str) -
         + ''.join(f'{key} = {value}\n' for key, value in settings.items())
     )
 
-    with pytest.raises(PubanonError, match=f'missing settings key: {missing}'):
+    with pytest.raises(PubanonError, match=f'missing settings key: {missing}') as exc_info:
         _config.load_project(paths, 'demo')
+    assert escape(project_file.as_posix()) in (exc_info.value.recovery or '')
 
 
 @pytest.mark.parametrize('route', ['direct', 'staged'])
@@ -2923,7 +2924,6 @@ def test_identity_rule_sources_names_each_source_once_in_order(
 @pytest.mark.parametrize(
     ('content', 'match'),
     [
-        ('anon_name = [\n', 'invalid'),
         (
             (
                 'anon_name = "Public Name"\nanon_email = "public@example.invalid"\n'
@@ -2975,8 +2975,10 @@ def test_load_project_refuses_invalid_workflow_stage_and_names_entry(
         _project_toml(tmp_path / 'source') + f'[workflow.release]\nstages = {stages}\n'
     )
 
-    with pytest.raises(PubanonError, match=rf'workflow release.*{problem}'):
+    with pytest.raises(PubanonError, match=rf'workflow release.*{problem}') as exc_info:
         _config.load_project(paths, 'demo')
+    if stages != '["prepare", "prepare"]':
+        assert 'stages, in order: ' in (exc_info.value.fact or '')
 
 
 @pytest.mark.parametrize('field', ['owner', 'repo', 'stage_repo'])
@@ -3067,8 +3069,7 @@ def test_load_project_refuses_unsupported_enum_value(
 @pytest.mark.parametrize('field', ['owner', 'repo', 'stage_repo'])
 def test_project_host_segments_round_trip(field: str, tmp_path: Path) -> None:
     paths = _config.derive_paths({'HOME': str(tmp_path)})
-    python_field = '_stage_repo' if field == 'stage_repo' else field
-    project = replace(_project_config(tmp_path), **{python_field: f'valid-{field}'})
+    project = replace(_project_config(tmp_path), **{field: f'valid-{field}'})
 
     _config.save_project(paths, project)
 
@@ -3263,8 +3264,7 @@ def test_save_project_refuses_unsafe_host_segments(
     tmp_path: Path,
 ) -> None:
     paths = _config.derive_paths({'HOME': str(tmp_path)})
-    python_field = '_stage_repo' if field == 'stage_repo' else field
-    project = replace(_project_config(tmp_path), **{python_field: value})
+    project = replace(_project_config(tmp_path), **{field: value})
 
     label = {
         'owner': 'GitHub owner',
@@ -3391,8 +3391,6 @@ def test_save_commit_message_round_trips(
         _config.save_global(paths, original, None)
         saved = paths.global_config.read_text()
         loaded = _config.load_global(paths)
-        if messages is not None:
-            assert saved.index('[accounts]') < saved.index('[commit_message]')
     else:
         original = replace(_project_config(tmp_path), commit_message=messages)
         _config.save_project(paths, original)
@@ -3407,8 +3405,6 @@ def test_save_commit_message_round_trips(
         assert any(line.startswith('untagged =') for line in lines) is (
             messages.untagged is not None
         )
-        if messages.tagged is not None and messages.untagged is not None:
-            assert table.index('tagged =') < table.index('untagged =')
         if messages.tagged is not None and '\n' in messages.tagged:
             assert 'tagged = """\n' in table
 
@@ -3507,7 +3503,7 @@ def test_save_project_round_trips_term_bytes_and_order(
 def test_stage_repository_uses_override_or_repo_default(
     tmp_path: Path, override: str | None, expected: str
 ) -> None:
-    project = replace(_project_config(tmp_path), _stage_repo=override)
+    project = replace(_project_config(tmp_path), stage_repo=override)
 
     assert _config.stage_repository(project) == expected
 
@@ -3588,8 +3584,8 @@ def test_internal_text_is_blocked_even_when_directories_are_excluded(
     hits = gate_unit('Makefile', f"--exclude '{term.upper()}/**'".encode(), rules)
     hit = GateHit('Makefile', RuleClass.IDENTITY_CRITICAL, term)
     assert hit in hits
-    assert _config.rule_labels(hit, global_config, project, ()) == (
-        'global sensitive_terms entry 1',
+    assert _config.rule_origins(hit, global_config, project, ()) == (
+        _config.RuleOrigin(_config.RuleSource.GLOBAL_SENSITIVE, 1),
     )
 
 

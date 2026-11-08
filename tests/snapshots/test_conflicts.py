@@ -22,7 +22,8 @@ from pubanon._snapshots._conflicts import (
     read_resolutions,
 )
 from pubanon._snapshots._records import ConflictStage, RewritePause
-from pubanon._snapshots._source import read_snapshot
+from pubanon._snapshots._source import REGULAR_MODE, Entry, read_snapshot
+from pubanon._terminal import display_path
 from pubanon._toml import toml_string
 from tests._git import git_env
 
@@ -342,7 +343,7 @@ def test_modify_delete_requires_explicit_deletion(tmp_path: Path, action: str) -
     _decide(directory, {'f': f'action = "{action}"'})
     (directory / 'tree/f').unlink()
     if action == 'keep':
-        with pytest.raises(PubanonError, match='existing'):
+        with pytest.raises(PubanonError, match='a declared resolution file is missing'):
             read_resolutions(store, directory, pause)
     else:
         tree, _ = read_resolutions(store, directory, pause)
@@ -545,6 +546,29 @@ def test_resolution_does_not_follow_replaced_control_roots(tmp_path: Path, targe
         assert sentinel.read_bytes() == before
 
 
+def test_resolution_errors_name_the_missing_file_and_manifest_position(
+    tmp_path: Path,
+) -> None:
+    store, pause = _merge(tmp_path, {'f': b'base\n'}, {'f': b'ours\n'}, {'f': b'theirs\n'})
+    directory = tmp_path / 'rewrite'
+    export_conflicts(store, directory, pause)
+    _decide(directory, {'f': 'action = "keep"'})
+    (directory / 'tree/f').unlink()
+
+    with pytest.raises(PubanonError, match='a declared resolution file is missing') as missing:
+        read_resolutions(store, directory, pause)
+    assert missing.value.fact == display_path(directory / 'tree' / 'f')
+
+    manifest = directory / 'resolutions.toml'
+    manifest.write_text(manifest.read_text() + 'broken = ?\n')
+    with pytest.raises(
+        PubanonError, match='cannot read the conflict resolution manifest'
+    ) as malformed:
+        read_resolutions(store, directory, pause)
+    assert 'malformed TOML at line ' in (malformed.value.fact or '')
+    assert 'prepare --continue' in (malformed.value.recovery or '')
+
+
 def test_symlink_versions_and_resolution_preserve_target_bytes(tmp_path: Path) -> None:
     store, pause = _merge(
         tmp_path,
@@ -578,11 +602,13 @@ def test_text_resolution_is_explicit_and_preserves_literal_bytes(tmp_path: Path)
     )
     directory = tmp_path / 'rewrite'
     export_conflicts(store, directory, pause)
-    with pytest.raises(PubanonError, match='unresolved'):
+    with pytest.raises(PubanonError, match='unresolved') as unresolved:
         read_resolutions(store, directory, pause)
+    assert unresolved.value.fact == 'path: f'
     _decide(directory, {'f': 'action = "keep"'})
-    with pytest.raises(PubanonError, match='markers'):
+    with pytest.raises(PubanonError, match='markers') as markers:
         read_resolutions(store, directory, pause)
+    assert markers.value.fact == 'path: f'
     (directory / 'tree/f').write_bytes(b'resolved\r\n\x80\n')
     (directory / 'tree/stable').write_bytes(b'undeclared edit')
     (directory / 'tree/extra').write_bytes(b'undeclared addition')
@@ -698,6 +724,19 @@ def test_windows_symlink_resolution_refuses_reinterpreted_targets(
     monkeypatch.setattr(_windows_fs, 'read_entry', _read_entry)
     with pytest.raises(PubanonError):
         _conflicts._read_entry(tmp_path, 'link', trusted_parent=tmp_path.parent)
+
+
+@pytest.mark.parametrize(
+    'paths',
+    [('Notes.txt', 'notes.txt'), ('docs', 'docs/a.txt'), ('Docs/a.txt', 'docs/b.txt')],
+)
+def test_resolution_outputs_refuse_portable_collisions(paths: tuple[str, str]) -> None:
+    entries = tuple(Entry(path, REGULAR_MODE, 'blob', b'x') for path in paths)
+    for ordered in (entries, entries[::-1]):
+        with pytest.raises(PubanonError, match='resolution destinations collide') as error:
+            _conflicts._validate_outputs(ordered)
+        assert error.value.fact is not None
+        assert all(path.split('/')[0] in error.value.fact for path in paths)
 
 
 def test_windows_undeclared_scan_does_not_descend_reparse_directories(

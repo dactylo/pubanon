@@ -15,6 +15,8 @@ def acquire(descriptor: int) -> None:
 
     Raises:
         BlockingIOError: Another process holds the lock.
+        OSError: The platform cannot acquire the lock for a reason other than
+            contention.
     """
     if sys.platform == 'win32':
         os.lseek(descriptor, 0, os.SEEK_SET)
@@ -29,7 +31,11 @@ def acquire(descriptor: int) -> None:
 
 
 def release(descriptor: int) -> None:
-    """Release an exclusive lock without closing its descriptor."""
+    """Release an exclusive lock without closing its descriptor.
+
+    Raises:
+        OSError: The platform lock cannot be released.
+    """
     if sys.platform == 'win32':
         os.lseek(descriptor, 0, os.SEEK_SET)
         msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)

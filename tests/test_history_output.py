@@ -5,10 +5,11 @@ from pathlib import Path
 import pytest
 
 from pubanon import _history_output
+from pubanon._config import RuleOrigin, RuleSource
 from pubanon._gate import GateHit, RuleClass
 from pubanon._snapshots import _audit
 from pubanon._terminal import color_context, escape, verbose_context
-from tests._setup import configure
+from tests._setup import make_global_config, make_project_config
 
 
 def _summary_audit(*rows: tuple[str, RuleClass, str, str | None]) -> _audit.HistoryAudit:
@@ -39,11 +40,8 @@ def test_earliest_release_names_oldest_witness_by_tags_or_commit() -> None:
     )
 
 
-def test_groups_findings_by_snapshot_with_release_tags(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _paths, global_config, project = configure(tmp_path, monkeypatch, tmp_path)
-    assert project is not None
+def test_groups_findings_by_snapshot_with_release_tags(tmp_path: Path) -> None:
+    global_config, project = make_global_config(), make_project_config(tmp_path)
     older, newer = 'a' * 40, 'b' * 40
     evidence = tuple(
         _audit.HistoryEvidence(
@@ -115,7 +113,7 @@ def test_highlights_source_match_without_changing_excerpt(
 
     with color_context('always'):
         lines = _history_output._finding_lines(
-            next(iter(findings.values())), ('global sensitive_terms entry 1',)
+            next(iter(findings.values())), (RuleOrigin(RuleSource.GLOBAL_SENSITIVE, 1),)
         )
 
     assert lines[1] == '    Rule: global sensitive_terms, item 1'
@@ -158,7 +156,7 @@ def test_keeps_full_tag_name_when_source_excerpt_is_shortened() -> None:
 
     with color_context('never'):
         lines = _history_output._finding_lines(
-            next(iter(findings.values())), ('global sensitive_terms entry 1',)
+            next(iter(findings.values())), (RuleOrigin(RuleSource.GLOBAL_SENSITIVE, 1),)
         )
 
     assert lines[0] == f'  tag {name}'
@@ -167,9 +165,8 @@ def test_keeps_full_tag_name_when_source_excerpt_is_shortened() -> None:
     assert lines[3].startswith('    Text: ...')
 
 
-def test_rules_line_accepts_gate_hits(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _paths, global_config, project = configure(tmp_path, monkeypatch, tmp_path)
-    assert project is not None
+def test_rules_line_accepts_gate_hits(tmp_path: Path) -> None:
+    global_config, project = make_global_config(), make_project_config(tmp_path)
     global_config = replace(global_config, sensitive_terms=('term-a', 'term-b'))
     hits = [
         GateHit('job 1 log', RuleClass.IDENTITY_CRITICAL, 'term-b'),
@@ -205,11 +202,8 @@ def test_summary_block_shows_row_details_and_limits_rows_unless_unlimited() -> N
     assert not any(line.startswith('  and ') for line in unlimited)
 
 
-def test_summary_escapes_labels_and_leaves_long_labels_unpadded(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _paths, global_config, project = configure(tmp_path, monkeypatch, tmp_path)
-    assert project is not None
+def test_summary_escapes_labels_and_leaves_long_labels_unpadded(tmp_path: Path) -> None:
+    global_config, project = make_global_config(), make_project_config(tmp_path)
     global_config = replace(global_config, sensitive_terms=('term-\x07a',))
     older = 'a' * 40
     long_path = 'docs/' + 'x' * 40 + '.md'
@@ -228,11 +222,8 @@ def test_summary_escapes_labels_and_leaves_long_labels_unpadded(
     assert not any('\x1b' in line or '\x07' in line for line in lines)
 
 
-def test_summary_groups_locations_by_first_published_snapshot(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _paths, global_config, project = configure(tmp_path, monkeypatch, tmp_path)
-    assert project is not None
+def test_summary_groups_locations_by_first_published_snapshot(tmp_path: Path) -> None:
+    global_config, project = make_global_config(), make_project_config(tmp_path)
     global_config = replace(global_config, sensitive_terms=('term-a', 'term-b'))
     older, newer = 'a' * 40, 'b' * 40
     critical = RuleClass.IDENTITY_CRITICAL
@@ -266,11 +257,8 @@ def test_summary_groups_locations_by_first_published_snapshot(
     ]
 
 
-def test_summary_limits_rows_and_counts_hidden_rows_not_locations(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _paths, global_config, project = configure(tmp_path, monkeypatch, tmp_path)
-    assert project is not None
+def test_summary_limits_rows_and_counts_hidden_rows_not_locations(tmp_path: Path) -> None:
+    global_config, project = make_global_config(), make_project_config(tmp_path)
     global_config = replace(global_config, sensitive_terms=('term-a', 'term-b'))
     older, newer = 'a' * 40, 'b' * 40
     critical = RuleClass.IDENTITY_CRITICAL
@@ -295,11 +283,8 @@ def test_summary_limits_rows_and_counts_hidden_rows_not_locations(
     assert f'  First published in commit {newer[:12]}:' not in lines
 
 
-def test_summary_separates_rule_classes_and_names_single_entries(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _paths, global_config, project = configure(tmp_path, monkeypatch, tmp_path)
-    assert project is not None
+def test_summary_separates_rule_classes_and_names_single_entries(tmp_path: Path) -> None:
+    global_config, project = make_global_config(), make_project_config(tmp_path)
     global_config = replace(global_config, sensitive_terms=('term-a',))
     project = replace(project, hygiene_terms=('style-term',))
     older = 'a' * 40

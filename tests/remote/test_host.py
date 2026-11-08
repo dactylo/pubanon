@@ -1,22 +1,25 @@
 import json
 import os
+import re
 import subprocess
 import threading
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import replace
+from dataclasses import fields, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast
 
 import pytest
 
-from pubanon._config import GlobalConfig, Paths, ProjectConfig, Settings
+from pubanon._config import GlobalConfig, ProjectConfig, Settings
 from pubanon._errors import ObservationTimeoutError, OperationCanceled, PubanonError
 from pubanon._remote import _host
 from pubanon._remote._host import _remote_refs
 from pubanon._run import GitResult
 from pubanon._terminal import diagnostic, verbose_context
+from tests._cli import FakeGhCall, read_gh_calls
 from tests._git import git_env
+from tests._setup import make_global_config, make_paths, make_project_config
 
 _ACCOUNT_ARGS = ['api', 'user', '--jq', '.login']
 _ACTIONS_RUNS_ARGS = ['api', 'repos/owner/repo/actions/runs?per_page=100&page=1']
@@ -62,26 +65,17 @@ class _UnauthorizedHandler(BaseHTTPRequestHandler):
 
 def _configs(tmp_path: Path) -> tuple[GlobalConfig, ProjectConfig]:
     return (
-        GlobalConfig(
+        replace(
+            make_global_config(),
             anon_name='Public Name',
             anon_email='public@example.invalid',
-            accounts={'github': 'anonymous-account'},
             sensitive_terms=(),
         ),
-        ProjectConfig(
-            name='demo',
-            source_path=tmp_path / 'source',
-            host='github',
+        replace(
+            make_project_config(tmp_path / 'source'),
             owner='publication-owner',
-            repo='public-repo',
-            visibility='private',
             allow=(),
-            deny=(),
-            secret_exceptions=(),
-            extra_terms=(),
-            hygiene_terms=(),
             self_publication=False,
-            required_checks=(),
         ),
     )
 
@@ -187,16 +181,8 @@ def _exception_graph(error: BaseException) -> tuple[BaseException, ...]:
     return tuple(graph)
 
 
-def _gh_calls(tmp_path: Path) -> list[dict[str, object]]:
-    return [
-        json.loads(line) for line in (tmp_path / 'fake-gh-calls.jsonl').read_text().splitlines()
-    ]
-
-
-def _paths(tmp_path: Path) -> Paths:
-    config_dir = tmp_path / 'config'
-    data_dir = tmp_path / 'data'
-    return Paths(config_dir, data_dir, config_dir / 'config.toml', data_dir / 'registry.json')
+def _gh_calls(tmp_path: Path) -> list[FakeGhCall]:
+    return read_gh_calls(tmp_path / 'fake-gh-calls.jsonl')
 
 
 def _release(tag: str, *, title: str = 'Page', notes: str = 'Notes\n') -> dict[str, object]:
@@ -316,7 +302,7 @@ def test_actions_jobs_names_the_given_command_when_it_cannot_classify_a_job(
 
 def test_actions_jobs_reads_every_attempt_and_classifies_jobs(fake_gh: Path) -> None:
     skipped = _actions_job_entry(
-        8,
+        107,
         run_attempt=2,
         conclusion='skipped',
         runner_id=None,
@@ -330,16 +316,27 @@ def test_actions_jobs_reads_every_attempt_and_classifies_jobs(fake_gh: Path) -> 
         [
             {
                 'args': _jobs_args(),
-                'stdout': json.dumps({'total_count': 2, 'jobs': [_actions_job_entry(), skipped]}),
-            }
+                'stdout': json.dumps(
+                    {'total_count': 101, 'jobs': [_actions_job_entry(i) for i in range(7, 107)]}
+                ),
+            },
+            {
+                'args': [
+                    'api',
+                    'repos/owner/repo/actions/runs/1/jobs?filter=all&per_page=100&page=2',
+                ],
+                'stdout': json.dumps({'total_count': 101, 'jobs': [skipped]}),
+            },
         ],
     )
 
-    assert _host.actions_jobs('owner', 'repo', 1) == (
+    jobs = _host.actions_jobs('owner', 'repo', 1)
+    assert [job.identifier for job in jobs] == list(range(7, 108))
+    assert (jobs[0], jobs[-1]) == (
         _host.ActionsJob(
             7, 1, 1, 'lint', runner_id=5, runner=b'GitHub Actions 5\nGitHub Actions\nubuntu-latest'
         ),
-        _host.ActionsJob(8, 1, 2, 'lint', runner_id=None, runner=b'Private group\nself-hosted'),
+        _host.ActionsJob(107, 1, 2, 'lint', runner_id=None, runner=b'Private group\nself-hosted'),
     )
 
 
@@ -401,9 +398,30 @@ def test_actions_runs_names_the_given_command_when_the_listing_changes(fake_gh: 
 
 
 def test_actions_runs_reads_every_run_with_checked_details(fake_gh: Path) -> None:
-    _write_responses(fake_gh, [_runs_response(_actions_run_entry())])
+    _write_responses(
+        fake_gh,
+        [
+            {
+                'args': _ACTIONS_RUNS_ARGS,
+                'stdout': json.dumps(
+                    {
+                        'total_count': 101,
+                        'workflow_runs': [_actions_run_entry(i) for i in range(1, 101)],
+                    }
+                ),
+            },
+            {
+                'args': ['api', 'repos/owner/repo/actions/runs?per_page=100&page=2'],
+                'stdout': json.dumps(
+                    {'total_count': 101, 'workflow_runs': [_actions_run_entry(101)]}
+                ),
+            },
+        ],
+    )
 
-    (run,) = _host.actions_runs('owner', 'repo')
+    runs = _host.actions_runs('owner', 'repo')
+    assert [item.identifier for item in runs] == list(range(1, 102))
+    run = runs[0]
 
     assert run[:7] == (1, 1, 'completed', 'CI', 'push', 'a' * 40, '2026-09-22T10:00:00Z')
     assert run.details.split(b'\n') == [
@@ -420,28 +438,6 @@ def test_actions_runs_reads_every_run_with_checked_details(fake_gh: Path) -> Non
         b'actor-login',
         b'trigger-login',
     ]
-
-
-def test_actions_runs_refuses_a_listing_that_changes_between_pages(fake_gh: Path) -> None:
-    first = [_actions_run_entry(index) for index in range(1, 101)]
-    _write_responses(
-        fake_gh,
-        [
-            {
-                'args': _ACTIONS_RUNS_ARGS,
-                'stdout': json.dumps({'total_count': 101, 'workflow_runs': first}),
-            },
-            {
-                'args': ['api', 'repos/owner/repo/actions/runs?per_page=100&page=2'],
-                'stdout': json.dumps(
-                    {'total_count': 102, 'workflow_runs': [_actions_run_entry(101)]}
-                ),
-            },
-        ],
-    )
-
-    with pytest.raises(PubanonError, match='workflow run listing changed while being read'):
-        _host.actions_runs('owner', 'repo')
 
 
 def test_all_releases_reads_every_page_in_order(fake_gh: Path, tmp_path: Path) -> None:
@@ -489,10 +485,11 @@ def test_authenticated_account_hides_missing_executable(
     private_executable = str(tmp_path / 'private-gh-canary')
     monkeypatch.setattr(_host, '_GH', private_executable)
 
-    with pytest.raises(PubanonError) as exc_info:
+    with pytest.raises(_host.GitHubCliUnavailableError) as exc_info:
         _host.authenticated_account()
 
-    assert str(exc_info.value) == 'GitHub authentication could not be verified'
+    assert str(exc_info.value) == 'cannot run GitHub CLI'
+    assert 'install GitHub CLI 2.97.0 or newer' in (exc_info.value.recovery or '')
     assert private_executable not in exc_info.value.render()
 
 
@@ -508,7 +505,7 @@ def test_authenticated_account_hides_timeout_streams(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(_host.subprocess, 'run', _timeout_run)
 
     with pytest.raises(PubanonError) as exc_info:
-        _host.authenticated_account(timeout=2.5)
+        _host.authenticated_account()
 
     graph = _exception_graph(exc_info.value)
     rendered = repr([vars(error) for error in graph]) + exc_info.value.render()
@@ -576,6 +573,20 @@ def test_blob_url_quotes_every_path_component(monkeypatch: pytest.MonkeyPatch) -
     )
 
 
+@pytest.mark.parametrize('version', ['2.97.0', '3.0.0'])
+def test_check_cli_version_accepts_the_floor_and_later(
+    monkeypatch: pytest.MonkeyPatch, version: str
+) -> None:
+    monkeypatch.setenv('PUBANON_FAKE_GH_VERSION', version)
+    _host.check_cli_version()
+
+
+def test_check_cli_version_refuses_older_versions(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv('PUBANON_FAKE_GH_VERSION', '2.96.9')
+    with pytest.raises(PubanonError, match=re.escape('GitHub CLI 2.97.0 or newer is required')):
+        _host.check_cli_version()
+
+
 def test_check_recovery_accepts_one_pass_verdicts() -> None:
     verdicts = (
         verdict
@@ -607,7 +618,7 @@ def test_check_result_percent_encodes_check_name(fake_gh: Path, tmp_path: Path) 
 
     _host.check_result(('publication-owner', 'public-repo'), 'a' * 40, 'Quality gate')
 
-    call = json.loads((tmp_path / 'fake-gh-calls.jsonl').read_text())
+    (call,) = _gh_calls(tmp_path)
     assert call['args'] == ['api', path]
 
 
@@ -711,8 +722,6 @@ def test_create_repository_posts_empty_private_user_repository(
     _host.create_repository(_destination(account='publication-owner'), None)
 
     assert _gh_calls(tmp_path) == [{'args': args, 'stdin': ''}]
-    assert 'visibility' not in ' '.join(args)
-    assert 'auto_init' not in ' '.join(args)
 
 
 def test_create_repository_posts_org_visibility_and_settings(
@@ -792,8 +801,6 @@ def test_create_repository_posts_org_visibility_and_settings(
         {'args': patch_args, 'stdin': ''},
         {'args': _SETTINGS_ARGS, 'stdin': ''},
     ]
-    assert 'default_branch' not in ' '.join(create_args)
-    assert 'auto_init' not in ' '.join(create_args)
 
 
 def test_create_repository_refuses_nonorganization_owner_before_post(
@@ -807,6 +814,27 @@ def test_create_repository_refuses_nonorganization_owner_before_post(
         _host.create_repository(_destination(), None)
 
     assert _gh_calls(tmp_path) == [{'args': owner_args, 'stdin': ''}]
+
+
+def test_create_repository_under_a_user_owner_names_the_fix(fake_gh: Path) -> None:
+    fake_gh.write_text(
+        json.dumps([{'args': ['api', 'users/someone', '--jq', '.type'], 'stdout': 'User\n'}])
+    )
+    destination = _host.Destination(
+        adapter='github',
+        owner='someone',
+        repo='public-repo',
+        url=_host.repository_url('someone', 'public-repo'),
+        account='anonymous-account',
+        visibility='private',
+    )
+
+    with pytest.raises(
+        PubanonError, match='account cannot create under the configured owner'
+    ) as exc_info:
+        _host.create_repository(destination, None)
+
+    assert 'anonymous-account' in (exc_info.value.recovery or '')
 
 
 def test_create_repository_variable_posts_name_and_value(fake_gh: Path, tmp_path: Path) -> None:
@@ -915,12 +943,12 @@ def test_disclosure_accepts_reordered_passes_and_sorts_by_id(fake_gh: Path) -> N
     result = _host.disclosure('publication-owner', 'public-repo')
 
     assert result.runs == (
-        _host.DisclosureEntry(1, 'build'),
-        _host.DisclosureEntry(2, 'publish'),
+        _host._DisclosureEntry(1, 'build'),
+        _host._DisclosureEntry(2, 'publish'),
     )
     assert result.artifacts == (
-        _host.DisclosureEntry(11, 'wheel'),
-        _host.DisclosureEntry(12, 'source'),
+        _host._DisclosureEntry(11, 'wheel'),
+        _host._DisclosureEntry(12, 'source'),
     )
 
 
@@ -938,10 +966,10 @@ def test_disclosure_accepts_stable_multi_page_inventory(
     result = _host.disclosure('publication-owner', 'public-repo')
 
     assert result.runs == tuple(
-        _host.DisclosureEntry(index, f'workflow-{index}') for index in range(1, 151)
+        _host._DisclosureEntry(index, f'workflow-{index}') for index in range(1, 151)
     )
     assert result.artifacts == tuple(
-        _host.DisclosureEntry(index, f'artifact-{index}') for index in range(701, 851)
+        _host._DisclosureEntry(index, f'artifact-{index}') for index in range(701, 851)
     )
     assert [call['args'] for call in _gh_calls(tmp_path)] == [
         [
@@ -990,8 +1018,8 @@ def test_disclosure_allows_equal_ids_across_resource_namespaces(fake_gh: Path) -
     )
 
     assert _host.disclosure('publication-owner', 'public-repo') == (
-        (_host.DisclosureEntry(7, 'build'),),
-        (_host.DisclosureEntry(7, 'wheel'),),
+        (_host._DisclosureEntry(7, 'build'),),
+        (_host._DisclosureEntry(7, 'wheel'),),
     )
 
 
@@ -1053,40 +1081,6 @@ def test_dispatch_workflow_sends_both_inputs_and_version_header(
         == 42
     )
     assert _gh_calls(tmp_path) == [{'args': _dispatch_args(), 'stdin': ''}]
-
-
-def test_fake_gh_autouse_records_and_refuses_unexpected_call(tmp_path: Path) -> None:
-    args = ['api', 'unexpected']
-
-    with pytest.raises(PubanonError) as exc_info:
-        _host._gh(args)
-
-    assert str(exc_info.value) == 'unexpected fake gh invocation: ["api", "unexpected"]'
-    assert _gh_calls(tmp_path) == [{'args': args, 'stdin': ''}]
-
-
-def test_fake_gh_consume_once_response_disappears(fake_gh: Path) -> None:
-    args = _REPOSITORY_ARGS
-    _write_responses(
-        fake_gh,
-        [
-            {
-                'args': args,
-                'returncode': 1,
-                'stdout': '{"status":"404"}\n',
-                'once': True,
-            },
-            {
-                'args': args,
-                'stdout': (
-                    '{"owner":"publication-owner","repo":"public-repo","visibility":"private"}\n'
-                ),
-            },
-        ],
-    )
-
-    assert not _host.repository_visible('publication-owner', 'public-repo')
-    assert _host.repository_visible('publication-owner', 'public-repo')
 
 
 def test_fetch_failure_preserves_existing_managed_refs(
@@ -1739,7 +1733,7 @@ def test_ls_remote_ignores_repository_local_url_rewrite(
         visibility='private',
     )
 
-    refs = _host.ls_remote(destination, _paths(tmp_path), 'demo')
+    refs = _host.ls_remote(destination, make_paths(tmp_path), 'demo')
 
     assert refs.main == commit
 
@@ -1785,7 +1779,7 @@ def test_ls_remote_reads_only_main_and_tags_despite_planted_pull_ref(
         visibility='private',
     )
 
-    refs = _host.ls_remote(destination, _paths(tmp_path), 'demo')
+    refs = _host.ls_remote(destination, make_paths(tmp_path), 'demo')
 
     assert refs == _host.RemoteRefs(commit, {'v1.0.0': commit})
 
@@ -1820,7 +1814,7 @@ def test_ls_remote_reads_refs_from_created_advisory_store(
         check=True,
         env=git_env(),
     )
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     destination = _host.Destination(
         adapter='github',
         owner='publication-owner',
@@ -1885,90 +1879,33 @@ def test_ls_remote_records_destination_branch_other_than_main(
         visibility='private',
     )
 
-    refs = _host.ls_remote(destination, _paths(tmp_path), 'demo')
+    refs = _host.ls_remote(destination, make_paths(tmp_path), 'demo')
 
     assert refs == _host.RemoteRefs(commit, {}, (('private-backup', commit),))
 
 
-def test_new_gh_reads_pin_github_host(
-    fake_gh: Path,
+def test_ls_remote_refuses_malformed_or_duplicate_direct_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv('GH_HOST', 'evil.example')
-    monkeypatch.setenv('PUBANON_FAKE_GH_RECORD_HOST', '1')
-    check_args = [
-        'api',
-        (
-            'repos/publication-owner/public-repo/commits/'
-            f'{"a" * 40}/check-runs?check_name=CI&filter=latest&per_page=100'
-        ),
-    ]
-    runs_args = [
-        'api',
-        'repos/publication-owner/public-repo/actions/runs?per_page=100&page=1',
-    ]
-    artifacts_args = [
-        'api',
-        'repos/publication-owner/public-repo/actions/artifacts?per_page=100&page=1',
-    ]
-    _write_responses(
-        fake_gh,
-        [
-            {
-                'args': _REPOSITORY_ARGS,
-                'stdout': (
-                    '{"owner":"publication-owner","repo":"public-repo","visibility":"private"}\n'
-                ),
-            },
-            {
-                'args': _SETTINGS_ARGS,
-                'stdout': (
-                    '{"description":null,"default_branch":"main",'
-                    '"issues":true,"wiki":false,"projects":true,'
-                    '"pull_requests":false,"discussions":false}\n'
-                ),
-            },
-            {
-                'args': check_args,
-                'stdout': '{"total_count":0,"check_runs":[]}\n',
-            },
-            {
-                'args': runs_args,
-                'stdout': '{"total_count":0,"workflow_runs":[]}\n',
-                'once': True,
-            },
-            {
-                'args': runs_args,
-                'stdout': '{"total_count":0,"workflow_runs":[]}\n',
-            },
-            {
-                'args': artifacts_args,
-                'stdout': '{"total_count":0,"artifacts":[]}\n',
-                'once': True,
-            },
-            {
-                'args': artifacts_args,
-                'stdout': '{"total_count":0,"artifacts":[]}\n',
-            },
-        ],
+    destination = _host.Destination(
+        adapter='github',
+        owner='publication-owner',
+        repo='public-repo',
+        url='file:///host.git',
+        account='anonymous-account',
+        visibility='private',
     )
 
-    assert _host.repository_visible('publication-owner', 'public-repo')
-    assert _host.repository_settings('publication-owner', 'public-repo').default_branch == 'main'
-    assert (
-        _host.check_result(('publication-owner', 'public-repo'), 'a' * 40, 'CI').state == 'missing'
-    )
-    assert _host.disclosure('publication-owner', 'public-repo') == (
-        (),
-        (),
-    )
+    output = b'not-a-reference\n'
 
-    calls = [
-        json.loads(line) for line in (tmp_path / 'fake-gh-calls.jsonl').read_text().splitlines()
-    ]
-    assert len(calls) == 7
-    assert {call['gh_host'] for call in calls} == {'github.com'}
+    def _fake_credential_child(*_args: object, **_kwargs: object) -> GitResult:
+        return GitResult(0, output, b'')
+
+    monkeypatch.setattr(_host, 'run_credential_child', _fake_credential_child)
+
+    with pytest.raises(PubanonError, match='invalid remote reference response'):
+        _host.ls_remote(destination, make_paths(tmp_path), 'demo')
 
 
 def test_push_invokes_gh_credential_helper_and_reports_transport_diagnostics(
@@ -2017,13 +1954,11 @@ def test_push_invokes_gh_credential_helper_and_reports_transport_diagnostics(
     assert (exc_info.value.fact or '').startswith('exit status 128: ')
     assert 'helper-stderr-canary' in exc_info.value.render()
     assert 'transport-stdout-canary.git' in exc_info.value.render()
-    calls = [
-        json.loads(line) for line in (tmp_path / 'fake-gh-calls.jsonl').read_text().splitlines()
-    ]
+    calls = _gh_calls(tmp_path)
     helper_calls = [call for call in calls if call['args'][:2] == ['auth', 'git-credential']]
     assert helper_calls
-    assert {call['gh_config_dir'] for call in helper_calls} == {config_dir}
-    assert {call['gh_host'] for call in helper_calls} == {'github.com'}
+    assert {call.get('gh_config_dir') for call in helper_calls} == {config_dir}
+    assert {call.get('gh_host') for call in helper_calls} == {'github.com'}
 
 
 def test_read_actions_job_requires_the_requested_job_and_run(fake_gh: Path) -> None:
@@ -2179,13 +2114,11 @@ def test_read_remote_refs_pins_credential_helper_to_github_host(
         server.server_close()
         thread.join()
 
-    calls = [
-        json.loads(line) for line in (tmp_path / 'fake-gh-calls.jsonl').read_text().splitlines()
-    ]
+    calls = _gh_calls(tmp_path)
     helper_calls = [call for call in calls if call['args'][:2] == ['auth', 'git-credential']]
     assert helper_calls
-    assert {call['gh_config_dir'] for call in helper_calls} == {config_dir}
-    assert {call['gh_host'] for call in helper_calls} == {'github.com'}
+    assert {call.get('gh_config_dir') for call in helper_calls} == {config_dir}
+    assert {call.get('gh_host') for call in helper_calls} == {'github.com'}
 
 
 def test_read_remote_refs_propagates_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2197,6 +2130,20 @@ def test_read_remote_refs_propagates_timeout(monkeypatch: pytest.MonkeyPatch) ->
 
     with pytest.raises(ObservationTimeoutError):
         _host.read_remote_refs(_destination(), timeout=2.5)
+
+
+def test_read_remote_refs_refuses_malformed_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = b'not-a-reference\n'
+
+    def _fake_credential_child(*_args: object, **_kwargs: object) -> GitResult:
+        return GitResult(0, output, b'')
+
+    monkeypatch.setattr(_host, 'run_credential_child', _fake_credential_child)
+
+    with pytest.raises(PubanonError, match='invalid remote reference response'):
+        _host.read_remote_refs(_destination())
 
 
 @pytest.mark.parametrize('immutable', [None, 'false', 0])
@@ -2315,6 +2262,85 @@ def test_remote_refs_records_unexpected_branch_as_fact() -> None:
     refs = _remote_refs(output)
 
     assert refs.branches == (('feature', oid_b),)
+
+
+def test_repository_check_and_disclosure_reads_pin_github_host(
+    fake_gh: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('GH_HOST', 'evil.example')
+    monkeypatch.setenv('PUBANON_FAKE_GH_RECORD_HOST', '1')
+    check_args = [
+        'api',
+        (
+            'repos/publication-owner/public-repo/commits/'
+            f'{"a" * 40}/check-runs?check_name=CI&filter=latest&per_page=100'
+        ),
+    ]
+    runs_args = [
+        'api',
+        'repos/publication-owner/public-repo/actions/runs?per_page=100&page=1',
+    ]
+    artifacts_args = [
+        'api',
+        'repos/publication-owner/public-repo/actions/artifacts?per_page=100&page=1',
+    ]
+    _write_responses(
+        fake_gh,
+        [
+            {
+                'args': _REPOSITORY_ARGS,
+                'stdout': (
+                    '{"owner":"publication-owner","repo":"public-repo","visibility":"private"}\n'
+                ),
+            },
+            {
+                'args': _SETTINGS_ARGS,
+                'stdout': (
+                    '{"description":null,"default_branch":"main",'
+                    '"issues":true,"wiki":false,"projects":true,'
+                    '"pull_requests":false,"discussions":false}\n'
+                ),
+            },
+            {
+                'args': check_args,
+                'stdout': '{"total_count":0,"check_runs":[]}\n',
+            },
+            {
+                'args': runs_args,
+                'stdout': '{"total_count":0,"workflow_runs":[]}\n',
+                'once': True,
+            },
+            {
+                'args': runs_args,
+                'stdout': '{"total_count":0,"workflow_runs":[]}\n',
+            },
+            {
+                'args': artifacts_args,
+                'stdout': '{"total_count":0,"artifacts":[]}\n',
+                'once': True,
+            },
+            {
+                'args': artifacts_args,
+                'stdout': '{"total_count":0,"artifacts":[]}\n',
+            },
+        ],
+    )
+
+    assert _host.repository_visible('publication-owner', 'public-repo')
+    assert _host.repository_settings('publication-owner', 'public-repo').default_branch == 'main'
+    assert (
+        _host.check_result(('publication-owner', 'public-repo'), 'a' * 40, 'CI').state == 'missing'
+    )
+    assert _host.disclosure('publication-owner', 'public-repo') == (
+        (),
+        (),
+    )
+
+    calls = _gh_calls(tmp_path)
+    assert len(calls) == 7
+    assert {call.get('gh_host') for call in calls} == {'github.com'}
 
 
 def test_repository_facts_shows_every_github_cli_line(fake_gh: Path) -> None:
@@ -2450,16 +2476,22 @@ def test_require_authenticated_account_returns_exact_host_account(
     assert returned == actual
 
 
-def test_set_default_branch_forwards_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _timed_gh(args: list[str], *, timeout: float | None = None) -> bytes:
-        assert args[0] == 'api'
-        assert timeout == 2.5
-        raise ObservationTimeoutError
+def test_set_default_branch_is_never_repeated_as_a_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The double takes no `read` argument, so a change sent as a repeatable read fails here.
+    calls: list[list[str]] = []
 
-    monkeypatch.setattr(_host, '_gh', _timed_gh)
+    def _change_gh(args: list[str], *, timeout: float | None = None) -> bytes:
+        assert timeout is None
+        calls.append(args)
+        return b''
 
-    with pytest.raises(ObservationTimeoutError):
-        _host.set_default_branch('publication-owner', 'public-repo', 'main', timeout=2.5)
+    monkeypatch.setattr(_host, '_gh', _change_gh)
+
+    _host.set_default_branch('publication-owner', 'public-repo', 'main')
+
+    assert calls == [
+        ['api', '-X', 'PATCH', 'repos/publication-owner/public-repo', '-f', 'default_branch=main']
+    ]
 
 
 def test_set_default_branch_sends_single_request(fake_gh: Path, tmp_path: Path) -> None:
@@ -2492,6 +2524,41 @@ def test_set_visibility_patches_public(fake_gh: Path, tmp_path: Path) -> None:
     _host.set_visibility('publication-owner', 'public-repo', 'public')
 
     assert _gh_calls(tmp_path) == [{'args': args, 'stdin': ''}]
+
+
+def test_settings_facts_compare_every_declared_setting() -> None:
+    assert _host.SettingsFacts._fields == tuple(field.name for field in fields(Settings))
+
+
+def test_settings_mismatches_reports_all_seven_fields_in_declared_order() -> None:
+    expected = Settings(
+        description='Public repository',
+        default_branch='main',
+        issues=True,
+        wiki=False,
+        projects=True,
+        pull_requests=True,
+        discussions=False,
+    )
+    actual = _host.SettingsFacts(
+        description='',
+        default_branch='trunk',
+        issues=False,
+        wiki=True,
+        projects=False,
+        pull_requests=False,
+        discussions=True,
+    )
+
+    assert _host.settings_differences(expected, actual) == [
+        'description: expected Public repository; actual ',
+        'default_branch: expected main; actual trunk',
+        'issues: expected true; actual false',
+        'wiki: expected false; actual true',
+        'projects: expected true; actual false',
+        'pull_requests: expected true; actual false',
+        'discussions: expected false; actual true',
+    ]
 
 
 @pytest.mark.parametrize(
@@ -2723,7 +2790,7 @@ def test_release_write_uses_verified_tag_and_retained_stdin(
     ],
 )
 def test_create_release_sets_latest_only_for_published_pages(
-    mode: _host.ReleaseCreationMode,
+    mode: _host._ReleaseCreationMode,
     flags: list[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3196,10 +3263,6 @@ def test_fetch_reads_main_and_tags_through_destination(
     ('heads', 'tags'),
     [
         ((), ()),
-        (('main',), ()),
-        (('stage',), ()),
-        (('main', 'stage'), ()),
-        (('main', 'stage', 'backup'), ()),
         (('main', 'stage', 'backup'), ('v1.0.0',)),
     ],
 )
@@ -3261,71 +3324,6 @@ def test_read_remote_refs_preserves_branches_and_tags_without_local_store(
         ).stdout
         == before
     )
-
-
-@pytest.mark.parametrize(
-    'output',
-    [
-        b'not-a-reference\n',
-        b'a' * 40 + b'\trefs/heads/main',
-        b'a' * 40 + b'\trefs/heads/\n',
-        b'a' * 40 + b'\trefs/tags/\n',
-        (b'a' * 40 + b'\trefs/heads/stage\n') * 2,
-        (b'a' * 40 + b'\trefs/tags/v1\n') * 2,
-    ],
-)
-def test_read_remote_refs_refuses_malformed_output(
-    output: bytes,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def _fake_credential_child(*_args: object, **_kwargs: object) -> GitResult:
-        return GitResult(0, output, b'')
-
-    monkeypatch.setattr(_host, 'run_credential_child', _fake_credential_child)
-
-    with pytest.raises(PubanonError, match='invalid remote reference response'):
-        _host.read_remote_refs(_destination())
-
-
-@pytest.mark.parametrize(
-    'output',
-    [
-        b'not-a-reference\n',
-        (
-            b'0000000000000000000000000000000000000000\trefs/heads/main\n'
-            b'1111111111111111111111111111111111111111\trefs/heads/main\n'
-        ),
-        (
-            b'0000000000000000000000000000000000000000\trefs/heads/main\n'
-            b'0000000000000000000000000000000000000000\trefs/heads/main\n'
-        ),
-        (
-            b'0000000000000000000000000000000000000000\trefs/tags/v1.0.0\n'
-            b'1111111111111111111111111111111111111111\trefs/tags/v1.0.0\n'
-        ),
-    ],
-)
-def test_ls_remote_refuses_malformed_or_duplicate_direct_output(
-    output: bytes,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    destination = _host.Destination(
-        adapter='github',
-        owner='publication-owner',
-        repo='public-repo',
-        url='file:///host.git',
-        account='anonymous-account',
-        visibility='private',
-    )
-
-    def _fake_credential_child(*_args: object, **_kwargs: object) -> GitResult:
-        return GitResult(0, output, b'')
-
-    monkeypatch.setattr(_host, 'run_credential_child', _fake_credential_child)
-
-    with pytest.raises(PubanonError, match='invalid remote reference response'):
-        _host.ls_remote(destination, _paths(tmp_path), 'demo')
 
 
 @pytest.mark.parametrize(
@@ -3581,7 +3579,7 @@ def test_transport_selects_absolute_store(
         'account',
         'private',
     )
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     store = paths.data_dir / 'projects' / 'demo' / 'store.git'
     calls: list[list[str]] = []
 
@@ -3610,14 +3608,15 @@ def test_verify_destination_delegates_configuration_account_authority(
     global_config, project_config = _configs(tmp_path)
     requirements: list[tuple[str, str]] = []
 
-    def _require_account(expected: str, *, authority: str) -> str:
+    def _require_account(expected: str, *, authority: str, timeout: float | None = None) -> str:
+        assert timeout is None
         requirements.append((expected, authority))
         raise PubanonError('account authority observed')
 
     monkeypatch.setattr(_host, 'require_authenticated_account', _require_account)
 
     with pytest.raises(PubanonError, match='account authority observed'):
-        _host.verify_destination(_paths(tmp_path), global_config, project_config)
+        _host.verify_destination(make_paths(tmp_path), global_config, project_config)
 
     assert requirements == [('anonymous-account', 'configuration')]
 
@@ -3647,7 +3646,7 @@ def test_verify_destination_derives_url_from_the_template(
         ],
     )
 
-    destination = _host.verify_destination(_paths(tmp_path), global_config, project_config)
+    destination = _host.verify_destination(make_paths(tmp_path), global_config, project_config)
 
     assert destination.url == 'file:///host/publication-owner/public-repo.git'
     assert destination.owner == 'publication-owner'
@@ -3677,7 +3676,7 @@ def test_verify_destination_explains_missing_or_inaccessible_repository(
     )
 
     with pytest.raises(PubanonError) as exc_info:
-        _host.verify_destination(_paths(tmp_path), global_config, project_config)
+        _host.verify_destination(make_paths(tmp_path), global_config, project_config)
 
     error = exc_info.value
     rendered = str(error)
@@ -3696,7 +3695,7 @@ def test_verify_destination_gates_current_coordinates_before_host_access(
     field: str,
     tmp_path: Path,
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     global_config, project = _configs(tmp_path)
     term = f'private-{field}'
     global_config = replace(global_config, sensitive_terms=(term,))
@@ -3725,7 +3724,7 @@ def test_verify_destination_hides_subprocess_launch_failure(
     monkeypatch.setattr(_host.subprocess, 'run', _fail_spawn)
 
     with pytest.raises(PubanonError) as exc_info:
-        _host.verify_destination(_paths(tmp_path), global_config, project_config)
+        _host.verify_destination(make_paths(tmp_path), global_config, project_config)
 
     assert str(exc_info.value) == 'cannot run GitHub CLI'
     assert private_executable not in exc_info.value.render()
@@ -3762,7 +3761,7 @@ def test_verify_destination_propagates_timeout_to_each_host_read(
     times = iter([0.0, 0.0, 0.0, 0.0, 1.0])
     monkeypatch.setattr(_host, '_monotonic', lambda: next(times))
 
-    _host.verify_destination(_paths(tmp_path), global_config, project_config, timeout=9.0)
+    _host.verify_destination(make_paths(tmp_path), global_config, project_config, timeout=9.0)
 
     assert calls == [('account', 9.0), ('repository', 8.0)]
 
@@ -3778,7 +3777,7 @@ def test_verify_destination_refuses_duplicate_account_output(
     )
 
     with pytest.raises(PubanonError, match='invalid authenticated account response'):
-        _host.verify_destination(_paths(tmp_path), global_config, project_config)
+        _host.verify_destination(make_paths(tmp_path), global_config, project_config)
 
 
 def test_verify_destination_refuses_duplicate_repository_facts(
@@ -3801,7 +3800,7 @@ def test_verify_destination_refuses_duplicate_repository_facts(
     )
 
     with pytest.raises(PubanonError, match='invalid repository response'):
-        _host.verify_destination(_paths(tmp_path), global_config, project_config)
+        _host.verify_destination(make_paths(tmp_path), global_config, project_config)
 
 
 def test_verify_destination_refuses_malformed_repository_facts(
@@ -3818,7 +3817,7 @@ def test_verify_destination_refuses_malformed_repository_facts(
     )
 
     with pytest.raises(PubanonError, match='invalid repository response'):
-        _host.verify_destination(_paths(tmp_path), global_config, project_config)
+        _host.verify_destination(make_paths(tmp_path), global_config, project_config)
 
 
 @pytest.mark.parametrize(
@@ -3851,7 +3850,7 @@ def test_verify_destination_refuses_repository_coordinate_mismatch(
     )
 
     with pytest.raises(PubanonError) as exc_info:
-        _host.verify_destination(_paths(tmp_path), global_config, project_config)
+        _host.verify_destination(make_paths(tmp_path), global_config, project_config)
 
     assert exc_info.value.fact == fact
     assert exc_info.value.expected == getattr(project_config, field)
@@ -3883,7 +3882,7 @@ def test_verify_destination_refuses_visibility_mismatch(
     )
 
     with pytest.raises(PubanonError) as exc_info:
-        _host.verify_destination(_paths(tmp_path), global_config, project_config)
+        _host.verify_destination(make_paths(tmp_path), global_config, project_config)
 
     error = exc_info.value
     assert error.fact == 'repository visibility'
@@ -3903,7 +3902,7 @@ def test_verify_destination_reports_account_mismatch(
     )
 
     with pytest.raises(PubanonError) as exc_info:
-        _host.verify_destination(_paths(tmp_path), global_config, project_config)
+        _host.verify_destination(make_paths(tmp_path), global_config, project_config)
 
     error = exc_info.value
     assert error.fact == 'authenticated account'
@@ -3931,7 +3930,7 @@ def test_verify_destination_reports_repository_lookup_failure(
     )
 
     with pytest.raises(PubanonError) as exc_info:
-        _host.verify_destination(_paths(tmp_path), global_config, project_config)
+        _host.verify_destination(make_paths(tmp_path), global_config, project_config)
 
     rendered = str(exc_info.value)
     assert 'Could not check GitHub repository' in rendered
@@ -3947,7 +3946,8 @@ def test_verify_recorded_destination_delegates_candidate_record_account_authorit
     destination = _destination()
     requirements: list[tuple[str, str]] = []
 
-    def _require_account(expected: str, *, authority: str) -> str:
+    def _require_account(expected: str, *, authority: str, timeout: float | None = None) -> str:
+        assert timeout is None
         requirements.append((expected, authority))
         raise PubanonError('account authority observed')
 
@@ -4792,3 +4792,90 @@ def test_job_log_failure_names_only_the_job_and_status(
     assert error.value.__cause__ is None
     assert 'private-log-sentinel' not in diagnostic(error.value)
     assert 'private-log-sentinel' not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ('observed', 'configured', 'expected'),
+    [
+        (('other-owner', 'public-repo', 'private'), 'private', 'set owner and repo in'),
+        (('publication-owner', 'public-repo', 'public'), 'private', 'pubanon repo reveal'),
+        (('publication-owner', 'public-repo', 'private'), 'public', 'visibility = "private"'),
+    ],
+)
+def test_destination_drift_names_the_next_step(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    observed: tuple[str, str, str],
+    configured: str,
+    expected: str,
+) -> None:
+    global_config, project = _configs(tmp_path)
+    project = replace(project, visibility=configured)
+
+    def _account(_expected: str, *, authority: str, timeout: float | None = None) -> str:
+        del authority, timeout
+        return _expected
+
+    def _facts(_owner: str, _repo: str, *, timeout: float | None = None) -> tuple[str, str, str]:
+        del timeout
+        return observed
+
+    monkeypatch.setattr(_host, 'require_authenticated_account', _account)
+    monkeypatch.setattr(_host, 'repository_facts', _facts)
+
+    with pytest.raises(PubanonError, match='does not match configuration') as exc_info:
+        _host.verify_destination(make_paths(tmp_path), global_config, project)
+
+    assert expected in (exc_info.value.recovery or '')
+
+
+@pytest.mark.parametrize(
+    ('output', 'expected'),
+    [
+        (b'a' * 40 + b'\trefs/heads/main\n', _host.RemoteRefs('a' * 40, {})),
+        (b'b' * 40 + b'\trefs/heads/stage\n', _host.RemoteRefs(None, {}, (('stage', 'b' * 40),))),
+        (
+            b'a' * 40 + b'\trefs/heads/main\n' + b'b' * 40 + b'\trefs/heads/stage\n',
+            _host.RemoteRefs('a' * 40, {}, (('stage', 'b' * 40),)),
+        ),
+        (
+            b'b' * 40
+            + b'\trefs/heads/stage\n'
+            + b'a' * 40
+            + b'\trefs/heads/main\n'
+            + b'c' * 40
+            + b'\trefs/heads/backup\n',
+            _host.RemoteRefs('a' * 40, {}, (('backup', 'c' * 40), ('stage', 'b' * 40))),
+        ),
+    ],
+)
+def test_remote_refs_preserves_branch_shapes(output: bytes, expected: _host.RemoteRefs) -> None:
+    assert _remote_refs(output) == expected
+
+
+@pytest.mark.parametrize(
+    'output',
+    [
+        b'not-a-reference\n',
+        b'a' * 40 + b'\trefs/heads/main',
+        b'a' * 40 + b'\trefs/heads/\n',
+        b'a' * 40 + b'\trefs/tags/\n',
+        (b'a' * 40 + b'\trefs/heads/stage\n') * 2,
+        (b'a' * 40 + b'\trefs/tags/v1\n') * 2,
+        (
+            b'0000000000000000000000000000000000000000\trefs/heads/main\n'
+            b'1111111111111111111111111111111111111111\trefs/heads/main\n'
+        ),
+        (
+            b'0000000000000000000000000000000000000000\trefs/heads/main\n'
+            b'0000000000000000000000000000000000000000\trefs/heads/main\n'
+        ),
+        (
+            b'0000000000000000000000000000000000000000\trefs/tags/v1.0.0\n'
+            b'1111111111111111111111111111111111111111\trefs/tags/v1.0.0\n'
+        ),
+    ],
+)
+def test_remote_refs_refuses_malformed_output(output: bytes) -> None:
+    with pytest.raises(PubanonError, match='invalid remote reference response'):
+        _remote_refs(output)

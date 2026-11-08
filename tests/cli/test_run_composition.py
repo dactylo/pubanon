@@ -15,10 +15,9 @@ from pubanon._errors import PubanonError
 from pubanon._remote import _host, _lifecycle, _releases, _stage, _watch
 from pubanon._snapshots import _candidate, _discard, _records, _store
 from tests._cli import prepare, save_workflows, stub_remote
-from tests._git import git_env
+from tests._git import git_bytes, git_env
 from tests._setup import configure
-from tests.remote.test_releases import _Host as _ReleaseHost
-from tests.remote.test_stage import _git
+from tests.remote.test_releases import Host as _ReleaseHost
 
 
 def _prepare_stale_stage(
@@ -38,7 +37,7 @@ def _prepare_stale_stage(
     monkeypatch.setattr(_host, '_URL_TEMPLATE', final_host.as_uri())
     for host in (stage_host, final_host):
         subprocess.run(['git', 'init', '--bare', '-q', host], check=True, env=git_env())
-    _git(
+    git_bytes(
         stage_host,
         'fetch',
         '-q',
@@ -71,7 +70,7 @@ def _prepare_stale_stage(
     _stage._save_stage(
         paths,
         project.name,
-        _stage.StageRecord(
+        _stage._StageRecord(
             candidate_a.commit,
             project.owner,
             _config.stage_repository(project),
@@ -321,7 +320,7 @@ def test_composed_publication_requires_explicit_route_change_after_forgetting_st
     _stub_repository_settings(monkeypatch, project)
     project = replace(project, publication_route='staged')
     _config.save_project(paths, project)
-    stage_refs = _git(stage_host, 'show-ref')
+    stage_refs = git_bytes(stage_host, 'show-ref')
     stage_record = _stage.load_stage(paths, project.name)
     project = save_workflows(paths, project, ship=('publish',))
     global_config = _config.load_global(paths)
@@ -364,8 +363,8 @@ def test_composed_publication_requires_explicit_route_change_after_forgetting_st
     assert retained is not None
     assert retained == candidate_b
     assert _stage.load_stage(paths, project.name) == stage_record
-    assert _git(final_host, 'for-each-ref') == b''
-    assert _git(stage_host, 'show-ref') == stage_refs
+    assert git_bytes(final_host, 'for-each-ref') == b''
+    assert git_bytes(stage_host, 'show-ref') == stage_refs
     assert _cli.main(['stage', 'forget', '--project', project.name, '--yes']) == 0
     assert _stage.load_stage(paths, project.name) is None
     assert _cli.main(argv) == 1
@@ -387,11 +386,11 @@ def test_composed_publication_requires_explicit_route_change_after_forgetting_st
     monkeypatch.setattr(_host, 'push', _locked_push)
     assert _cli.main(argv) == 0
     output = capsys.readouterr().out
-    assert _git(final_host, 'show-ref').decode().splitlines() == [
+    assert git_bytes(final_host, 'show-ref').decode().splitlines() == [
         f'{candidate_b.commit} refs/heads/main',
         f'{candidate_b.commit} refs/tags/v1.0.0',
     ]
-    assert _git(stage_host, 'show-ref') == stage_refs
+    assert git_bytes(stage_host, 'show-ref') == stage_refs
     assert _stage.load_stage(paths, project.name) is None
     assert _records.load_candidate(paths, project.name) is None
     assert 'Workflow ship (direct route): publish' in output
@@ -406,7 +405,6 @@ def test_run_decline_after_preview_retains_candidate(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     project = save_workflows(paths, project, ship=('prepare', 'inspect', 'publish'))
     monkeypatch.chdir(source)
     host = tmp_path / 'host.git'
@@ -555,13 +553,13 @@ def workflow_page(
         return host.commit, {host.tag: host.commit}
 
     monkeypatch.setattr(_candidate, 'published_refs', _published)
-    monkeypatch.setattr(_host, 'verify_destination', host._destination)
-    monkeypatch.setattr(_host, 'ls_remote', host._refs)
-    monkeypatch.setattr(_host, 'read_release', host._read)
-    monkeypatch.setattr(_host, 'all_releases', host._all)
-    monkeypatch.setattr(_host, 'create_release', host._create)
-    monkeypatch.setattr(_releases, '_monotonic', host.clock._monotonic)
-    monkeypatch.setattr(_releases, '_sleep', host.clock._sleep)
+    monkeypatch.setattr(_host, 'verify_destination', host.verify_destination)
+    monkeypatch.setattr(_host, 'ls_remote', host.refs)
+    monkeypatch.setattr(_host, 'read_release', host.read)
+    monkeypatch.setattr(_host, 'all_releases', host.all)
+    monkeypatch.setattr(_host, 'create_release', host.create)
+    monkeypatch.setattr(_releases, '_monotonic', host.clock.monotonic)
+    monkeypatch.setattr(_releases, '_sleep', host.clock.sleep)
     return paths, project, host
 
 
@@ -575,7 +573,7 @@ def test_run_reads_notes_once_before_lock_and_keeps_exact_bytes(
     notes_file = tmp_path / 'notes.md'
     notes = b'First\r\nSecond\n'
     notes_file.write_bytes(notes)
-    read_notes = cli_releases.read_notes_file
+    read_notes = cli_releases._read_notes_file
     reads: list[str] = []
 
     def _read(path: str) -> bytes:
@@ -585,7 +583,7 @@ def test_run_reads_notes_once_before_lock_and_keeps_exact_bytes(
         notes_file.unlink()
         return result
 
-    monkeypatch.setattr(cli_releases, 'read_notes_file', _read)
+    monkeypatch.setattr(cli_releases, '_read_notes_file', _read)
     assert (
         _cli.main(
             [
@@ -698,7 +696,7 @@ def test_run_resume_previews_and_creates_missing_page_under_lock(
         *,
         title: str,
         notes: bytes,
-        mode: _host.ReleaseCreationMode = 'latest',
+        mode: _host._ReleaseCreationMode = 'latest',
     ) -> None:
         with (
             pytest.raises(PubanonError, match='another pubanon command is running'),
@@ -706,7 +704,7 @@ def test_run_resume_previews_and_creates_missing_page_under_lock(
         ):
             pass
         events.append('create')
-        host._create(dest, tag, title=title, notes=notes, mode=mode)
+        host.create(dest, tag, title=title, notes=notes, mode=mode)
 
     def _watch_ci(*_args: object, **_kwargs: object) -> None:
         assert host.page is not None

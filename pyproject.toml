@@ -10,7 +10,7 @@ requires = [ "editables>=0.3", "hatch-fancy-pypi-readme>=25.1", "hatchling>=1.27
 # ==========================================================
 [project]
 name = "pubanon"
-version = "0.7.0"
+version = "0.7.1"
 description = "Publish selected files to GitHub under a separate identity"
 keywords = [ "anonymization", "git", "privacy", "publishing", "security" ]
 license = "MIT"
@@ -94,11 +94,6 @@ lint.ignore = [
   "T201",   # print() found
   "TRY003", # Avoid specifying long messages outside exception class
 ]
-lint.per-file-ignores."src/pubanon/_cli/_workflow.py" = [ "SLF001" ]
-lint.per-file-ignores."src/pubanon/_config.py" = [ "SLF001" ]
-lint.per-file-ignores."src/pubanon/_remote/_publish.py" = [ "SLF001" ]
-lint.per-file-ignores."src/pubanon/_remote/_stage.py" = [ "SLF001" ]
-lint.per-file-ignores."src/pubanon/_snapshots/_candidate.py" = [ "SLF001" ]
 lint.per-file-ignores."tests/**/*.py" = [
   "D",       # No docstrings required in tests
   "PLR2004", # Allow magic values in tests
@@ -117,6 +112,8 @@ max_supported_python = "3.15"
 # ==========================================================
 [tool.pyright]
 pythonVersion = "3.13"  # Keep in sync with tool.ruff.target-version
+venv = ".venv"  # Created by make setup
+venvPath = "."
 typeCheckingMode = "strict"
 extraPaths = [ ".", "src" ]
 executionEnvironments = [

@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.7.1 (2026-11-07)
+
+### Changed
+
+- Error messages name the next step, such as the command to rerun, the file to correct, or
+  `pubanon init --edit`.
+- Blocked release pages describe each match as a "sensitive term" or "policy term".
+
+### Fixed
+
+- `prepare` refuses a tagged version that is not the newest version in your changelog, so a package
+  and its changelog section can no longer be published out of step.
+- When GitHub CLI is missing, commands say how to install it, and `doctor` reports a GitHub CLI
+  older than 2.97.0.
+- `release edit` no longer rewrites a page with the title or notes it already has, and
+  `--refresh-notes` works on a page without a title.
+
+### Security
+
+- `package watch` and `repo reveal` no longer load Python modules from the current directory when
+  they check PyPI, so a file there such as `json.py` cannot run as part of the check.
+
 ## 0.7.0 (2026-10-18)
 
 ### Added

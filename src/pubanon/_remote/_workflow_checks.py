@@ -16,20 +16,13 @@ type _Combination = dict[str, _Scalar]
 type _Scalar = str | int | float | bool | None
 
 _EXPRESSION = re.compile(r'\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}')
-_REGULAR_MODES = frozenset({0o100644, 0o100755})
 _WORKFLOW_DIRECTORY = '.github/workflows/'
 _WORKFLOW_PATH = re.compile(r'\.github/workflows/[^/]+\.ya?ml')
 
 
 @dataclass(frozen=True)
-class CheckCaution:
-    """Explain why a discovered check needs review before being required.
-
-    Attributes:
-        name: Discovered GitHub check name.
-        path: Workflow file defining this check.
-        reasons: Trigger or condition limitations for ordinary branch pushes.
-    """
+class _CheckCaution:
+    """Explain why a discovered check needs review before being required."""
 
     name: str
     path: str
@@ -49,7 +42,7 @@ class Discovery:
 
     names: tuple[str, ...]
     notes: tuple[str, ...]
-    cautions: tuple[CheckCaution, ...] = ()
+    cautions: tuple[_CheckCaution, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -80,7 +73,11 @@ class _YamlLoader(Protocol):
     """Describe the typed part of the ruamel safe-loader boundary."""
 
     def load(self, stream: str, /) -> object:
-        """Load one YAML document."""
+        """Load one YAML document.
+
+        Raises:
+            YAMLError: The input cannot be parsed as one YAML document.
+        """
 
 
 def _as_mapping(value: object) -> Mapping[object, object] | None:
@@ -369,7 +366,7 @@ def _discover_workflow(
     names: list[str],
     notes: list[str],
     seen: set[str],
-    cautions: list[CheckCaution],
+    cautions: list[_CheckCaution],
 ) -> None:
     """Add discoverable names and notes from one workflow entry."""
     root, problem = _load_workflow(entry.data)
@@ -397,7 +394,7 @@ def _discover_workflow(
         if 'if' in job:
             reasons += ('job runs only when its if: condition holds',)
         for name in discovered:
-            caution = CheckCaution(name, entry.path, reasons)
+            caution = _CheckCaution(name, entry.path, reasons)
             if reasons and caution not in cautions:
                 cautions.append(caution)
             if name in seen:
@@ -413,7 +410,7 @@ def _workflow_entries(snapshot: _source.Snapshot) -> tuple[_source.Entry, ...]:
         entry
         for entry in snapshot
         if entry.kind == 'blob'
-        and entry.mode in _REGULAR_MODES
+        and entry.mode in _source.FILE_MODES
         and _WORKFLOW_PATH.fullmatch(entry.path) is not None
     )
 
@@ -480,7 +477,7 @@ def discover(snapshot: _source.Snapshot) -> Discovery:
     names: list[str] = []
     notes: list[str] = []
     seen: set[str] = set()
-    cautions: list[CheckCaution] = []
+    cautions: list[_CheckCaution] = []
 
     for entry in _workflow_entries(snapshot):
         _discover_workflow(entry, names, notes, seen, cautions)

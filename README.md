@@ -30,37 +30,35 @@ uv tool install --reinstall .
 
 ## Your first release
 
+This walkthrough uses private staging to check a release before publishing it to a private final
+repository, then making that repository public. For other routes and CI setups, see the
+[publication guide](docs/guide.md).
+
 ### Choose your publication identity
 
 ```sh
 pubanon setup
 ```
 
-Setup asks for the name and email to use in published Git history, the terms you want to keep
-private, and the default publication route for new projects. The built-in route is `staged`; choose
-`direct` if you intend to publish without private staging. Setup verifies your GitHub CLI account
-and shows your answers before saving. Choose the name and email you want readers to see: existing
-publication commits keep that identity. Use `pubanon setup --edit` to change saved answers,
-`pubanon init --edit` to change a project's settings, or `pubanon doctor` to check readiness.
+Choose the name and email for published Git history, the terms you want to keep private, and the
+`staged` publication route. Setup checks your GitHub CLI account and shows your answers before
+saving.
 
 ### Select your project and files
 
-Enter a private source repository with no Git remote:
+From a private source repository with no Git remote, run:
 
 ```sh
-cd /path/to/private-project
 pubanon init
 ```
 
-Follow the prompts to choose files, a GitHub destination, a publication route, whether to create
-release pages, and repository settings. Choose the `staged` route and `private` visibility for this
-walkthrough so you can test before the final upload and check the result on GitHub before making it
-public. Review your choices and save. pubanon stores its configuration outside the source
-repository.
+Choose the files and GitHub destination, `staged` publication, and `private` visibility. Review the
+repository settings and CI checks, then save. pubanon keeps its configuration outside your source
+repository. See [project setup](docs/guide.md#initialize-a-project) for the individual choices.
 
-### Prepare and review
+### Prepare and test
 
-Commit the changes you want to publish in your source repository, then run:
+Commit the changes you want to publish, including the package version when you have one:
 
 ```sh
 pubanon prepare
@@ -69,26 +67,13 @@ pubanon stage push
 pubanon stage watch
 ```
 
-`prepare` saves the selected committed files as a local *snapshot*; uncommitted changes are left
-out. If the selected `pyproject.toml` declares a package version, pubanon uses it for the release
-tag; otherwise the snapshot is untagged. See [version tags](docs/guide.md#version-tags) to choose
-an explicit version.
-
-`inspect` shows the release details and a read-only review copy of the files. To run builds or
-tests, copy the files somewhere writable first. To change the snapshot, edit and commit in the
-source, then run `pubanon discard` and `pubanon prepare` again.
-
-`stage push` sends that exact snapshot to a separate private GitHub repository, asking before it
-creates the repository the first time. Staging never changes your source branches, and the same
-staging repository is reused for later releases. When `init` connects a CI workflow
-(`ci_workflow`), use `stage push --full-tests` for a full test run or `stage push --hosted` for a
-hosted run; see [Request CI from stage push](docs/guide.md#request-ci-from-stage-push).
-`stage watch` waits for its configured checks; if you have neither `ci_workflow` nor configured
-checks, skip it and review the staging repository yourself.
+`prepare` saves the selected committed files as a local snapshot. `inspect` shows its details and a
+read-only review copy. `stage push` sends that exact snapshot to a private staging repository;
+`stage watch` waits for the configured CI checks. Review the files and results before continuing.
+See [version tags](docs/guide.md#version-tags) and
+[private staging](docs/guide.md#private-first-ci) for other version and CI choices.
 
 ### Publish and make it public
-
-When you are satisfied, run:
 
 ```sh
 pubanon repo create
@@ -97,23 +82,14 @@ pubanon repo watch
 pubanon repo reveal
 ```
 
-`repo create` creates the final repository, still private, or verifies a matching empty repository
-you created beforehand. Before the first upload, keep in mind that GitHub can retain old commits,
-activity, Actions logs, and artifacts even after history is replaced. Staging lets you test before
-anything reaches the final repository.
+`repo create` creates or checks the final private repository. `publish` previews the release and
+asks before uploading it. `repo watch` waits for that repository's CI. Finally, `repo reveal`
+checks the publication and asks before making it public. Read its findings and
+[verification limits](docs/operations.md#post-publication-verification) before confirming.
 
-`publish` asks for confirmation, then sends the snapshot to the final repository. If you turned on
-release pages, a tagged publication also gets a release page, shown in the preview first. A new
-page defaults to the tag as its title and, as its notes, that version's section of a published root
-`CHANGELOG.md` followed by a link to the file, or empty notes when that file is absent. Otherwise
-pubanon prints the command that adds one later. On the `staged` route, `publish` first checks that
-the staged snapshot passed its configured checks. `repo watch` waits for the final repository's own
-CI; skip it if neither `ci_workflow` nor checks are configured. `repo reveal` checks the published
-history, settings, and Actions logs, names what it cannot check, such as artifact contents, and
-asks before making the repository public.
-
-For the next release, commit your changes, updating the package version if you have one, and repeat
-these steps without `repo create` and `repo reveal`.
+For the next release, commit your changes and repeat the preparation, staging, publication, and CI
+steps. You no longer need `repo create` or `repo reveal`. See
+[release pages](docs/guide.md#github-release-pages) to add a GitHub announcement for each version.
 
 ## Where to go next
 

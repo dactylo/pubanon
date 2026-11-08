@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     import argparse
 
 
-from pubanon._cli import _context, _init_draft, _selection
+from pubanon._cli import _context, _init_draft, _selection, _setup
 
 _RELEASE_PAGE_SUMMARY = {'draft': 'yes, as drafts', 'no': 'no', 'yes': 'yes'}
 _UNSELECTED_SHOWN = 5
@@ -67,7 +67,7 @@ def _changelog_sections_prompt(
             kind='note',
         )
         return None
-    changelog = page.changelog or 'CHANGELOG.md'
+    changelog = page.changelog_path
     data = next(
         (entry.data for entry in snapshot if entry.path == changelog and entry.kind == 'blob'),
         None,
@@ -122,6 +122,16 @@ def _choose_saved_draft(
             recovery=recovery,
         ) from None
     return choice
+
+
+def _decision_paths(ctx: _context.ProjectContext, snapshot: _source.Snapshot) -> list[str]:
+    """Return snapshot paths left for guided selection after global and reserved exclusions."""
+    return _policy.evaluate_membership(
+        [entry.path for entry in snapshot],
+        ('**',),
+        (),
+        global_deny=_config.global_deny(ctx.global_config),
+    ).allowed
 
 
 def _description_prompt(current: str | None, source: Path | None = None) -> str:
@@ -189,13 +199,7 @@ def _draft_flagged_choice(paths: list[str], draft: _init_draft.Draft) -> _init_d
     remaining = [path for path in _policy.secret_like(paths, ()) if path not in answered]
     if not remaining:
         return replace(draft, phase='groups' if draft.reviewing else 'preview')
-    output(
-        'These filenames can contain credentials. '
-        'A name match is a warning, not proof of a secret.',
-        kind='warning',
-    )
-    print(f'\n{style("File:")} {escape(remaining[0])}')
-    choice = ask('Include it?', choices=['include', 'exclude', 'back', 'quit'])
+    choice = _selection.ask_credential_file(remaining[0], back=True)
     if choice == 'quit':
         raise OperationCanceled('Canceled.')
     if choice == 'back':
@@ -248,7 +252,11 @@ def _manual_required_checks(default: tuple[str, ...]) -> tuple[str, ...]:
     output('Quote names containing commas, for example "test (linux, 3.13)".', kind='note')
     while True:
         raw_checks = ask(
-            'Required CI checks (comma separated, blank for none)',
+            (
+                'Required CI checks (comma separated, blank to keep, none to clear)'
+                if default
+                else 'Required CI checks (comma separated, blank for none)'
+            ),
             default=_check_names_csv(default),
         )
         try:
@@ -266,17 +274,6 @@ def _manual_required_checks(default: tuple[str, ...]) -> tuple[str, ...]:
                 if item.strip() and item.strip().casefold() != 'none'
             )
         )
-
-
-def _publication_route_prompt(*, default: str) -> str:
-    """Read an explicit route while showing the global default."""
-    print('Staged: try snapshots privately before final publication.')
-    print('Direct: upload straight to the final repository.')
-    while True:
-        route = ask('Publication route (staged/direct)', default=default).casefold()
-        if route in _config.PUBLICATION_ROUTES:
-            return route
-        output('Choose staged or direct.', kind='warning')
 
 
 def _recover_invalid_draft(ctx: _context.ProjectContext, resume: str) -> None:
@@ -484,16 +481,9 @@ def _project_from_draft(
     ctx: _context.ProjectContext, snapshot: _source.Snapshot, draft: _init_draft.Draft
 ) -> _context.ProjectContext:
     """Derive a proposed configuration from saved choices and the current tree."""
-    paths = _policy.evaluate_membership(
-        [entry.path for entry in snapshot],
-        ('**',),
-        (),
-        global_deny=_config.global_deny(ctx.global_config),
-    ).allowed
+    paths = _decision_paths(ctx, snapshot)
     flagged = set(_policy.secret_like(paths, ()))
-    ordinary = [
-        path for path in paths if path not in flagged and not _policy.is_reserved_path(path)
-    ]
+    ordinary = [path for path in paths if path not in flagged]
     allow = (
         [pattern for pattern, action in draft.groups if action == 'include']
         if draft.reviewing
@@ -556,24 +546,18 @@ def _draft_group_choice(
 ) -> _init_draft.Draft:
     """Resolve one unmatched group and retain its decision for resume or Back."""
     proposed = _project_from_draft(ctx, snapshot, draft)
-    paths = _policy.evaluate_membership(
-        [entry.path for entry in snapshot],
-        ('**',),
-        (),
-        global_deny=_config.global_deny(ctx.global_config),
-    ).allowed
+    paths = _decision_paths(ctx, snapshot)
     flagged = set(_policy.secret_like(paths, ()))
     ordinary = [path for path in paths if path not in flagged]
-    membership = _policy.evaluate_membership(
+    decision = _selection.ask_next_group(
         ordinary,
         proposed.project.allow,
         proposed.project.deny,
         global_deny=_config.global_deny(ctx.global_config),
     )
-    if not membership.unmatched:
+    if decision is None:
         return replace(draft, phase='preview')
-    pattern, admitted = _policy.narrowest_offer(membership.unmatched, guided=True)[0]
-    action, pattern = _selection.policy_decision(pattern, admitted, membership, back=True)
+    action, pattern = decision
     if action == 'back':
         return _back_init_selection(draft)
     choice = 'include' if action == 'publish' else 'exclude'
@@ -617,9 +601,7 @@ def _draft_selection(
     """Review a resumable selection and allow correction before continuing."""
     print('Choose the files to publish. Nothing is published now.')
     paths = [entry.path for entry in snapshot]
-    decision_paths = _policy.evaluate_membership(
-        paths, ('**',), (), global_deny=_config.global_deny(ctx.global_config)
-    ).allowed
+    decision_paths = _decision_paths(ctx, snapshot)
     heading('Files needing your decision:', separate=True)
     if not _policy.secret_like(decision_paths, ()):
         print('  None.')
@@ -660,7 +642,7 @@ def _report_existing_project_init(
             ('Source tags', 'yes' if project.source_tags else 'no'),
         ]
     )
-    project_file = paths.config_dir / 'projects' / f'{project.name}.toml'
+    project_file = paths.project_file(project.name)
     detail(f'Project configuration: {escape(path_text(project_file))}')
     if relocated:
         output(
@@ -960,8 +942,9 @@ def _draft_field(
     elif step == 'publication_route':
         draft = replace(
             draft,
-            publication_route=_publication_route_prompt(
-                default=draft.publication_route or ctx.global_config.default_publication_route
+            publication_route=_setup.ask_route(
+                'Publication route (staged/direct)',
+                default=draft.publication_route or ctx.global_config.default_publication_route,
             ),
         )
     elif step == 'checks':
@@ -1031,7 +1014,9 @@ def _edit_project_section(
     elif action == 'route':
         project = replace(
             project,
-            publication_route=_publication_route_prompt(default=project.publication_route),
+            publication_route=_setup.ask_route(
+                'Publication route (staged/direct)', default=project.publication_route
+            ),
         )
     elif action == 'tags':
         project = replace(project, source_tags=_source_tags_prompt(default=project.source_tags))
@@ -1058,7 +1043,7 @@ def _edit_existing_project(ctx: _context.ProjectContext) -> None:
     snapshot = _source.read_snapshot(source, _source.pin(source, 'HEAD').commit)
     original = ctx.project
     project = original
-    project_file = ctx.paths.config_dir / 'projects' / f'{project.name}.toml'
+    project_file = ctx.paths.project_file(project.name)
     output('To change the selected files, run pubanon prepare and choose review.', kind='note')
     while True:
         _project_review(project, snapshot, ctx.global_config)
@@ -1115,20 +1100,36 @@ def _initial_project(
                 draft = _draft_review(ctx, snapshot, draft)
             else:
                 draft = _draft_field(ctx, snapshot, draft)
+    except _init_draft.DraftSaveError as error:
+        error.fact = 'project configuration was not saved'
+        error.recovery = f'rerun {escape(resume)}'
+        raise
     except (OperationCanceled, PubanonError) as error:
         if isinstance(error, OperationCanceled):
             output(f'Setup progress saved. Rerun {escape(resume)} to resume.', kind='note')
-        error.fact = 'project configuration was not saved; setup draft was saved'
-        error.recovery = f'rerun {escape(resume)} to resume'
+        saved = 'project configuration was not saved; setup draft was saved'
+        error.fact = saved if error.fact is None else f'{error.fact}; {saved}'
+        resume_step = f'rerun {escape(resume)} to resume'
+        error.recovery = (
+            resume_step if error.recovery is None else f'{error.recovery}, then {resume_step}'
+        )
         raise
     return _connect_workflow(_project_from_draft(ctx, snapshot, draft), snapshot).project
 
 
 def command_init(args: argparse.Namespace) -> None:
-    """Initialize, rebuild, or relocate one project registration."""
+    """Initialize, rebuild, or relocate one project registration.
+
+    Raises:
+        PubanonError: Configuration, source safety, registration, or saving
+            cannot be completed.
+        OperationCanceled: An interactive decision is declined or the operation
+            is canceled.
+    """
     paths = _config.derive_paths(os.environ)
     global_config = _config.load_global(paths)
     source, registered = _init_source(paths)
+    _source.require_commit(source)
     if args.project is not None and registered is not None and args.project != registered:
         raise PubanonError(
             'source is already registered to another project',
@@ -1136,7 +1137,7 @@ def command_init(args: argparse.Namespace) -> None:
         )
     name = args.project or registered or source.name
     _config.require_project_name(name)
-    project_file = paths.config_dir / 'projects' / f'{name}.toml'
+    project_file = paths.project_file(name)
     if args.edit and not project_file.exists():
         raise PubanonError('no saved project to edit', recovery='pubanon init')
     if args.yes and not project_file.exists():

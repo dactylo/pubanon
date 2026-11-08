@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pubanon import (
@@ -32,9 +31,7 @@ if TYPE_CHECKING:
     import argparse
 
 
-def _report_resolved_page(
-    ctx: _context.ProjectContext, record: _candidate.CandidateRecord
-) -> None:
+def _report_resolved_page(ctx: _context.ProjectContext, record: _records.CandidateRecord) -> None:
     """Report read-only page status without changing a resolved Git outcome."""
     if not _config.release_pages_enabled(ctx.project):
         return
@@ -113,7 +110,7 @@ def _verify_repo_settings(
         if repaired or review_findings:
             raise PubanonError(failure, fact=exc.render(), recovery=recovery) from exc
         raise
-    mismatches = _lifecycle.settings_mismatches(ctx.project.settings, facts)
+    mismatches = _host.settings_differences(ctx.project.settings, facts)
     if mismatches:
         raise PubanonError(
             failure,
@@ -124,7 +121,12 @@ def _verify_repo_settings(
 
 
 def package_watch(args: argparse.Namespace) -> None:
-    """Wait for one selected package release."""
+    """Wait for one selected package release.
+
+    Raises:
+        PubanonError: Configuration or package observation fails or reaches its
+            timeout.
+    """
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
@@ -136,7 +138,7 @@ def package_watch(args: argparse.Namespace) -> None:
 
 def publish_context(
     ctx: _context.ProjectContext,
-    record: _candidate.CandidateRecord,
+    record: _records.CandidateRecord,
     *,
     yes: bool,
     release_page: _releases.PageRequest | None = None,
@@ -163,22 +165,15 @@ def publish_context(
 
 
 def command_publish(args: argparse.Namespace) -> None:
-    """Publish or resolve prepared history."""
-    notes = (
-        cli_releases.read_notes_file(args.release_notes_file)
-        if args.release_notes_file is not None
-        else None
-    )
-    page = _releases.PageRequest(
-        skip=args.no_release_page,
-        notes=notes,
-        notes_file=(
-            Path(args.release_notes_file).absolute()
-            if args.release_notes_file is not None
-            else None
-        ),
-        requested=args.release_page,
-    )
+    """Publish or resolve prepared history.
+
+    Raises:
+        PubanonError: Retained publication checks, transport, outcome
+            resolution, or local finalization fails.
+        OperationCanceled: An interactive decision is declined or the operation
+            is canceled.
+    """
+    page = cli_releases.page_request(args)
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
@@ -230,7 +225,14 @@ def command_publish(args: argparse.Namespace) -> None:
 
 
 def repo_create(args: argparse.Namespace) -> None:
-    """Create and verify the configured host repository."""
+    """Create and verify the configured host repository.
+
+    Raises:
+        PubanonError: Configuration or host checks fail, or creation cannot be
+            verified.
+        OperationCanceled: An interactive decision is declined or the operation
+            is canceled.
+    """
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
@@ -244,7 +246,13 @@ def repo_create(args: argparse.Namespace) -> None:
 
 
 def repo_restore(args: argparse.Namespace) -> None:
-    """Restore GitHub or the local saved publication history."""
+    """Restore GitHub or the local saved publication history.
+
+    Raises:
+        PubanonError: Local or remote history cannot be verified or restored.
+        OperationCanceled: An interactive decision is declined or the operation
+            is canceled.
+    """
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
@@ -256,7 +264,7 @@ def repo_restore(args: argparse.Namespace) -> None:
         _repair.check_store_repair_candidate(paths, name)
         destination = _host.verify_destination(ctx.paths, ctx.global_config, ctx.project)
         remote = _host.ls_remote(destination, paths, name)
-        _context.refuse_unexpected_branches(remote)
+        _host.refuse_unexpected_branches(remote)
         local_main, local_tags = _candidate.published_refs(ctx.paths, ctx.project.name)
         local_refs = remote._replace(main=local_main, tags=local_tags, branches=())
         if remote.main is None:
@@ -288,7 +296,14 @@ def repo_restore(args: argparse.Namespace) -> None:
 
 
 def repo_reveal(args: argparse.Namespace) -> None:
-    """Reveal or reverify the configured host repository."""
+    """Reveal or reverify the configured host repository.
+
+    Raises:
+        PubanonError: Configuration, disclosure checks, or host reveal cannot
+            be completed.
+        OperationCanceled: An interactive decision is declined or the operation
+            is canceled.
+    """
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
@@ -297,7 +312,12 @@ def repo_reveal(args: argparse.Namespace) -> None:
 
 
 def repo_watch(args: argparse.Namespace) -> None:
-    """Wait for required CI checks on published main or an exact tag."""
+    """Wait for required CI checks on published main or an exact tag.
+
+    Raises:
+        PubanonError: Configuration or required CI observation fails or reaches
+            its timeout.
+    """
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
@@ -313,7 +333,14 @@ def repo_watch(args: argparse.Namespace) -> None:
 
 
 def stage_delete(args: argparse.Namespace) -> None:
-    """Delete the configured private staging repository under the project lock."""
+    """Delete the configured private staging repository under the project lock.
+
+    Raises:
+        PubanonError: Staging ownership, host deletion, read-back, or local
+            cleanup fails.
+        OperationCanceled: An interactive decision is declined or the operation
+            is canceled.
+    """
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
@@ -322,7 +349,13 @@ def stage_delete(args: argparse.Namespace) -> None:
 
 
 def stage_forget(args: argparse.Namespace) -> None:
-    """Forget local staging tracking under the project lock."""
+    """Forget local staging tracking under the project lock.
+
+    Raises:
+        PubanonError: Configuration or removal of local staging tracking fails.
+        OperationCanceled: An interactive decision is declined or the operation
+            is canceled.
+    """
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
@@ -331,7 +364,14 @@ def stage_forget(args: argparse.Namespace) -> None:
 
 
 def stage_push(args: argparse.Namespace) -> None:
-    """Push one retained snapshot to the staging repository."""
+    """Push one retained snapshot to the staging repository.
+
+    Raises:
+        PubanonError: Preparation, staging checks, transport, read-back, or a
+            configured CI request fails.
+        OperationCanceled: An interactive decision is declined or the operation
+            is canceled.
+    """
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
@@ -346,7 +386,14 @@ def stage_push(args: argparse.Namespace) -> None:
 
 
 def stage_repair(args: argparse.Namespace) -> None:
-    """Repair staging tracking under the project lock."""
+    """Repair staging tracking under the project lock.
+
+    Raises:
+        PubanonError: Current staging facts cannot support repair, or repair
+            cannot be persisted.
+        OperationCanceled: An interactive decision is declined or the operation
+            is canceled.
+    """
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
@@ -355,7 +402,12 @@ def stage_repair(args: argparse.Namespace) -> None:
 
 
 def stage_status(args: argparse.Namespace) -> None:
-    """Report staging facts, tracking, and exact snapshot checks."""
+    """Report staging facts, tracking, and exact snapshot checks.
+
+    Raises:
+        PubanonError: Configuration, retained tracking, host facts, or required
+            checks are unacceptable.
+    """
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
@@ -364,7 +416,12 @@ def stage_status(args: argparse.Namespace) -> None:
 
 
 def stage_watch(args: argparse.Namespace) -> None:
-    """Wait for required CI checks on the recorded staged snapshot."""
+    """Wait for required CI checks on the recorded staged snapshot.
+
+    Raises:
+        PubanonError: Configuration or staged CI observation fails or reaches
+            its timeout.
+    """
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
@@ -380,7 +437,12 @@ def stage_watch(args: argparse.Namespace) -> None:
 
 
 def verify_repo(args: argparse.Namespace) -> None:
-    """Compare host repository facts with the local publication expectation."""
+    """Compare host repository facts with the local publication expectation.
+
+    Raises:
+        PubanonError: Configuration or the comparison of saved and hosted
+            publication facts fails.
+    """
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
 
@@ -390,7 +452,7 @@ def verify_repo(args: argparse.Namespace) -> None:
         _context.require_advisory_store(paths, name)
         destination = _host.verify_destination(ctx.paths, ctx.global_config, ctx.project)
         remote = _host.ls_remote(destination, paths, name)
-        _context.refuse_unexpected_branches(remote)
+        _host.refuse_unexpected_branches(remote)
         local_main, local_tags = _candidate.published_refs(ctx.paths, ctx.project.name)
         local_refs = remote._replace(main=local_main, tags=local_tags, branches=())
         if local_main is not None and remote.main is None and not remote.tags:
@@ -411,8 +473,7 @@ def verify_repo(args: argparse.Namespace) -> None:
                     'If local saved publication history is correct, review '
                     'pubanon repo restore --to remote. If GitHub history is correct, '
                     'review pubanon repo restore --to local. '
-                    'For outside changes, follow the guide outside-fix procedure '
-                    '(docs/guide.md#accepting-an-outside-fix).'
+                    'For outside changes, see "Accepting an outside fix" in the operator guide.'
                 ),
             )
         settings = _verify_repo_settings(ctx, repaired=False)

@@ -1,5 +1,4 @@
 import re
-from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
 
@@ -9,9 +8,9 @@ from pubanon._config import GlobalConfig, ProjectConfig
 from pubanon._errors import OperationCanceled, PubanonError
 from pubanon._gate import RuleClass
 from pubanon._remote import _actions, _host
-from pubanon._remote._host import ActionsJob, ActionsRun, LogAbsence
+from pubanon._remote._host import ActionsJob, ActionsRun, _LogAbsence
 from pubanon._terminal import color_context, escape, verbose_context
-from tests._setup import configure
+from tests._setup import Script, configure
 
 _ACCOUNT = 'anonymous-account'
 _AUDIT_MENU = 'What should happen to these logs? [d]elete / [k]eep: '
@@ -22,7 +21,6 @@ _RULES = {RuleClass.IDENTITY_CRITICAL: ('term-a',), RuleClass.HYGIENE: ('style-t
 _RUN = 40000000001
 _SECOND = 40000000002
 _THIRD = 40000000003
-_Script = Callable[[Sequence[str | tuple[str, str]]], None]
 
 
 class _Host:
@@ -36,7 +34,7 @@ class _Host:
         self.kept: set[int] = set()
         self.log_calls: list[int] = []
         self.log_errors: dict[int, PubanonError] = {}
-        self.logs: dict[int, bytes | LogAbsence] = {}
+        self.logs: dict[int, bytes | _LogAbsence] = {}
         self.reads: dict[int, ActionsJob | BaseException] = {}
         self.runs: list[tuple[ActionsRun, ...]] = [()]
         self.switch_after_delete = False
@@ -62,7 +60,9 @@ class _Host:
         if self.switch_after_delete:
             self.account = 'other-account'
 
-    def job_log(self, _owner: str, _repo: str, job_id: int, *, command: str) -> bytes | LogAbsence:
+    def job_log(
+        self, _owner: str, _repo: str, job_id: int, *, command: str
+    ) -> bytes | _LogAbsence:
         self.commands.append(command)
         self.log_calls.append(job_id)
         error = self.log_errors.get(job_id)
@@ -89,7 +89,6 @@ def _configs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[GlobalConfig, ProjectConfig]:
     _paths, global_config, project = configure(tmp_path, monkeypatch, tmp_path)
-    assert project is not None
     return (
         replace(global_config, sensitive_terms=('term-a',)),
         replace(project, hygiene_terms=('style-term',)),
@@ -139,7 +138,7 @@ def _run(
     return ActionsRun(identifier, attempt, status, 'CI', 'push', 'a' * 40, created, details)
 
 
-def _log_review(host: _Host) -> _actions.ActionsReview:
+def _log_review(host: _Host) -> _actions._ActionsReview:
     host.runs = [(_run(attempt=2), _run(_SECOND, created='2026-09-23T10:00:00Z'))]
     host.jobs = {_RUN: (_job(1), _job(2, attempt=2)), _SECOND: (_job(3, run=_SECOND),)}
     host.logs = {1: b'term-a\n', 2: b'ok\n', 3: b'ok\n'}
@@ -280,7 +279,7 @@ def test_check_matches_terms_split_by_terminal_sequences(
 
     with verbose_context(enabled=True), color_context('never'):
         review = _actions.check(_COORDINATES, _ACCOUNT, _RULES)
-        summary = _actions.summary(review, configs, ())
+        summary = _actions._summary(review, configs, ())
 
     assert [(item.job, item.hit.term, item.lines) for item in review.findings] == [
         (1, 'term-a', (2,)),
@@ -347,7 +346,7 @@ def test_check_reports_none_without_jobs(host: _Host, capsys: pytest.CaptureFixt
     [(b'', 'GitHub returned an empty log'), ('storage-404', 'its log is not available yet')],
 )
 def test_check_requires_a_log_from_every_job_that_ran(
-    host: _Host, log: bytes | LogAbsence, reason: str
+    host: _Host, log: bytes | _LogAbsence, reason: str
 ) -> None:
     host.runs = [(_run(),)]
     host.jobs = {_RUN: (_job(1),)}
@@ -403,7 +402,7 @@ def test_check_tracks_original_lines_across_multiline_control_strings(
 
     with verbose_context(enabled=True), color_context('never'):
         review = _actions.check(_COORDINATES, _ACCOUNT, _RULES)
-        summary = _actions.summary(review, configs, ())
+        summary = _actions._summary(review, configs, ())
 
     assert [(item.hit.term, item.lines) for item in review.findings] == [
         ('term-a', (3, 4, 6, 7)),
@@ -436,7 +435,7 @@ def test_clean_sentence_counts_checked_and_unavailable_logs(host: _Host) -> None
 
 
 def test_decide_cancel_changes_nothing(
-    configs: tuple[GlobalConfig, ProjectConfig], host: _Host, answers: _Script
+    configs: tuple[GlobalConfig, ProjectConfig], host: _Host, answers: Script
 ) -> None:
     review = _log_review(host)
     answers([(_MENU, 'c')])
@@ -467,7 +466,7 @@ def test_decide_fails_when_the_terminal_cannot_answer(
 def test_decide_offers_keep_or_cancel_when_only_details_match(
     configs: tuple[GlobalConfig, ProjectConfig],
     host: _Host,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     host.runs = [(_run(details=b'CI\nterm-a'),)]
@@ -486,7 +485,7 @@ def test_decide_offers_keep_or_cancel_when_only_details_match(
 def test_decide_says_details_remain_when_deleting_logs(
     configs: tuple[GlobalConfig, ProjectConfig],
     host: _Host,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     host.runs = [(_run(details=b'CI\nterm-a'),)]
@@ -519,7 +518,7 @@ def test_decide_without_findings_asks_nothing(
 def test_offer_log_deletion_asks_nothing_when_only_details_match(
     configs: tuple[GlobalConfig, ProjectConfig],
     host: _Host,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     host.runs = [(_run(details=b'CI\nterm-a'),)]
@@ -535,7 +534,7 @@ def test_offer_log_deletion_asks_nothing_when_only_details_match(
 def test_offer_log_deletion_deletes_after_confirmation(
     configs: tuple[GlobalConfig, ProjectConfig],
     host: _Host,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     review = _log_review(host)
@@ -557,7 +556,7 @@ def test_offer_log_deletion_deletes_after_confirmation(
 
 @pytest.mark.parametrize('answer', ['keep', 'decline'])
 def test_offer_log_deletion_keeps_logs_on_keep_or_a_declined_confirmation(
-    configs: tuple[GlobalConfig, ProjectConfig], host: _Host, answers: _Script, answer: str
+    configs: tuple[GlobalConfig, ProjectConfig], host: _Host, answers: Script, answer: str
 ) -> None:
     review = _log_review(host)
     if answer == 'keep':
@@ -577,7 +576,7 @@ def test_offer_log_deletion_keeps_logs_on_keep_or_a_declined_confirmation(
 
 
 def test_offer_log_deletion_reports_an_unfinished_deletion_with_its_command(
-    configs: tuple[GlobalConfig, ProjectConfig], host: _Host, answers: _Script
+    configs: tuple[GlobalConfig, ProjectConfig], host: _Host, answers: Script
 ) -> None:
     host.runs = [(_run(),)]
     host.jobs = {_RUN: (_job(1),)}
@@ -695,7 +694,7 @@ def test_show_unchecked_names_each_part_by_its_count(
 def test_decide_keep_returns_no_deletions(
     configs: tuple[GlobalConfig, ProjectConfig],
     host: _Host,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
     already_public: bool,
 ) -> None:
@@ -722,7 +721,7 @@ def test_decide_keep_returns_no_deletions(
 def test_decide_delete_removes_and_verifies_logs_of_every_attempt(
     configs: tuple[GlobalConfig, ProjectConfig],
     host: _Host,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
     confirmed: bool,
 ) -> None:
@@ -755,7 +754,7 @@ def test_decide_delete_removes_and_verifies_logs_of_every_attempt(
 def test_delete_preserves_safe_status_facts_without_log_text(
     configs: tuple[GlobalConfig, ProjectConfig],
     host: _Host,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
     scenario: tuple[str, bool],
 ) -> None:
@@ -844,7 +843,7 @@ def test_delete_preserves_safe_status_facts_without_log_text(
 def test_delete_reports_confirmed_unknown_and_unreached_runs(
     configs: tuple[GlobalConfig, ProjectConfig],
     host: _Host,
-    answers: _Script,
+    answers: Script,
     failure: str,
     expected: tuple[str, str],
 ) -> None:
@@ -905,7 +904,7 @@ def test_summary_escapes_names_from_github(
     host.logs = {1: b'term-a\n'}
 
     with color_context('never'):
-        lines = _actions.summary(_actions.check(_COORDINATES, _ACCOUNT, _RULES), configs, ())
+        lines = _actions._summary(_actions.check(_COORDINATES, _ACCOUNT, _RULES), configs, ())
 
     assert not any('\x1b' in line or '\x07' in line for line in lines)
     heading = (
@@ -930,7 +929,7 @@ def test_summary_groups_by_run_oldest_first_and_labels_attempts(
     review = _actions.check(_COORDINATES, _ACCOUNT, _RULES)
 
     with color_context('never'):
-        lines = _actions.summary(review, configs, ())
+        lines = _actions._summary(review, configs, ())
 
     assert lines == [
         'Sensitive terms in Actions logs: 1 term in 3 locations',
@@ -957,7 +956,7 @@ def test_summary_hint_names_the_command_that_reruns_the_check(
     review = _actions.check(_COORDINATES, _ACCOUNT, _RULES, command='pubanon audit --remote')
 
     with color_context('never'):
-        lines = _actions.summary(review, configs, ())
+        lines = _actions._summary(review, configs, ())
 
     assert 'pubanon audit --remote --verbose' in lines[-1]
 
@@ -971,7 +970,7 @@ def test_summary_in_verbose_mode_links_jobs_lists_lines_and_shows_every_row(
     host.logs = dict.fromkeys(range(1, 23), b'ok\nterm-a\nte\x1b[1mrm-a\n')
 
     with verbose_context(enabled=True), color_context('never'):
-        lines = _actions.summary(_actions.check(_COORDINATES, _ACCOUNT, _RULES), configs, ())
+        lines = _actions._summary(_actions.check(_COORDINATES, _ACCOUNT, _RULES), configs, ())
 
     index = lines.index('    job job-01  term-a')
     assert lines[index + 1 : index + 3] == [

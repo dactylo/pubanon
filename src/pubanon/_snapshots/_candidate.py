@@ -1,7 +1,5 @@
 """Build and retain one publication candidate."""
 
-# pyright: reportPrivateUsage=false
-
 import os
 import re
 import time
@@ -11,6 +9,7 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
+from pubanon._changelog import is_strict_version, version_from_tag
 from pubanon._config import (
     GlobalConfig,
     Paths,
@@ -36,17 +35,15 @@ from pubanon._snapshots._records import (
 from pubanon._snapshots._source import (
     PinnedSource,
     Snapshot,
+    parse_oid,
     read_snapshot,
     snapshot_digest,
 )
-from pubanon._terminal import (
-    output,
-)
+from pubanon._terminal import escape, output
 
 CANDIDATE_REF = 'refs/pubanon/candidate'
 REWRITE_MERGED_REF = 'refs/pubanon/rewrite/merged'
 _OID_PATTERN = re.compile(OID_HEX)
-_VERSION_PATTERN = re.compile(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)')
 
 
 @dataclass(frozen=True)
@@ -70,10 +67,10 @@ class CandidateInputs:
         replace_scope: Correct one publication or replace all history.
     """
 
-    _snapshot: Snapshot
-    _pinned: PinnedSource
-    _version: str | None
-    _message: str | None
+    snapshot: Snapshot
+    pinned: PinnedSource
+    version: str | None
+    message: str | None
     prestate: tuple[str | None, dict[str, str]] | None = None
     replaces: str | None = None
     replace_scope: Literal['one', 'all'] | None = None
@@ -83,38 +80,25 @@ class CandidateInputs:
 class _BuildMetadata:
     """Hold resolved construction metadata without consulting saved provenance."""
 
-    _parents: tuple[str, ...]
-    _descendants: tuple[str, ...]
-    _old_tree: str | None
-    _old_message: str | None
-    _tags: tuple[str, ...]
-    _version: str | None
-    _message: str | None
+    parents: tuple[str, ...]
+    descendants: tuple[str, ...]
+    old_tree: str | None
+    old_message: str | None
+    tags: tuple[str, ...]
+    version: str | None
+    message: str | None
 
 
 def _complete_unreplayed(record: CandidateRecord, metadata: _BuildMetadata) -> CandidateRecord:
     """Complete all-history and latest-publication corrections without replay."""
-    if record.replaces is None or (record.replace_scope != 'all' and metadata._descendants):
+    if record.replaces is None or (record.replace_scope != 'all' and metadata.descendants):
         return record
     tags = dict(record.prestate_tags) if record.replace_scope == 'one' else {}
-    for tag in metadata._tags:
+    for tag in metadata.tags:
         tags[tag] = record.commit
     if record.tag_intent is not None:
         tags[record.tag_intent] = record.commit
     return replace(record, tip=record.commit, poststate_tags=tags)
-
-
-def _oid(output: bytes, failure: str) -> str:
-    """Parse one object ID without exposing malformed command output."""
-    if not output.endswith(b'\n') or b'\n' in output[:-1]:
-        raise PubanonError(failure)
-    try:
-        oid = output[:-1].decode('ascii')
-    except UnicodeDecodeError as exc:
-        raise PubanonError(failure) from exc
-    if _OID_PATTERN.fullmatch(oid) is None:
-        raise PubanonError(failure)
-    return oid
 
 
 def _oids(output: bytes, count: int, failure: str) -> list[str]:
@@ -122,7 +106,7 @@ def _oids(output: bytes, count: int, failure: str) -> list[str]:
     lines = output.splitlines(keepends=True)
     if len(lines) != count:
         raise PubanonError(failure)
-    return [_oid(line, failure) for line in lines]
+    return [parse_oid(line, failure) for line in lines]
 
 
 def _replacement_parent_graph(store: Path, main: str) -> dict[str, tuple[str, ...]]:
@@ -167,7 +151,7 @@ def git_result(
         Standard output bytes from a successful command.
 
     Raises:
-        PubanonError: Git reports an unsuccessful command.
+        PubanonError: Git cannot start or reports an unsuccessful command.
     """
     result = run_git(
         ['--git-dir', str(store.absolute()), *args],
@@ -287,6 +271,27 @@ def _write_tree(store: Path, snapshot: Snapshot) -> str:
     return _write_trees(store, contents)
 
 
+def identity_env(g: GlobalConfig, *, author_date: str, committer_date: str) -> dict[str, str]:
+    """Return Git author and committer variables for the publication identity.
+
+    Args:
+        g: Global configuration supplying the publication identity.
+        author_date: Git author date, such as `<epoch> +0000`.
+        committer_date: Git committer date in the same form.
+
+    Returns:
+        Environment variables for `git commit-tree`.
+    """
+    return {
+        'GIT_AUTHOR_DATE': author_date,
+        'GIT_AUTHOR_EMAIL': g.anon_email,
+        'GIT_AUTHOR_NAME': g.anon_name,
+        'GIT_COMMITTER_DATE': committer_date,
+        'GIT_COMMITTER_EMAIL': g.anon_email,
+        'GIT_COMMITTER_NAME': g.anon_name,
+    }
+
+
 def outcome_unknown(record: CandidateRecord | None) -> bool:
     """Return whether a retained candidate needs publication outcome resolution."""
     return record is not None and record.state == STATE_UNKNOWN_OUTCOME
@@ -332,6 +337,10 @@ def commit_fields(store: Path, commit: str) -> tuple[str, tuple[str, ...], bytes
     Returns:
         The tree ID, ordered parent IDs, author timestamp and timezone bytes,
         and exact commit message bytes.
+
+    Raises:
+        PubanonError: The commit cannot be read or its required metadata is
+            malformed.
     """
     return parse_commit_fields(
         git_result(
@@ -347,6 +356,9 @@ def publication_archive(paths: Paths, project: str, commit: str) -> bool:
 
     Conflicting or symbolic references are refused; similarly prefixed child
     references are not evidence for the exact publication.
+
+    Raises:
+        PubanonError: The archive is symbolic, conflicting, or unreadable.
     """
     store = _store.candidate_store_path(paths, project)
     if not store.exists():
@@ -388,6 +400,10 @@ def publication_record(
     derives its tree, message, digest, provenance, and matching strict release
     tag from the retained poststate and omits pinned-source data. The result is
     not persisted.
+
+    Raises:
+        PubanonError: Required replay objects or retained replacement state are
+            unavailable or invalid.
     """
     entry = next((entry for entry in candidate.replayed if entry.new == commit), None)
     if commit != candidate.commit and entry is None:
@@ -398,20 +414,15 @@ def publication_record(
     tag = candidate.tag_intent
     if entry is not None:
         store = _store.candidate_store_path(paths, project)
-        raw = run_git(
-            ['--git-dir', str(store.absolute()), 'cat-file', 'commit', commit], cwd=store
-        ).stdout
-        tree = raw.splitlines()[0].removeprefix(b'tree ').decode('ascii')
-        message = raw.partition(b'\n\n')[2].decode('utf-8')
+        tree, _parents, _date, raw_message = commit_fields(store, commit)
+        message = raw_message.decode('utf-8')
         digest = snapshot_digest(read_snapshot(store, commit, git_dir=store))
         tags = _records.candidate_poststate(candidate)[1]
         tag = next(
             (
                 name
                 for name in sorted(tags)
-                if tags[name] == commit
-                and name.startswith('v')
-                and _VERSION_PATTERN.fullmatch(name[1:]) is not None
+                if tags[name] == commit and version_from_tag(name) is not None
             ),
             None,
         )
@@ -459,7 +470,7 @@ def read_ref(store: Path, ref: str) -> str | None:
         name, separator, raw_oid = line.partition(b' ')
         if not name or not separator:
             raise PubanonError('Git returned an invalid snapshot store ref')
-        oid = _oid(raw_oid, 'Git returned an invalid snapshot store ref')
+        oid = parse_oid(raw_oid, 'Git returned an invalid snapshot store ref')
         if name == ref.encode():
             if exact is not None:
                 raise PubanonError('Git returned an invalid snapshot store ref')
@@ -478,7 +489,8 @@ def published_refs(paths: Paths, project: str) -> tuple[str | None, dict[str, st
         The optional main tip and complete tag map.
 
     Raises:
-        PubanonError: The project name or stored references are invalid.
+        PubanonError: The project name is invalid, or stored references cannot
+            be read or are malformed.
     """
     store = _store.candidate_store_path(paths, project)
     if not store.exists():
@@ -546,8 +558,8 @@ def replacement_descendants(store: Path, selected: str, main: str | None) -> tup
         `selected` equals `main`.
 
     Raises:
-        PubanonError: Main is missing, history is nonlinear, or `selected` is
-            outside main's ancestry.
+        PubanonError: Main is missing, history cannot be read or is nonlinear,
+            or `selected` is outside main's ancestry.
     """
     if main is None:
         raise PubanonError('nothing to replace; this would be the first publication')
@@ -598,7 +610,7 @@ def tag_intent_for(version: str | None) -> str | None:
     """
     if version is None:
         return None
-    if _VERSION_PATTERN.fullmatch(version) is None:
+    if not is_strict_version(version):
         raise PubanonError('version must have X.Y.Z form')
     return f'v{version}'
 
@@ -626,30 +638,26 @@ def _commit_message(
     derived = derived_private_terms(paths, p, os.environ)
     rules = assemble_rules(g, p, derived)
 
-    identity = f'{g.anon_name} <{g.anon_email}>'
+    identity = g.identity
     identity_hits = gate_unit('publication identity', identity.encode(), rules)
     if identity_hits:
         raise identity_refusal(identity_rule_sources(identity_hits, g, p, derived))
     if tag_intent is not None and gate_unit('tag intent', tag_intent.encode(), rules):
-        raise PubanonError('the release tag did not pass content checks')
+        raise PubanonError(
+            'the release tag did not pass content checks',
+            fact=f'tag: {escape(tag_intent)}',
+            recovery='remove the matching sensitive or policy term, or release another version',
+        )
     if gate_unit('commit message', controlled_bytes, rules):
-        raise PubanonError('the snapshot commit message did not pass content checks')
+        raise PubanonError(
+            'the snapshot commit message did not pass content checks',
+            fact=f'message: {escape(controlled)}',
+            recovery=(
+                'pass a different message with --message, or change [commit_message] in the '
+                'global configuration'
+            ),
+        )
     return tag_intent, controlled
-
-
-def version_from_tag(tag: str) -> str | None:
-    """Return the version from one strict `vX.Y.Z` release tag.
-
-    Args:
-        tag: Candidate Git tag name.
-
-    Returns:
-        The `X.Y.Z` version, or `None` for a nonrelease tag.
-    """
-    if not tag.startswith('v'):
-        return None
-    version = tag[1:]
-    return version if _VERSION_PATTERN.fullmatch(version) is not None else None
 
 
 def replacement_version(version: str | None, tags: Sequence[str]) -> str | None:
@@ -686,7 +694,7 @@ def _build_metadata(
         raise PubanonError('replacement selection and scope must be supplied together')
     if inputs.replaces is None:
         parents = () if parent is None else (parent,)
-        return _BuildMetadata(parents, (), None, None, (), inputs._version, inputs._message)
+        return _BuildMetadata(parents, (), None, None, (), inputs.version, inputs.message)
     descendants = replacement_descendants(store, inputs.replaces, parent)
     old_tree, old_parents, _date, raw_message = commit_fields(store, inputs.replaces)
     if inputs.replace_scope == 'all' and inputs.replaces != parent:
@@ -701,7 +709,7 @@ def _build_metadata(
         for tag, oid in prestate_tags.items()
         if oid == inputs.replaces and inputs.replace_scope == 'one'
     )
-    version = replacement_version(inputs._version, tags)
+    version = replacement_version(inputs.version, tags)
     return _BuildMetadata(
         parents,
         descendants,
@@ -709,7 +717,7 @@ def _build_metadata(
         old_message,
         tags,
         version,
-        old_message if inputs._message is None else inputs._message,
+        old_message if inputs.message is None else inputs.message,
     )
 
 
@@ -750,42 +758,24 @@ def build_candidate(
         parent, prestate_tags = inputs.prestate
     metadata = _build_metadata(store, inputs, parent, prestate_tags)
     tag_intent, controlled_message = _commit_message(
-        paths, g, p, metadata._version, metadata._message
+        paths, g, p, metadata.version, metadata.message
     )
-    if len(metadata._tags) > 1:
+    if len(metadata.tags) > 1:
         tag_intent = None
-    if inputs.replace_scope == 'one' and not metadata._tags and tag_intent in prestate_tags:
+    if inputs.replace_scope == 'one' and not metadata.tags and tag_intent in prestate_tags:
         raise PubanonError('intended tag is already published')
-    tree = _write_tree(store, inputs._snapshot)
-    if tree == metadata._old_tree and controlled_message == metadata._old_message:
+    tree = _write_tree(store, inputs.snapshot)
+    if tree == metadata.old_tree and controlled_message == metadata.old_message:
         output('Replacement has unchanged files and commit message.', kind='warning')
     epoch = int(time.time())
     date = f'{epoch} +0000'
-    env = {
-        'GIT_AUTHOR_DATE': date,
-        'GIT_AUTHOR_EMAIL': g.anon_email,
-        'GIT_AUTHOR_NAME': g.anon_name,
-        'GIT_COMMITTER_DATE': date,
-        'GIT_COMMITTER_EMAIL': g.anon_email,
-        'GIT_COMMITTER_NAME': g.anon_name,
-    }
+    env = identity_env(g, author_date=date, committer_date=date)
     args = ['commit-tree', tree]
-    for correction_parent in metadata._parents:
+    for correction_parent in metadata.parents:
         args.extend(['-p', correction_parent])
-    commit = _oid(
-        git_result(
-            args,
-            store=store,
-            failure='cannot write snapshot commit',
-            input_bytes=controlled_message.encode() + b'\n',
-            env_extra=env,
-        ),
-        'Git returned an invalid snapshot commit ID',
-    )
-    if commit == inputs.replaces:
-        # Equal objects in the same second still need a distinct correction ID.
-        env['GIT_AUTHOR_DATE'] = env['GIT_COMMITTER_DATE'] = f'{epoch + 1} +0000'
-        commit = _oid(
+
+    def _write_commit() -> str:
+        return parse_oid(
             git_result(
                 args,
                 store=store,
@@ -795,6 +785,12 @@ def build_candidate(
             ),
             'Git returned an invalid snapshot commit ID',
         )
+
+    commit = _write_commit()
+    if commit == inputs.replaces:
+        # Equal objects in the same second still need a distinct correction ID.
+        env['GIT_AUTHOR_DATE'] = env['GIT_COMMITTER_DATE'] = f'{epoch + 1} +0000'
+        commit = _write_commit()
     git_result(
         ['update-ref', '--no-deref', CANDIDATE_REF, commit],
         store=store,
@@ -803,10 +799,10 @@ def build_candidate(
     record = CandidateRecord(
         commit=commit,
         tree=tree,
-        snapshot_digest=snapshot_digest(inputs._snapshot),
+        snapshot_digest=snapshot_digest(inputs.snapshot),
         tag_intent=tag_intent,
         fingerprint=fingerprint(g, p),
-        pinned=inputs._pinned,
+        pinned=inputs.pinned,
         destination=RecordedDestination(
             p.host,
             p.owner,

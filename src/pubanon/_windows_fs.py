@@ -47,7 +47,11 @@ def _function(library: str, name: str, result: object, arguments: tuple[object, 
 
 
 def check_directory(path: Path) -> None:
-    """Require a directory entry without traversing a leaf link during cleanup."""
+    """Require a directory entry without traversing a leaf link during cleanup.
+
+    Raises:
+        OSError: The entry cannot be inspected or is not a safe directory.
+    """
     if not stat.S_ISDIR(path.lstat().st_mode) or path.is_junction():
         raise OSError('not a plain directory')
 
@@ -74,7 +78,12 @@ def read_entry(path: Path) -> tuple[int, bytes]:
 
 
 def replace(source: Path, target: Path) -> None:
-    """Commit a flushed temporary file using a same-volume write-through replacement."""
+    """Commit a flushed temporary file using a same-volume write-through replacement.
+
+    Raises:
+        OSError: Windows replacement support is unavailable or the
+            write-through move fails.
+    """
     move = _function(
         'kernel32',
         'MoveFileExW',

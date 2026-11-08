@@ -94,7 +94,6 @@ def test_clean_empty_does_not_create_store(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     paths, _global, project = configure(tmp_path, monkeypatch, make_repo())
-    assert project is not None
     assert _cli.main(['clean', '--project', project.name]) == 0
     assert 'Nothing to remove.' in capsys.readouterr().out
     assert not _store.candidate_store_path(paths, project.name).exists()
@@ -143,7 +142,6 @@ def test_clean_only_review_copies_yes_skips_prompt(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     paths, _global, project = configure(tmp_path, monkeypatch, make_repo())
-    assert project is not None
     copy = paths.data_dir / 'projects' / project.name / 'inspections' / ('a' * 40)
     copy.mkdir(parents=True)
     (copy / 'notes').write_text('notes')

@@ -1,13 +1,9 @@
 """Compose release and declared workflow commands."""
 
-# pyright: reportPrivateUsage=false
-
 from __future__ import annotations
 
 import os
-import shlex
 from dataclasses import dataclass, field, replace
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pubanon import (
@@ -30,6 +26,7 @@ from pubanon._terminal import (
     heading,
     next_step,
     output,
+    project_command,
 )
 
 if TYPE_CHECKING:
@@ -42,24 +39,24 @@ _CANDIDATE_BOUND_STAGES = frozenset({'inspect', 'prepare', 'publish', 'stage pus
 class _RunPlan:
     """Retain one verified declared-workflow invocation."""
 
-    _ctx: _context.ProjectContext
-    _stages: tuple[str, ...]
-    _remaining_stages: tuple[str, ...]
-    _record: _candidate.CandidateRecord | None
-    _intended: str | None
-    _published_ctx: _context.ProjectContext | None
-    _stage_creation_needed: bool
-    _release_page: _releases.PageRequest = field(default_factory=_releases.PageRequest)
+    ctx: _context.ProjectContext
+    stages: tuple[str, ...]
+    remaining_stages: tuple[str, ...]
+    record: _records.CandidateRecord | None
+    intended: str | None
+    published_ctx: _context.ProjectContext | None
+    stage_creation_needed: bool
+    release_page: _releases.PageRequest = field(default_factory=_releases.PageRequest)
 
 
 @dataclass
 class _RunState:
     """Track one in-process declared-workflow execution."""
 
-    _ctx: _context.ProjectContext
-    _record: _candidate.CandidateRecord | None
-    _published_completed: bool
-    _release_page: _releases.PageRequest = field(default_factory=_releases.PageRequest)
+    ctx: _context.ProjectContext
+    record: _records.CandidateRecord | None
+    published_completed: bool
+    release_page: _releases.PageRequest = field(default_factory=_releases.PageRequest)
 
 
 def _published_run_context(
@@ -160,10 +157,10 @@ def _resolve_run_plan(
 
 def _run_inspect_stage(state: _RunState, *, publishing: bool) -> None:
     """Materialize and report one retained snapshot for workflow inspection."""
-    if state._record is None:
+    if state.record is None:
         raise PubanonError('no prepared snapshot is retained', recovery='pubanon prepare')
-    ctx = state._ctx
-    proof = _verification.prove_objects(ctx.paths, ctx.project.name, state._record)
+    ctx = state.ctx
+    proof = _verification.prove_objects(ctx.paths, ctx.project.name, state.record)
     _inspect.inspection_copy(ctx, proof, workflow=True)
     print('Inspection does not pause this workflow for file review.')
     if not publishing:
@@ -172,9 +169,9 @@ def _run_inspect_stage(state: _RunState, *, publishing: bool) -> None:
 
 def _run_prepare_stage(args: argparse.Namespace, state: _RunState) -> None:
     """Execute or resume one declared prepare stage."""
-    if state._record is None:
-        state._record = _prepare.prepare_locked(
-            state._ctx,
+    if state.record is None:
+        state.record = _prepare.prepare_locked(
+            state.ctx,
             _prepare.PrepareOptions(
                 source='HEAD',
                 version=args.version,
@@ -183,39 +180,39 @@ def _run_prepare_stage(args: argparse.Namespace, state: _RunState) -> None:
                 yes=args.yes,
             ),
         )
-        state._ctx = _context.load_context(state._ctx.paths, state._ctx.project.name)
+        state.ctx = _context.load_context(state.ctx.paths, state.ctx.project.name)
         return
     _verification.verify_retained_candidate(
-        state._ctx.paths,
-        state._ctx.global_config,
-        state._ctx.project,
-        state._record,
+        state.ctx.paths,
+        state.ctx.global_config,
+        state.ctx.project,
+        state.record,
         env=os.environ,
     )
 
 
 def _run_publish_stage(args: argparse.Namespace, state: _RunState) -> None:
     """Verify the invocation tag and invoke the publication primitive."""
-    if state._record is None:
+    if state.record is None:
         raise PubanonError('no prepared snapshot is retained', recovery='pubanon prepare')
     intended = _candidate.tag_intent_for(args.version)
-    if state._record.tag_intent != intended:
+    if state.record.tag_intent != intended:
         raise PubanonError(
             'the prepared snapshot has a different release tag',
             expected=escape(intended or 'none'),
-            actual=escape(state._record.tag_intent or 'none'),
+            actual=escape(state.record.tag_intent or 'none'),
             recovery='to use the prepared snapshot: pubanon inspect and follow its next step; '
             'to replace it: pubanon discard, then pubanon prepare',
         )
     _publish.publish(
         cli_remote.publish_context(
-            state._ctx,
-            state._record,
+            state.ctx,
+            state.record,
             yes=args.yes,
-            release_page=state._release_page,
+            release_page=state.release_page,
         )
     )
-    state._published_completed = True
+    state.published_completed = True
 
 
 def _run_reveal_stage(args: argparse.Namespace, state: _RunState) -> None:
@@ -225,47 +222,47 @@ def _run_reveal_stage(args: argparse.Namespace, state: _RunState) -> None:
             '--yes cannot make the repository public',
             recovery='run pubanon repo reveal interactively',
         )
-    _lifecycle.reveal(state._ctx.paths, state._ctx.global_config, state._ctx.project)
-    state._ctx = _context.load_context(state._ctx.paths, state._ctx.project.name)
+    _lifecycle.reveal(state.ctx.paths, state.ctx.global_config, state.ctx.project)
+    state.ctx = _context.load_context(state.ctx.paths, state.ctx.project.name)
 
 
 def _run_stage_push_stage(args: argparse.Namespace, plan: _RunPlan, state: _RunState) -> None:
     """Recheck staging visibility and invoke the staging primitive."""
     visible = _stage.staging_repository_visible(
-        state._ctx.paths, state._ctx.global_config, state._ctx.project
+        state.ctx.paths, state.ctx.global_config, state.ctx.project
     )
-    if (not visible) != plan._stage_creation_needed:
+    if (not visible) != plan.stage_creation_needed:
         raise PubanonError(
             'staging repository visibility changed after preview',
             recovery='rerun the workflow for a current preview',
         )
-    _stage.stage_push(state._ctx.paths, state._ctx.global_config, state._ctx.project, yes=args.yes)
+    _stage.stage_push(state.ctx.paths, state.ctx.global_config, state.ctx.project, yes=args.yes)
 
 
 def _run_wants_page(plan: _RunPlan) -> bool:
     """Select page work for a tagged publishing workflow and its overrides."""
-    page = plan._release_page
+    page = plan.release_page
     return (
-        'publish' in plan._stages
-        and plan._intended is not None
+        'publish' in plan.stages
+        and plan.intended is not None
         and not page.skip
         and (
             page.requested
             or page.notes is not None
-            or _config.release_pages_enabled(plan._ctx.project)
+            or _config.release_pages_enabled(plan.ctx.project)
         )
     )
 
 
 def _resume_run_page(args: argparse.Namespace, plan: _RunPlan) -> None:
     """Create a missing page with a fresh preview under the workflow lock."""
-    ctx = plan._published_ctx
+    ctx = plan.published_ctx
     if ctx is None or not _run_wants_page(plan):
         return
-    tag = plan._intended
+    tag = plan.intended
     if tag is None:
         raise ValueError('release page resume requires a publication tag')
-    page = plan._release_page
+    page = plan.release_page
     if page.notes is None and _releases.page_status(
         ctx.paths, ctx.global_config, ctx.project, tag
     ):
@@ -280,25 +277,25 @@ def _resume_run_page(args: argparse.Namespace, plan: _RunPlan) -> None:
 def _run_mutations(plan: _RunPlan) -> list[str]:
     """Return every external mutation in the remaining declared stages."""
     mutations: list[str] = []
-    draft = 'draft ' if _config.draft_release_pages(plan._ctx.project) else ''
-    page_change = f'create {draft}release page {plan._intended} if none exists'
-    if plan._published_ctx is not None and _run_wants_page(plan):
+    draft = 'draft ' if _config.draft_release_pages(plan.ctx.project) else ''
+    page_change = f'create {draft}release page {plan.intended} if none exists'
+    if plan.published_ctx is not None and _run_wants_page(plan):
         mutations.append(page_change)
-    for stage in plan._remaining_stages:
+    for stage in plan.remaining_stages:
         if stage == 'stage push':
-            if plan._stage_creation_needed:
+            if plan.stage_creation_needed:
                 mutations.append(
                     'create staging repository '
-                    f'{plan._ctx.project.owner}/{_config.stage_repository(plan._ctx.project)} '
+                    f'{plan.ctx.project.owner}/{_config.stage_repository(plan.ctx.project)} '
                     '(first use)'
                 )
             mutations.append('replace the files in the private staging repository')
         elif stage == 'publish':
             mutations.append(
-                f'publish to {plan._ctx.project.owner}/{plan._ctx.project.repo} on main'
+                f'publish to {plan.ctx.project.owner}/{plan.ctx.project.repo} on main'
             )
-            if plan._intended is not None:
-                mutations.append(f'create release tag {plan._intended}')
+            if plan.intended is not None:
+                mutations.append(f'create release tag {plan.intended}')
             if _run_wants_page(plan):
                 mutations.append(page_change)
         elif stage == 'repo reveal':
@@ -309,9 +306,9 @@ def _run_mutations(plan: _RunPlan) -> list[str]:
 def _run_watch_ci_stage(args: argparse.Namespace, state: _RunState, *, staged: bool) -> None:
     """Invoke one exact-target CI watch stage."""
     _watch.watch_ci(
-        state._ctx.paths,
-        state._ctx.global_config,
-        state._ctx.project,
+        state.ctx.paths,
+        state.ctx.global_config,
+        state.ctx.project,
         staged=staged,
         version=None if staged else args.version,
         timeout=_watch.DEFAULT_TIMEOUT,
@@ -321,9 +318,9 @@ def _run_watch_ci_stage(args: argparse.Namespace, state: _RunState, *, staged: b
 def _run_watch_package_stage(args: argparse.Namespace, state: _RunState) -> None:
     """Invoke one version-bound package watch stage."""
     _watch.watch_package(
-        state._ctx.paths,
-        state._ctx.global_config,
-        state._ctx.project,
+        state.ctx.paths,
+        state.ctx.global_config,
+        state.ctx.project,
         version=args.version,
         timeout=_watch.DEFAULT_TIMEOUT,
     )
@@ -339,7 +336,7 @@ def _execute_run_stage(
     if stage == 'prepare':
         _run_prepare_stage(args, state)
     elif stage == 'inspect':
-        _run_inspect_stage(state, publishing='publish' in plan._remaining_stages)
+        _run_inspect_stage(state, publishing='publish' in plan.remaining_stages)
     elif stage == 'stage push':
         _run_stage_push_stage(args, plan, state)
     elif stage == 'stage watch':
@@ -358,9 +355,9 @@ def _execute_run_stage(
 
 def _show_run_preview(name: str, plan: _RunPlan) -> None:
     """Print one declared workflow's resolved stages and mutations."""
-    stages = ', '.join(plan._stages)
+    stages = ', '.join(plan.stages)
     output(
-        f'Workflow {escape(name)} ({escape(plan._ctx.project.publication_route)} route): '
+        f'Workflow {escape(name)} ({escape(plan.ctx.project.publication_route)} route): '
         f'{escape(stages)}'
     )
     mutations = _run_mutations(plan)
@@ -377,22 +374,15 @@ def _stepwise_commands(
 ) -> str:
     """Render exact individual recovery commands after publication."""
     commands: list[str] = []
-    name = state._ctx.project.name
+    name = state.ctx.project.name
     version_args = ('--version', args.version) if args.version is not None else ()
     for stage in stages:
         if stage in {'repo watch', 'package watch'}:
-            command = _context.project_command(
-                name, *stage.split(), f'--project={name}', *version_args
-            )
+            command = project_command(name, *stage.split(), f'--project={name}', *version_args)
         else:
-            command = _context.project_command(name, *stage.split(), f'--project={name}')
+            command = project_command(name, *stage.split(), f'--project={name}')
         commands.append(f'  {command}')
     return 'finish stepwise:\n' + '\n'.join(commands)
-
-
-def _watch_version_option(args: argparse.Namespace) -> str:
-    """Preserve a workflow's selected release in follow-up observations."""
-    return f' --version {shlex.quote(args.version)}' if args.version else ''
 
 
 def _workflow_recovery(recovery: str | None, stepwise: str) -> str:
@@ -410,8 +400,8 @@ def _workflow_recovery(recovery: str | None, stepwise: str) -> str:
 
 def _execute_run(args: argparse.Namespace, plan: _RunPlan) -> None:
     """Execute every remaining stage with post-publication recovery."""
-    state = _RunState(plan._ctx, plan._record, plan._published_ctx is not None, plan._release_page)
-    for index, stage in enumerate(plan._remaining_stages):
+    state = _RunState(plan.ctx, plan.record, plan.published_ctx is not None, plan.release_page)
+    for index, stage in enumerate(plan.remaining_stages):
         try:
             if stage not in {'publish', 'repo reveal'} and (stage != 'stage push' or args.yes):
                 heading(stage.capitalize(), separate=True)
@@ -419,57 +409,49 @@ def _execute_run(args: argparse.Namespace, plan: _RunPlan) -> None:
         except (PubanonError, KeyboardInterrupt) as error:
             exc = error if isinstance(error, PubanonError) else OperationCanceled('Canceled.')
             recovery_index = index
-            if not state._published_completed and stage == 'publish':
-                if _records.load_candidate(state._ctx.paths, state._ctx.project.name) is not None:
+            if not state.published_completed and stage == 'publish':
+                if _records.load_candidate(state.ctx.paths, state.ctx.project.name) is not None:
                     raise exc from None
                 try:
-                    state._published_completed = (
-                        _published_run_context(state._ctx, plan._stages, plan._intended)
-                        is not None
+                    state.published_completed = (
+                        _published_run_context(state.ctx, plan.stages, plan.intended) is not None
                     )
                 except (PubanonError, KeyboardInterrupt):
                     raise exc from None
-                if state._published_completed:
+                if state.published_completed:
                     recovery_index += 1
-            if not state._published_completed:
+            if not state.published_completed:
                 raise exc from None
             fact = exc.fact
             completed = 'The publication itself completed.'
             exc.fact = f'{fact}\n{completed}' if fact else completed
-            stepwise = _stepwise_commands(args, state, plan._remaining_stages[recovery_index:])
+            stepwise = _stepwise_commands(args, state, plan.remaining_stages[recovery_index:])
             exc.recovery = _workflow_recovery(exc.recovery, stepwise)
             raise exc from None
 
 
 def command_run(args: argparse.Namespace) -> None:
-    """Execute one declared workflow while holding the project lock."""
-    notes = (
-        cli_releases.read_notes_file(args.release_notes_file)
-        if args.release_notes_file is not None
-        else None
-    )
-    page = _releases.PageRequest(
-        skip=args.no_release_page,
-        notes=notes,
-        notes_file=(
-            Path(args.release_notes_file).absolute()
-            if args.release_notes_file is not None
-            else None
-        ),
-        requested=args.release_page,
-    )
+    """Execute one declared workflow while holding the project lock.
+
+    Raises:
+        PubanonError: Configuration, workflow selection, or a constituent
+            workflow stage fails.
+        OperationCanceled: An interactive decision is declined or the operation
+            is canceled.
+    """
+    page = cli_releases.page_request(args)
     paths = _config.derive_paths(os.environ)
     name = _context.project_name(paths, args.project)
     with _config.project_lock(paths, name):
         plan = _resolve_run_plan(args, _context.load_context(paths, name), page)
-        if args.version is None and 'publish' in plan._stages and plan._intended is not None:
-            args.version = plan._intended.removeprefix('v')
+        if args.version is None and 'publish' in plan.stages and plan.intended is not None:
+            args.version = plan.intended.removeprefix('v')
         _show_run_preview(args.name, plan)
         _resume_run_page(args, plan)
-        if plan._published_ctx is not None and not plan._remaining_stages:
-            output(f'Nothing to do: {escape(plan._intended or "untagged")} is already published.')
+        if plan.published_ctx is not None and not plan.remaining_stages:
+            output(f'Nothing to do: {escape(plan.intended or "untagged")} is already published.')
             return
-        if args.yes and plan._stage_creation_needed:
+        if args.yes and plan.stage_creation_needed:
             raise PubanonError(
                 '--yes cannot answer first-use staging repository creation',
                 recovery='run interactively: pubanon stage push',
@@ -482,17 +464,12 @@ def command_run(args: argparse.Namespace) -> None:
         if _records.load_candidate(paths, name) is not None:
             print('The snapshot is prepared but has not been published.')
             next_step('pubanon inspect')
-        elif (
-            (plan._ctx.project.required_checks or plan._ctx.project.ci_workflow)
-            and 'repo watch' not in plan._stages
-            and 'repo reveal' not in plan._stages
+        elif 'repo reveal' not in plan.stages and (
+            following := _watch.next_after_publication(
+                plan.ctx.project,
+                version=args.version,
+                ci_observed='repo watch' in plan.stages,
+                package_observed='package watch' in plan.stages,
+            )
         ):
-            next_step(f'pubanon repo watch{_watch_version_option(args)}')
-        elif (
-            plan._ctx.project.package is not None
-            and 'package watch' not in plan._stages
-            and 'repo reveal' not in plan._stages
-        ):
-            next_step(f'pubanon package watch{_watch_version_option(args)}')
-        elif 'repo reveal' not in plan._stages and plan._ctx.project.visibility == 'private':
-            next_step('pubanon repo reveal')
+            next_step(following)

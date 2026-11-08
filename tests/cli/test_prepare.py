@@ -81,8 +81,7 @@ def test_incomplete_prepare_recovery_selects_project(
     name: str,
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
-    _paths, _global_config, project = configure(tmp_path, monkeypatch, source, project=name)
-    assert project is not None
+    _paths, _global_config, _project = configure(tmp_path, monkeypatch, source, project=name)
     record = SimpleNamespace(replaces='a' * 40, tip=None, tag_intent='v1.0.0')
 
     def _paused(*_args: object, **_kwargs: object) -> SimpleNamespace:
@@ -102,6 +101,54 @@ def test_incomplete_prepare_recovery_selects_project(
     assert argv == ['pubanon', 'prepare', f'--project={name}', '--continue']
 
 
+@pytest.mark.parametrize(
+    ('changelog', 'version'),
+    [
+        pytest.param(None, '0.0.2', id='no-changelog'),
+        pytest.param(b'## 0.0.2 (2026-10-24)\n\n## 0.0.1 (2026-10-01)\n', '0.0.2', id='newest'),
+        pytest.param(b'## 0.0.1\n\n## 0.0.2\n', '0.0.2', id='oldest-first'),
+        pytest.param(b'## October 2026\n', '0.0.2', id='no-version-headings'),
+        pytest.param(b'## 0.0.1\n', None, id='untagged'),
+    ],
+)
+def test_prepare_changelog_check_allows_matching_or_unversioned_changelogs(
+    changelog: bytes | None, version: str | None
+) -> None:
+    snapshot = (
+        () if changelog is None else (_source.Entry('CHANGELOG.md', 0o100644, 'blob', changelog),)
+    )
+    _prepare._require_changelog_version(None, snapshot, version)
+
+
+@pytest.mark.parametrize(
+    ('newest', 'recovery'),
+    [
+        pytest.param('0.0.1', 'add a 0.0.2 section to CHANGELOG.md', id='changelog-behind'),
+        pytest.param('0.0.3', 'update and commit the package version to 0.0.3', id='ahead'),
+    ],
+)
+def test_prepare_changelog_check_refuses_other_newest_version(newest: str, recovery: str) -> None:
+    data = f'## {newest} (2026-10-24)\n\n## 0.0.0 (2026-01-01)\n'.encode()
+    snapshot = (_source.Entry('CHANGELOG.md', 0o100644, 'blob', data),)
+    with pytest.raises(PubanonError, match=r'newest version in CHANGELOG\.md') as exc_info:
+        _prepare._require_changelog_version(None, snapshot, '0.0.2')
+    assert exc_info.value.expected == '0.0.2'
+    assert exc_info.value.actual == newest
+    assert recovery in (exc_info.value.recovery or '')
+
+
+def test_prepare_changelog_check_uses_configured_path_and_heading() -> None:
+    settings = _config.ReleasePageSettings(
+        changelog='docs/CHANGES.md', changelog_heading='## Version {version}'
+    )
+    snapshot = (
+        _source.Entry('CHANGELOG.md', 0o100644, 'blob', b'## 0.0.2\n'),
+        _source.Entry('docs/CHANGES.md', 0o100644, 'blob', b'## Version 0.0.1\n'),
+    )
+    with pytest.raises(PubanonError, match=r'newest version in docs/CHANGES\.md'):
+        _prepare._require_changelog_version(settings, snapshot, '0.0.2')
+
+
 def test_prepare_excludes_denied_credential_path_with_metacharacters(
     tmp_path: Path,
     make_repo: Callable[..., Path],
@@ -110,7 +157,6 @@ def test_prepare_excludes_denied_credential_path_with_metacharacters(
     path = 'keys/id[old]_rsa'
     source = make_repo(files={path: 'private key fixture\n'})
     paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     _config.save_project(paths, replace(project, allow=('keys/**',)))
     monkeypatch.chdir(source)
 
@@ -167,7 +213,6 @@ def test_prepare_gates_current_publication_coordinates_before_candidate_build(
 ) -> None:
     term = 'private-coordinate'
     paths, _global_config, project = configured_project
-    assert project is not None
     project = replace(project, repo=f'public-{term}', extra_terms=(term,))
     _config.save_project(paths, project)
 
@@ -189,7 +234,6 @@ def test_prepare_gates_default_staging_coordinates_before_candidate_build(
 ) -> None:
     term = 'default-stage'
     paths, _global_config, project = configured_project
-    assert project is not None
     project = replace(
         project,
         repo='public-default',
@@ -215,10 +259,9 @@ def test_prepare_gates_explicit_staging_coordinates_before_candidate_build(
 ) -> None:
     term = 'staging-hygiene-canary'
     paths, _global_config, project = configured_project
-    assert project is not None
     project = replace(
         project,
-        _stage_repo=f'public-{term}',
+        stage_repo=f'public-{term}',
         hygiene_terms=(term,),
     )
     _config.save_project(paths, project)
@@ -310,7 +353,6 @@ def test_prepare_keeps_long_source_excerpts_readable_and_escapes_controls(
         }
     )
     paths, config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     _config.save_global(
         paths, replace(config, sensitive_terms=terms), paths.global_config.read_bytes()
     )
@@ -364,7 +406,6 @@ def test_prepare_refuses_intact_utf8_term_in_mixed_blob(
     term = 'Privat\u00e9Alias'
     source = make_repo(files={'mixed.bin': b'\xffPrivat\xc3\xa9Alias\n'})
     paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     _config.save_project(paths, replace(project, extra_terms=(term,)))
 
     answers([])
@@ -480,7 +521,6 @@ def test_prepare_refuses_sensitive_term_in_path(
 ) -> None:
     source = make_repo(files={'docs/Private Person.txt': 'public\n'})
     paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
 
     answers([])
     assert (
@@ -488,6 +528,27 @@ def test_prepare_refuses_sensitive_term_in_path(
     )
 
     assert 'cannot prepare: blocked text in included files' in capsys.readouterr().err
+    assert _records.load_candidate(paths, project.name) is None
+
+
+def test_prepare_refuses_version_missing_from_changelog(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = make_repo(
+        files={
+            'CHANGELOG.md': '# Changelog\n\n## 0.0.1 (2026-10-01)\n\n- First.\n',
+            'pyproject.toml': '[project]\nname = "demo"\nversion = "0.0.2"\n',
+        }
+    )
+    paths, _global_config, project = configure(tmp_path, monkeypatch, source)
+
+    status = _cli.main(['prepare', '--project', project.name, '--yes'])
+
+    assert status != 0
+    assert 'newest version in CHANGELOG.md' in capsys.readouterr().err
     assert _records.load_candidate(paths, project.name) is None
 
 
@@ -582,9 +643,7 @@ def test_prepare_replacement_replays_or_replaces_all_from_current_source(
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize('selector', [(), ('latest',)])
 def test_prepare_replace_latest_preserves_earlier_publications(
-    selector: tuple[str, ...],
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
@@ -595,7 +654,7 @@ def test_prepare_replace_latest_preserves_earlier_publications(
     store = _store.candidate_store_path(paths, project.name)
     previous_tip = run_git(['rev-parse', 'refs/heads/main'], cwd=store).stdout.decode().strip()
     capsys.readouterr()
-    assert _cli.main(['prepare', '--project', project.name, '--yes', '--replace', *selector]) == 0
+    assert _cli.main(['prepare', '--project', project.name, '--yes', '--replace', 'latest']) == 0
     record = _records.load_candidate(paths, project.name)
     assert record is not None
     assert record.replaces == previous_tip
@@ -675,7 +734,6 @@ def test_prepare_reports_gate_term_and_escaped_finding_unit(
     separator = '\x1b' if os.name != 'nt' else '\u2028'
     source = make_repo(files={f'docs/{term}{separator}.txt': 'public\n'})
     paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     _config.save_project(paths, replace(project, hygiene_terms=(term,)))
 
     answers([])
@@ -726,7 +784,6 @@ def test_prepare_reports_operator_outcome_before_candidate_details(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     paths, _global_config, project = configured_project
-    assert project is not None
 
     assert (
         _cli.main(['prepare', '--project', project.name, '--acknowledge-new-paths', '--yes']) == 0
@@ -749,7 +806,6 @@ def test_prepare_review_excludes_included_file_only_after_acceptance(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n', 'docs/draft.md': 'Private Person\n'})
     paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     prompts = iter(
         [
             ('Use this selection?', 'r'),
@@ -911,7 +967,6 @@ def test_prepare_shows_included_files_and_committed_source_lines(
         }
     )
     paths, config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     _config.save_global(
         paths,
         replace(
@@ -952,7 +1007,6 @@ def test_prepare_source_older_revision_uses_selected_bytes(
         files={'README.md': 'older\n', 'pyproject.toml': '[project]\nversion = "0.0.1"\n'}
     )
     paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     (source / 'README.md').write_text('newer\n')
     (source / 'pyproject.toml').write_text('[project]\nversion = "0.0.2"\n')
     subprocess.run(['git', '-C', source, 'add', '.'], check=True, env=git_env())
@@ -1008,7 +1062,6 @@ def test_prepare_uses_committed_package_version_and_rejects_mismatch(
 ) -> None:
     source = make_repo(files={'pyproject.toml': '[project]\nname = "demo"\nversion = "0.0.1"\n'})
     paths, _global, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     (source / 'pyproject.toml').write_text('[project]\nname = "demo"\nversion = "0.0.2"\n')
     argv = ['prepare', '--project', project.name, '--yes']
     if requested is not None:
@@ -1038,7 +1091,6 @@ def test_prepare_validates_version_before_prompts(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     ctx = ProjectContext(paths, global_config, project)
 
     def _forbidden(*_args: object, **_kwargs: object) -> None:
@@ -1085,7 +1137,6 @@ def test_prepare_yes_allows_first_release_new_paths_without_stdin(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     ctx = ProjectContext(paths, global_config, project)
 
     def _forbidden(_prompt: str) -> bool:
@@ -1145,7 +1196,6 @@ def test_prepare_ignores_private_directories_but_blocks_references_in_makefile(
         }
     )
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     _config.save_global(
         paths,
         replace(
@@ -1195,7 +1245,6 @@ def test_prepare_ignores_files_but_blocks_references_in_makefile(
         }
     )
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     _config.save_global(
         paths,
         replace(

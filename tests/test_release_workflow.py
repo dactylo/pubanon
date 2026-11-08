@@ -76,7 +76,7 @@ def _release(
 
 
 def _repository(
-    make_repo: Callable[..., Path], version: str = '0.6.0', *, tagged: bool
+    make_repo: Callable[..., Path], version: str = '0.6.0', *, tagged: bool | str
 ) -> tuple[Path, str]:
     pyproject = f'[project]\nname = "example"\nversion = "{version}"\n'
     repo = make_repo(files={'pyproject.toml': pyproject})
@@ -89,6 +89,19 @@ def _repository(
     ).stdout.strip()
     if tagged:
         subprocess.run(['git', '-C', str(repo), 'tag', f'v{version}'], check=True, env=git_env())
+    if tagged == 'mismatch':
+        subprocess.run(
+            ['git', '-C', str(repo), 'commit', '--allow-empty', '-qm', 'next'],
+            check=True,
+            env=git_env(),
+        )
+        commit = subprocess.run(
+            ['git', '-C', str(repo), 'rev-parse', 'HEAD'],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=git_env(),
+        ).stdout.strip()
     return repo, commit
 
 
@@ -167,7 +180,7 @@ def test_page_step_publishes_a_late_draft_when_run_again(tmp_path: Path, fake_gh
     first = _publish_page(tmp_path, fake_gh, [_release(2, 'v0.5.0')])
 
     assert first == (
-        'No release page for v0.6.0. If pubanon creates a draft for it later, '
+        'No release page for v0.6.0. If a draft is created for it later, '
         'rerun this workflow to publish it.\n'
     )
     assert gh_calls(tmp_path) == [_LISTING_ARGS]
@@ -256,6 +269,7 @@ def test_start_step_starts_the_release_workflow_on_a_tagged_version(
     ('version', 'tagged', 'summary'),
     [
         ('0.6.0', False, 'No v0.6.0 tag at this commit; nothing to publish.\n'),
+        ('0.6.0', 'mismatch', 'No v0.6.0 tag at this commit; nothing to publish.\n'),
         (
             '0.6.0rc1',
             True,
@@ -273,7 +287,7 @@ def test_start_step_starts_nothing_without_a_strict_version_tag(
     make_repo: Callable[..., Path],
     *,
     version: str,
-    tagged: bool,
+    tagged: bool | str,
     summary: str,
 ) -> None:
     repo, commit = _repository(make_repo, version, tagged=tagged)
@@ -357,6 +371,7 @@ def test_verify_step_refuses_missing_or_failed_ci(
     ('version', 'tagged', 'message'),
     [
         ('0.6.0', False, 'v0.6.0 must point to the selected commit before publishing.'),
+        ('0.6.0', 'mismatch', 'v0.6.0 must point to the selected commit before publishing.'),
         ('0.6.0rc1', True, 'Version 0.6.0rc1 in pyproject.toml must have X.Y.Z form to publish.'),
         ('01.2.3', True, 'Version 01.2.3 in pyproject.toml must have X.Y.Z form to publish.'),
     ],
@@ -366,7 +381,7 @@ def test_verify_step_refuses_a_commit_without_a_strict_version_tag(
     make_repo: Callable[..., Path],
     *,
     version: str,
-    tagged: bool,
+    tagged: bool | str,
     message: str,
 ) -> None:
     repo, commit = _repository(make_repo, version, tagged=tagged)

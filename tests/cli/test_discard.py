@@ -72,8 +72,7 @@ def test_discard_recovery_command_selects_project(
     name: str,
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
-    paths, _global_config, project = configure(tmp_path, monkeypatch, source, project=name)
-    assert project is not None
+    paths, _global_config, _project = configure(tmp_path, monkeypatch, source, project=name)
     copy = paths.data_dir / 'projects' / name / 'inspections' / ('a' * 40)
     copy.mkdir(parents=True)
     assert _cli.main(['discard', f'--project={name}']) == 0
@@ -93,8 +92,7 @@ def test_discard_recovery_shows_unrenderable_project(
 ) -> None:
     name = 'line\nbreak'
     source = make_repo(files={'README.md': 'public\n'})
-    paths, _global_config, project = configure(tmp_path, monkeypatch, source, project=name)
-    assert project is not None
+    paths, _global_config, _project = configure(tmp_path, monkeypatch, source, project=name)
     (paths.data_dir / 'projects' / name / 'inspections' / ('a' * 40)).mkdir(parents=True)
     assert _cli.main(['discard', f'--project={name}']) == 0
     output = capsys.readouterr().out
@@ -154,7 +152,6 @@ def test_discard_reports_when_candidate_and_inspection_directory_are_already_abs
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     _paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
 
     assert _cli.main(['discard', '--project', project.name]) == 0
 
@@ -180,9 +177,16 @@ def test_discard_rewrite_removes_private_progress_and_keeps_publication_copy(
     assert _records.rewrite_path(paths, project.name).exists()
     assert _records.rewrite_directory(paths, project.name).is_dir()
     capsys.readouterr()
+    assert _cli.main(['prepare', '--project', project.name]) == 1
+    refusal = capsys.readouterr().err
+    assert 'a rewrite is already retained' in refusal
+    assert 'deletes your conflict edits' in refusal
     assert _cli.main(['discard', '--project', project.name]) == 0
-    output = capsys.readouterr().out
-    assert 'Discarded the prepared snapshot.' in output
+    captured = capsys.readouterr()
+    assert 'Removing the paused rewrite, including any conflict edits.' in (
+        captured.out + captured.err
+    )
+    assert 'Discarded the prepared snapshot.' in captured.out
     assert _records.load_candidate(paths, project.name) is None
     assert not _records.rewrite_path(paths, project.name).exists()
     assert not _records.rewrite_directory(paths, project.name).exists()
@@ -206,3 +210,35 @@ def test_discard_unknown_outcome_keeps_record_and_review_copy(
     assert 'pubanon publish --project=demo --resolve' in capsys.readouterr().err
     assert inspection.exists()
     assert _records.load_candidate(paths, project.name) == pending
+
+
+@pytest.mark.slow
+def test_discard_warns_before_removing_a_paused_rewrite(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = make_repo(files={'README.md': 'original\n'})
+    paths, project, _original = replacement_context(tmp_path, source, monkeypatch, conflict=True)
+    assert _cli.main(['prepare', '--project', project.name, '--replace', 'v1.0.0', '--yes']) == 0
+    directory = _records.rewrite_directory(paths, project.name)
+    real_remove = _filesystem.remove_tree
+    before_removal: list[str] = []
+
+    def _fail_rewrite_removal(path: Path) -> bool:
+        if path != directory:
+            return real_remove(path)
+        captured = capsys.readouterr()
+        before_removal.append(captured.out + captured.err)
+        raise OSError(path)
+
+    monkeypatch.setattr(_filesystem, 'remove_tree', _fail_rewrite_removal)
+    capsys.readouterr()
+
+    assert _cli.main(['discard', '--project', project.name]) == 1
+
+    assert len(before_removal) == 1
+    assert 'Removing the paused rewrite, including any conflict edits.' in before_removal[0]
+    assert directory.is_dir()
+    assert 'cannot finish rewrite cleanup' in capsys.readouterr().err

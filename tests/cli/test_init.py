@@ -2,7 +2,7 @@ import json
 import re
 import subprocess
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
@@ -16,9 +16,7 @@ from pubanon._snapshots import _candidate, _records, _source
 from pubanon._terminal import escape
 from tests._cli import gh_calls
 from tests._git import git_env
-from tests._setup import configure
-
-_Script = Callable[[Sequence[str | tuple[str, str]]], None]
+from tests._setup import Script, configure
 
 _CONNECTABLE = """\
 on:
@@ -54,7 +52,7 @@ def _assert_initial_selection_sections(output: str) -> None:
     decisions = output.split('Files needing your decision\n', maxsplit=1)[1].split(
         'Files to publish\n', maxsplit=1
     )[0]
-    assert 'filenames can contain credentials' in decisions
+    assert 'filename can contain credentials' in decisions
     assert 'not proof of a secret' in decisions
     assert '.env' in decisions
     assert 'keys/id_rsa' in decisions
@@ -112,19 +110,25 @@ def _default_route(answer: Callable[[str], str]) -> Callable[[str], str]:
     return _reply
 
 
+def _literal_snapshot(files: dict[str, str | bytes]) -> _source.Snapshot:
+    return tuple(
+        _source.Entry(name, 0o100644, 'blob', data.encode() if isinstance(data, str) else data)
+        for name, data in sorted(files.items())
+    )
+
+
 def _edit_checks(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
     workflows: dict[str, str],
     **changes: object,
 ) -> tuple[_context.ProjectContext, _source.Snapshot, _config.ProjectConfig]:
     files = {f'.github/workflows/{name}': data for name, data in workflows.items()}
-    source = make_repo(files={**files, 'README.md': 'public\n'})
+    source = tmp_path / 'source'
+    source.mkdir()
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     project = replace(project, **changes)
-    snapshot = _source.read_snapshot(source, _source.pin(source, 'HEAD').commit)
+    snapshot = _literal_snapshot({**files, 'README.md': 'public\n'})
     return _context.ProjectContext(paths, global_config, project), snapshot, project
 
 
@@ -135,7 +139,6 @@ def _unselected_project(
 ) -> tuple[_config.Paths, Path]:
     source = make_repo(files={'README.md': 'public\n', 'extra.txt': 'new\n'})
     paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     _config.save_project(paths, replace(project, allow=('README.md',)))
     monkeypatch.chdir(source)
     monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
@@ -144,13 +147,11 @@ def _unselected_project(
 
 def test_changelog_sections_prompt_defers_to_a_notes_template(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _ctx, snapshot, project = _edit_checks(
         tmp_path,
-        make_repo,
         monkeypatch,
         {},
         release_page=_config.ReleasePageSettings(enabled=True, notes='Release {tag}'),
@@ -204,17 +205,16 @@ def test_changelog_sections_prompt_defers_to_a_notes_template(
 )
 def test_changelog_sections_prompt_reports_the_source_changelog(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     case: tuple[dict[str, str | bytes], _config.ReleasePageSettings, list[str]],
 ) -> None:
     files, page, lines = case
-    source = make_repo(files={'README.md': 'public\n', **files})
+    source = tmp_path / 'source'
+    source.mkdir()
     _paths, _global_config, configured = configure(tmp_path, monkeypatch, source)
-    assert configured is not None
     project = replace(configured, release_page=page)
-    snapshot = _source.read_snapshot(source, _source.pin(source, 'HEAD').commit)
+    snapshot = _literal_snapshot({'README.md': 'public\n', **files})
 
     def _answer(prompt: str) -> str:
         assert prompt == _SECTIONS
@@ -233,7 +233,6 @@ def test_existing_project_report_shows_release_page_drafts(
     source = tmp_path / 'source'
     source.mkdir()
     paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     project = replace(project, release_page=_config.ReleasePageSettings(enabled=True, draft=True))
 
     _init._report_existing_project_init(
@@ -517,17 +516,45 @@ def test_init_does_not_offer_checks_from_excluded_workflow(
     assert 'GitHub checks found' not in capsys.readouterr().out
 
 
+def test_init_draft_that_may_have_been_saved_is_not_reported_unsaved(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = make_repo(files={'README.md': 'public\n'})
+    configure(tmp_path, monkeypatch)
+    monkeypatch.chdir(source)
+
+    original_save = _init_draft.save
+    saves: list[None] = []
+
+    def _uncertain_later_save(paths: _config.Paths, name: str, draft: _init_draft.Draft) -> None:
+        if saves:
+            raise _init_draft.DraftSaveError('init draft may have been saved')
+        saves.append(None)
+        original_save(paths, name, draft)
+
+    monkeypatch.setattr(_init_draft, 'save', _uncertain_later_save)
+    monkeypatch.setattr('builtins.input', _default_route(lambda _prompt: 'c'))
+
+    assert _cli.main(['init', '--project', 'demo']) == 1
+    error = capsys.readouterr().err
+    assert 'init draft may have been saved' in error
+    assert 'not saved' not in error.replace('project configuration was not saved', '')
+    assert 'rerun pubanon init --project=demo' in error
+
+
 @pytest.mark.parametrize('page', [None, _config.ReleasePageSettings(enabled=None)])
 def test_init_edit_accepting_off_release_pages_keeps_unset_configuration(
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
-    answers: _Script,
+    answers: Script,
     page: _config.ReleasePageSettings | None,
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     _config.save_project(paths, replace(project, release_page=page))
     project_file = paths.config_dir / 'projects' / 'demo.toml'
     before = project_file.read_bytes()
@@ -547,16 +574,17 @@ def test_init_edit_accepting_off_release_pages_keeps_unset_configuration(
 )
 def test_connect_workflow_follows_the_current_route_and_selection(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
     case: tuple[str, tuple[str, ...], str | None],
 ) -> None:
     route, deny, expected = case
-    source = make_repo(files={'.github/workflows/ci.yml': _CONNECTABLE, 'README.md': 'public\n'})
+    source = tmp_path / 'source'
+    source.mkdir()
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     project = replace(project, publication_route=route, deny=deny)
-    snapshot = _source.read_snapshot(source, _source.pin(source, 'HEAD').commit)
+    snapshot = _literal_snapshot(
+        {'.github/workflows/ci.yml': _CONNECTABLE, 'README.md': 'public\n'}
+    )
 
     connected = _init._connect_workflow(
         _context.ProjectContext(paths, global_config, project), snapshot
@@ -569,12 +597,11 @@ def test_init_edit_can_correct_description_after_failed_save(
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     assert project.settings is not None
     monkeypatch.chdir(source)
     monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
@@ -615,7 +642,7 @@ def test_init_edit_cancel_after_blocked_checks_saves_nothing(
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
-    answers: _Script,
+    answers: Script,
 ) -> None:
     _paths, project_file = _unselected_project(tmp_path, make_repo, monkeypatch)
     before = project_file.read_bytes()
@@ -639,7 +666,7 @@ def test_init_edit_cancel_or_unchanged_save_writes_nothing(
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
@@ -662,12 +689,11 @@ def test_init_edit_changes_checks_and_repository_settings(
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     assert project.settings is not None
     monkeypatch.chdir(source)
     monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
@@ -702,13 +728,11 @@ def test_init_edit_changes_checks_and_repository_settings(
 
 def test_init_edit_changes_the_workflow_by_number(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
-    answers: _Script,
+    answers: Script,
 ) -> None:
     ctx, snapshot, project = _edit_checks(
         tmp_path,
-        make_repo,
         monkeypatch,
         {'ci.yml': _CONNECTABLE, 'other.yml': _CONNECTABLE},
         publication_route='staged',
@@ -733,13 +757,12 @@ def test_init_edit_changes_the_workflow_by_number(
 
 def test_init_edit_connects_the_offered_workflow(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     ctx, snapshot, project = _edit_checks(
-        tmp_path, make_repo, monkeypatch, {'ci.yml': _CONNECTABLE}, publication_route='staged'
+        tmp_path, monkeypatch, {'ci.yml': _CONNECTABLE}, publication_route='staged'
     )
     answers(
         [
@@ -758,13 +781,11 @@ def test_init_edit_connects_the_offered_workflow(
 
 def test_init_edit_disconnects_the_workflow(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
-    answers: _Script,
+    answers: Script,
 ) -> None:
     ctx, snapshot, project = _edit_checks(
         tmp_path,
-        make_repo,
         monkeypatch,
         {'ci.yml': _CONNECTABLE},
         publication_route='staged',
@@ -788,12 +809,11 @@ def test_init_edit_invalid_saved_default_branch_can_cancel_after_failed_save(
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
-    paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
+    paths, global_config, _project = configure(tmp_path, monkeypatch, source)
     _config.save_global(
         paths,
         replace(global_config, sensitive_terms=(*global_config.sensitive_terms, 'main')),
@@ -826,7 +846,7 @@ def test_init_edit_keeps_unsaved_edits_when_new_files_block_checks(
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     paths, _project_file = _unselected_project(tmp_path, make_repo, monkeypatch)
@@ -876,13 +896,10 @@ def test_init_edit_refuses_without_project_or_terminal(
 
 def test_init_edit_skips_the_workflow_prompt_without_candidates(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
-    answers: _Script,
+    answers: Script,
 ) -> None:
-    ctx, snapshot, project = _edit_checks(
-        tmp_path, make_repo, monkeypatch, {}, publication_route='staged'
-    )
+    ctx, snapshot, project = _edit_checks(tmp_path, monkeypatch, {}, publication_route='staged')
     answers([(_EDIT, 'c'), ('Required CI checks (comma separated, blank for none): ', '')])
 
     assert _init._edit_project_section(ctx, snapshot, project).ci_workflow is None
@@ -890,12 +907,11 @@ def test_init_edit_skips_the_workflow_prompt_without_candidates(
 
 def test_init_edit_suggests_no_workflow_on_the_direct_route(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
-    answers: _Script,
+    answers: Script,
 ) -> None:
     ctx, snapshot, project = _edit_checks(
-        tmp_path, make_repo, monkeypatch, {'ci.yml': _CONNECTABLE}, publication_route='direct'
+        tmp_path, monkeypatch, {'ci.yml': _CONNECTABLE}, publication_route='direct'
     )
     answers(
         [
@@ -912,17 +928,16 @@ def test_init_edit_turns_on_release_pages_and_keeps_other_settings(
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     project = replace(
         project,
         allow=('README.md',),
         deny=('private/**',),
-        _stage_repo='private-stage',
+        stage_repo='private-stage',
         workflows={'ship': ('publish',)},
         package=_config.PackageObservation('pypi', 'demo', ('published',)),
         commit_message=_config.CommitMessageSettings(
@@ -955,14 +970,12 @@ def test_init_edit_turns_on_release_pages_and_keeps_other_settings(
 
 def test_init_edit_warns_about_a_workflow_that_cannot_be_connected(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     ctx, snapshot, project = _edit_checks(
         tmp_path,
-        make_repo,
         monkeypatch,
         {'ci.yml': _CONNECTABLE},
         publication_route='staged',
@@ -992,7 +1005,6 @@ def test_init_existing_project_with_local_publication_offers_prepare(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     monkeypatch.chdir(source)
     observed: list[tuple[_config.Paths, str]] = []
 
@@ -1005,6 +1017,35 @@ def test_init_existing_project_with_local_publication_offers_prepare(
     assert _cli.main(['init', '--project', project.name]) == 0
     assert observed == [(paths, project.name)]
     assert 'Next: pubanon prepare' in capsys.readouterr().out
+
+
+def test_init_failed_draft_save_is_not_reported_as_saved(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = make_repo(files={'README.md': 'public\n'})
+    configure(tmp_path, monkeypatch)
+    monkeypatch.chdir(source)
+
+    original_save = _init_draft.save
+    saves: list[None] = []
+
+    def _fail_later_save(paths: _config.Paths, name: str, draft: _init_draft.Draft) -> None:
+        if saves:
+            raise _init_draft.DraftSaveError('cannot save init draft')
+        saves.append(None)
+        original_save(paths, name, draft)
+
+    monkeypatch.setattr(_init_draft, 'save', _fail_later_save)
+    monkeypatch.setattr('builtins.input', _default_route(lambda _prompt: 'c'))
+
+    assert _cli.main(['init', '--project', 'demo']) == 1
+    error = capsys.readouterr().err
+    assert 'cannot save init draft' in error
+    assert 'setup draft was saved' not in error
+    assert 'rerun pubanon init --project=demo' in error
 
 
 def test_init_final_review_can_change_release_pages(
@@ -1319,6 +1360,23 @@ def test_init_quit_shows_sectioned_preview_and_retained_list(
     assert 'setup draft was saved' in error
 
 
+def test_init_refuses_a_repository_without_commits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    configure(tmp_path, monkeypatch)
+    source = tmp_path / 'empty-source'
+    subprocess.run(['git', 'init', '-q', str(source)], check=True, env=git_env())
+    monkeypatch.chdir(source)
+
+    assert _cli.main(['init']) == 1
+
+    error = capsys.readouterr().err
+    assert 'the source repository has no commits yet' in error
+    assert 'cannot resolve source selector' not in error
+
+
 def test_init_refuses_explicit_project_conflicting_with_registry_before_config_write(
     tmp_path: Path,
     make_repo: Callable[..., Path],
@@ -1347,8 +1405,7 @@ def test_init_refuses_noncanonical_stored_subdirectory_without_relocation(
 ) -> None:
     source = make_repo(files={'nested/file.txt': 'nested\n'})
     nested = source / 'nested'
-    paths, _global_config, project = configure(tmp_path, monkeypatch, nested)
-    assert project is not None
+    paths, _global_config, _project = configure(tmp_path, monkeypatch, nested)
     original = (paths.config_dir / 'projects' / 'demo.toml').read_bytes()
     monkeypatch.chdir(nested)
 
@@ -1378,7 +1435,6 @@ def test_init_relocation_enables_self_publication(
     old_source = make_repo('old', files={'README.md': 'old\n'})
     new_source = make_repo('new', files={'README.md': 'new\n'})
     paths, _, project = configure(tmp_path, monkeypatch, old_source)
-    assert project is not None
     _config.save_project(paths, replace(project, self_publication=False))
     monkeypatch.chdir(new_source)
 
@@ -1405,7 +1461,6 @@ def test_init_relocation_registry_collision_preserves_existing_config(
     source = make_repo('current', files={'README.md': 'current\n'})
     old_source = make_repo('old', files={'README.md': 'old\n'})
     paths, _global_config, beta = configure(tmp_path, monkeypatch, source, project='beta')
-    assert beta is not None
     alpha = replace(beta, name='alpha', source_path=old_source.resolve())
     _config.save_project(paths, alpha)
     alpha_path = paths.config_dir / 'projects' / 'alpha.toml'
@@ -1430,7 +1485,6 @@ def test_init_relocation_reserves_new_source_before_saving_configuration(
     old_source = make_repo('old', files={'README.md': 'old\n'})
     new_source = make_repo('new', files={'README.md': 'new\n'})
     paths, _global_config, project = configure(tmp_path, monkeypatch, old_source, project='demo')
-    assert project is not None
     _config.save_project(
         paths,
         replace(
@@ -1493,7 +1547,6 @@ def test_init_renders_registered_project_with_its_configured_terms(
         source,
         project=registered,
     )
-    assert project is not None
     _config.save_project(paths, replace(project, extra_terms=(term,)))
     monkeypatch.chdir(source)
     capsys.readouterr()
@@ -1547,7 +1600,6 @@ def test_init_rerun_leaves_existing_settings_untouched(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     settings = _config.Settings(
         description='kept',
         default_branch='main',
@@ -1894,7 +1946,6 @@ def test_init_review_follows_question_order_and_lists_each_check(
     source = tmp_path / 'source'
     source.mkdir()
     _paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     reviewed = replace(
         project,
         publication_route='staged',
@@ -1930,8 +1981,7 @@ def test_init_review_shows_overridden_private_staging_destination(
     source = tmp_path / 'source'
     source.mkdir()
     _paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
-    reviewed = replace(project, _stage_repo='review-snapshots', publication_route='staged')
+    reviewed = replace(project, stage_repo='review-snapshots', publication_route='staged')
     snapshot = (_source.Entry('README.md', 0o100644, 'blob', b'public\n'),)
 
     _init._project_review(reviewed, snapshot, _global_config)
@@ -2088,7 +2138,6 @@ def test_init_route_flag_preserves_prepared_candidate_and_other_settings(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     monkeypatch.chdir(source)
     assert _cli.main(['prepare', '--project', 'demo', '--acknowledge-new-paths', '--yes']) == 0
     candidate = _records.load_candidate(paths, 'demo')
@@ -2150,8 +2199,7 @@ def test_init_route_flag_refuses_incomplete_saved_project_without_rewriting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
-    paths, _, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
+    paths, _, _project = configure(tmp_path, monkeypatch, source)
     project_file = paths.config_dir / 'projects' / 'demo.toml'
     incomplete = '\n'.join(
         line
@@ -2173,7 +2221,6 @@ def test_init_same_source_uses_idempotent_registry_update(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     _config.save_project(
         paths,
         replace(
@@ -2305,13 +2352,12 @@ def test_init_saves_each_release_page_answer(
 )
 def test_init_edit_release_pages_starts_from_the_saved_answer(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
-    answers: _Script,
+    answers: Script,
     case: tuple[_config.ReleasePageSettings, str, str, _config.ReleasePageSettings],
 ) -> None:
     saved, default, key, expected = case
-    ctx, snapshot, project = _edit_checks(tmp_path, make_repo, monkeypatch, {}, release_page=saved)
+    ctx, snapshot, project = _edit_checks(tmp_path, monkeypatch, {}, release_page=saved)
     prompt = (
         f'Create a release page for each published version? [y]es / [d]raft / [n]o [{default}]: '
     )
@@ -2328,7 +2374,7 @@ def test_init_self_publication_flag_enables_existing_project(
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
@@ -2371,7 +2417,7 @@ def test_init_self_publication_flag_sets_project_field(
     tmp_path: Path,
     make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
-    answers: _Script,
+    answers: Script,
 ) -> None:
     source = make_repo(name='pubanon', files={'README.md': 'public\n'})
     paths, _, _ = configure(tmp_path, monkeypatch)
@@ -2581,7 +2627,6 @@ def test_init_source_tags_flags_update_existing_project(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     monkeypatch.chdir(source)
 
     def _unexpected(prompt: str) -> str:
@@ -2647,7 +2692,6 @@ def test_project_from_draft_keeps_or_replaces_the_saved_sections_answer(
     source = tmp_path / 'source'
     source.mkdir()
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     saved = _config.ReleasePageSettings(
         enabled=True, changelog_section=False, changelog_heading='## Version {version}'
     )
@@ -2674,7 +2718,6 @@ def test_project_from_draft_omits_reserved_case_variants_from_proposed_groups(
     source = tmp_path / 'source'
     source.mkdir()
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     snapshot = tuple(
         _source.Entry(path, 0o100644, 'blob', b'fixture')
         for path in ('.PubAnon.toml', 'nested/.PUBANON.TOML', 'README.md')
@@ -2694,19 +2737,18 @@ def test_project_from_draft_omits_reserved_case_variants_from_proposed_groups(
 )
 def test_project_review_counts_a_connected_workflow_as_configured_ci(
     tmp_path: Path,
-    make_repo: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     case: tuple[tuple[str, ...], str | None, bool],
 ) -> None:
     checks, workflow, warned = case
-    source = make_repo(files={'README.md': 'public\n'})
+    source = tmp_path / 'source'
+    source.mkdir()
     _paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     project = replace(
         project, publication_route='staged', required_checks=checks, ci_workflow=workflow
     )
-    snapshot = _source.read_snapshot(source, _source.pin(source, 'HEAD').commit)
+    snapshot = _literal_snapshot({'README.md': 'public\n'})
 
     _init._project_review(project, snapshot, global_config)
 
@@ -2727,7 +2769,7 @@ def test_release_pages_prompt_explains_when_pages_are_created(
     route: str,
     ci_configured: bool,
     timing: str,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     answers([(_PAGES, 'd')])
@@ -3192,7 +3234,6 @@ def test_relocation_invalidates_candidate_and_discard_prepare_recovers(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     _config.save_project(
         paths,
         replace(

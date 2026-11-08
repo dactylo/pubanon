@@ -4,7 +4,7 @@ import shlex
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import Literal
@@ -23,6 +23,7 @@ if os.name != 'nt':
 from pubanon import _terminal
 from pubanon._errors import OperationCanceled, PubanonError
 from pubanon._remote._host import CheckState, CheckVerdict
+from tests._setup import Script
 
 _ASK_DIRECTLY = (
     'from pubanon._terminal import ask\nprint("RESULT", repr(ask("Description")), flush=True)\n'
@@ -35,26 +36,25 @@ _ASK_THROUGH_MAIN = (
     '_cli._dispatch = _command\n'
     'raise SystemExit(_cli.main(["setup"]))\n'
 )
-_Script = Callable[[Sequence[tuple[str, str]]], None]
 
 
-def test_ask_accepts_one_pass_choices(answers: _Script) -> None:
+def test_ask_accepts_one_pass_choices(answers: Script) -> None:
     answers([('Continue? [y]es / [n]o: ', 'y')])
 
     assert _terminal.ask('Continue?', choices=(choice for choice in ('yes', 'no'))) == 'yes'
 
 
-def test_ask_blank_takes_default(answers: _Script) -> None:
+def test_ask_blank_takes_default(answers: Script) -> None:
     answers([('GitHub owner [acct]: ', '')])
     assert _terminal.ask('GitHub owner', default='acct') == 'acct'
 
 
-def test_ask_choices_add_colon_to_plain_question(answers: _Script) -> None:
+def test_ask_choices_add_colon_to_plain_question(answers: Script) -> None:
     answers([('Terms: [a]dd / [r]eplace / re[m]ove / [d]one: ', 'm')])
     assert _terminal.ask('Terms', choices=['add', 'replace', 're[m]ove', 'done']) == 'remove'
 
 
-def test_ask_choices_blank_takes_default(answers: _Script) -> None:
+def test_ask_choices_blank_takes_default(answers: Script) -> None:
     answers([('Description: [k]eep / [r]eplace / [c]lear [keep]: ', '')])
     assert (
         _terminal.ask('Description', choices=['keep', 'replace', 'clear'], default='keep')
@@ -62,13 +62,13 @@ def test_ask_choices_blank_takes_default(answers: _Script) -> None:
     )
 
 
-def test_ask_choices_honor_marked_letter_and_default(answers: _Script) -> None:
+def test_ask_choices_honor_marked_letter_and_default(answers: Script) -> None:
     answers([('Terms: [a]dd / re[m]ove / [d]one [done]: ', 'm')])
     assert _terminal.ask('Terms:', choices=['add', 're[m]ove', 'done'], default='done') == 'remove'
 
 
 def test_ask_choices_reask_on_invalid_answer(
-    answers: _Script, capsys: pytest.CaptureFixture[str]
+    answers: Script, capsys: pytest.CaptureFixture[str]
 ) -> None:
     prompt = 'Save? [s]ave / [e]dit / [c]ancel: '
     answers([(prompt, 'x'), (prompt, ''), (prompt, 'c')])
@@ -76,30 +76,22 @@ def test_ask_choices_reask_on_invalid_answer(
     assert capsys.readouterr().out == 'Choose save, edit, or cancel.\n' * 2
 
 
-def test_ask_empty_default_allows_blank(answers: _Script) -> None:
+def test_ask_empty_default_allows_blank(answers: Script) -> None:
     answers([('Repository description: ', '')])
     assert _terminal.ask('Repository description', default='') == ''
 
 
-def test_ask_escapes_displayed_default(answers: _Script) -> None:
+def test_ask_escapes_displayed_default(answers: Script) -> None:
     answers([('Name [a\\x1b[31mb\\\\c]: ', '')])
     assert _terminal.ask('Name', default='a\x1b[31mb\\c') == 'a\x1b[31mb\\c'
 
 
 def test_ask_reasks_beyond_three_blank_answers(
-    answers: _Script, capsys: pytest.CaptureFixture[str]
+    answers: Script, capsys: pytest.CaptureFixture[str]
 ) -> None:
     answers([('project: ', '')] * 4 + [('project: ', 'demo')])
     assert _terminal.ask('project') == 'demo'
     assert capsys.readouterr().out == 'A value is required.\n' * 4
-
-
-def test_ask_reasks_on_blank_without_default(
-    answers: _Script, capsys: pytest.CaptureFixture[str]
-) -> None:
-    answers([('Publication name: ', ''), ('Publication name: ', 'Alias')])
-    assert _terminal.ask('Publication name') == 'Alias'
-    assert capsys.readouterr().out == 'A value is required.\n'
 
 
 def test_ask_rejects_ambiguous_abbreviations() -> None:
@@ -107,13 +99,13 @@ def test_ask_rejects_ambiguous_abbreviations() -> None:
         _terminal.ask('Action', choices=['replace', 'remove'])
 
 
-def test_ask_returns_free_text_with_whitespace_intact(answers: _Script) -> None:
+def test_ask_returns_free_text_with_whitespace_intact(answers: Script) -> None:
     answers([('Publication name: ', ' Some Alias ')])
     assert _terminal.ask('Publication name') == ' Some Alias '
 
 
 def test_ask_two_choices_render_retry_hint(
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     prompt = 'Whitespace: [k]eep / [r]e-enter: '
@@ -150,13 +142,13 @@ def test_color_context_restores_nested_mode_after_failure(
     assert _terminal.style('Label') == 'Label'
 
 
-def test_confirm_accepts_uppercase_key(answers: _Script) -> None:
+def test_confirm_accepts_uppercase_key(answers: Script) -> None:
     answers([('Publish? [y/n] ', 'Y')])
     assert _terminal.confirm('Publish?') is True
 
 
 def test_confirm_reasks_on_blank_without_default(
-    answers: _Script, capsys: pytest.CaptureFixture[str]
+    answers: Script, capsys: pytest.CaptureFixture[str]
 ) -> None:
     answers(
         [
@@ -171,7 +163,7 @@ def test_confirm_reasks_on_blank_without_default(
 
 
 def test_confirmation_resets_color_before_answer(
-    monkeypatch: pytest.MonkeyPatch, answers: _Script
+    monkeypatch: pytest.MonkeyPatch, answers: Script
 ) -> None:
     monkeypatch.delenv('NO_COLOR', raising=False)
     monkeypatch.setattr(sys.stdout, 'isatty', lambda: True)
@@ -227,10 +219,6 @@ def test_escape_lines_splits_only_at_line_feeds() -> None:
         '',
         'vertical\\x0btab\\u2028separator\\x0dreturn\\x1c',
     ]
-
-
-def test_escape_renders_controls_and_backslashes_visibly() -> None:
-    assert _terminal.escape('a\x1b[31mb\\c') == 'a\\x1b[31mb\\\\c'
 
 
 def test_field_styles_label_and_optional_value(
@@ -475,7 +463,7 @@ def test_diagnostic_layout(error: PubanonError, expected: str) -> None:
 
 
 @pytest.mark.parametrize(('reply', 'expected'), [('s', 'save'), ('E', 'edit')])
-def test_ask_choices_accept_single_keys(answers: _Script, reply: str, expected: str) -> None:
+def test_ask_choices_accept_single_keys(answers: Script, reply: str, expected: str) -> None:
     answers([('Save? [s]ave / [e]dit / [c]ancel: ', reply)])
     assert _terminal.ask('Save?', choices=['save', 'edit', 'cancel']) == expected
 
@@ -516,7 +504,7 @@ def test_color_context_controls_terminal_style(
     ],
 )
 def test_confirm_renders_default_and_accepts_answers(
-    answers: _Script, default: bool | None, prompt: str, reply: str, expected: bool
+    answers: Script, default: bool | None, prompt: str, reply: str, expected: bool
 ) -> None:
     answers([(prompt, reply)])
     assert _terminal.confirm('Publish?', default=default) is expected
@@ -603,7 +591,7 @@ def test_free_text_edits_across_wrapped_lines(script: str, keys: bytes, expected
 @pytest.mark.skipif(os.name == 'nt', reason='readline prompt markers are POSIX-only')
 def test_free_text_prompt_marks_color_as_zero_width(
     monkeypatch: pytest.MonkeyPatch,
-    answers: _Script,
+    answers: Script,
 ) -> None:
     monkeypatch.delenv('NO_COLOR', raising=False)
     monkeypatch.setattr(sys.stdout, 'isatty', lambda: True)
@@ -914,7 +902,7 @@ def test_shell_command_selects_exact_project(name: str) -> None:
 
 
 def test_terminal_prompt_styles_question_and_choices(
-    monkeypatch: pytest.MonkeyPatch, answers: _Script
+    monkeypatch: pytest.MonkeyPatch, answers: Script
 ) -> None:
     monkeypatch.delenv('NO_COLOR', raising=False)
     monkeypatch.setattr(sys.stdout, 'isatty', lambda: True)

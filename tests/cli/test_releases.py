@@ -35,7 +35,7 @@ def _refresh_change(previous: _host.GitHubRelease, notes: bytes) -> policy.Relea
         previous.title,
         notes,
         previous,
-        origin=policy.NotesOrigin('section', 'CHANGELOG.md', '1.2.3'),
+        origin=policy._NotesOrigin('section', 'CHANGELOG.md', '1.2.3'),
     )
 
 
@@ -146,7 +146,7 @@ def test_create_keeps_checked_bytes_and_lock_through_confirmation(
         *,
         title: str,
         notes: bytes,
-        mode: _host.ReleaseCreationMode = 'latest',
+        mode: _host._ReleaseCreationMode = 'latest',
     ) -> None:
         assert mode == 'latest'
         seen.append(notes)
@@ -210,7 +210,7 @@ def test_create_preview_names_the_notes_source_and_shows_hints(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _paths, _global, project = configured_project
-    origin = policy.NotesOrigin(
+    origin = policy._NotesOrigin(
         'link',
         'CHANGELOG.md',
         '1.2.3',
@@ -230,8 +230,8 @@ def test_create_preview_names_the_notes_source_and_shows_hints(
             origin=origin,
         )
 
-    def _apply(*_args: object) -> policy.ReleaseResult:
-        return policy.ReleaseResult(_page(notes='See the [changelog](url).\n'), written=True)
+    def _apply(*_args: object) -> policy._ReleaseResult:
+        return policy._ReleaseResult(_page(notes='See the [changelog](url).\n'), written=True)
 
     monkeypatch.setattr(policy, 'prepare_change', _prepare)
     monkeypatch.setattr(policy, 'apply_change', _apply)
@@ -285,7 +285,7 @@ def test_create_reports_matching_page_without_claiming_write(
             _page(),
         )
 
-    def _apply(*_args: object) -> policy.ReleaseResult:
+    def _apply(*_args: object) -> policy._ReleaseResult:
         pytest.fail('matching page was applied')
 
     def _confirm(_question: str) -> bool:
@@ -311,6 +311,120 @@ def test_create_reports_matching_page_without_claiming_write(
     output = capsys.readouterr().out
     assert 'Release page already exists: https://example.invalid/page' in output
     assert 'Release page created:' not in output
+
+
+def test_create_without_options_previews_defaults_and_missing_changelog_hint(
+    configured_project: tuple[_config.Paths, _config.GlobalConfig, _config.ProjectConfig],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _paths, _global, project = configured_project
+    prepared: list[policy.ReleaseRequest] = []
+
+    def _prepare(
+        _paths: _config.Paths,
+        _g: _config.GlobalConfig,
+        _p: _config.ProjectConfig,
+        request: policy.ReleaseRequest,
+    ) -> policy.ReleaseChange:
+        prepared.append(request)
+        return policy.ReleaseChange(
+            'create',
+            _destination(),
+            request.tag,
+            'a' * 40,
+            request.tag,
+            b'',
+            None,
+            origin=policy._NotesOrigin('empty'),
+        )
+
+    def _apply(*_args: object) -> policy._ReleaseResult:
+        return policy._ReleaseResult(_page(notes=''), written=True)
+
+    monkeypatch.setattr(policy, 'prepare_change', _prepare)
+    monkeypatch.setattr(policy, 'apply_change', _apply)
+    assert _cli.main(['release', 'create', 'v1.2.3', '--project', project.name, '--yes']) == 0
+    assert prepared == [policy.ReleaseRequest('create', 'v1.2.3', None, None)]
+    rendered = capsys.readouterr().out
+    assert 'v1.2.3' in rendered
+    assert 'No CHANGELOG.md' in rendered
+    assert 'set release_page.changelog' in rendered
+
+
+def test_edit_can_clear_notes_without_prompt(
+    configured_project: tuple[_config.Paths, _config.GlobalConfig, _config.ProjectConfig],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _paths, _global, project = configured_project
+    notes_file = tmp_path / 'empty.md'
+    notes_file.write_bytes(b'')
+    seen: list[bytes] = []
+
+    def _prepare(
+        _paths: _config.Paths,
+        _g: _config.GlobalConfig,
+        _p: _config.ProjectConfig,
+        request: policy.ReleaseRequest,
+    ) -> policy.ReleaseChange:
+        assert request.notes == b''
+        assert request.notes_file == notes_file.absolute()
+        return policy.ReleaseChange(
+            'edit', _destination(), request.tag, 'a' * 40, 'Title', b'', _page()
+        )
+
+    def _apply(
+        _paths: _config.Paths,
+        _g: _config.GlobalConfig,
+        _p: _config.ProjectConfig,
+        change: policy.ReleaseChange,
+    ) -> policy._ReleaseResult:
+        seen.append(change.notes)
+        return policy._ReleaseResult(_page(notes=''), written=True)
+
+    def _unexpected_confirm(_question: str) -> bool:
+        pytest.fail('--yes prompted')
+
+    monkeypatch.setattr(policy, 'prepare_change', _prepare)
+    monkeypatch.setattr(policy, 'apply_change', _apply)
+    monkeypatch.setattr(_releases, 'confirm', _unexpected_confirm)
+    assert (
+        _cli.main(
+            [
+                'release',
+                'edit',
+                'v1.2.3',
+                '--project',
+                project.name,
+                '--notes-file',
+                str(notes_file),
+                '--yes',
+            ]
+        )
+        == 0
+    )
+    assert seen == [b'']
+
+
+@pytest.mark.parametrize(
+    ('title', 'notes', 'expected'),
+    [
+        ('Title', b'new', "Confirmation updates this page's notes."),
+        ('New title', b'old', "Confirmation updates this page's title."),
+        ('New title', b'new', "Confirmation updates this page's title and notes."),
+    ],
+)
+def test_edit_preview_names_only_the_fields_that_change(
+    title: str, notes: bytes, expected: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    change = policy.ReleaseChange(
+        'edit', _destination(), 'v1.2.3', 'a' * 40, title, notes, _page(notes='old')
+    )
+
+    _releases._preview(change)
+
+    assert capsys.readouterr().out.rstrip('\n').endswith(expected)
 
 
 @pytest.mark.parametrize(
@@ -360,8 +474,8 @@ def test_create_reports_the_observed_page_status(
             draft=drafts,
         )
 
-    def _apply(*_args: object) -> policy.ReleaseResult:
-        return policy.ReleaseResult(page, written=True)
+    def _apply(*_args: object) -> policy._ReleaseResult:
+        return policy._ReleaseResult(page, written=True)
 
     monkeypatch.setattr(policy, 'prepare_change', _prepare)
     monkeypatch.setattr(policy, 'apply_change', _apply)
@@ -372,100 +486,6 @@ def test_create_reports_the_observed_page_status(
     assert ('rerun the workflow or publish the page on GitHub' in out) is guided
 
 
-def test_create_without_options_previews_defaults_and_missing_changelog_hint(
-    configured_project: tuple[_config.Paths, _config.GlobalConfig, _config.ProjectConfig],
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _paths, _global, project = configured_project
-    prepared: list[policy.ReleaseRequest] = []
-
-    def _prepare(
-        _paths: _config.Paths,
-        _g: _config.GlobalConfig,
-        _p: _config.ProjectConfig,
-        request: policy.ReleaseRequest,
-    ) -> policy.ReleaseChange:
-        prepared.append(request)
-        return policy.ReleaseChange(
-            'create',
-            _destination(),
-            request.tag,
-            'a' * 40,
-            request.tag,
-            b'',
-            None,
-            origin=policy.NotesOrigin('empty'),
-        )
-
-    def _apply(*_args: object) -> policy.ReleaseResult:
-        return policy.ReleaseResult(_page(notes=''), written=True)
-
-    monkeypatch.setattr(policy, 'prepare_change', _prepare)
-    monkeypatch.setattr(policy, 'apply_change', _apply)
-    assert _cli.main(['release', 'create', 'v1.2.3', '--project', project.name, '--yes']) == 0
-    assert prepared == [policy.ReleaseRequest('create', 'v1.2.3', None, None)]
-    rendered = capsys.readouterr().out
-    assert 'v1.2.3' in rendered
-    assert 'No CHANGELOG.md' in rendered
-    assert 'set release_page.changelog' in rendered
-
-
-def test_edit_can_clear_notes_without_prompt(
-    configured_project: tuple[_config.Paths, _config.GlobalConfig, _config.ProjectConfig],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _paths, _global, project = configured_project
-    notes_file = tmp_path / 'empty.md'
-    notes_file.write_bytes(b'')
-    seen: list[bytes] = []
-
-    def _prepare(
-        _paths: _config.Paths,
-        _g: _config.GlobalConfig,
-        _p: _config.ProjectConfig,
-        request: policy.ReleaseRequest,
-    ) -> policy.ReleaseChange:
-        assert request.notes == b''
-        assert request.notes_file == notes_file.absolute()
-        return policy.ReleaseChange(
-            'edit', _destination(), request.tag, 'a' * 40, 'Title', b'', _page()
-        )
-
-    def _apply(
-        _paths: _config.Paths,
-        _g: _config.GlobalConfig,
-        _p: _config.ProjectConfig,
-        change: policy.ReleaseChange,
-    ) -> policy.ReleaseResult:
-        seen.append(change.notes)
-        return policy.ReleaseResult(_page(notes=''), written=True)
-
-    def _unexpected_confirm(_question: str) -> bool:
-        pytest.fail('--yes prompted')
-
-    monkeypatch.setattr(policy, 'prepare_change', _prepare)
-    monkeypatch.setattr(policy, 'apply_change', _apply)
-    monkeypatch.setattr(_releases, 'confirm', _unexpected_confirm)
-    assert (
-        _cli.main(
-            [
-                'release',
-                'edit',
-                'v1.2.3',
-                '--project',
-                project.name,
-                '--notes-file',
-                str(notes_file),
-                '--yes',
-            ]
-        )
-        == 0
-    )
-    assert seen == [b'']
-
-
 def test_edit_refresh_notes_changes_nothing_but_explains_link_only_notes(
     configured_project: tuple[_config.Paths, _config.GlobalConfig, _config.ProjectConfig],
     monkeypatch: pytest.MonkeyPatch,
@@ -473,7 +493,7 @@ def test_edit_refresh_notes_changes_nothing_but_explains_link_only_notes(
 ) -> None:
     _paths, _global, project = configured_project
     link = 'See the [changelog](url).\n'
-    origin = policy.NotesOrigin(
+    origin = policy._NotesOrigin(
         'link',
         'CHANGELOG.md',
         '1.2.3',
@@ -484,7 +504,7 @@ def test_edit_refresh_notes_changes_nothing_but_explains_link_only_notes(
     def _prepare(*_args: object) -> policy.ReleaseChange:
         return replace(_refresh_change(_page(notes=link), link.encode()), origin=origin)
 
-    def _unexpected_apply(*_args: object) -> policy.ReleaseResult:
+    def _unexpected_apply(*_args: object) -> policy._ReleaseResult:
         pytest.fail('an unchanged page was edited')
 
     monkeypatch.setattr(policy, 'prepare_change', _prepare)
@@ -516,8 +536,8 @@ def test_edit_refresh_notes_shows_current_and_new_notes(
         requests.append(request)
         return _refresh_change(_page(notes='old'), b'- A thing.\n')
 
-    def _apply(*_args: object) -> policy.ReleaseResult:
-        return policy.ReleaseResult(_page(notes='- A thing.\n'), written=True)
+    def _apply(*_args: object) -> policy._ReleaseResult:
+        return policy._ReleaseResult(_page(notes='- A thing.\n'), written=True)
 
     monkeypatch.setattr(policy, 'prepare_change', _prepare)
     monkeypatch.setattr(policy, 'apply_change', _apply)
@@ -554,9 +574,9 @@ def test_edit_refresh_notes_still_changes_a_requested_title(
         _g: _config.GlobalConfig,
         _p: _config.ProjectConfig,
         change: policy.ReleaseChange,
-    ) -> policy.ReleaseResult:
+    ) -> policy._ReleaseResult:
         applied.append(change.title)
-        return policy.ReleaseResult(_page(notes='same\n'), written=True)
+        return policy._ReleaseResult(_page(notes='same\n'), written=True)
 
     monkeypatch.setattr(policy, 'prepare_change', _prepare)
     monkeypatch.setattr(policy, 'apply_change', _apply)
@@ -564,6 +584,30 @@ def test_edit_refresh_notes_still_changes_a_requested_title(
     argv += ['--title', 'New title', '--refresh-notes', '--yes']
     assert _cli.main(argv) == 0
     assert applied == ['New title']
+
+
+def test_edit_that_changes_nothing_never_writes(
+    configured_project: tuple[_config.Paths, _config.GlobalConfig, _config.ProjectConfig],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _paths, _global, project = configured_project
+
+    def _prepare(*_args: object) -> policy.ReleaseChange:
+        return policy.ReleaseChange(
+            'edit', _destination(), 'v1.2.3', 'a' * 40, 'Title', b'old', _page(notes='old')
+        )
+
+    def _unexpected_apply(*_args: object) -> policy._ReleaseResult:
+        pytest.fail('an unchanged page was edited')
+
+    monkeypatch.setattr(policy, 'prepare_change', _prepare)
+    monkeypatch.setattr(policy, 'apply_change', _unexpected_apply)
+    argv = ['release', 'edit', 'v1.2.3', '--project', project.name, '--title', 'Title', '--yes']
+    assert _cli.main(argv) == 0
+    assert capsys.readouterr().out == (
+        'Nothing to change: the release page already has these notes and this title.\n'
+    )
 
 
 def test_empty_list_is_success(
@@ -660,40 +704,3 @@ def test_notes_file_errors_precede_write(
         == 1
     )
     assert 'notes' in capsys.readouterr().err.lower()
-
-
-def test_release_recovery_qualifies_project_outside_its_directory(
-    configured_project: tuple[_config.Paths, _config.GlobalConfig, _config.ProjectConfig],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _paths, _global, project = configured_project
-    monkeypatch.chdir(tmp_path)
-    notes_file = tmp_path / 'notes.md'
-    notes_file.write_text('public notes')
-
-    def _already_exists(
-        _paths: _config.Paths,
-        _g: _config.GlobalConfig,
-        _p: _config.ProjectConfig,
-        _request: policy.ReleaseRequest,
-    ) -> policy.ReleaseChange:
-        raise PubanonError('release page already exists', recovery='pubanon release show v1.2.3')
-
-    monkeypatch.setattr(policy, 'prepare_change', _already_exists)
-    assert (
-        _cli.main(
-            [
-                'release',
-                'create',
-                'v1.2.3',
-                '--project',
-                project.name,
-                '--notes-file',
-                str(notes_file),
-            ]
-        )
-        == 1
-    )
-    assert 'pubanon release show --project=demo v1.2.3' in capsys.readouterr().err

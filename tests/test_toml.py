@@ -2,10 +2,18 @@ import tomllib
 
 import pytest
 
+from pubanon import _toml
 from pubanon._toml import toml_array, toml_multiline_string, toml_string
 
 _SURROGATE_MAX = '\udfff'
 _SURROGATE_MIN = '\ud800'
+
+
+def test_decode_error_position_keeps_only_coordinates() -> None:
+    with pytest.raises(tomllib.TOMLDecodeError) as exc_info:
+        tomllib.loads('secret = "private-canary"\nbroken = ?\n')
+    assert _toml.decode_error_position(exc_info.value) == 'line 2, column 10'
+    assert _toml.decode_error_position(ValueError('no position')) is None
 
 
 def test_toml_array_uses_scalar_safe_encoding_for_every_item() -> None:

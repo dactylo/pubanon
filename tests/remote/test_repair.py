@@ -19,20 +19,18 @@ from pubanon._snapshots import (
     _verification,
 )
 from tests._git import remove_tree
+from tests._setup import make_paths
 from tests.remote.test_publish import (
-    _configs as _publish_configs,
+    configs as _publish_configs,
 )
 from tests.remote.test_publish import (
-    _configure_host,
-    _context,
-    _git_command,
-    _literal_history_commit,
-    _new_host,
-    _remote_ref,
-    _second_source_commit,
-)
-from tests.remote.test_publish import (
-    _paths as _publish_paths,
+    configure_host,
+    context,
+    git_command,
+    literal_history_commit,
+    new_host,
+    remote_ref,
+    second_source_commit,
 )
 
 
@@ -40,11 +38,11 @@ def _published_repair_context(
     fake_gh: Path, make_repo: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
 ) -> tuple[_publish.PublishContext, _host.Destination, Path]:
     source = make_repo(files={'README.md': 'public\n'})
-    host = _new_host(source.parent)
-    _configure_host(host, fake_gh, monkeypatch)
-    ctx = _context(source.parent, source)
+    host = new_host(source.parent)
+    configure_host(host, fake_gh, monkeypatch)
+    ctx = context(source.parent, source)
     _publish.publish(ctx)
-    destination = _host.verify_destination(ctx._paths, ctx._global_config, ctx._project)
+    destination = _host.verify_destination(ctx.paths, ctx.global_config, ctx.project)
     return ctx, destination, host
 
 
@@ -56,23 +54,21 @@ def test_rebuild_store_from_host_allows_following_release(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = make_repo(files={'README.md': 'first\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    first = _context(tmp_path, source)
+    host = new_host(tmp_path)
+    configure_host(host, fake_gh, monkeypatch)
+    first = context(tmp_path, source)
     _publish.publish(first)
-    store = _store.store_path(first._paths, first._project.name)
+    store = _store.store_path(first.paths, first.project.name)
     remove_tree(store)
-    destination = _host.verify_destination(first._paths, first._global_config, first._project)
+    destination = _host.verify_destination(first.paths, first.global_config, first.project)
 
-    _repair.rebuild_store(
-        first._paths, (first._global_config, first._project), destination, yes=True
-    )
+    _repair.rebuild_store(first.paths, (first.global_config, first.project), destination, yes=True)
 
-    assert _remote_ref(store, 'refs/heads/main') == first._record.commit
-    _second_source_commit(source)
-    second = _context(tmp_path, source)
+    assert remote_ref(store, 'refs/heads/main') == first.record.commit
+    second_source_commit(source)
+    second = context(tmp_path, source)
     _publish.publish(second)
-    assert _remote_ref(host, 'refs/heads/main') == second._record.commit
+    assert remote_ref(host, 'refs/heads/main') == second.record.commit
 
 
 @pytest.mark.slow
@@ -83,12 +79,12 @@ def test_rebuild_store_preserves_existing_history_when_fetch_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = make_repo(files={'README.md': 'first\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    ctx = _context(tmp_path, source)
+    host = new_host(tmp_path)
+    configure_host(host, fake_gh, monkeypatch)
+    ctx = context(tmp_path, source)
     _publish.publish(ctx)
-    store = _store.store_path(ctx._paths, ctx._project.name)
-    destination = _host.verify_destination(ctx._paths, ctx._global_config, ctx._project)
+    store = _store.store_path(ctx.paths, ctx.project.name)
+    destination = _host.verify_destination(ctx.paths, ctx.global_config, ctx.project)
 
     def _fail_fetch(
         _destination: _host.Destination,
@@ -100,12 +96,10 @@ def test_rebuild_store_preserves_existing_history_when_fetch_fails(
     monkeypatch.setattr(_host, 'fetch', _fail_fetch)
 
     with pytest.raises(PubanonError, match='simulated fetch failure'):
-        _repair.rebuild_store(
-            ctx._paths, (ctx._global_config, ctx._project), destination, yes=True
-        )
+        _repair.rebuild_store(ctx.paths, (ctx.global_config, ctx.project), destination, yes=True)
 
-    assert _remote_ref(store, 'refs/heads/main') == ctx._record.commit
-    _git_command(store, 'cat-file', '-e', f'{ctx._record.commit}^{{commit}}')
+    assert remote_ref(store, 'refs/heads/main') == ctx.record.commit
+    git_command(store, 'cat-file', '-e', f'{ctx.record.commit}^{{commit}}')
 
 
 @pytest.mark.slow
@@ -116,35 +110,35 @@ def test_rebuild_store_refreshes_stale_existing_store(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = make_repo(files={'README.md': 'first\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    first = _context(tmp_path, source)
+    host = new_host(tmp_path)
+    configure_host(host, fake_gh, monkeypatch)
+    first = context(tmp_path, source)
     _publish.publish(first)
-    store = _store.store_path(first._paths, first._project.name)
-    _second_source_commit(source)
-    second = _context(tmp_path, source)
-    _git_command(
+    store = _store.store_path(first.paths, first.project.name)
+    second_source_commit(source)
+    second = context(tmp_path, source)
+    git_command(
         store,
         'push',
         str(host),
-        f'{second._record.commit}:refs/heads/main',
-        f'{second._record.commit}:refs/tags/v2.0.0',
+        f'{second.record.commit}:refs/heads/main',
+        f'{second.record.commit}:refs/tags/v2.0.0',
     )
-    _discard.discard(first._paths, first._project.name, force=False)
-    _git_command(store, 'update-ref', 'refs/tags/local-only', first._record.commit)
-    destination = _host.verify_destination(first._paths, first._global_config, first._project)
+    _discard.discard(first.paths, first.project.name, force=False)
+    git_command(store, 'update-ref', 'refs/tags/local-only', first.record.commit)
+    destination = _host.verify_destination(first.paths, first.global_config, first.project)
 
     result = _repair.rebuild_store(
-        first._paths, (first._global_config, first._project), destination, yes=True
+        first.paths, (first.global_config, first.project), destination, yes=True
     )
 
-    assert _remote_ref(store, 'refs/heads/main') == second._record.commit
-    assert _remote_ref(store, 'refs/tags/v2.0.0') == second._record.commit
-    assert _remote_ref(store, 'refs/tags/local-only') is None
+    assert remote_ref(store, 'refs/heads/main') == second.record.commit
+    assert remote_ref(store, 'refs/tags/v2.0.0') == second.record.commit
+    assert remote_ref(store, 'refs/tags/local-only') is None
 
     assert result.refs == _host.RemoteRefs(
-        second._record.commit,
-        {'v2.0.0': second._record.commit},
+        second.record.commit,
+        {'v2.0.0': second.record.commit},
     )
     assert result.audit == _audit.HistoryAudit((), (), ())
 
@@ -157,37 +151,37 @@ def test_rebuild_store_restores_current_findings_without_acknowledgment_or_ances
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    ctx = _context(tmp_path, source)
+    host = new_host(tmp_path)
+    configure_host(host, fake_gh, monkeypatch)
+    ctx = context(tmp_path, source)
     _publish.publish(ctx)
-    store = _store.store_path(ctx._paths, ctx._project.name)
-    tree = _git_command(host, 'rev-parse', 'main^{tree}').decode().strip()
-    restored = _literal_history_commit(host, tree, message=b'Private Person\n')
-    _git_command(host, 'update-ref', 'refs/heads/main', restored)
-    _git_command(store, 'symbolic-ref', 'refs/pubanon/repair/stale', 'refs/heads/main')
-    _git_command(store, 'update-ref', 'refs/pubanon/unrelated', ctx._record.commit)
-    archive_ref = _records.publication_ref(ctx._record.commit)
-    record_path = _records.publication_path(ctx._paths, ctx._project.name, ctx._record.commit)
+    store = _store.store_path(ctx.paths, ctx.project.name)
+    tree = git_command(host, 'rev-parse', 'main^{tree}').decode().strip()
+    restored = literal_history_commit(host, tree, message=b'Private Person\n')
+    git_command(host, 'update-ref', 'refs/heads/main', restored)
+    git_command(store, 'symbolic-ref', 'refs/pubanon/repair/stale', 'refs/heads/main')
+    git_command(store, 'update-ref', 'refs/pubanon/unrelated', ctx.record.commit)
+    archive_ref = _records.publication_ref(ctx.record.commit)
+    record_path = _records.publication_path(ctx.paths, ctx.project.name, ctx.record.commit)
     original_record = record_path.read_bytes()
-    assert _remote_ref(store, archive_ref) == ctx._record.commit
-    destination = _host.verify_destination(ctx._paths, ctx._global_config, ctx._project)
-    before = ctx._project.acknowledged_exposure
+    assert remote_ref(store, archive_ref) == ctx.record.commit
+    destination = _host.verify_destination(ctx.paths, ctx.global_config, ctx.project)
+    before = ctx.project.acknowledged_exposure
 
     result = _repair.rebuild_store(
-        ctx._paths, (ctx._global_config, ctx._project), destination, yes=True
+        ctx.paths, (ctx.global_config, ctx.project), destination, yes=True
     )
 
     assert result.refs == _host.RemoteRefs(restored, {})
-    assert _remote_ref(store, 'refs/heads/main') == restored
+    assert remote_ref(store, 'refs/heads/main') == restored
     assert any(finding.term == 'Private Person' for finding in result.audit.findings)
     assert not result.audit.identity_problems
-    assert ctx._project.acknowledged_exposure == before == ''
-    assert _git_command(store, 'for-each-ref', 'refs/pubanon/repair/') == b''
-    assert _remote_ref(store, 'refs/pubanon/unrelated') == ctx._record.commit
-    assert _remote_ref(store, archive_ref) == ctx._record.commit
+    assert ctx.project.acknowledged_exposure == before == ''
+    assert git_command(store, 'for-each-ref', 'refs/pubanon/repair/') == b''
+    assert remote_ref(store, 'refs/pubanon/unrelated') == ctx.record.commit
+    assert remote_ref(store, archive_ref) == ctx.record.commit
     assert record_path.read_bytes() == original_record
-    assert _history.select_publication(ctx._paths, ctx._project.name, ctx._record.commit).record
+    assert _history.select_publication(ctx.paths, ctx.project.name, ctx.record.commit).record
 
 
 @pytest.mark.slow
@@ -199,37 +193,37 @@ def test_repair_decline_preserves_newer_local_refs(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     source = make_repo(files={'README.md': 'first\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    first = _context(tmp_path, source, version='1.0.0')
+    host = new_host(tmp_path)
+    configure_host(host, fake_gh, monkeypatch)
+    first = context(tmp_path, source, version='1.0.0')
     _publish.publish(first)
-    _second_source_commit(source)
-    second = _context(tmp_path, source, version='2.0.0')
+    second_source_commit(source)
+    second = context(tmp_path, source, version='2.0.0')
     _publish.publish(second)
-    store = _store.store_path(first._paths, first._project.name)
-    _git_command(host, 'update-ref', 'refs/heads/main', first._record.commit)
-    _git_command(host, 'update-ref', '-d', 'refs/tags/v2.0.0')
-    local_before = _git_command(store, 'for-each-ref')
-    host_before = _git_command(host, 'for-each-ref')
-    destination = _host.verify_destination(first._paths, first._global_config, first._project)
+    store = _store.store_path(first.paths, first.project.name)
+    git_command(host, 'update-ref', 'refs/heads/main', first.record.commit)
+    git_command(host, 'update-ref', '-d', 'refs/tags/v2.0.0')
+    local_before = git_command(store, 'for-each-ref')
+    host_before = git_command(host, 'for-each-ref')
+    destination = _host.verify_destination(first.paths, first.global_config, first.project)
     capsys.readouterr()
     answers = ['n']
 
     def _decline(prompt: str) -> str:
         assert prompt == 'Replace local publication refs with verified GitHub refs? [y/n] '
         output = capsys.readouterr().out
-        assert f'refs/heads/main: {second._record.commit} -> {first._record.commit}' in output
-        assert f'refs/tags/v2.0.0: {second._record.commit} -> absent' in output
+        assert f'refs/heads/main: {second.record.commit} -> {first.record.commit}' in output
+        assert f'refs/tags/v2.0.0: {second.record.commit} -> absent' in output
         return answers.pop(0)
 
     monkeypatch.setattr('builtins.input', _decline)
     with pytest.raises(OperationCanceled, match=r'Canceled\. Nothing was restored.'):
         _repair.rebuild_store(
-            first._paths, (first._global_config, first._project), destination, yes=False
+            first.paths, (first.global_config, first.project), destination, yes=False
         )
     assert not answers
-    assert _git_command(store, 'for-each-ref') == local_before
-    assert _git_command(host, 'for-each-ref') == host_before
+    assert git_command(store, 'for-each-ref') == local_before
+    assert git_command(host, 'for-each-ref') == host_before
 
 
 @pytest.mark.slow
@@ -237,10 +231,10 @@ def test_repair_noop_avoids_consent_and_managed_ref_writes(
     fake_gh: Path, make_repo: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     ctx, destination, host = _published_repair_context(fake_gh, make_repo, monkeypatch)
-    store = _store.store_path(ctx._paths, ctx._project.name)
+    store = _store.store_path(ctx.paths, ctx.project.name)
     local_before, host_before = (
-        _git_command(store, 'for-each-ref'),
-        _git_command(host, 'for-each-ref'),
+        git_command(store, 'for-each-ref'),
+        git_command(host, 'for-each-ref'),
     )
 
     def _refuse_action(*_args: object) -> None:
@@ -249,11 +243,11 @@ def test_repair_noop_avoids_consent_and_managed_ref_writes(
     monkeypatch.setattr('builtins.input', _refuse_action)
     monkeypatch.setattr(_repair, '_install_repair_refs', _refuse_action)
     result = _repair.rebuild_store(
-        ctx._paths, (ctx._global_config, ctx._project), destination, yes=False
+        ctx.paths, (ctx.global_config, ctx.project), destination, yes=False
     )
-    assert result.refs == _host.RemoteRefs(ctx._record.commit, {})
-    assert _git_command(store, 'for-each-ref') == local_before
-    assert _git_command(host, 'for-each-ref') == host_before
+    assert result.refs == _host.RemoteRefs(ctx.record.commit, {})
+    assert git_command(store, 'for-each-ref') == local_before
+    assert git_command(host, 'for-each-ref') == host_before
 
 
 @pytest.mark.slow
@@ -266,17 +260,17 @@ def test_rebuild_store_atomic_failure_preserves_managed_refs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    ctx = _context(tmp_path, source, version='1.0.0')
+    host = new_host(tmp_path)
+    configure_host(host, fake_gh, monkeypatch)
+    ctx = context(tmp_path, source, version='1.0.0')
     _publish.publish(ctx)
-    store = _store.store_path(ctx._paths, ctx._project.name)
-    tree = _git_command(host, 'rev-parse', 'main^{tree}').decode().strip()
-    advanced = _literal_history_commit(host, tree, message=b'advance\n', parent=ctx._record.commit)
-    _git_command(host, 'update-ref', 'refs/heads/main', advanced)
-    _git_command(host, 'update-ref', 'refs/tags/v2.0.0', advanced)
-    _git_command(store, 'update-ref', 'refs/tags/obsolete', ctx._record.commit)
-    destination = _host.verify_destination(ctx._paths, ctx._global_config, ctx._project)
+    store = _store.store_path(ctx.paths, ctx.project.name)
+    tree = git_command(host, 'rev-parse', 'main^{tree}').decode().strip()
+    advanced = literal_history_commit(host, tree, message=b'advance\n', parent=ctx.record.commit)
+    git_command(host, 'update-ref', 'refs/heads/main', advanced)
+    git_command(host, 'update-ref', 'refs/tags/v2.0.0', advanced)
+    git_command(store, 'update-ref', 'refs/tags/obsolete', ctx.record.commit)
+    destination = _host.verify_destination(ctx.paths, ctx.global_config, ctx.project)
     real_install = _repair._install_repair_refs
     expected = b''
 
@@ -285,20 +279,18 @@ def test_rebuild_store_atomic_failure_preserves_managed_refs(
         if failure == 'locked-tag':
             (store / 'refs/tags/v2.0.0.lock').write_text('locked')
         else:
-            _git_command(store, 'update-ref', 'refs/heads/main', advanced)
-        expected = _git_command(store, 'for-each-ref', 'refs/heads/', 'refs/tags/')
+            git_command(store, 'update-ref', 'refs/heads/main', advanced)
+        expected = git_command(store, 'for-each-ref', 'refs/heads/', 'refs/tags/')
         real_install(repo, before, fetched)
 
     monkeypatch.setattr(_repair, '_install_repair_refs', _install)
     with pytest.raises(PubanonError):
-        _repair.rebuild_store(
-            ctx._paths, (ctx._global_config, ctx._project), destination, yes=True
-        )
+        _repair.rebuild_store(ctx.paths, (ctx.global_config, ctx.project), destination, yes=True)
 
-    assert _git_command(store, 'for-each-ref', 'refs/heads/', 'refs/tags/') == expected
-    assert _remote_ref(store, 'refs/tags/obsolete') == ctx._record.commit
-    assert _remote_ref(store, 'refs/tags/v2.0.0') is None
-    assert _git_command(store, 'for-each-ref', 'refs/pubanon/repair/') == b''
+    assert git_command(store, 'for-each-ref', 'refs/heads/', 'refs/tags/') == expected
+    assert remote_ref(store, 'refs/tags/obsolete') == ctx.record.commit
+    assert remote_ref(store, 'refs/tags/v2.0.0') is None
+    assert git_command(store, 'for-each-ref', 'refs/pubanon/repair/') == b''
 
 
 @pytest.mark.parametrize('state', [_candidate.STATE_RETAINED, _candidate.STATE_UNKNOWN_OUTCOME])
@@ -306,7 +298,7 @@ def test_rebuild_store_candidate_guard_precedes_missing_store_creation(
     state: str,
     tmp_path: Path,
 ) -> None:
-    paths = _publish_paths(tmp_path)
+    paths = make_paths(tmp_path)
     global_config, project = _publish_configs(tmp_path / 'source')
     record = _records.CandidateRecord(
         commit='a' * 40,
@@ -358,17 +350,17 @@ def test_rebuild_store_host_races_report_actual_local_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    ctx = _context(tmp_path, source, version='1.0.0')
+    host = new_host(tmp_path)
+    configure_host(host, fake_gh, monkeypatch)
+    ctx = context(tmp_path, source, version='1.0.0')
     _publish.publish(ctx)
-    store = _store.store_path(ctx._paths, ctx._project.name)
-    before = _git_command(store, 'for-each-ref', 'refs/heads/', 'refs/tags/')
-    tree = _git_command(host, 'rev-parse', 'main^{tree}').decode().strip()
-    advanced = _literal_history_commit(host, tree, message=b'advance\n', parent=ctx._record.commit)
-    _git_command(host, 'update-ref', 'refs/heads/main', advanced)
-    _git_command(host, 'update-ref', 'refs/tags/v2.0.0', advanced)
-    destination = _host.verify_destination(ctx._paths, ctx._global_config, ctx._project)
+    store = _store.store_path(ctx.paths, ctx.project.name)
+    before = git_command(store, 'for-each-ref', 'refs/heads/', 'refs/tags/')
+    tree = git_command(host, 'rev-parse', 'main^{tree}').decode().strip()
+    advanced = literal_history_commit(host, tree, message=b'advance\n', parent=ctx.record.commit)
+    git_command(host, 'update-ref', 'refs/heads/main', advanced)
+    git_command(host, 'update-ref', 'refs/tags/v2.0.0', advanced)
+    destination = _host.verify_destination(ctx.paths, ctx.global_config, ctx.project)
     real_ls_remote = _host.ls_remote
     calls = 0
 
@@ -379,24 +371,22 @@ def test_rebuild_store_host_races_report_actual_local_state(
             if boundary == 'post-read':
                 raise PubanonError('simulated read failure')
             ref = 'refs/heads/extra' if boundary.endswith('branch') else 'refs/heads/main'
-            _git_command(host, 'update-ref', ref, ctx._record.commit)
+            git_command(host, 'update-ref', ref, ctx.record.commit)
         return real_ls_remote(dest, paths, project)
 
     monkeypatch.setattr(_host, 'ls_remote', _observe)
     with pytest.raises(PubanonError) as error:
-        _repair.rebuild_store(
-            ctx._paths, (ctx._global_config, ctx._project), destination, yes=True
-        )
+        _repair.rebuild_store(ctx.paths, (ctx.global_config, ctx.project), destination, yes=True)
 
     if boundary.startswith('pre'):
         assert 'managed refs were not replaced' in error.value.render()
-        assert _git_command(store, 'for-each-ref', 'refs/heads/', 'refs/tags/') == before
+        assert git_command(store, 'for-each-ref', 'refs/heads/', 'refs/tags/') == before
     else:
         assert 'local refs may have changed' in error.value.render()
         assert 'pubanon repo restore --to local' in error.value.render()
-        assert _remote_ref(store, 'refs/heads/main') == advanced
-        assert _remote_ref(store, 'refs/tags/v2.0.0') == advanced
-    assert _git_command(store, 'for-each-ref', 'refs/pubanon/repair/') == b''
+        assert remote_ref(store, 'refs/heads/main') == advanced
+        assert remote_ref(store, 'refs/tags/v2.0.0') == advanced
+    assert git_command(store, 'for-each-ref', 'refs/pubanon/repair/') == b''
 
 
 @pytest.mark.parametrize(
@@ -418,33 +408,31 @@ def test_rebuild_store_refuses_retained_candidate_without_losing_objects(
 ) -> None:
     state, recovery = case
     source = make_repo(files={'README.md': 'first\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    ctx = _context(tmp_path, source)
-    record = replace(ctx._record, state=state)
-    _candidate.save_candidate(ctx._paths, ctx._project.name, record)
-    destination = _host.verify_destination(ctx._paths, ctx._global_config, ctx._project)
-    store = _store.store_path(ctx._paths, ctx._project.name)
+    host = new_host(tmp_path)
+    configure_host(host, fake_gh, monkeypatch)
+    ctx = context(tmp_path, source)
+    record = replace(ctx.record, state=state)
+    _candidate.save_candidate(ctx.paths, ctx.project.name, record)
+    destination = _host.verify_destination(ctx.paths, ctx.global_config, ctx.project)
+    store = _store.store_path(ctx.paths, ctx.project.name)
     inspection = _verification.materialize_inspect(
-        ctx._paths,
-        ctx._project.name,
-        _verification.prove_objects(ctx._paths, ctx._project.name, record),
+        ctx.paths,
+        ctx.project.name,
+        _verification.prove_objects(ctx.paths, ctx.project.name, record),
     )
     inspected = (inspection / 'README.md').read_bytes()
 
     with pytest.raises(PubanonError, match='snapshot') as error:
-        _repair.rebuild_store(
-            ctx._paths, (ctx._global_config, ctx._project), destination, yes=True
-        )
+        _repair.rebuild_store(ctx.paths, (ctx.global_config, ctx.project), destination, yes=True)
 
     assert error.value.recovery == recovery
     if state == _candidate.STATE_RETAINED:
         rendered = error.value.render()
         assert 'pubanon prepare' in rendered
         assert 'rebuilds the discarded snapshot' in rendered
-    assert _records.load_candidate(ctx._paths, ctx._project.name) == record
-    assert _remote_ref(store, _candidate.CANDIDATE_REF) == record.commit
-    _git_command(store, 'cat-file', '-e', f'{record.commit}^{{commit}}')
+    assert _records.load_candidate(ctx.paths, ctx.project.name) == record
+    assert remote_ref(store, _candidate.CANDIDATE_REF) == record.commit
+    git_command(store, 'cat-file', '-e', f'{record.commit}^{{commit}}')
     assert (inspection / 'README.md').read_bytes() == inspected
 
 
@@ -458,29 +446,29 @@ def test_rebuild_store_rejects_structural_import_preserving_managed_refs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
-    host = _new_host(tmp_path)
-    _configure_host(host, fake_gh, monkeypatch)
-    ctx = _context(tmp_path, source, version='1.0.0')
+    host = new_host(tmp_path)
+    configure_host(host, fake_gh, monkeypatch)
+    ctx = context(tmp_path, source, version='1.0.0')
     _publish.publish(ctx)
-    store = _store.store_path(ctx._paths, ctx._project.name)
-    before = _git_command(store, 'for-each-ref', 'refs/heads/', 'refs/tags/')
-    tree = _git_command(host, 'rev-parse', 'main^{tree}').decode().strip()
-    foreign = _literal_history_commit(
+    store = _store.store_path(ctx.paths, ctx.project.name)
+    before = git_command(store, 'for-each-ref', 'refs/heads/', 'refs/tags/')
+    tree = git_command(host, 'rev-parse', 'main^{tree}').decode().strip()
+    foreign = literal_history_commit(
         host,
         tree,
         author_name='Private Person' if invalid == 'identity' else 'Anonymous Publisher',
         message=b'public import\n',
     )
     if invalid in {'merge', 'signed'}:
-        raw = _git_command(host, 'cat-file', 'commit', foreign)
+        raw = git_command(host, 'cat-file', 'commit', foreign)
         extra = (
-            f'parent {ctx._record.commit}\nparent {foreign}\n'.encode()
+            f'parent {ctx.record.commit}\nparent {foreign}\n'.encode()
             if invalid == 'merge'
             else b'gpgsig signature\n'
         )
         header, rest = raw.split(b'\n', 1)
         foreign = (
-            _git_command(
+            git_command(
                 host,
                 'hash-object',
                 '-t',
@@ -496,22 +484,20 @@ def test_rebuild_store_rejects_structural_import_preserving_managed_refs(
             .decode()
             .strip()
         )
-    _git_command(
+    git_command(
         host,
         'update-ref',
         'refs/heads/main',
-        ctx._record.commit if invalid == 'outside-tag' else foreign,
+        ctx.record.commit if invalid == 'outside-tag' else foreign,
     )
-    _git_command(host, 'update-ref', 'refs/tags/new-tag', foreign)
-    destination = _host.verify_destination(ctx._paths, ctx._global_config, ctx._project)
+    git_command(host, 'update-ref', 'refs/tags/new-tag', foreign)
+    destination = _host.verify_destination(ctx.paths, ctx.global_config, ctx.project)
 
     with pytest.raises(PubanonError, match='structur'):
-        _repair.rebuild_store(
-            ctx._paths, (ctx._global_config, ctx._project), destination, yes=True
-        )
+        _repair.rebuild_store(ctx.paths, (ctx.global_config, ctx.project), destination, yes=True)
 
-    assert _git_command(store, 'for-each-ref', 'refs/heads/', 'refs/tags/') == before
-    assert _git_command(store, 'for-each-ref', 'refs/pubanon/repair/') == b''
+    assert git_command(store, 'for-each-ref', 'refs/heads/', 'refs/tags/') == before
+    assert git_command(store, 'for-each-ref', 'refs/pubanon/repair/') == b''
 
 
 @pytest.mark.slow
@@ -520,11 +506,11 @@ def test_repair_consent_preserves_ref_leases_and_cancellation(
     fake_gh: Path, make_repo: Callable[..., Path], monkeypatch: pytest.MonkeyPatch, decision: str
 ) -> None:
     ctx, destination, host = _published_repair_context(fake_gh, make_repo, monkeypatch)
-    store = _store.store_path(ctx._paths, ctx._project.name)
-    _git_command(store, 'update-ref', 'refs/tags/local-only', ctx._record.commit)
+    store = _store.store_path(ctx.paths, ctx.project.name)
+    git_command(store, 'update-ref', 'refs/tags/local-only', ctx.record.commit)
     local_before, host_before = (
-        _git_command(store, 'for-each-ref'),
-        _git_command(host, 'for-each-ref'),
+        git_command(store, 'for-each-ref'),
+        git_command(host, 'for-each-ref'),
     )
     answers = ['y']
     changed_oid = ''
@@ -536,32 +522,30 @@ def test_repair_consent_preserves_ref_leases_and_cancellation(
         if decision == 'cancel':
             raise KeyboardInterrupt
         target = host if decision == 'host-moved' else store
-        tree = _git_command(target, 'rev-parse', 'main^{tree}').decode().strip()
-        changed_oid = _literal_history_commit(
-            target, tree, message=b'moved\n', parent=ctx._record.commit
+        tree = git_command(target, 'rev-parse', 'main^{tree}').decode().strip()
+        changed_oid = literal_history_commit(
+            target, tree, message=b'moved\n', parent=ctx.record.commit
         )
         ref = 'refs/heads/main' if decision == 'host-moved' else 'refs/tags/local-only'
-        _git_command(target, 'update-ref', ref, changed_oid)
+        git_command(target, 'update-ref', ref, changed_oid)
         return response
 
     monkeypatch.setattr('builtins.input', _answer)
     with pytest.raises(PubanonError) as error:
-        _repair.rebuild_store(
-            ctx._paths, (ctx._global_config, ctx._project), destination, yes=False
-        )
+        _repair.rebuild_store(ctx.paths, (ctx.global_config, ctx.project), destination, yes=False)
     assert not answers
     if decision == 'host-moved':
         assert 'host refs changed during consent' in error.value.render()
     elif decision == 'cancel':
         assert isinstance(error.value, OperationCanceled)
     if decision != 'local-moved':
-        assert _git_command(store, 'for-each-ref') == local_before
+        assert git_command(store, 'for-each-ref') == local_before
     else:
-        assert _remote_ref(store, 'refs/tags/local-only') == changed_oid
-        assert _remote_ref(store, 'refs/heads/main') == ctx._record.commit
+        assert remote_ref(store, 'refs/tags/local-only') == changed_oid
+        assert remote_ref(store, 'refs/heads/main') == ctx.record.commit
     if decision != 'host-moved':
-        assert _git_command(host, 'for-each-ref') == host_before
-    assert _git_command(store, 'for-each-ref', 'refs/pubanon/repair/') == b''
+        assert git_command(host, 'for-each-ref') == host_before
+    assert git_command(store, 'for-each-ref', 'refs/pubanon/repair/') == b''
 
 
 @pytest.mark.parametrize(

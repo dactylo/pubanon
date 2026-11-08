@@ -6,7 +6,6 @@ import re
 import subprocess
 import sys
 from collections.abc import Callable, Iterator
-from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 from typing import cast
@@ -26,8 +25,7 @@ from pubanon._cli import _status as cli_status
 from pubanon._cli._arguments import build_parser
 from pubanon._cli._downstream import _ClosableTextOutput
 from pubanon._errors import PubanonError
-from pubanon._remote import _host, _watch
-from pubanon._snapshots import _store
+from pubanon._remote import _watch
 from pubanon._terminal import ask, confirm, next_step
 from tests._git import git_env
 from tests._process import process_transcript, run_closing_after_first_line, run_with_closed_output
@@ -214,6 +212,25 @@ def test_create_help_describes_optional_page_defaults(capsys: pytest.CaptureFixt
     assert 'normally TAG' in normalized_help
 
 
+def test_error_recovery_qualifies_project_outside_its_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / 'source'
+    source.mkdir()
+    _paths, _global, project = configure(tmp_path, monkeypatch, source)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(_run, 'check_floors', lambda: None)
+
+    def _refuse(_args: argparse.Namespace) -> None:
+        raise PubanonError('release page already exists', recovery='pubanon release show v1.2.3')
+
+    monkeypatch.setattr(cli_status, 'command_status', _refuse)
+    assert _cli.main(['status', '--project', project.name]) == 1
+    assert 'pubanon release show --project=demo v1.2.3' in capsys.readouterr().err
+
+
 def test_every_visible_option_and_command_has_lowercase_help() -> None:
     problems = [
         f'{name}: {text!r}'
@@ -316,6 +333,7 @@ def test_parser_construction_error_is_reported(
 
 
 def test_prepare_rewrite_continue_reaches_handler(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_run, 'check_floors', lambda: None)
     seen: list[bool] = []
 
     def _handler(args: argparse.Namespace) -> None:
@@ -345,7 +363,7 @@ def test_project_command_guidance_matches_registered_commands() -> None:
                 pending.extend(group.choices.values())
         elif any('--project' in action.option_strings for action in parser._actions):
             commands.add(parser.prog.removeprefix('pubanon '))
-    assert commands == set(_terminal.PROJECT_COMMANDS)
+    assert commands == set(_terminal._PROJECT_COMMANDS)
     with _terminal.guidance_context(project='chosen'):
         for command in commands:
             assert _terminal.guidance(f'pubanon {command}') == (
@@ -388,10 +406,6 @@ def test_repo_restore_requires_destination(
 def test_repo_reveal_has_no_yes_option(capsys: pytest.CaptureFixture[str]) -> None:
     assert _cli.main(['repo', 'reveal', '--project', 'demo', '--yes']) == 2
     assert 'unrecognized arguments: --yes' in capsys.readouterr().err
-
-
-def test_repo_reveal_help_exits_successfully() -> None:
-    assert _cli.main(['repo', 'reveal', '--help']) == 0
 
 
 def test_root_help_describes_version_as_the_standard_action(
@@ -620,95 +634,6 @@ def test_cli_interrupt_reports_cancellation_without_traceback(
 
 
 @pytest.mark.parametrize(
-    'case',
-    [
-        (['status', '--project', 'demo', '--remote'], 0),
-        (['repo', 'verify', '--project', 'demo'], 1),
-    ],
-)
-def test_cli_ref_diagnostics_preserve_effective_terms(
-    case: tuple[list[str], int],
-    tmp_path: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    argv, expected_status = case
-    term = 'private-ref-name'
-    source = make_repo(files={'README.md': 'public\n'})
-    paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
-    project = replace(project, extra_terms=(term,))
-    _config.save_project(paths, project)
-    commit = (
-        subprocess.run(
-            ['git', '-C', source, 'rev-parse', 'HEAD'],
-            check=True,
-            capture_output=True,
-            env=git_env(),
-        )
-        .stdout.decode()
-        .strip()
-    )
-    store = _store.store_path(paths, project.name)
-    subprocess.run(
-        [
-            'git',
-            '-C',
-            store,
-            'fetch',
-            '-q',
-            str(source),
-            f'{commit}:refs/tags/{term}-local',
-        ],
-        check=True,
-        env=git_env(),
-    )
-    for tag in ('unchanged', f'{term}-changed'):
-        subprocess.run(
-            ['git', '-C', store, 'update-ref', f'refs/tags/{tag}', commit],
-            check=True,
-            env=git_env(),
-        )
-    destination = _host.Destination(
-        adapter='github',
-        owner=project.owner,
-        repo=project.repo,
-        url='https://github.com/anonymous-account/public-repo.git',
-        account=global_config.accounts['github'],
-        visibility=project.visibility,
-    )
-
-    def _verified_destination(
-        _paths: _config.Paths,
-        _global: _config.GlobalConfig,
-        _project: _config.ProjectConfig,
-    ) -> _host.Destination:
-        return destination
-
-    def _remote_refs(
-        _destination: _host.Destination,
-        _paths: _config.Paths,
-        _project: str,
-    ) -> _host.RemoteRefs:
-        return _host.RemoteRefs(
-            None,
-            {'unchanged': commit, f'{term}-remote': commit, f'{term}-changed': '1' * 40},
-        )
-
-    monkeypatch.setattr(_host, 'verify_destination', _verified_destination)
-    monkeypatch.setattr(_host, 'ls_remote', _remote_refs)
-
-    assert _cli.main(argv) == expected_status
-    captured = capsys.readouterr()
-    rendered = captured.out + captured.err
-    assert term in rendered
-    if argv[0] == 'status':
-        diagnostic = next(line for line in captured.out.splitlines() if line.startswith('Tags '))
-        assert diagnostic == (f'Tags that differ: {term}-changed, {term}-local, {term}-remote')
-
-
-@pytest.mark.parametrize(
     ('argv', 'colored'),
     [
         (['--color=never', 'status', '--colo=always', '--help'], True),
@@ -838,6 +763,7 @@ def test_command_help_groups_options_in_workflow_order(
 def test_command_surface_dispatches(
     argv: list[str], handler_module: ModuleType, handler_name: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(_run, 'check_floors', lambda: None)
     seen: list[tuple[object, ...]] = []
 
     def _handler(*args: object, **_kwargs: object) -> None:
@@ -864,7 +790,6 @@ def test_configuration_readers_refuse_while_initialization_holds_project_lock(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     paths, _global_config, project = configured_project
-    assert project is not None
 
     def _unexpected_load(_paths: _config.Paths, _name: str) -> _config.ProjectConfig:
         pytest.fail('configuration reader loaded a project during initialization')
@@ -1001,6 +926,7 @@ def test_consequential_help_describes_behavior(
 def test_global_project_selection_reaches_show_handler(
     argv: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(_run, 'check_floors', lambda: None)
     seen: list[str] = []
 
     def _handler(args: argparse.Namespace) -> None:
@@ -1033,9 +959,11 @@ def test_history_and_inspect_usage_errors_precede_side_effects(
     [
         ['release'],
         ['release', 'create', 'v1.2.3', '--notes-file', 'notes', '--title', ''],
+        ['release', 'create', 'v1.2.3', '--notes-file', 'notes', '--title', '   '],
         ['release', 'edit', 'v1.2.3'],
         ['release', 'edit', 'v1.2.3', '--notes-file', 'notes', '--refresh-notes'],
         ['release', 'edit', 'v1.2.3', '--title', ''],
+        ['release', 'edit', 'v1.2.3', '--title', '   '],
         ['release', 'list', '--limit', '0'],
         ['release', 'list', '--limit', 'invalid'],
         ['release', 'show'],
@@ -1084,6 +1012,7 @@ def test_inspect_published_parser_permits_refresh(selector: str | None) -> None:
 def test_prepare_replacement_selector_reaches_handler(
     selector: str | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(_run, 'check_floors', lambda: None)
     seen: list[tuple[str | None, bool, str]] = []
 
     def _handler(args: argparse.Namespace) -> None:
@@ -1158,84 +1087,6 @@ def test_project_guidance_omits_only_the_project_selected_by_the_working_directo
     )
 
 
-@pytest.mark.parametrize(
-    'argv',
-    [
-        ['status', '--project', 'demo', '--remote'],
-        ['repo', 'verify', '--project', 'demo'],
-    ],
-)
-def test_remote_read_commands_gate_current_coordinates_before_host_access(
-    argv: list[str],
-    tmp_path: Path,
-    configured_project: tuple[_config.Paths, _config.GlobalConfig, _config.ProjectConfig],
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    term = 'private-coordinate'
-    paths, _global_config, project = configured_project
-    assert project is not None
-    _store.store_path(paths, project.name)
-    _config.save_project(
-        paths,
-        replace(project, repo=f'public-{term}', extra_terms=(term,)),
-    )
-
-    assert _cli.main(argv) == 1
-
-    rendered = capsys.readouterr().err
-    assert 'repository name did not pass content checks' in rendered
-    assert term in rendered
-    assert not (tmp_path / 'fake-gh-calls.jsonl').exists()
-
-
-@pytest.mark.parametrize(
-    'argv',
-    [
-        ['status', '--project', 'demo', '--remote'],
-        ['audit', '--project', 'demo', '--remote'],
-        ['repo', 'verify', '--project', 'demo'],
-    ],
-)
-def test_remote_read_only_commands_refuse_missing_store_without_creating_it(
-    argv: list[str],
-    tmp_path: Path,
-    make_repo: Callable[..., Path],
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    source = make_repo(files={'README.md': 'public\n'})
-    paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
-    remote = tmp_path / 'host.git'
-    subprocess.run(['git', 'init', '--bare', '-q', remote], check=True, env=git_env())
-    destination = _host.Destination(
-        adapter='github',
-        owner=project.owner,
-        repo=project.repo,
-        url=remote.as_uri(),
-        account=global_config.accounts['github'],
-        visibility=project.visibility,
-    )
-
-    def _verified_destination(
-        _paths: _config.Paths,
-        _global: _config.GlobalConfig,
-        _project: _config.ProjectConfig,
-    ) -> _host.Destination:
-        return destination
-
-    monkeypatch.setattr(_host, 'verify_destination', _verified_destination)
-    store = _store.candidate_store_path(paths, project.name)
-    assert not store.exists()
-
-    assert _cli.main(argv) == 1
-
-    error = capsys.readouterr().err
-    assert 'no saved published history was found' in error
-    assert 'pubanon repo restore --project=demo --to local' in error
-    assert not store.exists()
-
-
 @pytest.mark.parametrize('trailing_command', [[], ['doctor']])
 def test_root_version_uses_distribution_metadata_without_runtime_checks(
     trailing_command: list[str],
@@ -1300,7 +1151,7 @@ def test_runtime_floor_refusal_prevents_repository_handler(
         (['stage', 'repair', '--project', 'demo', '--yes'], 'repair', True),
     ],
 )
-def test_stage_parser_exposes_planned_subcommands(
+def test_stage_parser_exposes_subcommands(
     argv: list[str],
     stage_command: str,
     yes: bool | None,
@@ -1338,6 +1189,116 @@ def test_verbose_option_survives_nested_command_defaults(argv: list[str]) -> Non
     assert build_parser().parse_args(argv).verbose is True
 
 
+def test_watch_defaults_reach_observation_functions(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_repo(files={'README.md': 'public\n'})
+    paths, global_config, project = configure(tmp_path, monkeypatch, source)
+    received: list[tuple[object, ...]] = []
+
+    def _watch_ci(
+        *args: object,
+        staged: bool,
+        version: str | None,
+        timeout: int,
+    ) -> None:
+        actual_paths, actual_global, actual_project = args
+
+        received.append(
+            (
+                actual_paths,
+                actual_global,
+                actual_project,
+                {'staged': staged, 'version': version, 'timeout': timeout},
+            )
+        )
+
+    def _watch_package(
+        *args: object,
+        version: str | None,
+        timeout: int,
+    ) -> None:
+        actual_paths, actual_global, actual_project = args
+
+        received.append(
+            (
+                actual_paths,
+                actual_global,
+                actual_project,
+                {'version': version, 'timeout': timeout},
+            )
+        )
+
+    monkeypatch.setattr(_watch, 'watch_ci', _watch_ci)
+    monkeypatch.setattr(_watch, 'watch_package', _watch_package)
+
+    assert _cli.main(['stage', 'watch', '--project', project.name]) == 0
+    assert _cli.main(['stage', 'watch', '--project', project.name, '--timeout', '45']) == 0
+    assert _cli.main(['repo', 'watch', '--project', project.name]) == 0
+    assert (
+        _cli.main(
+            ['repo', 'watch', '--project', project.name, '--version', '1.2.3', '--timeout', '30']
+        )
+        == 0
+    )
+    assert _cli.main(['package', 'watch', '--project', project.name]) == 0
+    assert (
+        _cli.main(
+            [
+                'package',
+                'watch',
+                '--project',
+                project.name,
+                '--version',
+                '2.0.0',
+                '--timeout',
+                '60',
+            ]
+        )
+        == 0
+    )
+    assert received == [
+        (
+            paths,
+            global_config,
+            project,
+            {'staged': True, 'version': None, 'timeout': _watch.DEFAULT_TIMEOUT},
+        ),
+        (
+            paths,
+            global_config,
+            project,
+            {'staged': True, 'version': None, 'timeout': 45},
+        ),
+        (
+            paths,
+            global_config,
+            project,
+            {'staged': False, 'version': None, 'timeout': _watch.DEFAULT_TIMEOUT},
+        ),
+        (
+            paths,
+            global_config,
+            project,
+            {'staged': False, 'version': '1.2.3', 'timeout': 30},
+        ),
+        (
+            paths,
+            global_config,
+            project,
+            {'version': None, 'timeout': _watch.DEFAULT_TIMEOUT},
+        ),
+        (
+            paths,
+            global_config,
+            project,
+            {'version': '2.0.0', 'timeout': 60},
+        ),
+    ]
+
+
 @pytest.mark.parametrize(
     ('argv', 'expected'),
     [
@@ -1363,7 +1324,7 @@ def test_verbose_option_survives_nested_command_defaults(argv: list[str]) -> Non
         ),
     ],
 )
-def test_watch_parser_exposes_planned_options(
+def test_watch_parser_exposes_options(
     argv: list[str],
     expected: dict[str, object],
 ) -> None:

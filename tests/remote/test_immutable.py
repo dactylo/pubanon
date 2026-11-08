@@ -1,5 +1,4 @@
 import re
-from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
 
@@ -10,7 +9,7 @@ from pubanon._errors import OperationCanceled, PubanonError
 from pubanon._remote import _host, _immutable
 from pubanon._remote._host import Destination, GitHubRelease, ImmutableReleases
 from pubanon._terminal import color_context
-from tests._setup import configure
+from tests._setup import Script, configure
 
 _DESTINATION = Destination(
     'github',
@@ -20,7 +19,6 @@ _DESTINATION = Destination(
     'anonymous-account',
     'public',
 )
-_Script = Callable[[Sequence[str | tuple[str, str]]], None]
 
 
 class _Releases:
@@ -97,7 +95,6 @@ def _page(
 @pytest.fixture
 def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ProjectConfig:
     _paths, _global_config, project = configure(tmp_path, monkeypatch, tmp_path)
-    assert project is not None
     return replace(project, release_page=ReleasePageSettings(enabled=True))
 
 
@@ -140,7 +137,7 @@ def test_offer_asks_nothing_when_no_question_applies(
 def test_offer_converts_remaining_pages_when_the_setting_is_on(
     project: ProjectConfig,
     releases: _Releases,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     releases.setting = ImmutableReleases(enabled=True, enforced_by_owner=False)
@@ -162,7 +159,7 @@ def test_offer_converts_remaining_pages_when_the_setting_is_on(
 def test_offer_converts_using_the_current_title(
     project: ProjectConfig,
     releases: _Releases,
-    answers: _Script,
+    answers: Script,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     releases.pages = {1: _page(1, 'v0.1.0')}
@@ -202,7 +199,7 @@ def test_offer_ctrl_c_at_the_question_changes_nothing(
 
 
 def test_offer_ctrl_c_during_conversion_reports_and_cancels(
-    project: ProjectConfig, releases: _Releases, answers: _Script
+    project: ProjectConfig, releases: _Releases, answers: Script
 ) -> None:
     releases.pages = {1: _page(1, 'v0.1.0'), 2: _page(2, 'v0.2.0')}
     releases.fail['convert 2 v0.2.0'] = [KeyboardInterrupt()]
@@ -223,7 +220,7 @@ def test_offer_ctrl_c_during_conversion_reports_and_cancels(
 def test_offer_ctrl_c_during_outcome_recovery_reports_unknown_and_cancels(
     project: ProjectConfig,
     releases: _Releases,
-    answers: _Script,
+    answers: Script,
     initial_failure: BaseException,
 ) -> None:
     releases.fail['enable'] = [initial_failure]
@@ -245,7 +242,7 @@ def test_offer_ctrl_c_during_outcome_recovery_reports_unknown_and_cancels(
 def test_offer_decline_message_depends_on_the_setting(
     project: ProjectConfig,
     releases: _Releases,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
     enabled: bool,
 ) -> None:
@@ -273,7 +270,7 @@ def test_offer_decline_message_depends_on_the_setting(
 def test_offer_escapes_host_text_in_failure_reports(
     project: ProjectConfig,
     releases: _Releases,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     tag = 'v0.1.0\x1b[31m'
@@ -292,7 +289,7 @@ def test_offer_escapes_host_text_in_failure_reports(
 def test_offer_leaves_pages_without_a_title_mutable_and_names_them(
     project: ProjectConfig,
     releases: _Releases,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     releases.pages = {1: _page(1, 'v0.1.0', title=''), 2: _page(2, 'v0.2.0')}
@@ -341,7 +338,7 @@ def test_offer_refuses_changed_content_after_conversion(
 def test_offer_reports_unknown_outcomes_when_rereading_fails(
     project: ProjectConfig,
     releases: _Releases,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     releases.pages = {1: _page(1, 'v0.1.0')}
@@ -361,7 +358,7 @@ def test_offer_reports_unknown_outcomes_when_rereading_fails(
 def test_offer_reports_what_it_reads_after_a_failure(
     project: ProjectConfig,
     releases: _Releases,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     releases.pages = {1: _page(1, 'v0.1.0'), 2: _page(2, 'v0.2.0')}
@@ -384,7 +381,7 @@ def test_offer_reports_what_it_reads_after_a_failure(
 def test_offer_turns_on_the_setting_and_converts_pages_oldest_first(
     project: ProjectConfig,
     releases: _Releases,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     releases.pages = {
@@ -427,7 +424,7 @@ def test_offer_turns_on_the_setting_and_converts_pages_oldest_first(
 def test_offer_turns_on_the_setting_without_existing_pages(
     project: ProjectConfig,
     releases: _Releases,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     answers([('Turn on immutable releases? [y/n] ', 'y')])
@@ -442,7 +439,7 @@ def test_offer_turns_on_the_setting_without_existing_pages(
 def test_offer_warns_instead_of_failing(
     project: ProjectConfig,
     releases: _Releases,
-    answers: _Script,
+    answers: Script,
     capsys: pytest.CaptureFixture[str],
     failure: str,
 ) -> None:

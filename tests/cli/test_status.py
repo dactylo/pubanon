@@ -40,7 +40,6 @@ def test_every_status_mode_reports_read_only_result_and_next_action_last(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     _store.store_path(paths, project.name)
     destination = _host.Destination(
         adapter='github',
@@ -291,12 +290,36 @@ def test_status_current_visibility_requires_successful_same_destination_check(
         assert 'Configured visibility: public' in captured.out
         assert re.search(r'Current visibility: +public', captured.out)
     else:
-        assert 'Current visibility: public' not in captured.out
+        assert 'Current visibility:' not in captured.out
     if result == 'refused':
         assert 'repository visibility does not match configuration' in captured.err
     elif result == 'mismatch':
         assert 'GitHub differs' in captured.out
         assert captured.out.rstrip().endswith('Next: pubanon repo verify --project=demo')
+
+
+def test_status_gates_current_coordinates_before_host_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    argv = ['status', '--project', 'demo', '--remote']
+    term = 'private-coordinate'
+    source = tmp_path / 'source'
+    source.mkdir()
+    paths, _global_config, project = configure(tmp_path, monkeypatch, source)
+    _store.store_path(paths, project.name)
+    _config.save_project(
+        paths,
+        replace(project, repo=f'public-{term}', extra_terms=(term,)),
+    )
+
+    assert _cli.main(argv) == 1
+
+    rendered = capsys.readouterr().err
+    assert 'repository name did not pass content checks' in rendered
+    assert term in rendered
+    assert not (tmp_path / 'fake-gh-calls.jsonl').exists()
 
 
 def test_status_invalidated_candidate_routes_to_discard_then_prepare(
@@ -334,6 +357,126 @@ def test_status_ordinary_retained_candidate_routes_to_inspection(
     assert 'Prepared: untagged' in output
     assert 'Next: pubanon inspect --project=demo\n' in output
     assert output.rstrip().splitlines()[-1].startswith('Next:')
+
+
+def test_status_ref_diagnostics_preserve_effective_terms(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    argv = ['status', '--project', 'demo', '--remote']
+    term = 'private-ref-name'
+    source = make_repo(files={'README.md': 'public\n'})
+    paths, global_config, project = configure(tmp_path, monkeypatch, source)
+    project = replace(project, extra_terms=(term,))
+    _config.save_project(paths, project)
+    commit = (
+        subprocess.run(
+            ['git', '-C', source, 'rev-parse', 'HEAD'],
+            check=True,
+            capture_output=True,
+            env=git_env(),
+        )
+        .stdout.decode()
+        .strip()
+    )
+    store = _store.store_path(paths, project.name)
+    subprocess.run(
+        [
+            'git',
+            '-C',
+            store,
+            'fetch',
+            '-q',
+            str(source),
+            f'{commit}:refs/tags/{term}-local',
+        ],
+        check=True,
+        env=git_env(),
+    )
+    for tag in ('unchanged', f'{term}-changed'):
+        subprocess.run(
+            ['git', '-C', store, 'update-ref', f'refs/tags/{tag}', commit],
+            check=True,
+            env=git_env(),
+        )
+    destination = _host.Destination(
+        adapter='github',
+        owner=project.owner,
+        repo=project.repo,
+        url='https://github.com/anonymous-account/public-repo.git',
+        account=global_config.accounts['github'],
+        visibility=project.visibility,
+    )
+
+    def _verified_destination(
+        _paths: _config.Paths,
+        _global: _config.GlobalConfig,
+        _project: _config.ProjectConfig,
+    ) -> _host.Destination:
+        return destination
+
+    def _remote_refs(
+        _destination: _host.Destination,
+        _paths: _config.Paths,
+        _project: str,
+    ) -> _host.RemoteRefs:
+        return _host.RemoteRefs(
+            None,
+            {'unchanged': commit, f'{term}-remote': commit, f'{term}-changed': '1' * 40},
+        )
+
+    monkeypatch.setattr(_host, 'verify_destination', _verified_destination)
+    monkeypatch.setattr(_host, 'ls_remote', _remote_refs)
+
+    assert _cli.main(argv) == 0
+    captured = capsys.readouterr()
+    rendered = captured.out + captured.err
+    assert term in rendered
+    diagnostic = next(line for line in captured.out.splitlines() if line.startswith('Tags '))
+    assert diagnostic == (f'Tags that differ: {term}-changed, {term}-local, {term}-remote')
+
+
+def test_status_refuses_missing_store_without_creating_it(
+    tmp_path: Path,
+    make_repo: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    argv = ['status', '--project', 'demo', '--remote']
+    source = make_repo(files={'README.md': 'public\n'})
+    paths, global_config, project = configure(tmp_path, monkeypatch, source)
+    remote = tmp_path / 'host.git'
+    subprocess.run(['git', 'init', '--bare', '-q', remote], check=True, env=git_env())
+    destination = _host.Destination(
+        adapter='github',
+        owner=project.owner,
+        repo=project.repo,
+        url=remote.as_uri(),
+        account=global_config.accounts['github'],
+        visibility=project.visibility,
+    )
+
+    def _verified_destination(
+        _paths: _config.Paths,
+        _global: _config.GlobalConfig,
+        _project: _config.ProjectConfig,
+    ) -> _host.Destination:
+        return destination
+
+    monkeypatch.setattr(_host, 'verify_destination', _verified_destination)
+    store = _store.candidate_store_path(paths, project.name)
+    assert not store.exists()
+
+    assert _cli.main(argv) == 1
+
+    error = capsys.readouterr().err
+    assert 'no saved published history was found' in error
+    assert 'never been published' in error
+    assert 'pubanon prepare' in error
+    assert 'pubanon repo restore --project=demo --to local' in error
+    assert not store.exists()
 
 
 @pytest.mark.parametrize('correction', [False, pytest.param(True, marks=pytest.mark.slow)])
@@ -410,7 +553,6 @@ def test_status_remote_refuses_unexpected_destination_branch_with_recovery(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     _store.store_path(paths, project.name)
     monkeypatch.chdir(source)
     commit = (
@@ -644,7 +786,6 @@ def test_status_summarizes_copies_without_listing_paths(
 ) -> None:
     source = make_repo(files={'README.md': 'public\n'})
     paths, _global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     copy = paths.data_dir / 'projects' / project.name / 'inspections' / ('a' * 40)
     copy.mkdir(parents=True)
 
@@ -673,7 +814,6 @@ def test_status_summarizes_recorded_publication_and_configuration(
     version, change = case
     source = tmp_path / 'source'
     paths, global_config, project = configure(tmp_path, monkeypatch, source)
-    assert project is not None
     commit = 'a' * 40
     record = _records.PublicationRecord(
         commit=commit,

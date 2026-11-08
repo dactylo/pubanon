@@ -1,7 +1,5 @@
 """Load pubanon configuration and coordinate local project state."""
 
-# pyright: reportPrivateUsage=false
-
 import hashlib
 import json
 import os
@@ -13,6 +11,7 @@ import unicodedata
 from collections.abc import Collection, Generator, Iterable, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import IO, NamedTuple, cast
 
@@ -21,13 +20,14 @@ from pubanon._errors import PubanonError
 from pubanon._gate import GateHit, RuleClass, first_match, gate_unit
 from pubanon._policy import RESERVED_DENY, literal_pattern
 from pubanon._terminal import display_path, escape, path_text
-from pubanon._toml import toml_array, toml_multiline_string, toml_string
+from pubanon._toml import decode_error_position, toml_array, toml_multiline_string, toml_string
 
 DEFAULT_HOST = 'github'
 PUBLICATION_ROUTES = frozenset({'direct', 'staged'})
 VISIBILITIES = frozenset({'private', 'public'})
 
 _ADAPTER_KEYS = frozenset({DEFAULT_HOST})
+_BUILTIN_HYGIENE_TERM = 'pubanon'
 _CHANGELOG_HEADING_START = re.compile(r'#{1,6} ')
 _CI_WORKFLOW_PATTERN = re.compile(r'[A-Za-z0-9_-][A-Za-z0-9._-]*\.ya?ml')
 _COMMIT_MESSAGE_KEYS = frozenset({'tagged', 'untagged'})
@@ -151,6 +151,11 @@ class GlobalConfig:
     ignored_files: tuple[str, ...] = ()
     commit_message: CommitMessageSettings | None = None
 
+    @property
+    def identity(self) -> str:
+        """The publication identity in `name <email>` form."""
+        return f'{self.anon_name} <{self.anon_email}>'
+
 
 @dataclass(frozen=True)
 class PackageObservation:
@@ -181,6 +186,40 @@ class Paths(NamedTuple):
     data_dir: Path
     global_config: Path
     registry: Path
+
+    def project_data(self, name: str) -> Path:
+        """Return one project's private data directory."""
+        return self.data_dir / 'projects' / name
+
+    def project_file(self, name: str) -> Path:
+        """Return one project's configuration file."""
+        return self.config_dir / 'projects' / f'{name}.toml'
+
+
+class RuleSource(StrEnum):
+    """Name each configured origin of a content rule, in display order."""
+
+    GLOBAL_SENSITIVE = 'global sensitive_terms'
+    PROJECT_EXTRA = 'project extra_terms'
+    DERIVED = 'derived private path'
+    BUILTIN_HYGIENE = 'built-in hygiene rule'
+    PROJECT_HYGIENE = 'project hygiene_terms'
+
+
+class RuleOrigin(NamedTuple):
+    """Identify one configured origin of a gate hit.
+
+    Attributes:
+        source: Configuration source holding the matching term.
+        entry: One-based entry number, or `None` for the built-in rule.
+    """
+
+    source: RuleSource
+    entry: int | None = None
+
+    def __str__(self) -> str:
+        """Render the origin as `<source> entry <n>`, or the bare source."""
+        return self.source if self.entry is None else f'{self.source} entry {self.entry}'
 
 
 @dataclass(frozen=True)
@@ -232,6 +271,11 @@ class ReleasePageSettings:
     changelog_section: bool | None = None
     changelog_heading: str | None = None
 
+    @property
+    def changelog_path(self) -> str:
+        """The configured changelog path, or `CHANGELOG.md` by default."""
+        return self.changelog or 'CHANGELOG.md'
+
 
 @dataclass(frozen=True)
 class ProjectConfig:
@@ -253,6 +297,8 @@ class ProjectConfig:
         self_publication: Whether to omit the default pubanon hygiene term.
         required_checks: Host checks required when validating staged or
             published commits.
+        stage_repo: Staging repository name override; `None` uses `repo` with
+            `-stage` appended.
         settings: Intended host repository settings. `None` is used only while
             assembling an unsaved initialization draft.
         acknowledged_exposure: Digest of accepted identity-critical history
@@ -282,7 +328,7 @@ class ProjectConfig:
     hygiene_terms: tuple[str, ...]
     self_publication: bool
     required_checks: tuple[str, ...]
-    _stage_repo: str | None = None
+    stage_repo: str | None = None
     settings: Settings | None = None
     acknowledged_exposure: str = ''
     package: PackageObservation | None = None
@@ -736,12 +782,18 @@ def _workflows_from_mapping(
         seen: set[str] = set()
         for stage in stages:
             if stage not in _WORKFLOW_STAGES:
-                raise PubanonError(f'workflow {name} contains unknown stage: {stage}')
+                raise PubanonError(
+                    f'workflow {escape(name)} contains unknown stage: {escape(stage)}',
+                    fact=f'stages, in order: {", ".join(_WORKFLOW_STAGES)}',
+                )
             if stage in seen:
                 raise PubanonError(f'workflow {name} contains duplicate stage: {stage}')
             stage_index = _WORKFLOW_STAGES.index(stage)
             if stage_index < previous_index:
-                raise PubanonError(f'workflow {name} stage is out of order: {stage}')
+                raise PubanonError(
+                    f'workflow {escape(name)} stage is out of order: {escape(stage)}',
+                    fact=f'stages, in order: {", ".join(_WORKFLOW_STAGES)}',
+                )
             previous_index = stage_index
             seen.add(stage)
         workflows[name] = stages
@@ -806,9 +858,11 @@ def _write_registry(paths: Paths, registry: dict[str, str]) -> None:
     try:
         _filesystem.write_private(paths.registry, payload)
     except _filesystem.DurableWriteError as exc:
+        if exc.interrupted_before_replacement:
+            raise KeyboardInterrupt from exc.__cause__
         message = (
             'project registry may have been saved'
-            if exc.replaced or (exc.interrupted and exc.replacement_attempted)
+            if exc.may_have_saved
             else 'cannot update project registry'
         )
         raise PubanonError(
@@ -829,7 +883,7 @@ def assemble_rules(
     Returns:
         Active terms grouped by security class.
     """
-    hygiene = p.hygiene_terms if p.self_publication else ('pubanon', *p.hygiene_terms)
+    hygiene = p.hygiene_terms if p.self_publication else (_BUILTIN_HYGIENE_TERM, *p.hygiene_terms)
     return {
         RuleClass.IDENTITY_CRITICAL: (*g.sensitive_terms, *p.extra_terms, *derived),
         RuleClass.HYGIENE: hygiene,
@@ -855,9 +909,13 @@ def check_publication_state_paths(
 
     Paths outside the configured source root impose no selection restriction.
     Ordinary directories sharing a state-directory name remain publishable.
+
+    Raises:
+        PubanonError: A selected path resolves into private publication state,
+            or the required path boundaries cannot be resolved.
     """
     source = _resolve_path(project.source_path, 'cannot resolve project source')
-    project_state = paths.data_dir / 'projects' / project.name
+    project_state = paths.project_data(project.name)
     for name in ('publications', 'source-worktrees', 'rewrite', 'rewrite.toml'):
         directory = _resolve_path(project_state / name, 'cannot resolve publication state')
         if not _is_within(directory, source, 'cannot inspect publication state'):
@@ -910,14 +968,19 @@ def configuration_error(path: Path, role: str, cause: Exception) -> PubanonError
     """
     category = 'unreadable'
     if isinstance(cause, FileNotFoundError):
-        category = 'missing'
-    elif isinstance(cause, PermissionError):
+        return PubanonError(
+            f'{role} configuration was not found',
+            fact=f'expected at {escape(path_text(path))}',
+            recovery='pubanon setup'
+            if role == 'global'
+            else "run pubanon init in the project's source repository",
+        )
+    if isinstance(cause, PermissionError):
         category = 'permission denied'
     elif isinstance(cause, tomllib.TOMLDecodeError):
         category = 'malformed TOML'
-        # Python 3.13 exposes coordinates only in the standard numeric suffix.
-        if position := re.search(r'\(at line (\d+), column (\d+)\)$', str(cause)):
-            category += f' at line {position[1]}, column {position[2]}'
+        if position := decode_error_position(cause):
+            category += f' at {position}'
     elif isinstance(cause, UnicodeError):
         category = 'invalid UTF-8'
     return PubanonError(
@@ -1047,10 +1110,12 @@ def global_mapping(cfg: GlobalConfig) -> dict[str, object]:
         cfg: Global configuration to represent.
 
     Returns:
-        Mapping accepted by `global_from_mapping`.
+        Mapping in `global_from_mapping`'s input format. Values remain subject
+        to the loader's validation.
 
     Raises:
-        PubanonError: The account mapping cannot be represented.
+        PubanonError: The account mapping cannot be represented or a
+            commit-message template is invalid.
     """
     try:
         accounts = dict(cfg.accounts)
@@ -1180,6 +1245,26 @@ def derived_private_terms(
     )
 
 
+def current_rules(
+    paths: Paths, g: GlobalConfig, p: ProjectConfig
+) -> dict[RuleClass, tuple[str, ...]]:
+    """Assemble the active rules, including private paths derived from this environment.
+
+    Args:
+        paths: Paths derived for this command.
+        g: Global configuration.
+        p: Project configuration.
+
+    Returns:
+        Active terms grouped by security class.
+
+    Raises:
+        PubanonError: A private machine or source path needed for dynamic rules
+            cannot be resolved.
+    """
+    return assemble_rules(g, p, derived_private_terms(paths, p, os.environ))
+
+
 def release_pages_enabled(p: ProjectConfig) -> bool:
     """Report whether tagged publications of a project create release pages.
 
@@ -1233,7 +1318,8 @@ def create_data_dirs(paths: Paths, name: str | None) -> Path:
         require_project_name(name)
     levels = [paths.data_dir]
     if name is not None:
-        levels.extend((paths.data_dir / 'projects', paths.data_dir / 'projects' / name))
+        project = paths.project_data(name)
+        levels.extend((project.parent, project))
     try:
         paths.data_dir.parent.mkdir(parents=True, exist_ok=True)
         for level in levels:
@@ -1261,7 +1347,7 @@ def project_lock(paths: Paths, name: str) -> Generator[None]:
             or operation lock access, acquisition, or release fails.
     """
     create_data_dirs(paths, name)
-    lock_path = paths.data_dir / 'projects' / name / 'project.lock'
+    lock_path = paths.project_data(name) / 'project.lock'
     with _exclusive_lock(lock_path, 'another pubanon command is running for this project'):
         yield
 
@@ -1306,6 +1392,10 @@ def registry_remove(paths: Paths, name: str) -> bool:
 
     Returns:
         Whether any entry was removed.
+
+    Raises:
+        PubanonError: Registry setup, exclusive locking, reading, or saving
+            fails.
     """
     create_data_dirs(paths, None)
     with _exclusive_lock(paths.registry.with_name('registry.lock'), 'project registry is active'):
@@ -1322,6 +1412,9 @@ def registry_source(paths: Paths, name: str) -> str | None:
 
     Returns:
         The registered source, or `None` when no entry maps to the name.
+
+    Raises:
+        PubanonError: Registry setup, exclusive locking, or reading fails.
     """
     if not paths.registry.exists() and not paths.data_dir.exists():
         return None
@@ -1331,44 +1424,44 @@ def registry_source(paths: Paths, name: str) -> str | None:
     return next((source for source, project in registry.items() if project == name), None)
 
 
-def rule_labels(
+def rule_origins(
     hit: GateHit, g: GlobalConfig, p: ProjectConfig | None, derived: Collection[str]
-) -> tuple[str, ...]:
+) -> tuple[RuleOrigin, ...]:
     """Name all active origins of a hit without exposing terms or paths.
 
     Args:
-        hit: Gate match whose origins are labeled.
+        hit: Gate match whose origins are named.
         g: Global configuration supplying sensitive terms.
         p: Project configuration, or `None` when no project is selected.
         derived: Private path terms derived for this project.
 
     Returns:
-        Source labels with one-based entry numbers in global, project, derived,
-        then hygiene order. Labels use the supplied configuration snapshot; the
-        built-in product rule has no configuration entry.
+        Origins with one-based entry numbers in `RuleSource` order. Origins use
+        the supplied configuration snapshot; the built-in product rule has no
+        configuration entry.
     """
     sources = (
-        ('global sensitive_terms', g.sensitive_terms),
-        ('project extra_terms', () if p is None else p.extra_terms),
-        ('derived private path', derived),
+        (RuleSource.GLOBAL_SENSITIVE, g.sensitive_terms),
+        (RuleSource.PROJECT_EXTRA, () if p is None else p.extra_terms),
+        (RuleSource.DERIVED, derived),
     )
     if hit.rule_class is RuleClass.IDENTITY_CRITICAL:
         return tuple(
-            f'{label} entry {index}'
-            for label, terms in sources
+            RuleOrigin(source, index)
+            for source, terms in sources
             for index, term in enumerate(terms, 1)
             if term == hit.term
         )
-    labels: list[str] = []
+    origins: list[RuleOrigin] = []
     if p is not None:
-        if not p.self_publication and hit.term == 'pubanon':
-            labels.append('built-in hygiene rule')
-        labels.extend(
-            f'project hygiene_terms entry {index}'
+        if not p.self_publication and hit.term == _BUILTIN_HYGIENE_TERM:
+            origins.append(RuleOrigin(RuleSource.BUILTIN_HYGIENE))
+        origins.extend(
+            RuleOrigin(RuleSource.PROJECT_HYGIENE, index)
             for index, term in enumerate(p.hygiene_terms, 1)
             if term == hit.term
         )
-    return tuple(labels)
+    return tuple(origins)
 
 
 def gate_details(
@@ -1398,9 +1491,9 @@ def gate_details(
             if span is None:
                 raise PubanonError('gate match location could not be determined')
             start, end = span
-            labels = ', '.join(rule_labels(hit, g, p, derived))
+            origins = ', '.join(map(str, rule_origins(hit, g, p, derived)))
             details[f'Finding {len(details) + 1}'] = (
-                f'{labels}; unit {name}; {location} bytes {start}:{end}; term {hit.term}'
+                f'{origins}; unit {name}; {location} bytes {start}:{end}; term {hit.term}'
             )
     return details
 
@@ -1492,7 +1585,7 @@ def stage_repository(p: ProjectConfig) -> str:
     Returns:
         Staging repository name.
     """
-    return p._stage_repo or f'{p.repo}-stage'
+    return p.stage_repo or f'{p.repo}-stage'
 
 
 def validate_changelog_heading(value: str) -> None:
@@ -1661,14 +1754,15 @@ def gate_host_coordinates(
         ('owner', validate_host_segment('owner', owner)),
         ('repo', validate_host_segment('repo', repo)),
     )
-    rules = assemble_rules(g, p, derived_private_terms(paths, p, os.environ))
+    rules = current_rules(paths, g, p)
     for field_name, value in fields:
         unit = f'repository {field_name}'
         hits = gate_unit(unit, value.encode(), rules)
         if hits:
             recovery = None
             if not p.self_publication and any(
-                hit.rule_class is RuleClass.HYGIENE and hit.term == 'pubanon' for hit in hits
+                hit.rule_class is RuleClass.HYGIENE and hit.term == _BUILTIN_HYGIENE_TERM
+                for hit in hits
             ):
                 recovery = (
                     'A built-in rule flags the word pubanon. If you are publishing pubanon '
@@ -1848,24 +1942,26 @@ def _validate_project_config(cfg: ProjectConfig, expected_name: str) -> None:
         raise PubanonError('source_path must be absolute')
     if _resolve_path(source_path, 'cannot resolve project source') != source_path:
         raise PubanonError('source_path must be canonical')
-    for key in (
-        'allow',
-        'deny',
-        'secret_exceptions',
-        'extra_terms',
-        'hygiene_terms',
-        'required_checks',
-    ):
-        _require_tuple_strings(data, key)
+    checked = {
+        key: _require_tuple_strings(data, key)
+        for key in (
+            'allow',
+            'deny',
+            'secret_exceptions',
+            'extra_terms',
+            'hygiene_terms',
+            'required_checks',
+        )
+    }
     for key in ('extra_terms', 'hygiene_terms'):
-        for term in cast('tuple[str, ...]', data[key]):
+        for term in checked[key]:
             try:
                 validate_term(term)
             except PubanonError:
                 raise PubanonError(f'{key} must not contain blank terms') from None
     _require_boolean(data, 'self_publication')
     _require_boolean(data, 'source_tags')
-    _validate_stage_repo(cfg._stage_repo, cfg.repo)
+    _validate_stage_repo(cfg.stage_repo, cfg.repo)
     _validate_ci_workflow(cfg.ci_workflow)
     validate_settings(cfg.settings)
     _validate_acknowledged_exposure(cfg.acknowledged_exposure)
@@ -1877,11 +1973,70 @@ def _validate_project_config(cfg: ProjectConfig, expected_name: str) -> None:
         raise PubanonError('project configuration name does not match requested project')
 
 
+def _project_from_mapping(
+    data: Mapping[str, object], project_file: Path, name: str
+) -> ProjectConfig:
+    """Validate one project mapping against its file and requested name."""
+    unknown = sorted(data.keys() - (_PROJECT_KEYS | _PROJECT_OPTIONAL_KEYS))
+    if unknown:
+        raise PubanonError(f'unknown project configuration key: {", ".join(unknown)}')
+    missing = sorted(_PROJECT_KEYS - data.keys())
+    if missing:
+        raise PubanonError(f'missing project configuration key: {", ".join(missing)}')
+    repo = validate_host_segment('repo', data['repo'])
+    settings = _settings_from_mapping(_require_table(data, 'settings'), project_file=project_file)
+    config = ProjectConfig(
+        name=_require_string(data, 'name'),
+        source_path=_require_absolute_path(data, 'source_path'),
+        host=_require_choice(data, 'host', _HOSTS),
+        owner=validate_host_segment('owner', data['owner']),
+        repo=repo,
+        publication_route=_require_choice(data, 'publication_route', PUBLICATION_ROUTES),
+        visibility=_require_choice(data, 'visibility', VISIBILITIES),
+        allow=_require_strings(data, 'allow'),
+        deny=_require_strings(data, 'deny'),
+        secret_exceptions=_require_strings(data, 'secret_exceptions'),
+        extra_terms=_require_terms(data, 'extra_terms', require_one=False),
+        hygiene_terms=_require_terms(data, 'hygiene_terms', require_one=False),
+        self_publication=_require_boolean(data, 'self_publication'),
+        source_tags=(_require_boolean(data, 'source_tags') if 'source_tags' in data else False),
+        required_checks=_require_strings(data, 'required_checks'),
+        stage_repo=_validate_stage_repo(data.get('stage_repo'), repo),
+        settings=settings,
+        acknowledged_exposure=_validate_acknowledged_exposure(
+            data.get('acknowledged_exposure', '')
+        ),
+        package=(
+            _package_from_mapping(_require_table(data, 'package')) if 'package' in data else None
+        ),
+        workflows=(
+            _workflows_from_mapping(_require_table(data, 'workflow')) if 'workflow' in data else {}
+        ),
+        ci_workflow=_validate_ci_workflow(data.get('ci_workflow')),
+        release_page=(
+            _release_page_from_mapping(_require_table(data, 'release_page'))
+            if 'release_page' in data
+            else None
+        ),
+        commit_message=(
+            _commit_message_from_mapping(
+                _commit_message_table(data, 'project configuration'), 'project configuration'
+            )
+            if 'commit_message' in data
+            else None
+        ),
+    )
+    _validate_project_config(config, name)
+    return config
+
+
 def global_from_mapping(data: Mapping[str, object]) -> GlobalConfig:
     """Validate and return one complete global configuration mapping.
 
     Args:
-        data: Parsed TOML mapping with every global configuration key.
+        data: Parsed TOML mapping with every required global configuration key;
+            `commit_message`, `ignored_directories`, and `ignored_files` are
+            optional.
 
     Returns:
         Validated global configuration.
@@ -1959,59 +2114,14 @@ def load_project(paths: Paths, name: str) -> ProjectConfig:
         PubanonError: The project configuration is missing, unreadable,
             malformed, or invalid.
     """
-    project_file = paths.config_dir / 'projects' / f'{name}.toml'
+    project_file = paths.project_file(name)
     data = _load_toml(project_file, 'project')
-    unknown = sorted(data.keys() - (_PROJECT_KEYS | _PROJECT_OPTIONAL_KEYS))
-    if unknown:
-        raise PubanonError(f'unknown project configuration key: {", ".join(unknown)}')
-    missing = sorted(_PROJECT_KEYS - data.keys())
-    if missing:
-        raise PubanonError(f'missing project configuration key: {", ".join(missing)}')
-    repo = validate_host_segment('repo', data['repo'])
-    settings = _settings_from_mapping(_require_table(data, 'settings'), project_file=project_file)
-    config = ProjectConfig(
-        name=_require_string(data, 'name'),
-        source_path=_require_absolute_path(data, 'source_path'),
-        host=_require_choice(data, 'host', _HOSTS),
-        owner=validate_host_segment('owner', data['owner']),
-        repo=repo,
-        publication_route=_require_choice(data, 'publication_route', PUBLICATION_ROUTES),
-        visibility=_require_choice(data, 'visibility', VISIBILITIES),
-        allow=_require_strings(data, 'allow'),
-        deny=_require_strings(data, 'deny'),
-        secret_exceptions=_require_strings(data, 'secret_exceptions'),
-        extra_terms=_require_terms(data, 'extra_terms', require_one=False),
-        hygiene_terms=_require_terms(data, 'hygiene_terms', require_one=False),
-        self_publication=_require_boolean(data, 'self_publication'),
-        source_tags=(_require_boolean(data, 'source_tags') if 'source_tags' in data else False),
-        required_checks=_require_strings(data, 'required_checks'),
-        _stage_repo=_validate_stage_repo(data.get('stage_repo'), repo),
-        settings=settings,
-        acknowledged_exposure=_validate_acknowledged_exposure(
-            data.get('acknowledged_exposure', '')
-        ),
-        package=(
-            _package_from_mapping(_require_table(data, 'package')) if 'package' in data else None
-        ),
-        workflows=(
-            _workflows_from_mapping(_require_table(data, 'workflow')) if 'workflow' in data else {}
-        ),
-        ci_workflow=_validate_ci_workflow(data.get('ci_workflow')),
-        release_page=(
-            _release_page_from_mapping(_require_table(data, 'release_page'))
-            if 'release_page' in data
-            else None
-        ),
-        commit_message=(
-            _commit_message_from_mapping(
-                _commit_message_table(data, 'project configuration'), 'project configuration'
-            )
-            if 'commit_message' in data
-            else None
-        ),
-    )
-    _validate_project_config(config, name)
-    return config
+    try:
+        return _project_from_mapping(data, project_file, name)
+    except PubanonError as error:
+        if error.recovery is None:
+            error.recovery = f'correct {escape(path_text(project_file))}, then rerun'
+        raise
 
 
 def save_global(paths: Paths, cfg: GlobalConfig, original: bytes | None) -> None:
@@ -2112,8 +2222,8 @@ def save_project(paths: Paths, cfg: ProjectConfig) -> None:
         f'required_checks = {_toml_array(cfg.required_checks)}\n'
         f'publication_route = {_toml_string(cfg.publication_route)}\n'
     )
-    if cfg._stage_repo is not None:
-        content += f'stage_repo = {_toml_string(cfg._stage_repo)}\n'
+    if cfg.stage_repo is not None:
+        content += f'stage_repo = {_toml_string(cfg.stage_repo)}\n'
     if cfg.ci_workflow is not None:
         content += f'ci_workflow = {_toml_string(cfg.ci_workflow)}\n'
     if cfg.acknowledged_exposure:
@@ -2140,8 +2250,8 @@ def save_project(paths: Paths, cfg: ProjectConfig) -> None:
     for workflow_name, stages in cfg.workflows.items():
         content += f'[workflow.{_toml_string(workflow_name)}]\nstages = {_toml_array(stages)}\n'
     payload = content.encode('utf-8')
-    projects_dir = paths.config_dir / 'projects'
-    project_file = projects_dir / f'{cfg.name}.toml'
+    project_file = paths.project_file(cfg.name)
+    projects_dir = project_file.parent
     try:
         paths.config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         _filesystem.chmod(paths.config_dir, 0o700)
@@ -2149,11 +2259,11 @@ def save_project(paths: Paths, cfg: ProjectConfig) -> None:
         _filesystem.chmod(projects_dir, 0o700)
         _filesystem.write_private(project_file, payload)
     except _filesystem.DurableWriteError as exc:
-        if exc.interrupted and not exc.replacement_attempted:
+        if exc.interrupted_before_replacement:
             raise KeyboardInterrupt from exc.__cause__
         message = (
             'project configuration may have been saved'
-            if exc.replaced or (exc.interrupted and exc.replacement_attempted)
+            if exc.may_have_saved
             else 'cannot save project configuration'
         )
         raise PubanonError(message) from exc.__cause__

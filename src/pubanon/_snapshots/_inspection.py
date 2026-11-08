@@ -1,6 +1,5 @@
 """Materialize and verify read-only review copies."""
 
-import ntpath
 import os
 import posixpath
 import re
@@ -16,10 +15,13 @@ from pubanon._errors import PubanonError
 from pubanon._run import OID_HEX
 from pubanon._snapshots import _records
 from pubanon._snapshots._source import (
+    FILE_MODES,
+    SYMLINK_MODE,
     Entry,
     Snapshot,
     path_portability_keys,
     validate_symlink_graph,
+    windows_unrepresentable,
 )
 from pubanon._terminal import (
     escape,
@@ -102,12 +104,12 @@ def _materialize_inspection_files(inspect: Path, snapshot: Snapshot) -> None:
             _filesystem.chmod(target, entry.mode & 0o777)
 
 
-def _path_collision(first: str, second: str) -> PubanonError:
+def _path_collision(headline: str, first: str, second: str) -> PubanonError:
     """Build a terminal-safe portability collision error."""
     first_display = escape(first)
     second_display = escape(second)
     return PubanonError(
-        'unsupported snapshot path collision',
+        headline,
         fact=f'paths: {first_display}; {second_display}',
     )
 
@@ -127,15 +129,7 @@ def _validate_windows_materialization(snapshot: Snapshot) -> None:
                     recovery='inspect this snapshot on a POSIX filesystem',
                 ) from exc
         for name in names:
-            if (
-                '\\' in name
-                or ':' in name
-                or any(
-                    ntpath.isreserved(component)
-                    for component in name.split('/')
-                    if component not in {'', '.', '..'}
-                )
-            ):
+            if windows_unrepresentable(name):
                 raise PubanonError(
                     'Windows cannot represent snapshot paths or symlink targets',
                     recovery='inspect this snapshot on a POSIX filesystem',
@@ -224,6 +218,10 @@ def inspection_paths(paths: Paths, project: str) -> tuple[Path, ...]:
     absent parent returns an empty tuple. Matching entries are listed even when
     their type will later be refused by the cleaner. Unrecognized entries are
     left alone, and symlink roots are never traversed.
+
+    Raises:
+        PubanonError: The inspection root is unsafe or its directory cannot be
+            listed.
     """
     root = _records.project_dir(paths, project) / 'inspections'
     copies: list[Path] = []
@@ -258,11 +256,14 @@ def clean_inspect(paths: Paths, project: str, *, commit: str | None = None) -> b
     return removed
 
 
-def validate_tree_paths(snapshot: Snapshot) -> None:
+def validate_tree_paths(
+    snapshot: Snapshot, *, collision: str = 'unsupported snapshot path collision'
+) -> None:
     """Validate all candidate paths before object creation.
 
     Args:
         snapshot: Entries whose paths, types, and modes must be portable.
+        collision: Error headline for two paths that collide.
 
     Raises:
         PubanonError: An entry is unsupported or its path collides with
@@ -270,7 +271,7 @@ def validate_tree_paths(snapshot: Snapshot) -> None:
     """
     entry_paths: dict[str, str] = {}
     directory_paths: dict[str, str] = {}
-    valid_modes = {'blob': {0o100644, 0o100755}, 'symlink': {0o120000}}
+    valid_modes = {'blob': FILE_MODES, 'symlink': {SYMLINK_MODE}}
     for entry in snapshot:
         parts = entry.path.split('/')
         key_parts = path_portability_keys(entry.path)
@@ -287,19 +288,19 @@ def validate_tree_paths(snapshot: Snapshot) -> None:
         if previous_entry is not None:
             if previous_entry == entry.path:
                 raise PubanonError('unsupported snapshot entry')
-            raise _path_collision(previous_entry, entry.path)
+            raise _path_collision(collision, previous_entry, entry.path)
         previous_directory = directory_paths.get(key)
         if previous_directory is not None:
-            raise _path_collision(previous_directory, entry.path)
+            raise _path_collision(collision, previous_directory, entry.path)
         for depth in range(1, len(key_parts)):
             ancestor = '/'.join(key_parts[:depth])
             directory = '/'.join(parts[:depth])
             previous_entry = entry_paths.get(ancestor)
             if previous_entry is not None:
-                raise _path_collision(previous_entry, directory)
+                raise _path_collision(collision, previous_entry, directory)
             previous_directory = directory_paths.get(ancestor)
             if previous_directory is not None and previous_directory != directory:
-                raise _path_collision(previous_directory, directory)
+                raise _path_collision(collision, previous_directory, directory)
             directory_paths.setdefault(ancestor, directory)
         entry_paths[key] = entry.path
 
@@ -318,8 +319,13 @@ def materialize_directory(directory: Path, snapshot: Snapshot) -> None:
     POSIX mode bits restrict the directory to owner-only access.
 
     Validate paths, modes, collisions, and symlink targets before creation.
-    The parent directory must exist. Existing files or directories are refused;
-    a newly created partial directory is removed on failure or interruption.
+    The parent directory must exist. Existing files or directories are refused.
+    On failure or interruption, cleanup of a newly created partial directory is
+    attempted; cleanup failure can leave that directory in place.
+
+    Raises:
+        PubanonError: Snapshot paths or entries are unsafe, the directory
+            already exists, or materialization or cleanup fails.
     """
     validate_tree_paths(snapshot)
     validate_symlink_graph(snapshot)
@@ -362,6 +368,10 @@ def materialize_snapshot(
     permissions. Refresh explicitly replaces only the selected copy.
 
     The caller must hold the project lock for the complete operation.
+
+    Raises:
+        PubanonError: The existing copy is unsafe or modified without
+            `refresh`, or exact materialization fails.
     """
     _validate_materialization(commit, snapshot)
     create_data_dirs(paths, project)

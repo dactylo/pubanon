@@ -1,19 +1,18 @@
 """Verify and execute publication transactions."""
 
-# pyright: reportPrivateUsage=false
-
 import os
 import re
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from typing import Literal
 
-from pubanon import _history_output
+from pubanon import _changelog, _history_output
 from pubanon._config import (
     GlobalConfig,
     Paths,
     ProjectConfig,
     assemble_rules,
+    current_rules,
     derived_private_terms,
     save_project,
 )
@@ -22,10 +21,9 @@ from pubanon._gate import RuleClass
 from pubanon._remote import _host, _lifecycle, _releases, _stage, _watch
 from pubanon._remote._ci import (
     RUN_ON_PUSH_VARIABLE,
-    RunQuery,
+    ci_acceptance,
     evidence_facts,
     evidence_recovery,
-    run_evidence,
 )
 from pubanon._remote._host import (
     Destination,
@@ -41,15 +39,13 @@ from pubanon._snapshots import (
     _source,
     _verification,
 )
-from pubanon._snapshots._candidate import (
-    CANDIDATE_REF,
+from pubanon._snapshots._candidate import CANDIDATE_REF, published_refs, save_candidate
+from pubanon._snapshots._records import (
     STATE_RETAINED,
     STATE_UNKNOWN_OUTCOME,
     CandidateRecord,
-    published_refs,
-    save_candidate,
+    load_candidate,
 )
-from pubanon._snapshots._records import load_candidate
 from pubanon._snapshots._source import check_source_safety
 from pubanon._snapshots._store import store_path
 from pubanon._snapshots._verification import verify_retained_candidate
@@ -58,6 +54,7 @@ from pubanon._terminal import (
     detail,
     detail_fields,
     display_check_result,
+    display_commit,
     display_path,
     display_time,
     escape,
@@ -67,8 +64,7 @@ from pubanon._terminal import (
     next_step,
     output,
     path_text,
-    project_fallback,
-    shell_command,
+    project_command,
     style,
     verbose_enabled,
 )
@@ -83,17 +79,24 @@ CORRECTION_RESTORE_NOTE = (
 class PublishContext:
     """Bundle the facts and interaction mode for one publication.
 
-    Positional constructor inputs provide the derived paths, active global
-    configuration, selected project, retained candidate, and interaction mode.
+    Attributes:
+        paths: Derived local configuration and data paths.
+        global_config: Active global identity and policy configuration.
+        project: Selected project configuration.
+        record: Retained candidate selected for publication.
+        yes: Skip ordinary confirmation and require unattended-safe
+            publication.
+        release_page: Invocation overrides for release-page creation and notes;
+            an empty request uses configured defaults.
     """
 
-    _paths: Paths
-    _global_config: GlobalConfig
-    _project: ProjectConfig
-    _record: CandidateRecord
+    paths: Paths
+    global_config: GlobalConfig
+    project: ProjectConfig
+    record: CandidateRecord
 
-    _yes: bool
-    _release_page: _releases.PageRequest = dataclass_field(default_factory=_releases.PageRequest)
+    yes: bool
+    release_page: _releases.PageRequest = dataclass_field(default_factory=_releases.PageRequest)
 
 
 @dataclass(frozen=True)
@@ -104,19 +107,19 @@ class SyncContext:
     configuration, selected project, and interaction mode.
     """
 
-    _paths: Paths
-    _global_config: GlobalConfig
-    _project: ProjectConfig
+    paths: Paths
+    global_config: GlobalConfig
+    project: ProjectConfig
 
-    _yes: bool
+    yes: bool
 
 
 @dataclass(frozen=True)
 class _Verified:
     """Bind a verified destination to its fresh remote references."""
 
-    _destination: Destination
-    _remote: RemoteRefs
+    destination: Destination
+    remote: RemoteRefs
 
 
 def _acknowledge_exposure(
@@ -175,26 +178,26 @@ def _audit_sync(
     remote: RemoteRefs,
 ) -> None:
     """Audit the sent range and require historical exposure acknowledgment."""
-    full_commits = _audit.published_commits(ctx._paths, ctx._project.name, new=local_main)
+    full_commits = _audit.published_commits(ctx.paths, ctx.project.name, new=local_main)
     focused_commits = frozenset(
-        _audit.published_commits(ctx._paths, ctx._project.name, new=local_main, old=remote.main)
+        _audit.published_commits(ctx.paths, ctx.project.name, new=local_main, old=remote.main)
     )
     missing_tags = {tag: local_tags[tag] for tag in local_tags if tag not in remote.tags}
-    derived = derived_private_terms(ctx._paths, ctx._project, os.environ)
+    derived = derived_private_terms(ctx.paths, ctx.project, os.environ)
     rules = assemble_rules(
-        ctx._global_config,
-        ctx._project,
+        ctx.global_config,
+        ctx.project,
         derived,
     )
     full_audit, range_audit = _audit.audit_history_pair(
-        ctx._paths,
-        ctx._project.name,
+        ctx.paths,
+        ctx.project.name,
         full_commits,
         local_tags,
         focused_commits,
         missing_tags,
         rules,
-        f'{ctx._global_config.anon_name} <{ctx._global_config.anon_email}>',
+        ctx.global_config.identity,
         tip=local_main,
     )
 
@@ -202,12 +205,12 @@ def _audit_sync(
         raise PubanonError(
             'published history has identity problems',
             fact=escape(', '.join(full_audit.identity_problems)),
-            recovery='pubanon audit',
+            recovery=_lifecycle.IDENTITY_PROBLEMS_RECOVERY,
         )
     range_details = _audit.history_details(
         range_audit,
-        ctx._global_config,
-        ctx._project,
+        ctx.global_config,
+        ctx.project,
         derived,
         short_commits=not verbose_enabled(),
     )
@@ -216,11 +219,11 @@ def _audit_sync(
             label = _history_output.HISTORY_LABELS[item.rule_class]
             output(f'{label}: {escape(item.description)}', kind='warning')
     _acknowledge_exposure(
-        ctx._paths,
-        (ctx._global_config, ctx._project),
+        ctx.paths,
+        (ctx.global_config, ctx.project),
         full_audit,
         (full_commits, local_tags),
-        unattended=ctx._yes,
+        unattended=ctx.yes,
     )
 
 
@@ -231,7 +234,7 @@ def _classify_ref_drift(
 ) -> tuple[str, str | None] | None:
     """Classify movement of one retained source ref."""
     current = run_git(
-        ['rev-parse', '--verify', selector_name], cwd=ctx._project.source_path, check=False
+        ['rev-parse', '--verify', selector_name], cwd=ctx.project.source_path, check=False
     )
     if current.returncode != 0:
         return 'deleted', None
@@ -239,7 +242,7 @@ def _classify_ref_drift(
         return None
     resolved = run_git(
         ['rev-parse', '--verify', f'{selector_name}^{{commit}}'],
-        cwd=ctx._project.source_path,
+        cwd=ctx.project.source_path,
         check=False,
     )
     if (
@@ -248,16 +251,16 @@ def _classify_ref_drift(
     ):
         raise PubanonError('source ref no longer resolves to a commit')
     current_commit = resolved.stdout[:-1].decode('ascii')
-    if current_commit == ctx._record.pinned.commit:
+    if current_commit == ctx.record.pinned.commit:
         return 'changed ref object with unchanged commit', current_commit
     advanced = run_git(
         [
             'merge-base',
             '--is-ancestor',
-            ctx._record.pinned.commit,
+            ctx.record.pinned.commit,
             current_commit,
         ],
-        cwd=ctx._project.source_path,
+        cwd=ctx.project.source_path,
         check=False,
     )
     if advanced.returncode == 0:
@@ -269,9 +272,9 @@ def _classify_ref_drift(
             'merge-base',
             '--is-ancestor',
             current_commit,
-            ctx._record.pinned.commit,
+            ctx.record.pinned.commit,
         ],
-        cwd=ctx._project.source_path,
+        cwd=ctx.project.source_path,
         check=False,
     )
     if rewound.returncode == 0:
@@ -279,19 +282,6 @@ def _classify_ref_drift(
     if rewound.returncode == 1:
         return 'diverged', current_commit
     raise PubanonError('cannot classify source ref drift')
-
-
-def _destination_from_record(record: CandidateRecord) -> Destination:
-    """Rebuild the recorded destination through the host URL seam."""
-    destination = record.destination
-    return Destination(
-        adapter=destination.adapter,
-        owner=destination.owner,
-        repo=destination.repo,
-        url=_host.repository_url(destination.owner, destination.repo),
-        account=destination.account,
-        visibility=destination.visibility,
-    )
 
 
 def _expected_pushed(record: CandidateRecord) -> RemoteRefs:
@@ -322,23 +312,23 @@ def _local_ref_command(ref: str, old: str | None, new: str | None, zero: str) ->
 
 def _finalize(ctx: PublishContext) -> None:
     """Apply a guarded local transaction and remove candidate metadata last."""
-    before = RemoteRefs(ctx._record.prestate_main, ctx._record.prestate_tags)
-    after = _expected_pushed(ctx._record)
-    actual = RemoteRefs(*published_refs(ctx._paths, ctx._project.name))
+    before = RemoteRefs(ctx.record.prestate_main, ctx.record.prestate_tags)
+    after = _expected_pushed(ctx.record)
+    actual = RemoteRefs(*published_refs(ctx.paths, ctx.project.name))
     if actual not in (before, after):
         raise PubanonError(
             'saved published history matches neither the state before this publication '
             'nor the state after it'
         )
-    store = store_path(ctx._paths, ctx._project.name)
+    store = store_path(ctx.paths, ctx.project.name)
     commands = ['start']
     refs = [('refs/heads/main', actual.main, after.main)]
     refs.extend(
         (f'refs/tags/{tag}', actual.tags.get(tag), after.tags.get(tag))
-        for tag in _changed_tags(ctx._record)
+        for tag in _changed_tags(ctx.record)
     )
     commands.extend(
-        _local_ref_command(ref, old, new, '0' * len(ctx._record.commit)) for ref, old, new in refs
+        _local_ref_command(ref, old, new, '0' * len(ctx.record.commit)) for ref, old, new in refs
     )
     anchor = run_git(
         ['--git-dir', str(store.absolute()), 'show-ref', '--verify', '--hash', CANDIDATE_REF],
@@ -352,7 +342,7 @@ def _finalize(ctx: PublishContext) -> None:
     elif actual != after:
         raise PubanonError('local snapshot ref is missing before finalization')
     else:
-        commands.append(f'verify {CANDIDATE_REF} {"0" * len(ctx._record.commit)}')
+        commands.append(f'verify {CANDIDATE_REF} {"0" * len(ctx.record.commit)}')
     commands.extend(('prepare', 'commit', ''))
     result = run_git(
         ['--git-dir', str(store.absolute()), 'update-ref', '--no-deref', '--stdin'],
@@ -363,7 +353,7 @@ def _finalize(ctx: PublishContext) -> None:
     if result.returncode != 0:
         raise PubanonError('cannot record published refs locally', fact=git_failure_fact(result))
     try:
-        _records.candidate_path(ctx._paths, ctx._project.name).unlink(missing_ok=True)
+        _records.candidate_path(ctx.paths, ctx.project.name).unlink(missing_ok=True)
     except OSError as exc:
         raise PubanonError('cannot remove published snapshot record') from exc
 
@@ -385,19 +375,19 @@ def _managed_outcome(record: CandidateRecord, remote: RemoteRefs) -> str:
 
 def _preserve_replayed_sources(ctx: PublishContext) -> PublishContext:
     """Persist each derived publication's independent frozen locator before creation."""
-    for index, entry in enumerate(ctx._record.replayed):
+    for index, entry in enumerate(ctx.record.replayed):
         if entry.original_source is None or entry.original_bookmark is None:
             continue
         bookmark = entry.source_bookmark
         if bookmark is None:
             bookmark = replace(
                 entry.original_bookmark,
-                refname=_source.bookmark_ref(ctx._project.name, entry.new),
+                refname=_source.bookmark_ref(ctx.project.name, entry.new),
             )
-            replayed = list(ctx._record.replayed)
+            replayed = list(ctx.record.replayed)
             replayed[index] = replace(entry, source_bookmark=bookmark)
-            ctx = replace(ctx, _record=replace(ctx._record, replayed=tuple(replayed)))
-            save_candidate(ctx._paths, ctx._project.name, ctx._record)
+            ctx = replace(ctx, record=replace(ctx.record, replayed=tuple(replayed)))
+            save_candidate(ctx.paths, ctx.project.name, ctx.record)
         _source.ensure_bookmark(bookmark, entry.original_source)
     return ctx
 
@@ -405,14 +395,14 @@ def _preserve_replayed_sources(ctx: PublishContext) -> PublishContext:
 def _preserve_source(ctx: PublishContext) -> PublishContext:
     """Persist bookmark intent before creating the source reference."""
     try:
-        bookmark = ctx._record.source_bookmark
+        bookmark = ctx.record.source_bookmark
         if bookmark is None:
             bookmark = _source.describe_bookmark(
-                ctx._project.source_path, ctx._project.name, ctx._record.commit
+                ctx.project.source_path, ctx.project.name, ctx.record.commit
             )
-            ctx = replace(ctx, _record=replace(ctx._record, source_bookmark=bookmark))
-            save_candidate(ctx._paths, ctx._project.name, ctx._record)
-        _source.ensure_bookmark(bookmark, ctx._record.pinned.commit)
+            ctx = replace(ctx, record=replace(ctx.record, source_bookmark=bookmark))
+            save_candidate(ctx.paths, ctx.project.name, ctx.record)
+        _source.ensure_bookmark(bookmark, ctx.record.pinned.commit)
     except (OSError, PubanonError) as exc:
         if isinstance(exc, OperationCanceled):
             raise
@@ -442,13 +432,24 @@ def _publication_cancelled(
     return cancelled
 
 
+def _outcome_unknown_cancelled(error: KeyboardInterrupt | OperationCanceled) -> OperationCanceled:
+    """Report a cancellation after a push whose outcome is not yet known."""
+    return _publication_cancelled(
+        error,
+        headline='the outcome of the last publication is unknown',
+        diagnostic_kind='error',
+        fact='Recovery information is retained.',
+        recovery='pubanon publish --resolve',
+    )
+
+
 def _refresh_source_tags(ctx: PublishContext) -> None:
     """Refresh opted-in local tags after finalization without changing the host outcome."""
-    if not ctx._project.source_tags:
+    if not ctx.project.source_tags:
         return
     try:
         warnings = _history.refresh_source_tags(
-            ctx._project, _history.publications(ctx._paths, ctx._project.name)
+            ctx.project, _history.publications(ctx.paths, ctx.project.name)
         )
     except (OSError, PubanonError) as error:
         if isinstance(error, OperationCanceled):
@@ -506,20 +507,9 @@ def _refuse_immutable_tag_changes(destination: Destination, record: CandidateRec
         )
 
 
-def _refuse_sync_branches(remote: RemoteRefs) -> None:
-    """Refuse destination branches outside the publication universe."""
-    if remote.branches:
-        raise PubanonError(
-            'destination contains an unexpected branch',
-            expected=escape(_host.remote_refs_text(RemoteRefs(remote.main, remote.tags, ()))),
-            actual=escape(_host.remote_refs_text(remote)),
-            recovery='remove every destination branch except main, then rerun',
-        )
-
-
 def _replacement_review(ctx: PublishContext, verified: _Verified, page: _releases.PagePlan) -> str:
     """Summarize the replacement scope before its single approval question."""
-    record = ctx._record
+    record = ctx.record
     if record.replaces is None or record.prestate_main is None:
         raise PubanonError('replacement snapshot is incomplete')
     _, after_tags = _records.candidate_poststate(record)
@@ -527,9 +517,9 @@ def _replacement_review(ctx: PublishContext, verified: _Verified, page: _release
     rows = [
         (
             'Repository',
-            f'{escape(verified._destination.owner)}/{escape(verified._destination.repo)}',
+            f'{escape(verified.destination.owner)}/{escape(verified.destination.repo)}',
         ),
-        ('Visibility', escape(verified._destination.visibility)),
+        ('Visibility', escape(verified.destination.visibility)),
     ]
     tags = sorted(tag for tag, oid in record.prestate_tags.items() if oid == record.replaces)
     rows.append(
@@ -542,20 +532,10 @@ def _replacement_review(ctx: PublishContext, verified: _Verified, page: _release
             ),
         )
     )
-    if record.replace_scope == 'all':
-        count = len(
-            _audit.published_commits(ctx._paths, ctx._project.name, new=record.prestate_main)
-        )
-        rows.append(
-            (
-                'Scope',
-                style(f'all published history ({count} snapshots) -> one snapshot', 'warning'),
-            )
-        )
-    else:
-        rows.append(('Scope', 'one published snapshot and its replayed descendants'))
-    width = 40 if verbose_enabled() else 12
-    rows.append(('Commit', f'{record.replaces[:width]} -> {record.commit[:width]}'))
+    rows.append(_reports.replacement_scope_row(ctx.paths, ctx.project.name, record))
+    rows.append(
+        ('Commit', f'{display_commit(record.replaces)} -> {display_commit(record.commit)}')
+    )
     updated = sorted(
         tag for tag, oid in after_tags.items() if record.prestate_tags.get(tag) != oid
     )
@@ -569,7 +549,7 @@ def _replacement_review(ctx: PublishContext, verified: _Verified, page: _release
     if record.replayed:
         rows.append(('Later snapshots', f'{len(record.replayed)} replayed'))
     rows.extend(
-        ('Replayed commit', f'{entry.old[:width]} -> {entry.new[:width]}')
+        ('Replayed commit', f'{display_commit(entry.old)} -> {display_commit(entry.new)}')
         for entry in record.replayed
     )
     fields(rows)
@@ -586,7 +566,7 @@ def _replacement_review(ctx: PublishContext, verified: _Verified, page: _release
         'packages are unchanged.',
         kind='warning',
     )
-    if verified._destination.visibility == 'public':
+    if verified.destination.visibility == 'public':
         output('warning: Public forks and caches may also retain the old commits.', kind='warning')
     suffix = ' and create its release page' if page.action == 'create' else ''
     return f'Publish this replacement{suffix}?'
@@ -599,16 +579,16 @@ def _publication_review_question(
     proof: _verification.ObjectProof,
 ) -> str:
     """Present the selected publication operation and return its confirmation."""
-    report = _reports.publication_report(ctx._paths, proof, ctx._project)
-    if ctx._record.replaces is not None:
+    report = _reports.publication_report(ctx.paths, proof, ctx.project)
+    if ctx.record.replaces is not None:
         question = _replacement_review(ctx, verified, page)
     else:
-        destination = verified._destination
+        destination = verified.destination
         target = f'{escape(destination.owner)}/{escape(destination.repo)}'
-        what = escape(ctx._record.tag_intent or 'untagged snapshot')
+        what = escape(ctx.record.tag_intent or 'untagged snapshot')
         heading(f'Publish {what}')
-        count = len(_reports.tree_paths(ctx._paths, ctx._project.name, ctx._record.commit))
-        changes = 'first release' if ctx._record.prestate_main is None else 'since last release'
+        count = len(_reports.tree_paths(ctx.paths, ctx.project.name, ctx.record.commit))
+        changes = 'first release' if ctx.record.prestate_main is None else 'since last release'
         fields(
             [
                 ('Destination', f'{target} ({escape(destination.visibility)})'),
@@ -619,15 +599,15 @@ def _publication_review_question(
         _releases.show_page_plan(page)
         suffix = ' and create its release page' if page.action == 'create' else ''
         question = f'Publish {what} to {target}{suffix}?'
-    if ctx._project.settings is not None:
-        output(field('Description', escape(ctx._project.settings.description) or '(empty)'))
+    if ctx.project.settings is not None:
+        output(field('Description', escape(ctx.project.settings.description) or '(empty)'))
     if verbose_enabled():
         output(report)
     else:
-        warning = _reports.credential_warning(ctx._paths, ctx._project.name, ctx._record)
+        warning = _reports.credential_warning(ctx.paths, ctx.project.name, ctx.record)
         if warning:
             output(warning)
-    if ctx._record.prestate_main is None and ctx._project.publication_route == 'direct':
+    if ctx.record.prestate_main is None and ctx.project.publication_route == 'direct':
         output(
             'warning: GitHub keeps a record of this upload even if you later replace '
             'published history.',
@@ -649,8 +629,8 @@ def _require_final_push_ci(destination: Destination) -> None:
 
 
 def _require_stage_ci(ctx: PublishContext, tip: str) -> None:
-    """Require fresh successful workflow evidence for the verified staging tip."""
-    destination, stage = _stage.verify_staged_target(ctx._paths, ctx._global_config, ctx._project)
+    """Require fresh successful CI evidence for the verified staging tip."""
+    destination, stage = _stage.verify_staged_target(ctx.paths, ctx.global_config, ctx.project)
     if stage.commit != tip:
         raise PubanonError(
             'staging evidence does not cover the retained snapshot',
@@ -658,67 +638,83 @@ def _require_stage_ci(ctx: PublishContext, tip: str) -> None:
             actual=escape(stage.commit),
             recovery='pubanon stage push',
         )
-    workflow = ctx._project.ci_workflow
-    if workflow is None:
-        return
-    evidence = run_evidence(
+    ci = ci_acceptance(
         (destination.owner, destination.repo),
-        RunQuery(workflow, tip, 'workflow_dispatch'),
-        required=ctx._project.required_checks,
+        tip,
+        workflow=ctx.project.ci_workflow,
+        required=ctx.project.required_checks,
+        event='workflow_dispatch',
     )
-    if evidence.state != 'success':
+    if (evidence := ci.evidence) is not None:
+        if not ci.accepted:
+            raise PubanonError(
+                'the latest staging CI run is not acceptable',
+                fact=evidence_facts(evidence),
+                recovery=evidence_recovery(evidence, staged=True, retry='pubanon stage watch'),
+            )
+        detail(field('Verified staged commit', escape(stage.commit)))
+        detail(field('Accepted CI run', evidence_facts(evidence)))
+        return
+    if unresolved := ci.failing:
         raise PubanonError(
-            'the latest staging CI run is not acceptable',
-            fact=evidence_facts(evidence),
-            recovery=evidence_recovery(evidence, staged=True, retry='pubanon stage watch'),
+            'required staging checks are not acceptable',
+            fact=', '.join(
+                f'{escape(verdict.name)}: {display_check_result(verdict)}'
+                for verdict in unresolved
+            ),
+            recovery=_host.check_recovery(unresolved, retry='pubanon stage watch'),
         )
     detail(field('Verified staged commit', escape(stage.commit)))
-    detail(field('Accepted CI run', evidence_facts(evidence)))
+    if ci.checks:
+        detail('Required staging checks passed.')
+        for verdict in ci.checks:
+            detail(field(escape(verdict.name), display_check_result(verdict)))
+    else:
+        output('No required staging checks configured.', kind='note')
 
 
 def _review_publication(
     ctx: PublishContext, verified: _Verified, page: _releases.PagePlan
 ) -> None:
     """Verify and review one candidate before attempting a push."""
-    main, tags = published_refs(ctx._paths, ctx._project.name)
+    main, tags = published_refs(ctx.paths, ctx.project.name)
     if main is not None:
-        commits = _audit.published_commits(ctx._paths, ctx._project.name, new=main)
-        rules = assemble_rules(
-            ctx._global_config,
-            ctx._project,
-            derived_private_terms(ctx._paths, ctx._project, os.environ),
-        )
+        commits = _audit.published_commits(ctx.paths, ctx.project.name, new=main)
+        rules = current_rules(ctx.paths, ctx.global_config, ctx.project)
         audit = _audit.audit_history(
-            ctx._paths,
-            ctx._project.name,
+            ctx.paths,
+            ctx.project.name,
             commits,
             tags,
             rules,
-            f'{ctx._global_config.anon_name} <{ctx._global_config.anon_email}>',
+            ctx.global_config.identity,
             tip=main,
         )
 
         # Replacement identity is proved over its complete poststate before host work.
-        if audit.identity_problems and ctx._record.replaces is None:
+        if audit.identity_problems and ctx.record.replaces is None:
             raise PubanonError(
                 'published history has identity problems',
                 fact=escape(', '.join(audit.identity_problems)),
-                recovery='pubanon audit',
+                recovery=(
+                    'pubanon audit shows the problems; to replace published history under the '
+                    'current identity: pubanon discard, then pubanon prepare --replace all'
+                ),
             )
         _acknowledge_exposure(
-            ctx._paths,
-            (ctx._global_config, ctx._project),
+            ctx.paths,
+            (ctx.global_config, ctx.project),
             audit,
             (commits, tags),
-            unattended=ctx._yes,
+            unattended=ctx.yes,
         )
     # Re-prove objects: the record was rewritten and prompts ran since _verify_for_publish.
-    proof = _verification.prove_objects(ctx._paths, ctx._project.name, ctx._record)
+    proof = _verification.prove_objects(ctx.paths, ctx.project.name, ctx.record)
     question = _publication_review_question(ctx, verified, page, proof)
-    inspection = _verification.materialize_inspect(ctx._paths, ctx._project.name, proof)
+    inspection = _verification.materialize_inspect(ctx.paths, ctx.project.name, proof)
     if verbose_enabled():
         output(field('Review copy', display_path(inspection)))
-    if not ctx._yes and not confirm(question):
+    if not ctx.yes and not confirm(question):
         raise PublicationCanceled(
             'Canceled. Nothing was published.',
             fact='The prepared snapshot is kept.',
@@ -731,9 +727,9 @@ def _save_publication_state(
 ) -> None:
     """Preserve known host facts if interrupted around an atomic record write."""
     try:
-        save_candidate(ctx._paths, ctx._project.name, record)
+        save_candidate(ctx.paths, ctx.project.name, record)
     except (OperationCanceled, KeyboardInterrupt) as error:
-        current = load_candidate(ctx._paths, ctx._project.name)
+        current = load_candidate(ctx.paths, ctx.project.name)
         recovery = (
             'pubanon publish --resolve'
             if current is not None and current.state == STATE_UNKNOWN_OUTCOME
@@ -765,7 +761,7 @@ def _sync_args(
 
 def _sync_description(ctx: PublishContext, destination: Destination) -> None:
     """Apply the reviewed description while retaining retryable snapshot state."""
-    settings = ctx._project.settings
+    settings = ctx.project.settings
     if settings is None:
         raise PubanonError('repository settings are missing')
     fact = (
@@ -824,10 +820,10 @@ def _settle(
     push_error: PubanonError | None,
 ) -> str:
     """Apply one classified managed outcome to local candidate state."""
-    outcome = _managed_outcome(ctx._record, remote)
-    drift = _unrelated_drift(ctx._record, remote)
+    outcome = _managed_outcome(ctx.record, remote)
+    drift = _unrelated_drift(ctx.record, remote)
     if outcome != 'pushed' and _verification.confirmed_publication(
-        ctx._paths, ctx._project.name, ctx._record
+        ctx.paths, ctx.project.name, ctx.record
     ):
         outcome = 'pushed'
         drift = (
@@ -836,10 +832,10 @@ def _settle(
         )
     escaped_drift = None if drift is None else escape(drift)
     if outcome == 'pushed':
-        if ctx._record.source_bookmark is None:
+        if ctx.record.source_bookmark is None:
             raise PubanonError('confirmed snapshot source bookmark is missing')
         try:
-            _history.record_publication(ctx._paths, ctx._project, ctx._record)
+            _history.record_publication(ctx.paths, ctx.project, ctx.record)
             _finalize(ctx)
             _refresh_source_tags(ctx)
         except (OSError, PubanonError, KeyboardInterrupt) as error:
@@ -851,13 +847,13 @@ def _settle(
                 else PubanonError(str(error))
             )
             landed = (
-                f'Published and verified commit {escape(ctx._record.commit)} '
+                f'Published and verified commit {escape(ctx.record.commit)} '
                 'on the host repository.'
             )
             failure.fact = f'{landed}\n{failure.fact}' if failure.fact else landed
             if (
                 isinstance(failure, OperationCanceled)
-                and not _records.candidate_path(ctx._paths, ctx._project.name).exists()
+                and not _records.candidate_path(ctx.paths, ctx.project.name).exists()
             ):
                 failure.diagnostic_kind = 'success'
                 failure.args = ('Publication and local finalization completed.',)
@@ -886,7 +882,7 @@ def _settle(
     if outcome == 'not-pushed':
         _save_publication_state(
             ctx,
-            replace(ctx._record, state=STATE_RETAINED),
+            replace(ctx.record, state=STATE_RETAINED),
             cancellation_fact=(
                 'The repository still points to the previous published snapshot. '
                 'The prepared snapshot is available to publish.'
@@ -895,8 +891,8 @@ def _settle(
         if escaped_drift is not None:
             output(f'unrelated remote drift: {escaped_drift}', kind='warning')
         return outcome
-    managed_tags = _changed_tags(ctx._record)
-    pushed = _expected_pushed(ctx._record)
+    managed_tags = _changed_tags(ctx.record)
+    pushed = _expected_pushed(ctx.record)
     pushed_tags = {tag: pushed.tags[tag] for tag in managed_tags if tag in pushed.tags}
     actual_tags = {tag: remote.tags[tag] for tag in managed_tags if tag in remote.tags}
     raise PubanonError(
@@ -906,11 +902,11 @@ def _settle(
             + escape(
                 _host.remote_refs_text(
                     RemoteRefs(
-                        ctx._record.prestate_main,
+                        ctx.record.prestate_main,
                         {
-                            tag: ctx._record.prestate_tags[tag]
+                            tag: ctx.record.prestate_tags[tag]
                             for tag in managed_tags
-                            if tag in ctx._record.prestate_tags
+                            if tag in ctx.record.prestate_tags
                         },
                     )
                 )
@@ -930,7 +926,7 @@ def _settle(
 
 def _push_candidate(ctx: PublishContext, verified: _Verified) -> None:
     """Push one verified candidate with unknown-outcome protection."""
-    unknown = replace(ctx._record, state=STATE_UNKNOWN_OUTCOME)
+    unknown = replace(ctx.record, state=STATE_UNKNOWN_OUTCOME)
     try:
         _save_publication_state(
             ctx, unknown, cancellation_fact='No push was attempted; prepared snapshot is retained.'
@@ -938,7 +934,7 @@ def _push_candidate(ctx: PublishContext, verified: _Verified) -> None:
     except (OSError, PubanonError) as error:
         if isinstance(error, OperationCanceled):
             raise
-        current = load_candidate(ctx._paths, ctx._project.name)
+        current = load_candidate(ctx.paths, ctx.project.name)
         retry = (
             'pubanon publish --resolve'
             if current is not None and current.state == STATE_UNKNOWN_OUTCOME
@@ -946,38 +942,26 @@ def _push_candidate(ctx: PublishContext, verified: _Verified) -> None:
         )
         raise PubanonError(
             'Nothing was published; snapshot state could not be saved',
-            fact=f'Source repository: {escape(path_text(ctx._project.source_path))}\n{error}',
+            fact=f'Source repository: {escape(path_text(ctx.project.source_path))}\n{error}',
             recovery=f'Restore private state write access, then run {retry}. '
             'The prepared snapshot and source bookmark are retained.',
         ) from error
-    ctx = replace(ctx, _record=unknown)
+    ctx = replace(ctx, record=unknown)
     push_error: PubanonError | None = None
     try:
         _host.push(
-            verified._destination,
-            store_path(ctx._paths, ctx._project.name),
-            _push_args(ctx._record),
+            verified.destination,
+            store_path(ctx.paths, ctx.project.name),
+            _push_args(ctx.record),
         )
     except (OperationCanceled, KeyboardInterrupt) as error:
-        raise _publication_cancelled(
-            error,
-            headline='the outcome of the last publication is unknown',
-            diagnostic_kind='error',
-            fact='Recovery information is retained.',
-            recovery='pubanon publish --resolve',
-        ) from None
+        raise _outcome_unknown_cancelled(error) from None
     except PubanonError as error:
         push_error = error
     try:
-        remote = _host.ls_remote(verified._destination, ctx._paths, ctx._project.name)
+        remote = _host.ls_remote(verified.destination, ctx.paths, ctx.project.name)
     except (OperationCanceled, KeyboardInterrupt) as error:
-        raise _publication_cancelled(
-            error,
-            headline='the outcome of the last publication is unknown',
-            diagnostic_kind='error',
-            fact='Recovery information is retained.',
-            recovery='pubanon publish --resolve',
-        ) from None
+        raise _outcome_unknown_cancelled(error) from None
     except PubanonError as read_error:
         facts = [read_error.render()]
         if push_error is not None:
@@ -999,10 +983,10 @@ def _push_candidate(ctx: PublishContext, verified: _Verified) -> None:
 
 def _verify_publication_route(ctx: PublishContext) -> None:
     """Require the exact private staged candidate and every configured CI check."""
-    if ctx._project.publication_route == 'direct':
+    if ctx.project.publication_route == 'direct':
         return
-    tip = _records.candidate_tip(ctx._record)
-    stage = _stage.load_stage(ctx._paths, ctx._project.name)
+    tip = _records.candidate_tip(ctx.record)
+    stage = _stage.load_stage(ctx.paths, ctx.project.name)
     if stage is not None and stage.commit != tip:
         raise PubanonError(
             'staging evidence does not cover the retained snapshot',
@@ -1010,50 +994,29 @@ def _verify_publication_route(ctx: PublishContext) -> None:
             actual=escape(stage.commit),
             recovery='pubanon stage push',
         )
-    if ctx._project.ci_workflow:
-        _require_stage_ci(ctx, tip)
-        return
-    destination, stage = _stage.verify_staged_target(ctx._paths, ctx._global_config, ctx._project)
-    verdicts = _watch.ci_verdicts(destination, tip, ctx._project.required_checks)
-    unresolved = [verdict for verdict in verdicts if verdict.state != 'success']
-    if unresolved:
-        raise PubanonError(
-            'required staging checks are not acceptable',
-            fact=', '.join(
-                f'{escape(verdict.name)}: {display_check_result(verdict)}'
-                for verdict in unresolved
-            ),
-            recovery=_host.check_recovery(unresolved, retry='pubanon stage watch'),
-        )
-    detail(field('Verified staged commit', escape(stage.commit)))
-    if verdicts:
-        detail('Required staging checks passed.')
-        for verdict in verdicts:
-            detail(field(escape(verdict.name), display_check_result(verdict)))
-    else:
-        output('No required staging checks configured.', kind='note')
+    _require_stage_ci(ctx, tip)
 
 
 def _verify_source(ctx: PublishContext) -> None:
     """Re-prove source safety, pinned existence, and selector intent."""
-    check_source_safety(ctx._project.source_path)
+    check_source_safety(ctx.project.source_path)
     result = run_git(
-        ['rev-parse', '--verify', f'{ctx._record.pinned.commit}^{{commit}}'],
-        cwd=ctx._project.source_path,
+        ['rev-parse', '--verify', f'{ctx.record.pinned.commit}^{{commit}}'],
+        cwd=ctx.project.source_path,
         check=False,
     )
-    if result.returncode != 0 or result.stdout != f'{ctx._record.pinned.commit}\n'.encode():
+    if result.returncode != 0 or result.stdout != f'{ctx.record.pinned.commit}\n'.encode():
         raise PubanonError('pinned source commit no longer exists')
-    if ctx._record.pinned.selector_kind == 'explicit':
+    if ctx.record.pinned.selector_kind == 'explicit':
         return
-    selector_name = ctx._record.pinned.selector_name
-    selector_oid = ctx._record.pinned.selector_oid
+    selector_name = ctx.record.pinned.selector_name
+    selector_oid = ctx.record.pinned.selector_oid
     if selector_name is None or selector_oid is None:
         raise PubanonError('snapshot selector intent is invalid')
     drift = _classify_ref_drift(ctx, selector_name, selector_oid)
     if drift is None:
         return
-    if ctx._yes:
+    if ctx.yes:
         raise PubanonError(
             '--yes cannot approve publishing after the selected source changed',
             recovery='rerun pubanon publish in an interactive terminal without --yes',
@@ -1073,7 +1036,7 @@ def _verify_sync_prefix(
     remote: RemoteRefs,
 ) -> None:
     """Prove the host is empty or a strict prefix of local history."""
-    store = store_path(ctx._paths, ctx._project.name)
+    store = store_path(ctx.paths, ctx.project.name)
     if remote.main is not None:
         exists = run_git(
             ['--git-dir', str(store.absolute()), 'cat-file', '-e', f'{remote.main}^{{commit}}'],
@@ -1171,28 +1134,27 @@ def _verify_remote(record: CandidateRecord, remote: RemoteRefs) -> None:
 
 def _verify_for_publish(ctx: PublishContext) -> _Verified:
     """Re-prove the closed publication verification list in order."""
-    if _records.rewrite_path(ctx._paths, ctx._project.name).exists():
+    if _records.rewrite_path(ctx.paths, ctx.project.name).exists():
         raise PubanonError(
             'rewrite completion is pending',
-            recovery=shell_command(
-                'pubanon', 'prepare', f'--project={ctx._project.name}', '--continue'
-            )
-            or project_fallback(ctx._project.name, 'prepare', '--continue'),
+            recovery=project_command(
+                ctx.project.name, 'prepare', f'--project={ctx.project.name}', '--continue'
+            ),
         )
     verify_retained_candidate(
-        ctx._paths, ctx._global_config, ctx._project, ctx._record, env=os.environ
+        ctx.paths, ctx.global_config, ctx.project, ctx.record, env=os.environ
     )
-    _lifecycle.gate_host_fields(ctx._paths, ctx._global_config, ctx._project)
+    _lifecycle.gate_host_fields(ctx.paths, ctx.global_config, ctx.project)
     _verify_source(ctx)
-    destination = _host.verify_destination(ctx._paths, ctx._global_config, ctx._project)
-    if ctx._project.ci_workflow:
+    destination = _host.verify_destination(ctx.paths, ctx.global_config, ctx.project)
+    if ctx.project.ci_workflow:
         _require_final_push_ci(destination)
-    recorded = _destination_from_record(ctx._record)
+    recorded = _releases.recorded_destination(ctx.record)
     if destination != recorded:
         raise PubanonError('verified destination does not match the snapshot record')
-    remote = _host.ls_remote(destination, ctx._paths, ctx._project.name)
-    _verify_remote(ctx._record, remote)
-    _refuse_immutable_tag_changes(destination, ctx._record)
+    remote = _host.ls_remote(destination, ctx.paths, ctx.project.name)
+    _verify_remote(ctx.record, remote)
+    _refuse_immutable_tag_changes(destination, ctx.record)
     return _Verified(destination, remote)
 
 
@@ -1202,24 +1164,17 @@ def publication_next_action(project: ProjectConfig, record: CandidateRecord | No
     A replacement record must contain its completed poststate. Return an empty
     string when no configured next step exists.
     """
-    if project.required_checks or project.ci_workflow:
-        return 'pubanon repo watch'
-    version = ''
+    version = None
     if record is not None and record.replaces is not None:
         tip, tags = _records.candidate_poststate(record)
         current = tuple(
             parsed
             for tag, oid in tags.items()
-            if oid == tip and (parsed := _candidate.version_from_tag(tag)) is not None
+            if oid == tip and (parsed := _changelog.version_from_tag(tag)) is not None
         )
         if current:
-            selected = max(current, key=lambda item: tuple(int(part) for part in item.split('.')))
-            version = f' --version {selected}'
-    if project.package is not None:
-        return f'pubanon package watch{version}'
-    if project.visibility == 'private':
-        return 'pubanon repo reveal'
-    return ''
+            version = max(current, key=_changelog.version_key)
+    return _watch.next_after_publication(project, version=version)
 
 
 def report_source_preservation(
@@ -1230,6 +1185,9 @@ def report_source_preservation(
     `commit` must be a complete publication object ID. Missing provenance or
     unavailable local recovery produces warning output; successful recovery is
     not required for this report.
+
+    Raises:
+        PubanonError: The saved publication record is unreadable or invalid.
     """
     record = _records.load_publication(paths, project, commit)
     bookmark = None if record is None else record.source_bookmark
@@ -1259,40 +1217,40 @@ def report_source_preservation(
 
 def _report_publication(ctx: PublishContext) -> None:
     """Describe completed publication and private preservation."""
-    recorded = ctx._record.destination
-    what = escape(ctx._record.tag_intent or 'untagged snapshot')
+    recorded = ctx.record.destination
+    what = escape(ctx.record.tag_intent or 'untagged snapshot')
     output(
         f'Published {what} to {escape(recorded.owner)}/{escape(recorded.repo)} '
         f'({escape(recorded.visibility)}).',
         kind='success',
     )
-    publication = _records.load_publication(ctx._paths, ctx._project.name, ctx._record.commit)
+    publication = _records.load_publication(ctx.paths, ctx.project.name, ctx.record.commit)
     if publication is not None:
         detail_fields([('Published', display_time(publication.confirmed_at))])
-    if ctx._record.replaces is None:
-        detail_fields([('Snapshot commit', ctx._record.commit)])
+    if ctx.record.replaces is None:
+        detail_fields([('Snapshot commit', ctx.record.commit)])
     else:
         corrected = sorted(
-            tag for tag, oid in ctx._record.prestate_tags.items() if oid == ctx._record.replaces
+            tag for tag, oid in ctx.record.prestate_tags.items() if oid == ctx.record.replaces
         )
-        label = ', '.join(escape(tag) for tag in corrected) or ctx._record.replaces[:12]
-        rows = [('Corrected snapshot', f'{label} ({ctx._record.replaces[:12]})')]
-        tip = _records.candidate_tip(ctx._record)
-        if tip != ctx._record.commit:
+        label = ', '.join(escape(tag) for tag in corrected) or ctx.record.replaces[:12]
+        rows = [('Corrected snapshot', f'{label} ({ctx.record.replaces[:12]})')]
+        tip = _records.candidate_tip(ctx.record)
+        if tip != ctx.record.commit:
             rows.append(
                 (
                     'Correction commit',
-                    ctx._record.commit if verbose_enabled() else ctx._record.commit[:12],
+                    display_commit(ctx.record.commit),
                 )
             )
-        if ctx._record.replayed:
-            rows.append(('Replayed snapshots', str(len(ctx._record.replayed))))
-        moved = ', '.join(escape(tag) for tag in _changed_tags(ctx._record)) or 'none'
+        if ctx.record.replayed:
+            rows.append(('Replayed snapshots', str(len(ctx.record.replayed))))
+        moved = ', '.join(escape(tag) for tag in _changed_tags(ctx.record)) or 'none'
         rows.append(('Moved tags', moved))
-        rows.append(('Snapshot commit', tip if verbose_enabled() else tip[:12]))
+        rows.append(('Snapshot commit', display_commit(tip)))
         fields(rows)
     report_source_preservation(
-        ctx._paths, ctx._project.name, ctx._record.commit, source_tags=ctx._project.source_tags
+        ctx.paths, ctx.project.name, ctx.record.commit, source_tags=ctx.project.source_tags
     )
 
 
@@ -1321,19 +1279,19 @@ def publish(ctx: PublishContext) -> None:
             Publication may already have landed; use the reported recovery
             action before retrying.
     """
-    _candidate.require_known_outcome(ctx._record)
+    _candidate.require_known_outcome(ctx.record)
     try:
         verified = _verify_for_publish(ctx)
         page = _releases.plan_publication_page(
-            ctx._paths, ctx._global_config, ctx._project, ctx._record, ctx._release_page
+            ctx.paths, ctx.global_config, ctx.project, ctx.record, ctx.release_page
         )
         _verify_publication_route(ctx)
         ctx = _preserve_source(ctx)
         ctx = _preserve_replayed_sources(ctx)
-        _history.preserve_previous_tip(ctx._paths, ctx._project.name, ctx._record)
+        _history.preserve_previous_tip(ctx.paths, ctx.project.name, ctx.record)
         _review_publication(ctx, verified, page)
-        if ctx._project.ci_workflow and ctx._project.publication_route != 'direct':
-            _require_stage_ci(ctx, _records.candidate_tip(ctx._record))
+        if ctx.project.ci_workflow and ctx.project.publication_route != 'direct':
+            _require_stage_ci(ctx, _records.candidate_tip(ctx.record))
     except (OperationCanceled, KeyboardInterrupt) as error:
         raise PublicationCanceled(
             'Canceled. Nothing was published.',
@@ -1345,13 +1303,13 @@ def publish(ctx: PublishContext) -> None:
         retained = (
             'Nothing was published. No push was attempted; snapshot recovery information and any '
             'source bookmark are retained. '
-            f'Source repository: {escape(path_text(ctx._project.source_path))}'
+            f'Source repository: {escape(path_text(ctx.project.source_path))}'
         )
         failure.fact = f'{retained}\n{failure.fact}' if failure.fact else retained
         if failure.recovery is None:
             failure.recovery = 'Correct the reported problem, then retry pubanon publish.'
         raise failure from None
-    _sync_description(ctx, verified._destination)
+    _sync_description(ctx, verified.destination)
     _push_candidate(ctx, verified)
     try:
         _report_publication(ctx)
@@ -1361,21 +1319,19 @@ def publish(ctx: PublishContext) -> None:
             headline='Publication and local finalization completed.',
             diagnostic_kind='success',
             fact=(
-                f'Published and verified commit {escape(ctx._record.commit)} '
+                f'Published and verified commit {escape(ctx.record.commit)} '
                 'on the host repository.'
             ),
             recovery='pubanon status --remote; do not publish a new snapshot',
         ) from None
 
-    outcome = _releases.complete_publication_page(
-        ctx._paths, ctx._global_config, ctx._project, page
-    )
+    outcome = _releases.complete_publication_page(ctx.paths, ctx.global_config, ctx.project, page)
     if outcome.url is not None:
-        _releases.show_page_outcome(ctx._project, outcome)
+        _releases.show_page_outcome(ctx.project, outcome)
     else:
         _releases.show_page_plan(page, published=True)
     output()
-    next_step(publication_next_action(ctx._project, ctx._record))
+    next_step(publication_next_action(ctx.project, ctx.record))
 
 
 def resolve(ctx: PublishContext) -> str:
@@ -1407,20 +1363,14 @@ def resolve(ctx: PublishContext) -> str:
             drift is finalized before a refusal explains that it must not be
             retried.
     """
-    if ctx._record.state != STATE_UNKNOWN_OUTCOME:
+    if ctx.record.state != STATE_UNKNOWN_OUTCOME:
         raise PubanonError('snapshot does not have an unknown publish outcome')
     try:
-        recorded = _destination_from_record(ctx._record)
+        recorded = _releases.recorded_destination(ctx.record)
         destination = _host.verify_recorded_destination(recorded)
-        remote = _host.ls_remote(destination, ctx._paths, ctx._project.name)
+        remote = _host.ls_remote(destination, ctx.paths, ctx.project.name)
     except (OperationCanceled, KeyboardInterrupt) as error:
-        raise _publication_cancelled(
-            error,
-            headline='the outcome of the last publication is unknown',
-            diagnostic_kind='error',
-            fact='Recovery information is retained.',
-            recovery='pubanon publish --resolve',
-        ) from None
+        raise _outcome_unknown_cancelled(error) from None
     outcome = _settle(ctx, remote, None)
     return 'published' if outcome == 'pushed' else 'not-sent'
 
@@ -1445,17 +1395,17 @@ def sync(ctx: SyncContext) -> None:
             be verified. A failed post-push verification may follow a
             successful host update.
     """
-    record = load_candidate(ctx._paths, ctx._project.name)
+    record = load_candidate(ctx.paths, ctx.project.name)
     _candidate.require_known_outcome(record)
-    local_main, local_tags = published_refs(ctx._paths, ctx._project.name)
+    local_main, local_tags = published_refs(ctx.paths, ctx.project.name)
     if local_main is None:
         raise PubanonError(
             'local published history has no main branch',
             recovery='pubanon repo restore --to local',
         )
-    destination = _host.verify_destination(ctx._paths, ctx._global_config, ctx._project)
-    remote = _host.ls_remote(destination, ctx._paths, ctx._project.name)
-    _refuse_sync_branches(remote)
+    destination = _host.verify_destination(ctx.paths, ctx.global_config, ctx.project)
+    remote = _host.ls_remote(destination, ctx.paths, ctx.project.name)
+    _host.refuse_unexpected_branches(remote)
     expected = RemoteRefs(local_main, local_tags, ())
     if remote == expected:
         output('The final repository already matches saved published history.', kind='success')
@@ -1470,10 +1420,10 @@ def sync(ctx: SyncContext) -> None:
         'from saved published history'
     )
     commits = _audit.published_commits(
-        ctx._paths, ctx._project.name, new=local_main, old=remote.main
+        ctx.paths, ctx.project.name, new=local_main, old=remote.main
     )
     metadata: dict[str, str] = {}
-    store = store_path(ctx._paths, ctx._project.name)
+    store = store_path(ctx.paths, ctx.project.name)
     for commit in commits:
         metadata[f'Commit {commit}'] = (
             run_git(
@@ -1519,13 +1469,13 @@ def sync(ctx: SyncContext) -> None:
     )
     for arg in args:
         detail(f'  {escape(arg)}')
-    if not ctx._yes and not confirm(
+    if not ctx.yes and not confirm(
         'Restore these branches and tags to '
         f'{escape(destination.owner)}/{escape(destination.repo)}?'
     ):
         raise OperationCanceled('Canceled. Nothing was pushed.')
-    _host.push(destination, store_path(ctx._paths, ctx._project.name), args)
-    readback = _host.ls_remote(destination, ctx._paths, ctx._project.name)
+    _host.push(destination, store_path(ctx.paths, ctx.project.name), args)
+    readback = _host.ls_remote(destination, ctx.paths, ctx.project.name)
     if readback != expected:
         raise PubanonError(
             'the final repository does not match saved published history after restoration',

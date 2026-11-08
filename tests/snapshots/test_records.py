@@ -17,6 +17,7 @@ from pubanon._snapshots import _records
 from pubanon._snapshots._source import PinnedSource, SourceBookmark
 from pubanon._terminal import escape
 from tests._permissions import assert_private_mode
+from tests._setup import make_paths
 
 _DIGEST = 'd' * 64
 _FINGERPRINT = 'e' * 64
@@ -74,15 +75,6 @@ def _candidate(root: Path, *, bookmark: bool = False) -> _records.CandidateRecor
         )
         if bookmark
         else None,
-    )
-
-
-def _paths(root: Path) -> Paths:
-    return Paths(
-        root / 'config',
-        root / 'data',
-        root / 'config' / 'config.toml',
-        root / 'data' / 'registry.json',
     )
 
 
@@ -161,7 +153,7 @@ def _rewrite(root: Path) -> _records.RewriteRecord:
 
 
 def test_absent_history_does_not_create_directory(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     assert _records.deleted_publications(paths, 'example') == set()
     assert _records.list_publications(paths, 'example') == ()
     assert _records.load_publication(paths, 'example', _OID) is None
@@ -169,7 +161,7 @@ def test_absent_history_does_not_create_directory(tmp_path: Path) -> None:
 
 
 def test_candidate_bookmark_round_trip(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     record = _candidate(tmp_path, bookmark=True)
     _records.save_candidate(paths, 'example', record)
     assert _records.load_candidate(paths, 'example') == record
@@ -196,7 +188,7 @@ def test_candidate_bookmark_round_trip(tmp_path: Path) -> None:
 def test_candidate_load_rejects_malformed_replacement_tables(
     tmp_path: Path, before: str, after: str
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     _records.save_candidate(paths, 'example', _replacement(tmp_path))
     path = _records.candidate_path(paths, 'example')
     text = path.read_text()
@@ -222,7 +214,7 @@ def test_candidate_poststate_preserves_ordinary_rule(tmp_path: Path) -> None:
 def test_candidate_record_read_uses_explicit_utf8(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     record = _candidate(tmp_path)
     _records.save_candidate(paths, 'example', record)
     record_path = paths.data_dir / 'projects' / 'example' / 'candidate.toml'
@@ -253,7 +245,7 @@ def test_candidate_record_refuses_unsafe_recorded_host_segments(
     value: str,
     tmp_path: Path,
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     record = _candidate(tmp_path)
     _records.save_candidate(paths, 'example', record)
     destination = replace(record.destination, **{field: value})
@@ -267,7 +259,7 @@ def test_candidate_record_refuses_unsafe_recorded_host_segments(
 
 
 def test_candidate_record_round_trips_non_bmp_message_and_ref(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     record = _candidate(tmp_path)
     _records.save_candidate(paths, 'example', record)
     non_bmp_record = replace(
@@ -317,7 +309,7 @@ def test_completed_provenance_refuses_invalid_resolution(
     )
     record = replace(_replacement(tmp_path), replayed=(entry,))
     with pytest.raises(PubanonError):
-        _records.save_candidate(_paths(tmp_path), 'example', record)
+        _records.save_candidate(make_paths(tmp_path), 'example', record)
 
 
 @pytest.mark.parametrize('source_known', [False, True])
@@ -335,7 +327,7 @@ def test_derived_publication_round_trip_and_first_confirmation(
             entry.old, _SOURCE if source_known else None, _OID, entry.resolutions
         ),
     )
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     _records.save_publication(paths, 'example', record)
     assert _records.load_publication(paths, 'example', entry.new) == record
     data = tomllib.loads(_records.publication_path(paths, 'example', entry.new).read_text())
@@ -350,7 +342,7 @@ def test_derived_publication_round_trip_and_first_confirmation(
 def test_existing_record_sync_failure_preserves_valid_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     record = _candidate(tmp_path)
     _records.save_candidate(paths, 'example', record)
     record_path = paths.data_dir / 'projects' / 'example' / 'candidate.toml'
@@ -372,7 +364,7 @@ def test_existing_record_sync_failure_preserves_valid_record(
 
 
 def test_failed_replace_preserves_complete_candidate(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     record = _candidate(tmp_path)
     _records.save_candidate(paths, 'example', record)
     path = _records.candidate_path(paths, 'example')
@@ -392,8 +384,8 @@ def test_failed_replace_preserves_complete_candidate(tmp_path: Path) -> None:
 
 def test_incomplete_replacement_round_trip_refuses_publishable_poststate(tmp_path: Path) -> None:
     record = replace(_replacement(tmp_path), tip=None, poststate_tags=None, replayed=())
-    _records.save_candidate(_paths(tmp_path), 'example', record)
-    assert _records.load_candidate(_paths(tmp_path), 'example') == record
+    _records.save_candidate(make_paths(tmp_path), 'example', record)
+    assert _records.load_candidate(make_paths(tmp_path), 'example') == record
     for operation in (_records.candidate_tip, _records.candidate_poststate):
         with pytest.raises(PubanonError, match='incomplete'):
             operation(record)
@@ -402,7 +394,7 @@ def test_incomplete_replacement_round_trip_refuses_publishable_poststate(tmp_pat
 def test_list_publications_refuses_malformed_and_disappearing_records(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     _records.save_publication(paths, 'example', _publication(tmp_path))
     path = _records.publication_path(paths, 'example', _OID)
     path.write_text('malformed = [')
@@ -425,7 +417,7 @@ def test_list_publications_refuses_malformed_and_disappearing_records(
 
 
 def test_listing_invalid_publication_filename_reports_retained_path(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     path = paths.data_dir / 'projects' / 'example' / 'publications' / 'not-an-oid.toml'
     path.parent.mkdir(parents=True)
     path.write_text('malformed record')
@@ -439,7 +431,7 @@ def test_listing_invalid_publication_filename_reports_retained_path(tmp_path: Pa
 
 def test_load_candidate_refuses_escaping_project_name(tmp_path: Path) -> None:
     with pytest.raises(PubanonError, match='invalid project name'):
-        _records.load_candidate(_paths(tmp_path), '../outside')
+        _records.load_candidate(make_paths(tmp_path), '../outside')
 
 
 @pytest.mark.parametrize(
@@ -450,20 +442,22 @@ def test_load_candidate_refuses_malformed_unknown_or_ambiguous_state(
     tmp_path: Path,
     mutate: Callable[[str], str],
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     _records.save_candidate(paths, 'example', _candidate(tmp_path))
     record_path = paths.data_dir / 'projects' / 'example' / 'candidate.toml'
     record_path.write_text(mutate(record_path.read_text()))
 
-    with pytest.raises(PubanonError, match='invalid snapshot record'):
+    with pytest.raises(PubanonError, match='invalid snapshot record') as exc_info:
         _records.load_candidate(paths, 'example')
+
+    assert 'pubanon discard --force' in (exc_info.value.recovery or '')
 
 
 @pytest.mark.parametrize('source_known', [False, True])
 def test_multiple_replays_preserve_order_and_unavailable_source_locators(
     tmp_path: Path, source_known: bool
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     first = _replay(tmp_path)
     second = _records.ReplayEntry('3' * 40, '4' * 40, _SOURCE if source_known else None)
     record = replace(
@@ -506,12 +500,12 @@ def test_ordinary_candidate_refuses_orphan_replacement_fields(
 ) -> None:
     with pytest.raises(PubanonError):
         _records.save_candidate(
-            _paths(tmp_path), 'example', replace(_candidate(tmp_path), **change)
+            make_paths(tmp_path), 'example', replace(_candidate(tmp_path), **change)
         )
 
 
 def test_publication_inventory_ignores_unrelated_files(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     directory = _records.publication_path(paths, 'example', _OID).parent
     directory.mkdir(parents=True)
     (directory / 'notes.txt').write_text('unrelated')
@@ -523,7 +517,7 @@ def test_publication_inventory_ignores_unrelated_files(tmp_path: Path) -> None:
 
 
 def test_publication_inventory_preserves_platform_suffix_matching(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     record = _publication(tmp_path)
     _records.save_publication(paths, 'example', record)
     record_path = _records.publication_path(paths, 'example', _OID)
@@ -551,7 +545,7 @@ def test_publication_inventory_refuses_scan_iteration_failure(
     operation: str,
     message: str,
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     if operation == 'deletions':
         _records.mark_publication_deleted(paths, 'example', _OID)
     else:
@@ -589,7 +583,7 @@ def test_publication_inventory_refuses_scan_open_failure(
     operation: str,
     message: str,
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     directory = _records.publication_path(paths, 'example', _OID).parent
     directory.mkdir(parents=True)
     real_scandir = os.scandir
@@ -619,7 +613,7 @@ def test_publication_inventory_refuses_scan_open_failure(
 def test_publication_load_rejects_malformed_derivation(
     tmp_path: Path, before: str, after: str
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     record = replace(
         _publication(tmp_path, bookmark=False),
         pinned=None,
@@ -635,7 +629,7 @@ def test_publication_load_rejects_malformed_derivation(
 
 
 def test_publication_rejects_filename_mismatch_and_naive_time(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     record = _publication(tmp_path)
     with pytest.raises(PubanonError):
         _records.save_publication(
@@ -666,7 +660,7 @@ def test_publication_rejects_filename_mismatch_and_naive_time(tmp_path: Path) ->
     ],
 )
 def test_publication_rejects_invalid_fields(tmp_path: Path, before: str, after: str) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     _records.save_publication(paths, 'example', _publication(tmp_path))
     path = _records.publication_path(paths, 'example', _OID)
     text = path.read_text()
@@ -677,7 +671,7 @@ def test_publication_rejects_invalid_fields(tmp_path: Path, before: str, after: 
 
 
 def test_publication_rejects_pinned_source_without_bookmark(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     record = _publication(tmp_path)
     with pytest.raises(PubanonError, match='invalid published snapshot record'):
         _records.save_publication(paths, 'example', replace(record, source_bookmark=None))
@@ -697,10 +691,12 @@ def test_publication_requires_exact_pinned_or_derived_form(tmp_path: Path, kind:
         record = replace(record, derivation=_records.Derivation('1' * 40, None, '2' * 40, ()))
     if kind == 'correction':
         record = replace(record, replaces=_SOURCE, replace_scope='one')
-    if kind != 'unknown-source-bookmark':
+    if kind == 'both':
+        record = replace(record, derivation=_records.Derivation('1' * 40, _SOURCE, '2' * 40, ()))
+    elif kind != 'unknown-source-bookmark':
         record = replace(record, source_bookmark=None)
     with pytest.raises(PubanonError):
-        _records.save_publication(_paths(tmp_path), 'example', record)
+        _records.save_publication(make_paths(tmp_path), 'example', record)
 
 
 @pytest.mark.parametrize('change', [{'replaces': _SOURCE}, {'replace_scope': 'one'}])
@@ -709,13 +705,13 @@ def test_publication_requires_paired_replacement_fields(
 ) -> None:
     with pytest.raises(PubanonError):
         _records.save_publication(
-            _paths(tmp_path), 'example', replace(_publication(tmp_path), **change)
+            make_paths(tmp_path), 'example', replace(_publication(tmp_path), **change)
         )
 
 
 @pytest.mark.parametrize('tagged', [True, False])
 def test_publication_round_trip_has_only_provenance(tmp_path: Path, tagged: bool) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     record = _publication(tmp_path)
     if not tagged:
         record = replace(record, tag_intent=None)
@@ -748,7 +744,7 @@ def test_publication_round_trip_has_only_provenance(tmp_path: Path, tagged: bool
 
 
 def test_relocated_publication_source_preserves_all_other_provenance(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     record = _publication(tmp_path)
     _records.save_publication(paths, 'example', record)
     assert record.source_bookmark is not None
@@ -768,7 +764,7 @@ def test_relocated_publication_source_preserves_all_other_provenance(tmp_path: P
 
 
 def test_relocated_publication_source_refuses_different_bookmark(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     record = _publication(tmp_path)
     _records.save_publication(paths, 'example', record)
     assert record.source_bookmark is not None
@@ -790,8 +786,8 @@ def test_replacement_all_can_explicitly_remove_every_tag(tmp_path: Path) -> None
         poststate_tags={},
         replayed=(),
     )
-    _records.save_candidate(_paths(tmp_path), 'example', record)
-    assert _records.load_candidate(_paths(tmp_path), 'example') == record
+    _records.save_candidate(make_paths(tmp_path), 'example', record)
+    assert _records.load_candidate(make_paths(tmp_path), 'example') == record
     assert _records.candidate_poststate(record) == (_OID, {})
 
 
@@ -820,12 +816,12 @@ def test_replacement_candidate_rejects_inconsistent_state(
 ) -> None:
     with pytest.raises(PubanonError, match='invalid snapshot'):
         _records.save_candidate(
-            _paths(tmp_path), 'example', replace(_replacement(tmp_path), **change)
+            make_paths(tmp_path), 'example', replace(_replacement(tmp_path), **change)
         )
 
 
 def test_replacement_earlier_round_trip_and_poststate(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     record = _replacement(tmp_path)
     _records.save_candidate(paths, 'example', record)
     assert _records.load_candidate(paths, 'example') == record
@@ -839,7 +835,7 @@ def test_replacement_earlier_round_trip_and_poststate(tmp_path: Path) -> None:
 @pytest.mark.parametrize('scope', ['one', 'all'])
 @pytest.mark.parametrize('tagged', [False, True])
 def test_replacement_latest_and_all_round_trip(tmp_path: Path, scope: str, tagged: bool) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     record = replace(
         _candidate(tmp_path),
         replaces=_SOURCE,
@@ -875,7 +871,7 @@ def test_replay_mapping_requires_unique_old_and_new(tmp_path: Path, same: str) -
         poststate_tags={'v1.0.0': _OID, 'v1.1.0': _OID, 'v1.2.3': second.new},
     )
     with pytest.raises(PubanonError):
-        _records.save_candidate(_paths(tmp_path), 'example', record)
+        _records.save_candidate(make_paths(tmp_path), 'example', record)
 
 
 @pytest.mark.parametrize(
@@ -895,18 +891,18 @@ def test_replay_validation_checks_mapping_and_bookmark_ownership(
         change = {'source_bookmark': entry.original_bookmark}
     record = replace(_replacement(tmp_path), replayed=(replace(entry, **change),))
     with pytest.raises(PubanonError):
-        _records.save_candidate(_paths(tmp_path), 'example', record)
+        _records.save_candidate(make_paths(tmp_path), 'example', record)
 
 
 def test_replaying_phase_refuses_pause(tmp_path: Path) -> None:
     with pytest.raises(PubanonError):
         _records.save_rewrite(
-            _paths(tmp_path), 'example', replace(_rewrite(tmp_path), pause=_pause())
+            make_paths(tmp_path), 'example', replace(_rewrite(tmp_path), pause=_pause())
         )
 
 
 def test_retry_keeps_first_confirmation_and_refuses_conflict(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     record = _publication(tmp_path)
     _records.save_publication(paths, 'example', record)
     _records.save_publication(
@@ -931,7 +927,7 @@ def test_retry_keeps_first_confirmation_and_refuses_conflict(tmp_path: Path) -> 
 def test_rewrite_load_refuses_malformed_nested_fields(
     tmp_path: Path, before: str, after: str
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     _records.save_rewrite(
         paths, 'example', replace(_rewrite(tmp_path), phase='awaiting', pause=_pause())
     )
@@ -960,14 +956,14 @@ def test_rewrite_refuses_invalid_conflict(tmp_path: Path, change: dict[str, obje
         _rewrite(tmp_path), phase='awaiting', pause=replace(pause, conflicts=(conflict,))
     )
     with pytest.raises(PubanonError):
-        _records.save_rewrite(_paths(tmp_path), 'example', record)
+        _records.save_rewrite(make_paths(tmp_path), 'example', record)
 
 
 @pytest.mark.parametrize('change', [{'old': _SOURCE}, {'tree': 'bad'}, {'conflicts': ()}])
 def test_rewrite_refuses_invalid_pause(tmp_path: Path, change: dict[str, object]) -> None:
     record = replace(_rewrite(tmp_path), phase='awaiting', pause=replace(_pause(), **change))
     with pytest.raises(PubanonError):
-        _records.save_rewrite(_paths(tmp_path), 'example', record)
+        _records.save_rewrite(make_paths(tmp_path), 'example', record)
 
 
 @pytest.mark.parametrize(
@@ -983,7 +979,9 @@ def test_rewrite_refuses_invalid_pause(tmp_path: Path, change: dict[str, object]
 )
 def test_rewrite_refuses_invalid_progress(tmp_path: Path, change: dict[str, object]) -> None:
     with pytest.raises(PubanonError):
-        _records.save_rewrite(_paths(tmp_path), 'example', replace(_rewrite(tmp_path), **change))
+        _records.save_rewrite(
+            make_paths(tmp_path), 'example', replace(_rewrite(tmp_path), **change)
+        )
 
 
 @pytest.mark.parametrize(
@@ -1006,7 +1004,7 @@ def test_rewrite_refuses_invalid_stage(tmp_path: Path, change: dict[str, object]
         _rewrite(tmp_path), phase='awaiting', pause=replace(pause, conflicts=(conflict,))
     )
     with pytest.raises(PubanonError):
-        _records.save_rewrite(_paths(tmp_path), 'example', record)
+        _records.save_rewrite(make_paths(tmp_path), 'example', record)
 
 
 def test_rewrite_refuses_out_of_order_replay(tmp_path: Path) -> None:
@@ -1014,12 +1012,12 @@ def test_rewrite_refuses_out_of_order_replay(tmp_path: Path) -> None:
         _rewrite(tmp_path), descendants=('3' * 40, '1' * 40), replayed=(_replay(tmp_path),)
     )
     with pytest.raises(PubanonError):
-        _records.save_rewrite(_paths(tmp_path), 'example', record)
+        _records.save_rewrite(make_paths(tmp_path), 'example', record)
 
 
 @pytest.mark.parametrize('phase', ['replaying', 'exporting', 'awaiting'])
 def test_rewrite_round_trip_permissions_and_atomic_replace(tmp_path: Path, phase: str) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     assert _records.load_rewrite(paths, 'example') is None
     assert not paths.data_dir.exists()
     record = replace(
@@ -1048,7 +1046,7 @@ def test_rewrite_round_trip_permissions_and_atomic_replace(tmp_path: Path, phase
 def test_save_candidate_directory_failure_reports_possible_save(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     record = _candidate(tmp_path)
 
     def _fail_directory(_path: Path) -> None:
@@ -1061,7 +1059,7 @@ def test_save_candidate_directory_failure_reports_possible_save(
 
 
 def test_save_candidate_refuses_surrogate_message(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     record = _candidate(tmp_path)
     _records.save_candidate(paths, 'example', record)
 
@@ -1074,7 +1072,7 @@ def test_save_candidate_refuses_surrogate_message(tmp_path: Path) -> None:
 
 
 def test_save_candidate_restores_owner_only_mode(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    paths = make_paths(tmp_path)
     record = _candidate(tmp_path)
     _records.save_candidate(paths, 'example', record)
     _filesystem.chmod(_records.candidate_path(paths, 'example'), 0o644)
@@ -1087,10 +1085,10 @@ def test_shared_diagnostic_paths_require_consistent_recorded_decisions(tmp_path:
     first = entry.resolutions[0]
     consistent = replace(entry, resolutions=(first, first))
     record = replace(_replacement(tmp_path), replayed=(consistent,))
-    _records.save_candidate(_paths(tmp_path), 'example', record)
-    assert _records.load_candidate(_paths(tmp_path), 'example') == record
+    _records.save_candidate(make_paths(tmp_path), 'example', record)
+    assert _records.load_candidate(make_paths(tmp_path), 'example') == record
     conflicting = replace(entry, resolutions=(first, replace(first, action='delete')))
     with pytest.raises(PubanonError):
         _records.save_candidate(
-            _paths(tmp_path), 'example', replace(record, replayed=(conflicting,))
+            make_paths(tmp_path), 'example', replace(record, replayed=(conflicting,))
         )

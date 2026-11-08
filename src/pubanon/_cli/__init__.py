@@ -184,7 +184,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     """Run one command with consistent color policy, including help and errors.
 
     If a reader closes standard output early, the remaining output is discarded
-    and the exit status reflects the work completed before the closure.
+    and the exit status reflects the complete command's result.
     Without a standard output stream at all, the command is refused before any
     other work.
 
@@ -194,7 +194,11 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     Returns:
         Zero for success, one for refusal, two for usage errors, or 130 for
-        interruption.
+        cancellation or interruption.
+
+    Raises:
+        OSError: A non-closure output error or null-device redirection failure
+            occurs.
     """
     if sys.stdout is None:
         # Started with standard output closed: nothing can be delivered, and

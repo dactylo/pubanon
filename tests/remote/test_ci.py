@@ -7,7 +7,8 @@ import pytest
 
 from pubanon._errors import ObservationTimeoutError, OperationCanceled, PubanonError
 from pubanon._remote import _ci, _host
-from pubanon._remote._host import CheckState, CheckVerdict, WorkflowRun
+from pubanon._remote._host import CheckState, CheckVerdict, WorkflowJob, WorkflowRun
+from tests._cli import read_gh_calls
 from tests._git import git_env
 
 _COMMIT = 'a' * 40
@@ -113,6 +114,55 @@ def _listing(
     }
 
 
+def _observations(
+    monkeypatch: pytest.MonkeyPatch,
+    first: tuple[WorkflowRun, ...] | PubanonError,
+    *,
+    second: tuple[WorkflowRun, ...] | PubanonError | None = None,
+    jobs: tuple[WorkflowJob, ...] = (WorkflowJob('quality', 'completed', 'success'),),
+) -> list[tuple[int, int]]:
+    listings = iter((first, first if second is None else second))
+    job_requests: list[tuple[int, int]] = []
+
+    def _runs(*_args: object, **_kwargs: object) -> tuple[WorkflowRun, ...]:
+        result = next(listings)
+        if isinstance(result, PubanonError):
+            raise result
+        return result
+
+    def _jobs(
+        _coordinates: tuple[str, str], run: int, attempt: int, **_kwargs: object
+    ) -> tuple[WorkflowJob, ...]:
+        job_requests.append((run, attempt))
+        return jobs
+
+    monkeypatch.setattr(_host, 'list_workflow_runs', _runs)
+    monkeypatch.setattr(_host, 'list_run_jobs', _jobs)
+    return job_requests
+
+
+def _observed_run(
+    number: int = 1,
+    *,
+    status: str = 'completed',
+    conclusion: str | None = 'success',
+    attempt: int = 1,
+) -> WorkflowRun:
+    return WorkflowRun(
+        number,
+        number,
+        attempt,
+        '.github/workflows/ci.yml',
+        'workflow_dispatch',
+        'main',
+        _COMMIT,
+        status,
+        conclusion,
+        'CI / hosted',
+        f'https://example.invalid/runs/{number}',
+    )
+
+
 def _read_run(run: dict[str, object]) -> dict[str, object]:
     return {'args': ['api', 'repos/owner/repo/actions/runs/9'], 'stdout': json.dumps(run)}
 
@@ -170,8 +220,29 @@ def _variable(value: str) -> dict[str, object]:
     }
 
 
-def test_disappearing_latest_run_is_pending(fake_gh: Path) -> None:
-    _script(fake_gh, _listing([_run(1)]), _jobs(1, ('quality', 'success')), _listing([]))
+def test_ci_verdicts_reads_each_configured_check_once_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str, str, str]] = []
+
+    def _check(coordinates: tuple[str, str], commit: str, name: str) -> CheckVerdict:
+        calls.append((*coordinates, commit, name))
+        return CheckVerdict(name, 'success', 'success')
+
+    monkeypatch.setattr(_host, 'check_result', _check)
+
+    assert _ci.ci_verdicts(('publication-owner', 'public-repo'), 'a' * 40, ('Build', 'Test')) == [
+        CheckVerdict('Build', 'success', 'success'),
+        CheckVerdict('Test', 'success', 'success'),
+    ]
+    assert calls == [
+        ('publication-owner', 'public-repo', 'a' * 40, 'Build'),
+        ('publication-owner', 'public-repo', 'a' * 40, 'Test'),
+    ]
+
+
+def test_disappearing_latest_run_is_pending(monkeypatch: pytest.MonkeyPatch) -> None:
+    _observations(monkeypatch, (_observed_run(),), second=())
     assert _evidence().state == 'pending'
 
 
@@ -346,8 +417,8 @@ def test_evidence_facts_names_run_and_failing_checks() -> None:
     assert _ci.evidence_facts(evidence._replace(run=None)) == 'no requested run'
 
 
-def test_evidence_is_missing_without_runs(fake_gh: Path) -> None:
-    _script(fake_gh, _listing([]))
+def test_evidence_is_missing_without_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    _observations(monkeypatch, ())
     evidence = _evidence()
     assert evidence.state == 'missing'
     assert evidence.run is None
@@ -383,13 +454,8 @@ def test_final_repository_evidence_queries_push_runs_on_main(fake_gh: Path) -> N
     assert evidence.state == 'success'
 
 
-def test_newer_run_between_listings_is_pending(fake_gh: Path) -> None:
-    _script(
-        fake_gh,
-        _listing([_run(1)]),
-        _jobs(1, ('quality', 'success')),
-        _listing([_run(1), _run(2)]),
-    )
+def test_newer_run_between_listings_is_pending(monkeypatch: pytest.MonkeyPatch) -> None:
+    _observations(monkeypatch, (_observed_run(),), second=(_observed_run(), _observed_run(2)))
     evidence = _evidence()
     assert evidence.state == 'pending'
     assert evidence.detail == 'a newer run or attempt appeared'
@@ -478,10 +544,11 @@ def test_require_ci_contract_reads_snapshot_workflow(
     assert invalid.value.fact == 'does not declare the boolean input full_tests'
 
 
-def test_rerun_attempt_reads_jobs_for_current_attempt(fake_gh: Path) -> None:
-    runs = [_run(1, attempt=3)]
-    _script(fake_gh, _listing(runs), _jobs(1, ('quality', 'success'), attempt=3), _listing(runs))
+def test_rerun_attempt_reads_jobs_for_current_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    requests = _observations(monkeypatch, (_observed_run(attempt=3),))
     assert _evidence().state == 'success'
+
+    assert requests == [(1, 3)]
 
 
 def test_start_stage_ci_bounds_stalled_registration_request(
@@ -512,7 +579,7 @@ def test_start_stage_ci_bounds_stalled_registration_request(
 
 
 def test_start_stage_ci_never_dispatches_when_registration_times_out(
-    fake_gh: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     now = [0.0]
     monkeypatch.setattr(_ci, '_monotonic', lambda: now[0])
@@ -521,14 +588,23 @@ def test_start_stage_ci_never_dispatches_when_registration_times_out(
         now[0] += seconds
 
     monkeypatch.setattr(_ci, '_sleep', sleep)
-    _script(fake_gh, {'args': _registered()['args'], 'returncode': 1, 'stderr': 'HTTP 404'})
+    registration_calls: list[float] = []
+
+    def _unregistered(_coordinates: tuple[str, str], _workflow: str, *, timeout: float) -> bool:
+        registration_calls.append(timeout)
+        return False
+
+    def _unexpected_dispatch(*_args: object, **_kwargs: object) -> int:
+        pytest.fail('dispatched an unregistered workflow')
+
+    monkeypatch.setattr(_host, 'workflow_registered', _unregistered)
+    monkeypatch.setattr(_host, 'dispatch_workflow', _unexpected_dispatch)
     with pytest.raises(PubanonError, match='not registered') as error:
         _ci.start_stage_ci(('owner', 'repo'), 'ci.yml', _COMMIT, hosted=False, full_tests=False)
     assert error.value.fact is not None
     assert 'snapshot is staged' in error.value.fact
     assert 'CI did not start' in error.value.fact
-    calls = (tmp_path / 'fake-gh-calls.jsonl').read_text().splitlines()
-    assert len(calls) == 12
+    assert registration_calls == list(range(60, 0, -5))
     assert now[0] == 60
 
 
@@ -602,11 +678,8 @@ def test_start_stage_ci_reports_refused_and_uncertain_dispatch(
     else:
         assert 'HTTP 422: host' in error.value.fact
         assert r'\x0a' not in error.value.fact
-    calls = [
-        json.loads(line)['args']
-        for line in (tmp_path / 'fake-gh-calls.jsonl').read_text().splitlines()
-    ]
-    assert calls.count(_dispatch()['args']) == 1
+    calls = [call['args'] for call in read_gh_calls(tmp_path / 'fake-gh-calls.jsonl')]
+    assert sum(call == _dispatch()['args'] for call in calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -629,21 +702,17 @@ def test_start_stage_ci_rejects_wrong_run_identity(
 @pytest.mark.parametrize(
     'change',
     [
-        {'run_attempt': 2},
+        {'attempt': 2},
         {'status': 'in_progress'},
         {'conclusion': 'failure'},
-        {'id': 2},
+        {'identifier': 2},
     ],
 )
 def test_attempt_change_between_listings_is_pending(
-    fake_gh: Path, change: dict[str, object]
+    monkeypatch: pytest.MonkeyPatch, change: dict[str, object]
 ) -> None:
-    _script(
-        fake_gh,
-        _listing([_run(1)]),
-        _jobs(1, ('quality', 'success')),
-        _listing([_run(1) | change]),
-    )
+    run = _observed_run()
+    _observations(monkeypatch, (run,), second=(run._replace(**change),))
     assert _evidence().state == 'pending'
 
 
@@ -698,8 +767,10 @@ def test_evidence_asks_the_budget_before_each_request(
 
 
 @pytest.mark.parametrize('status', ['queued', 'in_progress'])
-def test_evidence_is_pending_while_latest_run_is_incomplete(fake_gh: Path, status: str) -> None:
-    _script(fake_gh, _listing([_run(1), _run(2, status=status, conclusion=None)]))
+def test_evidence_is_pending_while_latest_run_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    _observations(monkeypatch, (_observed_run(), _observed_run(2, status=status, conclusion=None)))
     evidence = _evidence(('quality', 'package'))
     assert evidence.state == 'pending'
     assert evidence.run is not None
@@ -711,19 +782,22 @@ def test_evidence_is_pending_while_latest_run_is_incomplete(fake_gh: Path, statu
 
 
 @pytest.mark.parametrize('second', [False, True])
-def test_evidence_propagates_failed_or_malformed_host_reads(fake_gh: Path, second: bool) -> None:
-    responses = [_listing([_run(1)]), _jobs(1, ('quality', 'success'))] if second else []
-    _script(fake_gh, *responses, _listing([]) | {'stdout': 'not json'})
+def test_evidence_propagates_failed_or_malformed_host_reads(
+    monkeypatch: pytest.MonkeyPatch, second: bool
+) -> None:
+    error = PubanonError('invalid workflow run response')
+    _observations(monkeypatch, (_observed_run(),) if second else error, second=error)
     with pytest.raises(PubanonError, match='invalid workflow run response'):
         _evidence()
 
 
 @pytest.mark.parametrize('conclusion', ['skipped', 'failure', 'cancelled', 'timed_out', None])
 def test_evidence_rejects_skipped_or_absent_required_job(
-    fake_gh: Path, conclusion: str | None
+    monkeypatch: pytest.MonkeyPatch, conclusion: str | None
 ) -> None:
-    runs = [_run(1)]
-    _script(fake_gh, _listing(runs), _jobs(1, ('quality', conclusion)), _listing(runs))
+    _observations(
+        monkeypatch, (_observed_run(),), jobs=(WorkflowJob('quality', 'completed', conclusion),)
+    )
     evidence = _evidence(('quality', 'package', 'Quality'))
     assert evidence.state == 'unacceptable'
     assert evidence.checks == (
@@ -734,13 +808,13 @@ def test_evidence_rejects_skipped_or_absent_required_job(
 
 
 @pytest.mark.parametrize('conclusion', ['success', 'failure'])
-def test_evidence_reports_duplicate_job_names_as_ambiguous(fake_gh: Path, conclusion: str) -> None:
-    runs = [_run(1, conclusion=conclusion)]
-    _script(
-        fake_gh,
-        _listing(runs),
-        _jobs(1, ('quality', 'success'), ('quality', 'success')),
-        _listing(runs),
+def test_evidence_reports_duplicate_job_names_as_ambiguous(
+    monkeypatch: pytest.MonkeyPatch, conclusion: str
+) -> None:
+    _observations(
+        monkeypatch,
+        (_observed_run(conclusion=conclusion),),
+        jobs=(WorkflowJob('quality', 'completed', 'success'),) * 2,
     )
     evidence = _evidence()
     assert evidence.state == ('ambiguous' if conclusion == 'success' else 'unacceptable')
@@ -749,10 +823,9 @@ def test_evidence_reports_duplicate_job_names_as_ambiguous(fake_gh: Path, conclu
 
 @pytest.mark.parametrize('conclusion', ['success', 'failure', 'cancelled', 'skipped', None])
 def test_evidence_requires_run_conclusion_without_required_checks(
-    fake_gh: Path, conclusion: str | None
+    monkeypatch: pytest.MonkeyPatch, conclusion: str | None
 ) -> None:
-    runs = [_run(1, conclusion=conclusion)]
-    _script(fake_gh, _listing(runs), _jobs(1), _listing(runs))
+    _observations(monkeypatch, (_observed_run(conclusion=conclusion),), jobs=())
     evidence = _evidence(())
     assert evidence.state == ('success' if conclusion == 'success' else 'unacceptable')
     assert evidence.checks == ()
@@ -760,10 +833,13 @@ def test_evidence_requires_run_conclusion_without_required_checks(
 
 
 @pytest.mark.parametrize('latest', ['success', 'failure'])
-def test_latest_run_wins_over_older_results(fake_gh: Path, latest: str) -> None:
+def test_latest_run_wins_over_older_results(monkeypatch: pytest.MonkeyPatch, latest: str) -> None:
     older = 'failure' if latest == 'success' else 'success'
-    runs = [_run(2, conclusion=latest), _run(1, conclusion=older, attempt=99)]
-    _script(fake_gh, _listing(runs), _jobs(2, ('quality', latest)), _listing(runs))
+    _observations(
+        monkeypatch,
+        (_observed_run(2, conclusion=latest), _observed_run(1, conclusion=older, attempt=99)),
+        jobs=(WorkflowJob('quality', 'completed', latest),),
+    )
     evidence = _evidence()
     assert evidence.state == ('success' if latest == 'success' else 'unacceptable')
     assert evidence.run is not None
@@ -771,13 +847,11 @@ def test_latest_run_wins_over_older_results(fake_gh: Path, latest: str) -> None:
 
 
 @pytest.mark.parametrize('second', [False, True])
-def test_listing_change_between_pages_is_pending(fake_gh: Path, second: bool) -> None:
-    unstable = [
-        _listing([_run(n) for n in range(1, 101)], total=101),
-        _listing([_run(101)], page=2, total=102),
-    ]
-    responses = [_listing([_run(1)]), _jobs(1, ('quality', 'success'))] if second else []
-    _script(fake_gh, *responses, *unstable)
+def test_listing_change_between_pages_is_pending(
+    monkeypatch: pytest.MonkeyPatch, second: bool
+) -> None:
+    error = _host.RunListingChangedError('runs changed')
+    _observations(monkeypatch, (_observed_run(),) if second else error, second=error)
     evidence = _evidence()
     assert evidence.state == 'pending'
     assert evidence.detail == (
@@ -843,15 +917,12 @@ def test_start_stage_ci_waits_for_registration_then_dispatches_once(
     run = _ci.start_stage_ci(('owner', 'repo'), 'ci.yml', _COMMIT, hosted=True, full_tests=False)
     assert run.identifier == 9
     assert sleeps == [5]
-    calls = [
-        json.loads(line)['args']
-        for line in (tmp_path / 'fake-gh-calls.jsonl').read_text().splitlines()
-    ]
-    assert calls.count(_dispatch()['args']) == 1
+    calls = [call['args'] for call in read_gh_calls(tmp_path / 'fake-gh-calls.jsonl')]
+    assert sum(call == _dispatch()['args'] for call in calls) == 1
 
 
 @pytest.mark.parametrize('second', [False, True])
-def test_tied_run_numbers_are_ambiguous(fake_gh: Path, second: bool) -> None:
-    responses = [_listing([_run(1)]), _jobs(1, ('quality', 'success'))] if second else []
-    _script(fake_gh, *responses, _listing([_run(1), _run(1) | {'id': 2}]))
+def test_tied_run_numbers_are_ambiguous(monkeypatch: pytest.MonkeyPatch, second: bool) -> None:
+    tied = (_observed_run(), _observed_run()._replace(identifier=2))
+    _observations(monkeypatch, (_observed_run(),) if second else tied, second=tied)
     assert _evidence().state == ('pending' if second else 'ambiguous')

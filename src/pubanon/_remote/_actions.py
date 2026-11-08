@@ -14,10 +14,12 @@ from pubanon._remote._host import ActionsJob, ActionsRun
 from pubanon._terminal import (
     ask,
     confirm,
+    counted,
     detail_fields,
     escape,
     fields,
     output,
+    series,
     style,
     verbose_enabled,
 )
@@ -30,23 +32,11 @@ _HEADLINES = {
     RuleClass.IDENTITY_CRITICAL: 'Sensitive terms in Actions logs',
     RuleClass.HYGIENE: 'Policy terms in Actions logs',
 }
-_PAIR_SIZE = 2
 _REVEAL_COMMAND = 'pubanon repo reveal'
 
 
-class ActionsFinding(NamedTuple):
-    """Locate one configured term in Actions content.
-
-    Attributes:
-        run: Identifier of the run whose content matched.
-        location: Unescaped row label: `run details`, `job NAME`, or `runner
-            for job NAME`, with the attempt when a run has several.
-        job: Identifier of the job whose log matched, or None for run and
-            runner details.
-        hit: Matched term and rule class; `hit.unit` is unique per location.
-        lines: One-based log lines containing the term, gathered only in
-            verbose mode.
-    """
+class _ActionsFinding(NamedTuple):
+    """Locate one configured term in Actions content."""
 
     run: int
     location: str
@@ -55,37 +45,21 @@ class ActionsFinding(NamedTuple):
     lines: tuple[int, ...]
 
 
-class ActionsReview(NamedTuple):
-    """Hold one complete check of a repository's Actions content.
-
-    Attributes:
-        coordinates: Configured repository owner and name.
-        runs: Completed runs in GitHub's order.
-        jobs: Jobs from every attempt of every run.
-        read: Identifiers of jobs whose logs were read.
-        gone: Number of jobs that ran whose logs are gone.
-        findings: Matches in the order they were found.
-        command: Command that reruns the check, named in recovery and hint
-            text.
-    """
+class _ActionsReview(NamedTuple):
+    """Hold one complete check of a repository's Actions content."""
 
     coordinates: tuple[str, str]
     runs: tuple[ActionsRun, ...]
     jobs: tuple[ActionsJob, ...]
     read: frozenset[int]
     gone: int
-    findings: tuple[ActionsFinding, ...]
+    findings: tuple[_ActionsFinding, ...]
     command: str = _REVEAL_COMMAND
 
 
-def _checked(review: ActionsReview) -> int:
+def _checked(review: _ActionsReview) -> int:
     """Count jobs that ran and whose logs were read."""
     return sum(1 for job in review.jobs if job.ran and job.identifier in review.read)
-
-
-def _counted(count: int, noun: str) -> str:
-    """Return a count with a regular plural noun."""
-    return f'{count} {noun}' if count == 1 else f'{count} {noun}s'
 
 
 def _job_label(prefix: str, job: ActionsJob, attempts: Mapping[int, int]) -> str:
@@ -179,7 +153,7 @@ def _log_lines(log: bytes, hit: GateHit) -> tuple[int, ...]:
     return tuple(sorted(lines))
 
 
-def _matches(unit: str, data: bytes, rules: Mapping[RuleClass, Iterable[str]]) -> list[GateHit]:
+def _matches(unit: str, data: bytes, rules: Mapping[RuleClass, Collection[str]]) -> list[GateHit]:
     """Match content with and without terminal escape sequences, once per term."""
     hits = gate_unit(unit, data, rules)
     stripped = b''.join(chunk for _source, chunk in _plain_chunks(data))
@@ -218,7 +192,7 @@ def _require_gone(coordinates: tuple[str, str], job: ActionsJob, command: str) -
         raise PubanonError('a deleted log is still available', fact=f'job {job.identifier}')
 
 
-def _delete(review: ActionsReview, runs: Sequence[int], account: str) -> None:
+def _delete(review: _ActionsReview, runs: Sequence[int], account: str) -> None:
     """Delete run logs and confirm that every previously read log is gone."""
     owner, repo = review.coordinates
     sent: list[int] = []
@@ -251,7 +225,7 @@ def _delete(review: ActionsReview, runs: Sequence[int], account: str) -> None:
             fact='\n'.join(facts),
             recovery=f'rerun {review.command}',
         ) from None
-    output(f'Deleted the logs of {_counted(len(runs), "run")}.', kind='success')
+    output(f'Deleted the logs of {counted(len(runs), "run")}.', kind='success')
 
 
 def _row_details(
@@ -270,253 +244,12 @@ def _run_state(runs: Iterable[ActionsRun]) -> list[tuple[int, int, str]]:
     return sorted((run.identifier, run.attempt, run.status) for run in runs)
 
 
-def _series(parts: Sequence[str]) -> str:
-    """Join list items, adding a final comma when an item already contains `and`."""
-    if len(parts) == 1:
-        return parts[0]
-    if len(parts) == _PAIR_SIZE and not any(' and ' in part for part in parts):
-        return f'{parts[0]} and {parts[1]}'
-    return ', '.join(parts[:-1]) + f', and {parts[-1]}'
-
-
-def cancel_message(deleted: Sequence[int]) -> str:
-    """Return the cancellation message, naming any logs already deleted.
-
-    Args:
-        deleted: Runs whose logs this reveal deleted.
-    """
-    if not deleted:
-        return 'Canceled. Nothing was changed.'
-    return (
-        f'Canceled. Deleted the logs of {_counted(len(deleted), "run")}; nothing else was changed.'
-    )
-
-
-def _deletion_chosen(review: ActionsReview, runs: Sequence[int], *, cancelable: bool) -> bool:
-    """Ask whether to delete the matching runs' logs; True only after confirmation."""
-    choices = ['delete', 'keep', 'cancel'] if cancelable else ['delete', 'keep']
-    names = {run.identifier: run.workflow for run in review.runs}
-    listing = '; '.join(f'{run}, {escape(names[run])}' for run in runs)
-    count = _counted(len(runs), 'run')
-    try:
-        choice = ask('What should happen to these logs?', choices=choices)
-        if choice == 'delete' and any(item.job is None for item in review.findings):
-            output('Run and runner details stay; deleting logs cannot remove them.')
-        confirmed = choice == 'delete' and confirm(
-            f'Delete the logs of {count} ({listing})? This cannot be undone.'
-        )
-    except OperationCanceled:
-        raise
-    except PubanonError:
-        if cancelable:
-            raise
-        output(
-            'warning: could not ask about deleting Actions logs; nothing was deleted.',
-            kind='warning',
-        )
-        return False
-    if cancelable and not confirmed and choice != 'keep':
-        raise OperationCanceled(cancel_message(()))
-    return confirmed
-
-
-def clean_sentence(review: ActionsReview) -> str:
-    """Summarize a check without findings in one sentence for audit.
-
-    Args:
-        review: Completed Actions check without findings.
-    """
-    if not review.runs:
-        return 'No Actions runs to check.'
-    text = (
-        f'No configured sensitive terms were found in the Actions logs: {_checked(review)} checked'
-    )
-    if review.gone:
-        text += f', {review.gone} no longer available'
-    return f'{text}.'
-
-
-def deletion_note(deleted: Sequence[int]) -> str:
-    """Name logs this reveal deleted, for the details of a later error.
-
-    Args:
-        deleted: Runs whose logs this reveal deleted; must not be empty.
-    """
-    return f'Deleted the logs of {_counted(len(deleted), "run")}.'
-
-
-def require_unchanged(review: ActionsReview) -> None:
-    """Refuse when runs, attempts, statuses, or jobs differ from a review.
-
-    Separate requests cannot give an atomic view: a run that starts after this
-    read is not checked.
-
-    Args:
-        review: Completed Actions check to compare with.
-
-    Raises:
-        PubanonError: GitHub's runs or jobs differ, or a read fails.
-    """
-    owner, repo = review.coordinates
-    runs = _host.actions_runs(owner, repo, command=review.command)
-    if _run_state(runs) == _run_state(review.runs) and _job_state(
-        _jobs(review.coordinates, runs, review.command)
-    ) == _job_state(review.jobs):
-        return
-    raise PubanonError('Actions runs changed during the check', recovery=f'rerun {review.command}')
-
-
-def check(
-    coordinates: tuple[str, str],
-    account: str,
-    rules: Mapping[RuleClass, Iterable[str]],
-    *,
-    command: str = _REVEAL_COMMAND,
-) -> ActionsReview:
-    """Read and match every run's details, every job's runner, and every job log.
-
-    Logs stay in memory and are never printed or saved. A job that ran must
-    yield a log, or a log that GitHub's API reports missing while the job
-    itself still reads back unchanged under the configured account.
-
-    Args:
-        coordinates: Configured repository owner and name.
-        account: Configured account, checked again after any gone log.
-        rules: Content rules from `assemble_rules`.
-        command: Command that reruns the check, named in recovery text.
-
-    Returns:
-        The complete review, confirmed unchanged by a second read.
-
-    Raises:
-        PubanonError: A run is unfinished, a read fails or is invalid, a log
-            cannot be confirmed, the account changed, or the runs changed.
-    """
-    owner, repo = coordinates
-    runs = _host.actions_runs(owner, repo, command=command)
-    if any(run.status != 'completed' for run in runs):
-        raise PubanonError(
-            'workflow runs are still running',
-            recovery=f'wait for them to finish, then rerun {command}',
-        )
-    jobs = _jobs(coordinates, runs, command)
-    attempts = {run.identifier: run.attempt for run in runs}
-    findings = [
-        ActionsFinding(run.identifier, 'run details', None, hit, ())
-        for run in runs
-        for hit in _matches(f'run {run.identifier} details', run.details, rules)
-    ]
-    if jobs:
-        output(
-            f'Checking Actions logs: {_counted(len(runs), "run")}, {_counted(len(jobs), "job")}.'
-        )
-    read: set[int] = set()
-    gone = 0
-    for job in jobs:
-        findings.extend(
-            ActionsFinding(job.run, _job_label('runner for job ', job, attempts), None, hit, ())
-            for hit in _matches(f'job {job.identifier} runner', job.runner, rules)
-        )
-        log = _read_log(coordinates, job, command)
-        if log is None:
-            if job.ran:
-                gone += 1
-            continue
-        read.add(job.identifier)
-        findings.extend(
-            ActionsFinding(
-                job.run,
-                _job_label('job ', job, attempts),
-                job.identifier,
-                hit,
-                _log_lines(log, hit) if verbose_enabled() else (),
-            )
-            for hit in _matches(f'job {job.identifier} log', log, rules)
-        )
-    if gone:
-        _host.require_authenticated_account(account, authority='configuration')
-    review = ActionsReview(
-        coordinates, runs, jobs, frozenset(read), gone, tuple(findings), command
-    )
-    require_unchanged(review)
-    return review
-
-
-def row(review: ActionsReview) -> str:
-    """Summarize a check for the verification table; counts cover jobs that ran.
-
-    Args:
-        review: Completed Actions check.
-    """
-    checked = _checked(review)
-    if not checked and not review.gone:
-        counts = 'none'
-    else:
-        counts = f'{checked} checked'
-        if review.gone:
-            counts += f', {review.gone} no longer available'
-    if review.findings:
-        return f'{counts}; findings listed below'
-    return counts if counts == 'none' else f'{counts}; no sensitive terms'
-
-
-def show_unchecked(
-    coordinates: tuple[str, str],
-    runs: Sequence[int],
-    *,
-    artifacts: int,
-    caches: int,
-) -> None:
-    """Name the Actions content reveal cannot check, with links to review it.
-
-    Args:
-        coordinates: Configured repository owner and name.
-        runs: Workflow run identifiers, linked only in verbose mode.
-        artifacts: Number of artifacts whose contents stay unchecked.
-        caches: Number of Actions caches whose contents stay unchecked.
-    """
-    owner, repo = coordinates
-    contents = [
-        _counted(count, noun)
-        for count, noun in ((artifacts, 'artifact'), (caches, 'Actions cache'))
-        if count
-    ]
-    parts = [f'the contents of {" and ".join(contents)}'] if contents else []
-    if runs:
-        parts.append('job summaries and annotations')
-    parts.append('earlier pushes on the Activity page')
-    output(f'{style("Not checked:")} {_series(parts)}.')
-    fields(
-        [
-            ('Actions', f'https://github.com/{owner}/{repo}/actions'),
-            ('Activity', f'https://github.com/{owner}/{repo}/activity'),
-        ],
-        indent=2,
-    )
-    detail_fields(
-        [(f'Run {run}', f'https://github.com/{owner}/{repo}/actions/runs/{run}') for run in runs],
-        indent=2,
-    )
-
-
-def summary(
-    review: ActionsReview,
+def _summary(
+    review: _ActionsReview,
     configs: tuple[GlobalConfig, ProjectConfig],
     derived: Collection[str],
 ) -> list[str]:
-    """Summarize findings by rule class and run, oldest run first.
-
-    Rows show configured terms, never log text. Verbose mode links each log row
-    to its job, lists its log lines, and shows every row.
-
-    Args:
-        review: Completed Actions check.
-        configs: Global and project rules used to label each finding's origin.
-        derived: Private terms derived from the active environment.
-
-    Returns:
-        Escaped, styled display lines, or an empty list without findings.
-    """
+    """Summarize findings by rule class and run, oldest run first."""
     verbose = verbose_enabled()
     lines: list[str] = []
     for rule_class, headline in _HEADLINES.items():
@@ -565,14 +298,14 @@ def summary(
 
 
 def _present(
-    review: ActionsReview,
+    review: _ActionsReview,
     configs: tuple[GlobalConfig, ProjectConfig],
     derived: Collection[str],
     *,
     already_public: bool,
 ) -> tuple[int, ...]:
     """Show findings and what publishing them means; return runs with matching logs."""
-    for line in summary(review, configs, derived):
+    for line in _summary(review, configs, derived):
         output(line)
     log_runs = tuple(dict.fromkeys(item.run for item in review.findings if item.job is not None))
     if not log_runs:
@@ -593,8 +326,65 @@ def _present(
     return log_runs
 
 
+def cancel_message(deleted: Sequence[int]) -> str:
+    """Return the cancellation message, naming any logs already deleted.
+
+    Args:
+        deleted: Runs whose logs this reveal deleted.
+    """
+    if not deleted:
+        return 'Canceled. Nothing was changed.'
+    return (
+        f'Canceled. Deleted the logs of {counted(len(deleted), "run")}; nothing else was changed.'
+    )
+
+
+def _deletion_chosen(review: _ActionsReview, runs: Sequence[int], *, cancelable: bool) -> bool:
+    """Ask whether to delete the matching runs' logs; True only after confirmation."""
+    choices = ['delete', 'keep', 'cancel'] if cancelable else ['delete', 'keep']
+    names = {run.identifier: run.workflow for run in review.runs}
+    listing = '; '.join(f'{run}, {escape(names[run])}' for run in runs)
+    count = counted(len(runs), 'run')
+    try:
+        choice = ask('What should happen to these logs?', choices=choices)
+        if choice == 'delete' and any(item.job is None for item in review.findings):
+            output('Run and runner details stay; deleting logs cannot remove them.')
+        confirmed = choice == 'delete' and confirm(
+            f'Delete the logs of {count} ({listing})? This cannot be undone.'
+        )
+    except OperationCanceled:
+        raise
+    except PubanonError:
+        if cancelable:
+            raise
+        output(
+            'warning: could not ask about deleting Actions logs; nothing was deleted.',
+            kind='warning',
+        )
+        return False
+    if cancelable and not confirmed and choice != 'keep':
+        raise OperationCanceled(cancel_message(()))
+    return confirmed
+
+
+def clean_sentence(review: _ActionsReview) -> str:
+    """Summarize a check without findings in one sentence for audit.
+
+    Args:
+        review: Completed Actions check without findings.
+    """
+    if not review.runs:
+        return 'No Actions runs to check.'
+    text = (
+        f'No configured sensitive terms were found in the Actions logs: {_checked(review)} checked'
+    )
+    if review.gone:
+        text += f', {review.gone} no longer available'
+    return f'{text}.'
+
+
 def decide(
-    review: ActionsReview,
+    review: _ActionsReview,
     configs: tuple[GlobalConfig, ProjectConfig],
     derived: Collection[str],
     account: str,
@@ -619,8 +409,8 @@ def decide(
     Raises:
         OperationCanceled: The user canceled before changing anything, or
             interrupted deletion and the error lists each run's outcome.
-        PubanonError: Deletion did not finish; the error lists each run's
-            outcome.
+        PubanonError: Confirmation input is unavailable or deletion did not
+            finish. Deletion failures list each run's outcome.
     """
     if not review.findings:
         return ()
@@ -635,8 +425,17 @@ def decide(
     return log_runs
 
 
+def deletion_note(deleted: Sequence[int]) -> str:
+    """Name logs this reveal deleted, for the details of a later error.
+
+    Args:
+        deleted: Runs whose logs this reveal deleted; must not be empty.
+    """
+    return f'Deleted the logs of {counted(len(deleted), "run")}.'
+
+
 def offer_log_deletion(
-    review: ActionsReview,
+    review: _ActionsReview,
     configs: tuple[GlobalConfig, ProjectConfig],
     derived: Collection[str],
     account: str,
@@ -674,3 +473,155 @@ def offer_log_deletion(
         return ()
     _delete(review, log_runs, account)
     return log_runs
+
+
+def require_unchanged(review: _ActionsReview) -> None:
+    """Refuse when runs, attempts, statuses, or jobs differ from a review.
+
+    Separate requests cannot give an atomic view: a run that starts after this
+    read is not checked.
+
+    Args:
+        review: Completed Actions check to compare with.
+
+    Raises:
+        PubanonError: GitHub's runs or jobs differ, or a read fails.
+    """
+    owner, repo = review.coordinates
+    runs = _host.actions_runs(owner, repo, command=review.command)
+    if _run_state(runs) == _run_state(review.runs) and _job_state(
+        _jobs(review.coordinates, runs, review.command)
+    ) == _job_state(review.jobs):
+        return
+    raise PubanonError('Actions runs changed during the check', recovery=f'rerun {review.command}')
+
+
+def check(
+    coordinates: tuple[str, str],
+    account: str,
+    rules: Mapping[RuleClass, Collection[str]],
+    *,
+    command: str = _REVEAL_COMMAND,
+) -> _ActionsReview:
+    """Read and match every run's details, every job's runner, and every job log.
+
+    Logs stay in memory and are never printed or saved. A job that ran must
+    yield a log, or a log that GitHub's API reports missing while the job
+    itself still reads back unchanged under the configured account.
+
+    Args:
+        coordinates: Configured repository owner and name.
+        account: Configured account, checked again after any gone log.
+        rules: Content rules from `assemble_rules`.
+        command: Command that reruns the check, named in recovery text.
+
+    Returns:
+        The complete review, confirmed unchanged by a second read.
+
+    Raises:
+        PubanonError: A run is unfinished, a read fails or is invalid, a log
+            cannot be confirmed, the account changed, or the runs changed.
+    """
+    owner, repo = coordinates
+    runs = _host.actions_runs(owner, repo, command=command)
+    if any(run.status != 'completed' for run in runs):
+        raise PubanonError(
+            'workflow runs are still running',
+            recovery=f'wait for them to finish, then rerun {command}',
+        )
+    jobs = _jobs(coordinates, runs, command)
+    attempts = {run.identifier: run.attempt for run in runs}
+    findings = [
+        _ActionsFinding(run.identifier, 'run details', None, hit, ())
+        for run in runs
+        for hit in _matches(f'run {run.identifier} details', run.details, rules)
+    ]
+    if jobs:
+        output(f'Checking Actions logs: {counted(len(runs), "run")}, {counted(len(jobs), "job")}.')
+    read: set[int] = set()
+    gone = 0
+    for job in jobs:
+        findings.extend(
+            _ActionsFinding(job.run, _job_label('runner for job ', job, attempts), None, hit, ())
+            for hit in _matches(f'job {job.identifier} runner', job.runner, rules)
+        )
+        log = _read_log(coordinates, job, command)
+        if log is None:
+            if job.ran:
+                gone += 1
+            continue
+        read.add(job.identifier)
+        findings.extend(
+            _ActionsFinding(
+                job.run,
+                _job_label('job ', job, attempts),
+                job.identifier,
+                hit,
+                _log_lines(log, hit) if verbose_enabled() else (),
+            )
+            for hit in _matches(f'job {job.identifier} log', log, rules)
+        )
+    if gone:
+        _host.require_authenticated_account(account, authority='configuration')
+    review = _ActionsReview(
+        coordinates, runs, jobs, frozenset(read), gone, tuple(findings), command
+    )
+    require_unchanged(review)
+    return review
+
+
+def row(review: _ActionsReview) -> str:
+    """Summarize a check for the verification table; counts cover jobs that ran.
+
+    Args:
+        review: Completed Actions check.
+    """
+    checked = _checked(review)
+    if not checked and not review.gone:
+        counts = 'none'
+    else:
+        counts = f'{checked} checked'
+        if review.gone:
+            counts += f', {review.gone} no longer available'
+    if review.findings:
+        return f'{counts}; findings listed below'
+    return counts if counts == 'none' else f'{counts}; no sensitive terms'
+
+
+def show_unchecked(
+    coordinates: tuple[str, str],
+    runs: Sequence[int],
+    *,
+    artifacts: int,
+    caches: int,
+) -> None:
+    """Name the Actions content reveal cannot check, with links to review it.
+
+    Args:
+        coordinates: Configured repository owner and name.
+        runs: Workflow run identifiers, linked only in verbose mode.
+        artifacts: Number of artifacts whose contents stay unchecked.
+        caches: Number of Actions caches whose contents stay unchecked.
+    """
+    owner, repo = coordinates
+    contents = [
+        counted(count, noun)
+        for count, noun in ((artifacts, 'artifact'), (caches, 'Actions cache'))
+        if count
+    ]
+    parts = [f'the contents of {" and ".join(contents)}'] if contents else []
+    if runs:
+        parts.append('job summaries and annotations')
+    parts.append('earlier pushes on the Activity page')
+    output(f'{style("Not checked:")} {series(parts)}.')
+    fields(
+        [
+            ('Actions', f'https://github.com/{owner}/{repo}/actions'),
+            ('Activity', f'https://github.com/{owner}/{repo}/activity'),
+        ],
+        indent=2,
+    )
+    detail_fields(
+        [(f'Run {run}', f'https://github.com/{owner}/{repo}/actions/runs/{run}') for run in runs],
+        indent=2,
+    )
